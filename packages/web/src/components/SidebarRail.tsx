@@ -12,6 +12,7 @@ import {
   type ProjectEntry,
 } from "@/lib/projectList";
 import { CreateInstanceModal } from "./CreateInstanceModal";
+import { useProjectOrder } from "@/lib/useProjectOrder";
 
 interface SidebarRailProps {
   onExpand: () => void;
@@ -20,9 +21,8 @@ interface SidebarRailProps {
 /**
  * The collapsed sidebar: one icon per project, Slack-workspace style, so a
  * folded sidebar still lets you see and switch projects. It lists the same
- * projects in the same order as the expanded `Sidebar` (repo groups, no-remote
- * bucket last, active first within a group) because both derive the list from
- * `lib/projectList.ts`.
+ * projects in the same order as the expanded `Sidebar`, including the user's
+ * saved repository and project order.
  */
 export function SidebarRail({ onExpand }: SidebarRailProps) {
   const { cliClients, sessions, machines, attachSession, sessionId } = useStore();
@@ -33,7 +33,8 @@ export function SidebarRail({ onExpand }: SidebarRailProps) {
     () => buildProjectList(sessions, cliClients, machines),
     [cliClients, sessions, machines],
   );
-  const repoGroups = useMemo(() => groupProjectsByRepo(projects), [projects]);
+  const defaultGroups = useMemo(() => groupProjectsByRepo(projects), [projects]);
+  const { repoGroups } = useProjectOrder(defaultGroups);
 
   return (
     <nav

@@ -2,10 +2,10 @@
 
 import { useStore } from "@/lib/store";
 import { ThemePicker } from "@/components/ThemePicker";
-import { FolderOpen, RefreshCw, Share2, Users, X, Crown, Trash2, ChevronLeft, ChevronDown, ChevronRight, BarChart3, Server, Plus, LogOut, ArrowRightLeft, AlertTriangle, MoreHorizontal } from "lucide-react";
+import { FolderOpen, RefreshCw, Share2, Users, X, Crown, Trash2, ChevronLeft, ChevronDown, ChevronRight, BarChart3, Server, Plus, LogOut, ArrowRightLeft, AlertTriangle, MoreHorizontal, GripVertical } from "lucide-react";
 import { CreateInstanceModal } from "./CreateInstanceModal";
 import Link from "next/link";
-import { useMemo, useState, useEffect } from "react";
+import { useMemo, useState, useEffect, type DragEvent, type KeyboardEvent } from "react";
 import { createPortal } from "react-dom";
 import {
   paneUsageLimit,
@@ -19,6 +19,7 @@ import {
   projectNameFor,
   type ProjectRole,
 } from "@/lib/projectList";
+import { useProjectOrder } from "@/lib/useProjectOrder";
 
 // Truncate path in the middle to preserve the folder name at the end
 // e.g., "/home/shuai/workspace/long-project" -> "/home/.../long-project"
@@ -63,6 +64,12 @@ interface SidebarProps {
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || "https://apas.mpaxos.com";
 type SidebarView = "projects" | "idle";
+type SidebarItem = { groupKey: string; projectId?: string };
+type DropPlacement = "before" | "after";
+
+function sameSidebarItem(a: SidebarItem | null, b: SidebarItem): boolean {
+  return a?.groupKey === b.groupKey && a?.projectId === b.projectId;
+}
 
 /// Matches the session screen's fallback so one pane reads the same everywhere.
 function paneRowLabel(pane: { label?: string | null; kind: string; pane_id: number }): string {
@@ -233,7 +240,87 @@ export function Sidebar({ onClose, onCollapse, width }: SidebarProps) {
     );
   };
 
-  const repoGroups = useMemo(() => groupProjectsByRepo(projects), [projects]);
+  const defaultGroups = useMemo(() => groupProjectsByRepo(projects), [projects]);
+  const { repoGroups, moveGroup, moveProject } = useProjectOrder(defaultGroups);
+  const [draggedItem, setDraggedItem] = useState<SidebarItem | null>(null);
+  const [dropTarget, setDropTarget] = useState<(SidebarItem & { placement: DropPlacement }) | null>(null);
+  const [reorderAnnouncement, setReorderAnnouncement] = useState("");
+
+  const finishDrag = () => {
+    setDraggedItem(null);
+    setDropTarget(null);
+  };
+
+  const moveItem = (from: SidebarItem, to: SidebarItem, placement: DropPlacement) => {
+    if (from.projectId && to.projectId && from.groupKey === to.groupKey) {
+      moveProject(from.groupKey, from.projectId, to.projectId, placement);
+      const project = repoGroups.find((group) => group.key === from.groupKey)
+        ?.projects.find((project) => project.projectId === from.projectId);
+      setReorderAnnouncement(`Moved ${project?.name ?? "project"} ${placement} its neighbor.`);
+    } else if (!from.projectId && !to.projectId) {
+      moveGroup(from.groupKey, to.groupKey, placement);
+      const group = repoGroups.find((group) => group.key === from.groupKey);
+      setReorderAnnouncement(`Moved ${group?.label ?? "repository"} ${placement} its neighbor.`);
+    }
+  };
+
+  const canDrop = (target: SidebarItem) => {
+    if (!draggedItem || sameSidebarItem(draggedItem, target)) return false;
+    // Ordering never changes which repository a project belongs to.
+    return draggedItem.projectId
+      ? !!target.projectId && draggedItem.groupKey === target.groupKey
+      : !target.projectId;
+  };
+
+  const handleDragStart = (event: DragEvent, item: SidebarItem) => {
+    event.stopPropagation();
+    setDraggedItem(item);
+    event.dataTransfer.effectAllowed = "move";
+    event.dataTransfer.setData("application/x-apas-sidebar-item", JSON.stringify(item));
+  };
+
+  const handleDragOver = (event: DragEvent<HTMLElement>, target: SidebarItem) => {
+    if (!canDrop(target)) return;
+    event.preventDefault();
+    event.stopPropagation();
+    event.dataTransfer.dropEffect = "move";
+    const rect = event.currentTarget.getBoundingClientRect();
+    const placement = event.clientY < rect.top + rect.height / 2 ? "before" : "after";
+    setDropTarget((previous) => sameSidebarItem(previous, target) && previous?.placement === placement
+      ? previous
+      : { ...target, placement });
+  };
+
+  const handleDrop = (event: DragEvent<HTMLElement>, target: SidebarItem) => {
+    if (!canDrop(target) || !draggedItem) return;
+    event.preventDefault();
+    event.stopPropagation();
+    const rect = event.currentTarget.getBoundingClientRect();
+    moveItem(draggedItem, target, event.clientY < rect.top + rect.height / 2 ? "before" : "after");
+    finishDrag();
+  };
+
+  const handleReorderKey = (event: KeyboardEvent, item: SidebarItem) => {
+    if (event.key !== "ArrowUp" && event.key !== "ArrowDown") return;
+    event.preventDefault();
+    event.stopPropagation();
+    const ids = item.projectId
+      ? repoGroups.find((group) => group.key === item.groupKey)?.projects.map((project) => project.projectId) ?? []
+      : repoGroups.map((group) => group.key);
+    const index = ids.indexOf(item.projectId ?? item.groupKey);
+    const target = ids[index + (event.key === "ArrowUp" ? -1 : 1)];
+    if (!target) return;
+    moveItem(item, item.projectId
+      ? { groupKey: item.groupKey, projectId: target }
+      : { groupKey: target }, event.key === "ArrowUp" ? "before" : "after");
+  };
+
+  const renderDropIndicator = (item: SidebarItem) => {
+    if (!sameSidebarItem(dropTarget, item)) return null;
+    return <div aria-hidden="true" className={`pointer-events-none absolute inset-x-0 z-10 h-0.5 bg-blue-500 ${
+      dropTarget?.placement === "before" ? "-top-0.5" : "-bottom-0.5"
+    }`} />;
+  };
 
   // Collapsed repo groups, persisted to localStorage so the choice survives
   // reloads and the `repoGroups` recompute. Groups default to expanded.
@@ -686,6 +773,11 @@ export function Sidebar({ onClose, onCollapse, width }: SidebarProps) {
         </div>
       ) : (
       <div className="flex-1 overflow-y-auto p-2">
+        <p id="project-reorder-help" className="sr-only">
+          Drag a repository handle to move its group. Drag a project handle to move
+          it within its repository. With a handle focused, use the Up and Down arrow keys.
+        </p>
+        <p role="status" aria-live="polite" className="sr-only">{reorderAnnouncement}</p>
         {projects.length === 0 ? (
           <div className="text-center text-gray-400 text-sm py-8">
             <FolderOpen className="w-8 h-8 mx-auto mb-2 opacity-50" />
@@ -697,8 +789,32 @@ export function Sidebar({ onClose, onCollapse, width }: SidebarProps) {
             {repoGroups.map((group) => {
               const collapsed = collapsedGroups.has(group.key);
               return (
-                <div key={group.key}>
+                <div
+                  key={group.key}
+                  data-repo-key={group.key}
+                  className={`relative ${sameSidebarItem(draggedItem, { groupKey: group.key }) ? "opacity-40" : ""}`}
+                  onDragOver={(event) => handleDragOver(event, { groupKey: group.key })}
+                  onDrop={(event) => handleDrop(event, { groupKey: group.key })}
+                  onDragLeave={(event) => {
+                    if (!event.currentTarget.contains(event.relatedTarget as Node | null)) setDropTarget(null);
+                  }}
+                >
+                  {renderDropIndicator({ groupKey: group.key })}
                   <div className="flex items-center gap-1 px-1 py-1">
+                    <button
+                      type="button"
+                      draggable
+                      aria-label={`Reorder repository ${group.label}`}
+                      aria-describedby="project-reorder-help"
+                      aria-keyshortcuts="ArrowUp ArrowDown"
+                      title="Drag to reorder, or focus and use Up/Down arrows"
+                      onDragStart={(event) => handleDragStart(event, { groupKey: group.key })}
+                      onDragEnd={finishDrag}
+                      onKeyDown={(event) => handleReorderKey(event, { groupKey: group.key })}
+                      className="shrink-0 cursor-grab rounded p-0.5 text-gray-400 hover:bg-gray-200 hover:text-gray-600 focus-visible:outline-2 focus-visible:outline-blue-500 active:cursor-grabbing dark:hover:bg-gray-700 dark:hover:text-gray-200"
+                    >
+                      <GripVertical aria-hidden="true" className="h-3.5 w-3.5" />
+                    </button>
                     <button
                       onClick={() => toggleGroup(group.key)}
                       className="flex flex-1 min-w-0 items-center gap-1 text-xs font-semibold text-gray-500 dark:text-gray-400 hover:text-gray-700 dark:hover:text-gray-200 select-none"
@@ -729,7 +845,14 @@ export function Sidebar({ onClose, onCollapse, width }: SidebarProps) {
                   {!collapsed && (
                     <div className="mt-1 ml-2 pl-1.5 border-l border-gray-200 dark:border-gray-800 space-y-1">
                       {group.projects.map((project) => (
-              <div key={project.id}>
+              <div
+                key={project.projectId}
+                data-project-id={project.projectId}
+                className={`relative ${sameSidebarItem(draggedItem, { groupKey: group.key, projectId: project.projectId }) ? "opacity-40" : ""}`}
+                onDragOver={(event) => handleDragOver(event, { groupKey: group.key, projectId: project.projectId })}
+                onDrop={(event) => handleDrop(event, { groupKey: group.key, projectId: project.projectId })}
+              >
+                {renderDropIndicator({ groupKey: group.key, projectId: project.projectId })}
                 <div
                   onClick={() => handleProjectClick(project.id)}
                   className={`w-full flex items-center gap-2 px-3 py-2 rounded-lg text-left text-sm transition-colors cursor-pointer ${
@@ -738,6 +861,23 @@ export function Sidebar({ onClose, onCollapse, width }: SidebarProps) {
                       : "hover:bg-gray-200 dark:hover:bg-gray-800"
                   }`}
                 >
+                  {group.projects.length > 1 && (
+                    <button
+                      type="button"
+                      draggable
+                      aria-label={`Reorder project ${project.workingDir}`}
+                      aria-describedby="project-reorder-help"
+                      aria-keyshortcuts="ArrowUp ArrowDown"
+                      title="Drag within this repository, or focus and use Up/Down arrows"
+                      onClick={(event) => event.stopPropagation()}
+                      onDragStart={(event) => handleDragStart(event, { groupKey: group.key, projectId: project.projectId })}
+                      onDragEnd={finishDrag}
+                      onKeyDown={(event) => handleReorderKey(event, { groupKey: group.key, projectId: project.projectId })}
+                      className="shrink-0 cursor-grab rounded p-0.5 text-gray-400 hover:bg-gray-300 hover:text-gray-600 focus-visible:outline-2 focus-visible:outline-blue-500 active:cursor-grabbing dark:hover:bg-gray-700 dark:hover:text-gray-200"
+                    >
+                      <GripVertical aria-hidden="true" className="h-3.5 w-3.5" />
+                    </button>
+                  )}
                   <div
                     className={`w-2 h-2 rounded-full flex-shrink-0 ${
                       project.isActive ? "bg-green-500" : "bg-gray-400"

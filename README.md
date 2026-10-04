@@ -423,7 +423,7 @@ TMPDIR=/var/tmp cargo test -p apas-server
 
 ## Further reading
 
-**[CLAUDE.md](CLAUDE.md) is the canonical contributor and agent runbook**, with
+**[AGENTS.md](AGENTS.md) is the canonical contributor and agent runbook**, with
 the architecture, deployment procedure, and the reasoning behind decisions that
 are easy to undo by accident. Read it before changing anything here.
 

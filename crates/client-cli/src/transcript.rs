@@ -50,6 +50,9 @@ use uuid::Uuid;
 
 use crate::conversation::TurnRecord;
 
+#[cfg(target_os = "linux")]
+pub(crate) mod codex_daemon;
+
 /// Directory name claude derives from a working directory: the absolute path
 /// with every `/` replaced by `-`. Verified against a live transcript rather
 /// than assumed — `/home/users/shuai/apas` becomes `-home-users-shuai-apas`.
@@ -658,10 +661,7 @@ pub fn find_omp_session_file(home: &Path, conversation_id: Uuid) -> Option<PathB
         let Some(modified) = entry.metadata().ok().and_then(|meta| meta.modified().ok()) else {
             continue;
         };
-        if newest
-            .as_ref()
-            .is_none_or(|(newest, _)| modified > *newest)
-        {
+        if newest.as_ref().is_none_or(|(newest, _)| modified > *newest) {
             newest = Some((modified, path));
         }
     }
@@ -1088,10 +1088,16 @@ fn find_codex_rollout_in_proc(
             };
             let mut args = command.split(|byte| *byte == 0);
             let executable = args.next().and_then(|arg| std::str::from_utf8(arg).ok());
-            if executable.and_then(|arg| Path::new(arg).file_name())
-                != Some(std::ffi::OsStr::new("codex"))
-                || args.next() != Some(b"app-server".as_slice())
-            {
+            let named_codex = executable.and_then(|arg| Path::new(arg).file_name())
+                == Some(std::ffi::OsStr::new("codex"));
+            // Native providers use content-addressed `bin-<hash>` names on
+            // local storage. A direct app-server running the TUI's exact
+            // executable is just as specific as the ordinary `codex` name.
+            let same_executable = std::fs::read_link(process_dir.join("exe"))
+                .ok()
+                .zip(std::fs::read_link(proc_root.join(parent.to_string()).join("exe")).ok())
+                .is_some_and(|(child, parent)| child == parent);
+            if (!named_codex && !same_executable) || args.next() != Some(b"app-server".as_slice()) {
                 continue;
             }
         }
@@ -1848,7 +1854,7 @@ mod tests {
 
         assert_eq!(
             find_codex_rollout_in_proc(home.path(), Path::new("/repo"), 100, &proc_root),
-            Some(owned)
+            Some(owned.clone())
         );
         assert_eq!(
             find_codex_rollout_in_proc(home.path(), Path::new("/repo"), 200, &proc_root),
@@ -1857,6 +1863,25 @@ mod tests {
         assert!(
             find_codex_rollout_in_proc(home.path(), Path::new("/different"), 100, &proc_root)
                 .is_none()
+        );
+
+        // The local executable cache renames native Codex. Only the exact
+        // parent executable qualifies; an arbitrary app-server child does not.
+        std::fs::write(
+            proc_root.join("101/cmdline"),
+            b"/cache/bin-hash\0app-server\0",
+        )
+        .unwrap();
+        std::os::unix::fs::symlink("/cache/bin-hash", proc_root.join("100/exe")).unwrap();
+        std::os::unix::fs::symlink("/cache/bin-hash", proc_root.join("101/exe")).unwrap();
+        assert_eq!(
+            find_codex_rollout_in_proc(home.path(), Path::new("/repo"), 100, &proc_root),
+            Some(owned)
+        );
+        std::fs::remove_file(proc_root.join("101/exe")).unwrap();
+        std::os::unix::fs::symlink("/other/app-server", proc_root.join("101/exe")).unwrap();
+        assert!(
+            find_codex_rollout_in_proc(home.path(), Path::new("/repo"), 100, &proc_root).is_none()
         );
 
         std::fs::remove_dir_all(proc_root.join("101")).unwrap();
@@ -2003,12 +2028,18 @@ mod tests {
     /// `--continue` boundary, so the parent chain crosses the resume and the
     /// `custom` session_exit record sits between them.
     const OMP_REAL_SESSION: &str = concat!(
-        r#"{"type":"session","version":3,"id":"01a09e12-5973-77d9-aa66-861b4273e940","timestamp":"2026-09-14T03:59:57.811Z","cwd":"/tmp/work"}"#, "\n",
-        r#"{"type":"message","id":"49dfb5bf","parentId":"e9131629","timestamp":"2026-09-14T03:59:59.252Z","message":{"role":"user","content":[{"type":"text","text":"Remember the word: ALBATROSS. Reply OK."}],"timestamp":1789358399252}}"#, "\n",
-        r#"{"type":"message","id":"8be2a596","parentId":"49dfb5bf","timestamp":"2026-09-14T04:00:17.992Z","message":{"role":"assistant","content":[{"type":"thinking","thinking":""},{"type":"text","text":"OK"}],"model":"muse-spark-1.3-contributor","usage":{"input":17820,"output":19,"totalTokens":17839},"completedAt":1789358417992,"timestamp":1789358417992}}"#, "\n",
-        r#"{"type":"custom","customType":"session_exit","data":{"reason":"dispose","kind":"normal"},"id":"97a25f4a","parentId":"8be2a596","timestamp":"2026-09-14T04:00:18.027Z"}"#, "\n",
-        r#"{"type":"message","id":"76ed4686","parentId":"97a25f4a","timestamp":"2026-09-14T04:00:28.836Z","message":{"role":"user","content":[{"type":"text","text":"What word did I ask you to remember? One word."}],"timestamp":1789358428836}}"#, "\n",
-        r#"{"type":"message","id":"1863543b","parentId":"76ed4686","timestamp":"2026-09-14T04:00:31.986Z","message":{"role":"assistant","content":[{"type":"text","text":"ALBATROSS"}],"model":"muse-spark-1.3-contributor","usage":{"input":18010,"output":7,"totalTokens":18017},"completedAt":1789358431986,"timestamp":1789358431986}}"#, "\n",
+        r#"{"type":"session","version":3,"id":"01a09e12-5973-77d9-aa66-861b4273e940","timestamp":"2026-09-14T03:59:57.811Z","cwd":"/tmp/work"}"#,
+        "\n",
+        r#"{"type":"message","id":"49dfb5bf","parentId":"e9131629","timestamp":"2026-09-14T03:59:59.252Z","message":{"role":"user","content":[{"type":"text","text":"Remember the word: ALBATROSS. Reply OK."}],"timestamp":1789358399252}}"#,
+        "\n",
+        r#"{"type":"message","id":"8be2a596","parentId":"49dfb5bf","timestamp":"2026-09-14T04:00:17.992Z","message":{"role":"assistant","content":[{"type":"thinking","thinking":""},{"type":"text","text":"OK"}],"model":"muse-spark-1.3-contributor","usage":{"input":17820,"output":19,"totalTokens":17839},"completedAt":1789358417992,"timestamp":1789358417992}}"#,
+        "\n",
+        r#"{"type":"custom","customType":"session_exit","data":{"reason":"dispose","kind":"normal"},"id":"97a25f4a","parentId":"8be2a596","timestamp":"2026-09-14T04:00:18.027Z"}"#,
+        "\n",
+        r#"{"type":"message","id":"76ed4686","parentId":"97a25f4a","timestamp":"2026-09-14T04:00:28.836Z","message":{"role":"user","content":[{"type":"text","text":"What word did I ask you to remember? One word."}],"timestamp":1789358428836}}"#,
+        "\n",
+        r#"{"type":"message","id":"1863543b","parentId":"76ed4686","timestamp":"2026-09-14T04:00:31.986Z","message":{"role":"assistant","content":[{"type":"text","text":"ALBATROSS"}],"model":"muse-spark-1.3-contributor","usage":{"input":18010,"output":7,"totalTokens":18017},"completedAt":1789358431986,"timestamp":1789358431986}}"#,
+        "\n",
     );
 
     #[test]

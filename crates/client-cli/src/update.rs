@@ -884,7 +884,7 @@ mod tests {
         assert!(is_build_irrelevant_path("packages/web/src/lib/store.ts"));
         assert!(is_build_irrelevant_path("packages/web/package.json"));
         assert!(is_build_irrelevant_path("README.md"));
-        assert!(is_build_irrelevant_path("CLAUDE.md"));
+        assert!(is_build_irrelevant_path("AGENTS.md"));
         assert!(is_build_irrelevant_path("docs/architecture.md"));
         assert!(is_build_irrelevant_path(".github/workflows/ci.yml"));
         assert!(is_build_irrelevant_path("LICENSE"));
@@ -902,7 +902,7 @@ mod tests {
         // The exact scenario that stalled a reboot: web + docs only.
         assert!(!changed_files_need_rebuild(&[
             "packages/web/src/lib/store.ts".to_string(),
-            "CLAUDE.md".to_string(),
+            "AGENTS.md".to_string(),
         ]));
         // A single Rust change forces a rebuild.
         assert!(changed_files_need_rebuild(&[

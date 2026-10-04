@@ -2996,6 +2996,49 @@ async fn run_inner(
                         })
                         .collect()
                 };
+                #[cfg(target_os = "linux")]
+                let mut codex_process_paths = HashMap::new();
+                #[cfg(target_os = "linux")]
+                if let Some(home) = home.as_deref() {
+                    let mut daemon_panes = HashMap::new();
+                    for (_, provider, _, worktree, group) in &panes {
+                        let (Provider::Codex, Some(group)) = (provider, group) else {
+                            continue;
+                        };
+                        let cwd = terminal_transcript_cwd(&project_for_turns, worktree.as_deref());
+                        if let Some(path) = crate::transcript::find_codex_rollout_for_process_group(
+                            home, &cwd, *group,
+                        ) {
+                            codex_process_paths.insert(*group, path);
+                        } else {
+                            daemon_panes.insert(*group, cwd);
+                        }
+                    }
+                    match crate::transcript::codex_daemon::find_rollouts(home, &daemon_panes) {
+                        Ok(paths) => {
+                            codex_process_paths.extend(paths);
+                            for (pane_id, provider, _, _, _) in &panes {
+                                if *provider == Provider::Codex {
+                                    transcript_discovery_errors.remove(pane_id);
+                                }
+                            }
+                        }
+                        Err(error) => {
+                            for (pane_id, provider, _, _, group) in &panes {
+                                if *provider == Provider::Codex
+                                    && group.is_some_and(|group| daemon_panes.contains_key(&group))
+                                {
+                                    note_transcript_discovery_error(
+                                        &mut transcript_discovery_errors,
+                                        *pane_id,
+                                        "codex",
+                                        &error,
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
 
                 for (pane_id, provider, mut conv_id, worktree_path, process_group_id) in panes {
                     let transcript_cwd =
@@ -3003,17 +3046,13 @@ async fn run_inner(
                     let mut provider_working = None;
                     let (source, turns, verified_codex_session_id) = match provider {
                         Provider::Codex => {
+                            #[cfg(not(target_os = "linux"))]
                             let Some(home) = home.as_deref() else {
                                 continue;
                             };
                             #[cfg(target_os = "linux")]
-                            let process_path = process_group_id.and_then(|group| {
-                                crate::transcript::find_codex_rollout_for_process_group(
-                                    home,
-                                    &transcript_cwd,
-                                    group,
-                                )
-                            });
+                            let process_path = process_group_id
+                                .and_then(|group| codex_process_paths.remove(&group));
                             #[cfg(not(target_os = "linux"))]
                             let process_path = {
                                 let _ = process_group_id;
@@ -3024,10 +3063,9 @@ async fn run_inner(
                                 codex_paths.insert(pane_id, path.clone());
                                 (path, true)
                             } else if let Some(path) = codex_paths.get(&pane_id) {
-                                // Every cached Linux path entered through the
-                                // process-group branch above, so retaining it
-                                // across a brief descriptor gap retains the
-                                // same ownership proof.
+                                // Native descriptors and managed-daemon
+                                // listener matches both prove TUI ownership.
+                                // Retain that proof through temporary gaps.
                                 (path.clone(), cfg!(target_os = "linux"))
                             } else {
                                 #[cfg(target_os = "linux")]
@@ -7394,7 +7432,10 @@ mod tests {
             Some("sk-deepseek".to_string()),
         )
         .unwrap_err();
-        assert!(error.contains(shared::DEEPSEEK_RETIRED_PRO_MODEL), "{error}");
+        assert!(
+            error.contains(shared::DEEPSEEK_RETIRED_PRO_MODEL),
+            "{error}"
+        );
         assert!(error.contains(shared::DEEPSEEK_FLASH_MODEL), "{error}");
         assert!(error.contains("withdrawn"), "{error}");
     }
@@ -8534,11 +8575,7 @@ mod tests {
         answers.insert("Second".to_string(), "x".to_string());
         assert_eq!(
             super::encode_answer_keystrokes(&options, &answers),
-            Some(vec![
-                b"\x1b[B".to_vec(),
-                b"\r".to_vec(),
-                b"\r".to_vec(),
-            ]),
+            Some(vec![b"\x1b[B".to_vec(), b"\r".to_vec(), b"\r".to_vec(),]),
         );
     }
 

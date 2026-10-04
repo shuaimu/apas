@@ -1,1 +1,1498 @@
-CLAUDE.md
+# APAS - Autonomous Programming Agent System
+
+> Canonical contributor/agent runbook, and the only one. Keep architecture,
+> local development, deployment, and workflow guidance here. `AGENTS.md` is a
+> regular file read directly by Claude and Codex-style agents; verify it with
+> `python3 scripts/check_agent_runbooks.py`. The former `CLAUDE.md` and its
+> `AGENTS.md` symlink have been consolidated into this file.
+>
+> There used to be a hand-written `claude.md` holding a second copy of the
+> deployment procedure, plus an `agent.md` pointing at it and an `AGENTS.md`
+> generated from it. Both copies drifted — the duplicate lost the nginx rules,
+> the rolling order, and the system-administrator pre-check — and worse,
+> `claude.md` and `CLAUDE.md` differ only in case, so a clone on macOS or
+> Windows could not hold both and silently overwrote this file with the 3 KB
+> note. Do not reintroduce a second runbook under any casing.
+>
+> `packages/web/AGENTS.md` contains only Next.js's generated, package-scoped API
+> guidance, not another copy of this runbook. Keep that managed block: without
+> it, `next dev` recreates both a guidance file and a `CLAUDE.md` pointer.
+
+APAS runs coding agents against a project, from a browser or a phone. The CLI
+owns local panes and worktrees, the server brokers project/session state, and
+the web UI exposes the pane tabs, conversation and terminal views, the project
+overview, and diff/PR handoff surfaces.
+
+A project is a directory with an `.apas` file; the work happens in **panes**,
+each hosting one agent. A pane is created, talked to, rebooted and closed by a
+person — there is no orchestration layer above it.
+
+**Managed team mode was removed.** Four roles (Manager, Tech Lead, Developer,
+Reviewer) used to coordinate through `project_goal.md`, `team-todo.md` and
+`.apas-team.jsonl`, dispatching work to each other through an MCP server. It was
+the largest feature in the CLI and, at removal, had zero managed panes anywhere
+in the deployment. What it cost everything else was a second way to run a
+provider: a second spawn path, its own status and review plumbing, and a policy
+field carried at three levels. If you find a reference to a team role, the
+scratchpad, the TODO queue or `apas mcp-server`, it is stale — say so rather
+than reviving it.
+
+Two things that look like team mode and are not:
+
+- **`role` / `goal` / `backstory` on a pane** — identity metadata anyone can set
+  from the role modal, composed into the pane's system prompt by
+  `pane_identity::compose_system_prompt`.
+- **The "Start bot" deadloop** — a pane repeating a prompt on an interval. It
+  predates team mode and outlives it.
+
+## Architecture
+
+```
+┌─────────────────────┐    WebSocket     ┌─────────────────┐    WebSocket    ┌─────────────────────┐
+│ CLI client          │ ◄───────────────►│ apas-server     │◄───────────────►│ Web frontend        │
+│ (apas binary)       │                  │                 │                 │ (Next.js Overview)  │
+└─────────────────────┘                  └─────────────────┘                 └─────────────────────┘
+        │                                         │
+        │                                         ▼
+        │                                ┌─────────────────┐
+        │                                │ SQLite + JSONL  │
+        │                                │ data/sessions/  │
+        │                                └─────────────────┘
+        ▼
+┌─────────────────────┐
+│ Pane processes      │
+│ Claude/Codex/etc.   │
+│ worktrees + prompts │
+└─────────────────────┘
+```
+
+The CLI keeps project-local state in `.apas`, plus optional per-pane worktrees.
+The server caches and broadcasts machine, session and pane state. The web UI
+lets a person open panes, talk to them, inspect their diffs, and hand off to a
+PR.
+
+### Project sidebar ordering
+
+The expanded web sidebar has drag handles on repository headers and, when a
+repository contains several projects, on its project rows. Drag a header to
+move the whole group; drag a project within its existing group. The blue line
+marks insertion before or after the target. A focused handle also accepts the
+Up/Down arrow keys. Reordering never opens, moves, or changes access to a project,
+and the collapsed icon rail uses the same order.
+
+This is a browser-local, per-account layout preference, stored under
+`apas_project_order:<user-id>` by `lib/useProjectOrder.ts`, not server policy.
+It survives reloads and updates other tabs in the same browser, but does not
+sync between devices. Saved project positions use the stable `.apas` project
+id rather than the current representative session id. Unordered lists retain
+the existing activity/recency sort; a saved order takes precedence, with newly
+discovered entries following known ones. Temporarily missing entries keep their
+saved positions without creating phantom projects. The Idle sessions view
+continues to use its own waiting/recency ordering.
+
+## Project Structure
+
+```
+apas/
+├── crates/
+│   ├── client-cli/      # CLI binary (apas)
+│   │   ├── src/
+│   │   │   ├── main.rs        # CLI entry point and config commands
+│   │   │   ├── config.rs      # User/machine config and supported backend settings
+│   │   │   ├── project.rs     # .apas project metadata
+│   │   │   ├── pane_identity.rs # A pane's role/goal/backstory as a system prompt
+│   │   │   ├── claude_session_hook.rs # SessionStart hook: which transcript a pane writes
+│   │   │   ├── worktree.rs    # Isolated worktree creation/diff/cleanup
+│   │   │   ├── claude.rs      # Claude process wrapper
+│   │   │   ├── terminal_pane.rs # Pty host for kind:"terminal" panes (portable-pty)
+│   │   │   └── mode/
+│   │   │       ├── dual_pane.rs # Pane runtime: panes, deadloops, watchers
+│   │   │       ├── hybrid.rs    # Legacy single-pane local CLI + streaming
+│   │   │       ├── local.rs     # Offline mode
+│   │   │       └── remote.rs    # Remote-only mode
+│   │   └── Cargo.toml
+│   │
+│   ├── server/          # WebSocket server (apas-server)
+│   │   ├── src/
+│   │   │   ├── main.rs      # Server entry point
+│   │   │   ├── state.rs     # AppState with DB, sessions, storage
+│   │   │   ├── storage.rs   # File-based message storage (JSONL)
+│   │   │   ├── db/          # SQLite database
+│   │   │   ├── session/     # Session manager
+│   │   │   └── routes/
+│   │   │       ├── ws_cli.rs  # CLI WebSocket handler, pane/session replay
+│   │   │       └── ws_web.rs  # Web WebSocket handler, Overview/machine actions
+│   │   └── Cargo.toml
+│   │
+│   └── shared/          # Shared types between CLI and server
+│       ├── src/
+│       │   ├── lib.rs
+│       │   └── messages.rs  # Shared WebSocket/machine message types
+│       └── Cargo.toml
+│
+├── packages/
+│   └── web/             # Next.js web frontend
+│       ├── src/
+│       │   ├── app/
+│       │   │   ├── layout.tsx
+│       │   │   └── page.tsx
+│       │   ├── components/
+│       │   │   ├── overview/         # Manager/goal/TODO/pane-grid control surface
+│       │   │   ├── tabs/             # Pane tabs, task bars, diff modal
+│       │   │   │   └── TerminalPane.tsx  # xterm.js view for kind:"terminal" panes
+│       │   │   ├── chat/             # Message display
+│       │   │   ├── code/             # Code blocks
+│       │   │   └── tools/            # Tool cards
+│       │   └── lib/
+│       │       ├── store.ts          # Zustand state, WebSocket message handling
+│       │       ├── terminalBus.ts    # Pty frame fan-out (deliberately NOT zustand)
+│       │       └── mobileSelectedPane.ts # Which pane a session screen opens on
+│       └── package.json
+│
+├── data/                # Runtime data (created at runtime)
+│   ├── apas.db          # SQLite database
+│   └── sessions/        # Message storage
+│       └── {session-id}/
+│           └── messages.jsonl
+│
+├── Cargo.toml           # Workspace root
+└── AGENTS.md            # This file
+```
+
+## Build Commands
+
+```bash
+# Build all Rust crates
+cargo build
+
+# Build specific crate
+cargo build -p apas          # CLI
+cargo build -p apas-server   # Server
+cargo build -p shared        # Shared types
+
+# Run server
+cargo run -p apas-server
+
+# Run CLI (in a project directory)
+cargo run -p apas
+
+# Run CLI in offline mode (no server)
+cargo run -p apas -- --offline
+
+# Web frontend (from packages/web/)
+npm install
+npm run dev
+```
+
+The web lint gate imports `eslint-plugin-react-hooks` and `typescript-eslint`
+directly; it does not use `eslint-config-next`. That unused preset was removed
+because its glob dependency brought in an unpatched `braces` vulnerability.
+Do not restore the package without an actual configuration need and clean
+audits. Keep both lockfiles patched and verify both complete dependency graphs,
+including development dependencies, before deployment.
+
+### CLI build target (static musl)
+
+The shipped CLI is a **static musl** binary so a self-update rebuild never
+leaves `apas` depending on the build machine's glibc version. `install.sh` and
+the self-updater (`crates/client-cli/src/update.rs`) build it with
+`--target <arch>-unknown-linux-musl`; the server and plain `cargo build` stay
+on the host's glibc target (musl is deliberately **not** a global
+`build.target`, which would drag the server's bundled SQLite/ring through musl
+too). The CLI's TLS is rustls (not native-tls/OpenSSL) so nothing but ring's
+small C shim needs the musl toolchain.
+
+Building the CLI as it ships needs the musl target plus a musl C compiler:
+
+```bash
+rustup target add x86_64-unknown-linux-musl   # (aarch64-… on ARM)
+sudo apt-get install -y musl-tools            # provides musl-gcc + musl-dev
+
+cargo build --release --target x86_64-unknown-linux-musl -p apas
+```
+
+`.cargo/config.toml` points ring's C build at `musl-gcc` for the musl targets.
+If the musl toolchain is missing, `install.sh` and the self-updater fall back
+to a glibc build so an update can never brick the binary.
+
+## Configuration
+
+### CLI Config
+Located at `~/.config/apas/config.toml`:
+```toml
+[remote]
+server = "wss://apas.mpaxos.com"
+token = "your-token"
+
+[local]
+claude_path = "claude"
+```
+
+### Project Identification
+Each project directory gets a `.apas` file with project metadata and restored
+pane state:
+```json
+{
+  "id": "uuid",
+  "name": "project-name",
+  "created_at": "2024-01-01T00:00:00Z",
+  "auto_approve_todos": false,
+  "auto_merge_prs": false,
+  "panes": [
+    {
+      "pane_id": 440,
+      "role": null,
+      "mode": "interactive",
+      "managed": false
+    },
+    {
+      "pane_id": 612,
+      "role": null,
+      "mode": "interactive",
+      "kind": "terminal",
+      "provider": "codex",
+      "managed": false
+    }
+  ]
+}
+```
+
+A newly created project has **no panes**. The user opens what they want; a
+default Claude pane meant every fresh project immediately spawned an agent
+process nobody asked for. Three places used to force one into existence and all
+three are gone: the `ProjectMetadata` constructors, an "ensure there is always
+at least one pane" backfill at CLI launch, and `migrate_legacy`. That last one
+was the real blocker — it runs on *every* load via `get_or_create_project` and
+refilled any empty pane list with **two** legacy panes, so "no panes" was not
+representable at all. It is now gated on the legacy `deadloop_claude_session_id`
+/ `interactive_claude_session_id` fields actually being present, which is what
+distinguishes a pre-`panes` file from a new project.
+
+**Zero panes is a state, not an absence, and saying so takes three pieces.**
+A project starts with none and returns to none when the last pane is closed,
+which the UI allows. The trap is that "the roster is empty" and "no roster has
+arrived" look identical everywhere unless they are deliberately kept apart:
+
+- `Storage::load_pane_roster` answers `Option`, where `None` is a legacy
+  session that never persisted one. `load_pane_list` still flattens both for
+  callers that only want whatever panes exist.
+- The server sends `PaneList` for a *known* roster even when it is empty, and
+  infers panes from message history only when the roster is genuinely unknown.
+  Staying silent on empty left web clients showing panes the user had closed;
+  inferring on empty fabricated them back.
+- The web store's `paneListReceived` is the same distinction client-side. With
+  it false the UI synthesizes tabs from messages, as it must before the CLI
+  reports; with it true an empty roster means an empty project. Closing the
+  last pane with the two conflated rebuilt that pane as a ghost tab from its
+  own leftover messages.
+
+Anything that reads `panes.is_empty()` to mean "not reported yet" reintroduces
+this. The pane-keyed records (`paneMessages`, `paneStatuses`, `paneHasMore`)
+are pruned to the roster for the same reason, and because pane ids are reused.
+
+`auto_approve_todos`, `auto_merge_prs` and `disallowed_tab_types` are
+project-level policy flags, settable by the project owner or the operator of the
+cluster hosting it. `disallowed_tab_types` restricts which tab types users may
+create (see "Tab-type policy"); the other two were read by the team loop and are
+now inert, kept so an older `.apas` still parses.
+
+`managed: true` on a pane is likewise vestigial. It marked a pane as belonging
+to the managed team rather than to you, and it used to gate real behaviour:
+refusing PR creation, exempting the pane from the retired-agent-kind rule,
+forcing Claude panes to `effort: max`, and gating relaunch on team availability.
+Two boot-time migrations even *created* it, promoting any pane whose role
+mentioned "manager", "tech lead" or "reviewer" — so naming a pane "reviewer" in
+the role modal silently made it managed. None of that remains; a test asserts
+loading a project never marks a pane managed.
+
+New work is created as a terminal pane. `kind` defaults to `"agent"` when absent
+solely for compatibility, so `.apas` files written before terminal panes existed
+keep loading unchanged — see "Terminal panes" under Key Concepts. A `.apas` may
+also still carry `team_enabled`, a `role` like `"team manager"`, or
+`managed: true`; all three are ignored, and such a pane loads as an ordinary
+pane.
+
+## Message Types
+
+Key message types in `crates/shared/src/messages.rs`:
+
+- **CliToServer**: Register, SessionStart, StreamMessage, UserInput,
+  Heartbeat, ProjectFlagsChanged, TerminalOutput, TerminalExited, machine
+  config/status updates.
+- **ServerToCli**: Registered, SessionAssigned, Input, Signal,
+  UpdateProjectGoal, UpdateProjectFlags, TodoApproval, AddTodo,
+  TerminalInput, TerminalResize, pane/worktree/suggestion actions.
+- **WebToServer**: Authenticate, ListCliClients, AttachSession, Input,
+  UpdateProjectGoal, UpdateProjectFlags, TodoApproval, AddTodo,
+  TerminalInput, TerminalResize, TerminalAttach, machine/provider config
+  actions.
+- **ServerToWeb**: Authenticated, CliClients, SessionMessages, StreamMessage,
+  UserInput, ProjectFlagsChanged, Machines, PaneDiff, TerminalOutput,
+  TerminalSnapshot, TerminalExited.
+
+The `Terminal*` family is the pty byte channel for `kind: "terminal"` panes and
+is deliberately separate from `Output` / `StreamMessage` — see "Terminal panes"
+under Key Concepts for why.
+
+`WebToServer::UpdateProjectFlags` carries the project policy flags from the web
+to the server. The server **rejects the whole message from anyone who is neither the
+project owner nor the operator of the cluster hosting it**
+(`ws_web::can_manage_project_settings`) — this is the only authority gate in the
+WebSocket layer, everything else there authorizes on session *access* alone.
+It then forwards `ServerToCli::UpdateProjectFlags` to the CLI for `.apas`
+persistence; the CLI emits `CliToServer::ProjectFlagsChanged`, and the server
+broadcasts `ServerToWeb::ProjectFlagsChanged`. The CLI also re-broadcasts the
+flags from `.apas` every 5s, so a web client attaching mid-session hydrates
+without asking.
+
+## Data Storage
+
+- **SQLite** (`data/apas.db`): Users, CLI clients, sessions metadata
+- **JSONL files** (`data/sessions/{id}/messages.jsonl`): Chat messages per session
+- **Worktrees** (`.apas-worktrees/pane-<id>/`): isolated branches for a pane
+  working in isolation
+
+A project that predates the team-mode removal may still hold `project_goal.md`,
+`team-todo.md` and `.apas-team.jsonl` on disk. Nothing reads or writes them —
+they are left alone rather than deleted, because they are the user's files.
+
+## Development
+
+### Running locally
+```bash
+# Terminal 1: Server
+RUST_LOG=info cargo run -p apas-server
+
+# Terminal 2: Web frontend
+cd packages/web && npm run dev
+
+# Terminal 3: CLI (in any project directory). Registers the project and exits;
+# start it from the web. `--attach` opens the terminal UI for one already
+# running here.
+cargo run -p apas
+```
+
+### Environment Variables
+- `RUST_LOG`: Logging level (e.g., `info`, `debug`)
+- `NEXT_PUBLIC_WS_URL`: WebSocket URL for web frontend (default: `wss://apas.mpaxos.com`)
+
+## Deployment
+
+### Production Server
+
+The APAS server and web UI are deployed on an LXC container:
+
+- **Host**: `apas.mpaxos.com` (130.245.173.82)
+- **SSH**: `ssh root@apas.mpaxos.com`
+- **Edge**: **nginx** on port **80** reverse-proxies everything. The config is
+  version-controlled at **`deploy/nginx-apas.conf`** and deployed to
+  `/etc/nginx/conf.d/apas.conf` — edit the repo copy, `scp` it, `nginx -t`,
+  then `systemctl reload nginx`. `/ws/ /auth/ /admin/ /share/ /health` →
+  `apas-server` (`127.0.0.1:8080`), along with `/cluster/ /projects/
+  /mobile/`; everything else → the Next.js app
+  (`127.0.0.1:3000`). This exists so the web's WebSocket + HTTP API ride the
+  standard port 80 (`wss://apas.mpaxos.com/ws/web`) instead of the non-standard
+  `:8080`, which mobile carriers/Wi-Fi block — that broke mobile entirely.
+
+  **A proxied `location /X/` shadows the page at `/X`.** nginx answers a
+  request for a proxied prefix location *minus* its trailing slash with a 301
+  that appends one. So `/share` was redirected to `/share/`, which then matched
+  the API prefix and 404ed on `apas-server` — every share invite was dead
+  (`/share?code=...`), and the whole `/admin` page with it, while the
+  `/share/*` API endpoints looked perfectly healthy the entire time. The fix is
+  an exact-match location, which outranks the prefix and is exempt from the
+  redirect:
+
+  ```nginx
+  location = /share { proxy_pass http://127.0.0.1:3000; ... }
+  ```
+
+  `/auth`, `/admin`, and `/share` all have one. **Add another whenever you add
+  an API prefix that shares a name with a Next.js page**, and check
+  `curl -sL -o /dev/null -w '%{http_code} %{num_redirects}' <url>` — a page
+  answering `200 1` instead of `200 0` is this bug.
+
+  **The mirror-image mistake is easier to make: a new API prefix nginx does not
+  proxy at all.** Everything unmatched falls through to Next.js, so the route
+  answers `200` with the app's HTML instead of JSON, and only the caller
+  notices. `/cluster/` shipped this way and broke the entire cluster surface
+  until it was added here. **Whenever you add a route prefix to
+  `routes/create_router`, add the matching `location` in this file in the same
+  change**, and smoke-test it with `curl -s <url> | head -c 40` — an HTML
+  doctype where JSON belongs is this bug.
+- **apas-server**: `127.0.0.1:8080` — still also bound publicly on `:8080` for
+  the **CLI/daemon** (`wss://apas.mpaxos.com/ws/cli`); do not firewall 8080.
+- **Next.js web (apas-web)**: `127.0.0.1:3000` (moved off 80 via a systemd
+  drop-in `apas-web.service.d/port.conf` → `Environment=PORT=3000`).
+- The web's default WS/API URLs are now **port-less** (`wss://apas.mpaxos.com`,
+  `https://apas.mpaxos.com`); `NEXT_PUBLIC_WS_URL`/`NEXT_PUBLIC_API_URL` no
+  longer need to be set at build time.
+
+#### Directory Structure on Server
+```
+/opt/apas/
+├── apas-server         # Server binary
+├── data/
+│   ├── apas.db         # SQLite database
+│   └── sessions/       # Message storage
+└── web/                # Next.js web frontend
+```
+
+#### Systemd Services
+```bash
+# Check status
+systemctl status apas-server
+systemctl status apas-web
+
+# Restart services
+systemctl restart apas-server
+systemctl restart apas-web
+
+# nginx edge proxy (port 80). After editing /etc/nginx/conf.d/apas.conf:
+nginx -t && systemctl reload nginx
+
+# View logs
+journalctl -u apas-server -f
+journalctl -u apas-web -f
+journalctl -u nginx -f
+```
+
+#### Deploying Updates
+
+```bash
+# Verify both supported web dependency graphs in separate clean trees before
+# deployment. Both audits include development dependencies and fail on low or
+# higher severity findings.
+(cd packages/web && npm ci && npm run audit:npm)
+(cd packages/web && pnpm install --frozen-lockfile && pnpm run audit:pnpm)
+
+# Configure the system administrator BEFORE deploying the server. Without it,
+# /admin cannot be entered at all, and this deploy removes every account's
+# deployment-wide authority. Keep apas-server.toml mode 0600.
+#
+# Check the credential ROW, not the config block: the block being present
+# proves nothing, since a present block with an empty bootstrap_password is
+# exactly how this deployment lost account creation for a month.
+ssh root@apas.mpaxos.com "test \"\$(sqlite3 /opt/apas/data/apas.db 'select count(*) from system_admin_credential;')\" != 0 \
+  || echo 'NO SYSTEM ADMIN CREDENTIAL: /admin is unenterable and nobody can be invited'"
+
+# Build locally
+# cargo build -p apas-server --release
+cargo build --release
+
+# Stop server
+ssh root@apas.mpaxos.com "systemctl stop apas-server"
+
+# Copy binary to server
+scp target/release/apas-server root@apas.mpaxos.com:/opt/apas/
+
+sleep 1
+
+# Restart server
+ssh root@apas.mpaxos.com "systemctl restart apas-server"
+
+sleep 1
+
+# Back up the currently deployed web source and build before synchronization.
+web_backup_stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+ssh root@apas.mpaxos.com "install -d -m 700 /opt/apas/backups/web-${web_backup_stamp} && tar -C /opt/apas --exclude='web/node_modules' -czf /opt/apas/backups/web-${web_backup_stamp}/web.tgz web"
+
+# For web updates. `--delete` is important: without it, files removed
+# locally (renamed/retired components) stay on the server and the next
+# `npm run build` fails because those files still reference removed
+# store actions or types. Always inspect the dry-run before synchronizing.
+rsync -avn --delete --exclude 'node_modules' --exclude '.next' --exclude '.apas-version' packages/web/ root@apas.mpaxos.com:/opt/apas/web/
+rsync -av --delete --exclude 'node_modules' --exclude '.next' --exclude '.apas-version' packages/web/ root@apas.mpaxos.com:/opt/apas/web/
+
+# Restart apas-web (compute version locally since server lacks git history).
+# `npm run build` runs `prebuild` first (`eslint .`, packages/web/eslint.config.mjs),
+# which fails the build on React Rules-of-Hooks violations (e.g. a hook after an
+# early return -> React error #310 -> whole-app crash). So a lint failure here
+# aborts the deploy before restart — fix the reported hook error, don't bypass it.
+# `npm ci` installs the exact reviewed package-lock graph, including devDependencies.
+month_start="$(date +%Y-%m-01) 00:00:00"
+web_version="$(date +%y.%m).$(git rev-list --count --since="$month_start" HEAD)"
+ssh root@apas.mpaxos.com "cd /opt/apas/web && npm ci && NEXT_PUBLIC_WEB_UI_VERSION=${web_version} npm run build && systemctl restart apas-web"
+
+# Verify service state, public pages, API health, referenced /_next/static assets,
+# WebSocket/terminal attachment from the UI, and recent service errors.
+for path in / /login /machines /share /admin /health; do curl -fsSL "https://apas.mpaxos.com${path}" >/dev/null; done
+# Then sign in at https://apas.mpaxos.com/admin with the configured credential
+# and rotate it: the surface warns while it is still the bootstrap value, and
+# rotation invalidates every token issued against it.
+ssh root@apas.mpaxos.com "systemctl is-active apas-web apas-server && journalctl -u apas-web --since '5 minutes ago' -p err --no-pager -q && journalctl -u apas-server --since '5 minutes ago' -p err --no-pager -q"
+```
+
+For rollback, move the failed `/opt/apas/web` directory aside, extract the
+selected `/opt/apas/backups/web-<timestamp>/web.tgz` under `/opt/apas`, run
+`npm ci` and the versioned build from that restored tree, then restart and
+repeat every smoke check above. This emergency rollback restores the previous
+vulnerable dependency graph; follow it with a corrected patched deployment.
+
+## Versioning
+
+Versions are computed at build time as `YY.MM.N`, where `YY.MM` is the current
+year and month and `N` is `git rev-list --count --since="<YYYY-MM-01 00:00:00>"
+HEAD`.
+
+- The web version is resolved in `packages/web/next.config.ts`.
+- CLI and server versions are resolved in their crates' `build.rs`.
+- `packages/web/.apas-version` is dead. Nothing reads it, the deploy rsync
+  excludes it, and it should not be created or maintained.
+
+A build in a directory without `.git` cannot count commits, which is exactly
+the case for `/opt/apas/web` on the server. Pass `NEXT_PUBLIC_WEB_UI_VERSION`
+explicitly there, as the deploy commands above do.
+
+## Key Concepts
+
+1. **Pane Runtime**: The CLI restores panes from `.apas`, runs deadloop or
+   interactive processes, and can isolate a pane in a git worktree.
+2. **Hybrid Mode** (legacy): Single pane with local terminal + streaming.
+3. **Project-based Sessions**: Sessions are identified by project directory
+   and `.apas` project metadata.
+4. **Stream-JSON**: Uses Claude CLI's `--output-format stream-json` for
+   structured Claude output; other providers are bridged through their own
+   runtime paths.
+5. **Real-time Updates**: WebSocket connections broadcast live messages,
+   machine config, and pane diffs.
+6. **Pane kinds**: `PaneConfig.kind` picks how a pane hosts its agent, and
+   is orthogonal to `provider` (which binary) and `mode` (how autonomous).
+   See "Terminal panes" below.
+
+## Tab-type policy (`disallowed_tab_types`)
+
+A project's owner or admin can restrict which tab types users may create. A
+"tab type" is a **pane kind plus a provider** — `agent:claude`,
+`terminal:codex` (`shared::tab_type_key`). Neither half alone identifies one: a
+claude agent tab and a claude terminal tab are different capabilities, since the
+terminal runs the real TUI with permission prompts bypassed.
+
+Stored as a **deny** list, presented in the UI as an allow list. An allow list
+on the wire would make an absent field mean "nothing permitted", so every
+project predating the feature would refuse to open any tab. Empty deny list =
+everything allowed = existing projects unaffected. It also means a provider
+added later is permitted until an owner says otherwise, rather than vanishing
+from their menu.
+
+The catalog is deliberately **not** every `Provider`. DeepSeek is the Claude
+binary against a different backend, so the add-tab menu offers it as a Claude
+model. `shared::all_tab_types` and `packages/web/src/lib/tabTypes.ts` must
+agree; a test in `shared` reads the TS file and asserts they do.
+
+Enforced in the CLI (`tab_type_allowed_for`), which re-reads `.apas` on every
+`AddPane` — the web only hides menu entries, and the same message can arrive
+from a stale browser tab whose menu predates the restriction. It fails **open**
+on an unreadable `.apas`: the worst case
+is a tab an owner meant to block, whereas failing closed would lock everyone out
+of the project entirely.
+
+## Virtual clusters and system administration
+
+These are two different jobs and two different surfaces. They used to be one
+page behind one `cluster_role = "admin"` flag, which meant running *your own*
+machines required deployment-wide authority over everyone else's projects.
+
+**A virtual cluster is derived, not stored.** Every account operates exactly
+one: the machines whose client registered under it, plus the projects hosted in
+it. A project is hosted in an account's cluster when the account **owns it** or
+when **at least one of its sessions was created under it** (`db::
+project_in_user_cluster`). Sessions are the durable evidence of where a project
+actually runs — machines live only in memory, and projects carry no machine
+column. So a project owned by `soumojit.dalui` that runs on your daemon is in
+*your* cluster, and you administer it without being a member of it.
+
+**Belonging to a project is deliberately not hosting it.** Content access is
+owner ∨ member ∨ host; administration (lifecycle, stop-runtime, membership,
+ownership, policy) is host only. Otherwise anyone you shared a project with
+could suspend it. Running it on your own machine *does* make you a host — that
+is the point, not a loophole.
+
+The cluster surface is `/machines` (kept at that route so links still work),
+available to every active account with no role check: `routes/cluster.rs`
+scopes every request through the hosting predicate. `routes/admin.rs` backs the
+deployment-wide surface and both call the same DB operations, so the two cannot
+drift.
+
+**Cluster sharing is owner-administered and immediate.** The owner adds an
+existing active APAS account directly; the ordinary web flow has no invitation
+or acceptance step. Each active membership carries either an explicit machine
+allowlist or the legacy `NULL = all current and future machines` value. Machine
+projection, runtime access, project creation, and project-provisioning
+finalization all enforce that allowlist. The membership may also name the launch
+profile applied to projects that member creates; provisioning snapshots it and
+creates a one-profile project policy override. New projects are created from the
+web by entering a GitHub clone URL and choosing one of the member's visible
+machines. Invitation tables and endpoints remain only for compatibility with
+older clients and outstanding links.
+
+### Project shares and cluster shares are independent
+
+A **project share** grants conversations and other durable content for that
+project. When the selected session is hosted by the canonical project owner,
+the same explicit project role also grants live, project-scoped runtime use.
+It never grants machine inventory, project provisioning, provider
+configuration, cluster administration, or access to another project.
+
+A **cluster share** grants compute only on the membership's machine allowlist
+and applies its configured default launch profile to projects that member
+creates there. It never grants conversation or policy visibility for a project
+the member neither owns nor explicitly belongs to.
+
+The two grants compose for third-party hosting. If a session's host is neither
+the caller nor the canonical project owner, the caller needs both ordinary
+project access and active membership in the hosting cluster with permission for
+that session's exact machine. Revoking the cluster or machine grant stops later
+attachments and runtime mutations without deleting the project role or its
+persisted history.
+
+| Caller authority | Project content | Owner-hosted runtime | Third-party-hosted runtime | Shared machines / provisioning |
+| --- | --- | --- | --- | --- |
+| Project owner or explicit project user | Yes | Yes, for that project only | Only with host-cluster membership and exact-machine permission | No |
+| Cluster member only | No | No | No; project access is also required | Allowed machines only |
+| Project user plus matching host-cluster grant | Yes | Yes, from the project role | Yes, on the permitted machine | Allowed machines only |
+
+Resolve this per selected session and on every attach or runtime mutation; a
+project can have owner-hosted and third-party-hosted placements with different
+answers. `Database::check_session_runtime_access` is the common predicate.
+Content-only reads continue to use ordinary project access.
+
+Web navigation is also authorization-transactional. `attach_session` keeps the
+requested session pending; only a matching `session_attached` may change the
+active or persisted workspace, restore its cache, or request catch-up. Expected
+denials use `session_attachment_rejected` with the requested session and a safe
+project-access, host-machine-access, unavailable-project, or missing-session
+reason. Background and out-of-order results never become foreground navigation.
+
+**System administration is a credential, not an account.** One per deployment,
+stored in `system_admin_credential` outside the `users` table, seeded from
+`[system_admin]` in `apas-server.toml` only when no row exists — so editing the
+config later cannot revert a rotation. Its token carries `sub =
+"system-admin"`, `token_kind = "system_admin"`, and the credential version;
+rotating the password bumps that version and invalidates every outstanding
+token. An account token is rejected by `/admin/*` and this token is rejected
+everywhere else. No UI can grant it, and `bootstrap_admin_email` is gone.
+
+**An empty `bootstrap_password` is silent and total.** Seeding is skipped when
+the value is blank, and the only report is one `WARN` at startup. With no
+credential nobody can enter `/admin`; `/admin/users/invitations` is the sole
+code path that creates a registerable invitation, so nobody can be invited
+either. This deployment shipped that way and could not create a single account
+between 2026-08-08 and 2026-09-09. **Checking that the `[system_admin]` block
+exists is not enough** — the block was present the whole time with an empty
+password. Verify the credential row instead, which is the thing that actually
+decides:
+
+```bash
+ssh root@apas.mpaxos.com "sqlite3 /opt/apas/data/apas.db \
+  'select count(*) from system_admin_credential;'"   # 0 means /admin is unenterable
+```
+
+**Two ways to get an account, and only two.** An **invitation** admits exactly
+the address it names, from any domain, and is issued by the system
+administrator. **Self-signup** admits an address whose domain the deployment
+lists in `[auth] self_signup_email_domains`:
+
+```toml
+[auth]
+self_signup_email_domains = ["cs.stonybrook.edu", "stonybrook.edu"]
+```
+
+The allowlist **is** the switch. There is deliberately no separate
+`open_registration` boolean, because one could be set while the list is empty
+and admit the entire internet; empty or absent means invitation-only, which is
+both the default and what every config file written before this setting already
+says. Matching is **exact** — a parent domain does not admit its subdomains, so
+`mail.stonybrook.edu` must be listed in its own right. Widening is a config
+edit plus a restart, never a rebuild, and the server names the live policy at
+boot (`Registration is open to these email domains…`, or
+`Registration is invitation-only…`), so the state is never silent again.
+
+**The `/admin` login must stay inline on the page.** nginx proxies the whole
+`/admin/` prefix to `apas-server`, so a Next.js route at `/admin/login` would
+never be served. The page renders its own form when it holds no token, and
+keeps that token in `sessionStorage` under its own key — never in the zustand
+store, never in `localStorage`, so it dies with the tab. Nothing in the ordinary
+interface links to it.
+
+**`cluster_role` no longer means anything.** Every account migrates to `user`,
+and the column plus its wire field survive only so older web and mobile builds
+keep parsing identity responses. Two deployment-wide reads went with it: web
+machine listings no longer have an all-machines branch, and no account can
+revoke another account's mobile device.
+
+**Policy resolves over three levels** — deployment default (system
+administrator) → cluster default (`cluster_default_policies`, one row per
+account) → project override. The launch-profile allowlist **narrows
+monotonically**: each level may only restrict what the level above allows, and
+a widening write is rejected rather than silently clamped. It intersects over
+*every* hosting cluster, not just the owner's, so your cluster default governs
+the foreign-owned projects on your machines; intersection is order-independent,
+so a multi-hosted project still has one answer.
+
+`team_available` is **vestigial**. It is still on the wire and in stored policy
+so web and mobile builds that predate the team-mode removal keep parsing what
+they are sent — the same reason `cluster_role` survives — and it decides
+nothing. Do not reintroduce a read of it; a test asserts a policy carrying it
+behaves exactly like one without it.
+
+**Audit carries an actor kind and a cluster.** `admin_audit_events` was rebuilt
+once (create-copy-drop-rename, guarded by `schema_migrations`) because
+`actor_user_id` referenced `users(id)` with `PRAGMA foreign_keys=ON`, which made
+a non-account actor unrecordable. `cluster_invitations.created_by` was rebuilt
+for the same reason. `project_members.invited_by` keeps its key, so a
+system-administrator membership change is attributed there to the project owner
+while the audit row records who actually did it. An operator's audit view also
+applies the live hosting predicate, so a project hosted in several clusters is
+visible to each of them and pre-attribution rows still land where they belong.
+
+## Projects run inside the one instance
+
+A host runs one `apas` process for a user, and the projects run *in it* as
+supervised tasks. The daemon used to spawn each project as `apas --headless`
+into its own tmux session and then could not see it, which is why running state
+was inferred from `/proc` and why a restarted daemon came back owning nothing.
+A host is now one `apas` plus one **pane host per terminal pane**.
+
+**Pane hosts are deliberately not merged.** They own the PTYs so a provider
+survives the CLI being replaced — which is also what keeps this arrangement
+safe, since the blast radius is the supervision layer rather than running
+agents.
+
+**Stopping a project sets a flag it observes; it is never an aborted future.**
+Aborting would strand roughly thirty threads and every pane child. The flag
+ends the project through the same teardown an ordinary stop takes, and the wait
+is bounded at 30s so one project that will not stop cannot hold the instance
+the others are running in.
+
+**Failure containment rests on unwind.** `panic = "abort"` is not set, so a
+panicking project unwinds its own task, is reported as stopped, and leaves the
+others alone. A test fails if anyone ever sets it, because that would turn any
+project panic into a host-wide outage with nothing else looking different. The
+three `process::exit` calls that used to mean "stop this project" are gone;
+`run_inner` returns a `ProjectOutcome` and the caller decides.
+
+**Blocking work must stay off the runtime.** Each project's blocking readers
+already run on their own threads. New code that blocks in async would stall
+every other project, and a two-project test will not show it.
+
+**Two things the process boundary gave for free had to be replaced.** Each
+project carries a `project` span so its records are identifiable — the
+per-project tmux session and stderr log are gone, and the default `Full` log
+format prints the span fields. And `exec` now takes the projects with it, so an
+upgrade writes what was running to a manifest in the *runtime* directory
+(volatile, so a machine reboot starts nothing nobody asked for; cleared on read
+so a crash cannot retry forever) and starts them again afterwards. Pane hosts
+survive the `exec`, so a prompt resume lands inside their adoption grace.
+
+**A PATH trap comes with the merge.** The old model passed
+`env PATH=<login shell PATH>` on every spawned project's command line, because
+a daemon started from a minimal environment cannot find nvm/cargo-installed
+providers. In-process, projects inherit the daemon's PATH, so the daemon
+applies the login shell PATH to itself before any project starts.
+
+**The rollout is not additive.** An older instance's projects are separate
+processes this one cannot supervise, so a starting instance stops the
+process-per-project leftovers before starting anything — otherwise one `.apas`
+and one set of worktrees get two owners. It finds those by their `-d <path>`;
+it cannot find one a person started by running `apas` in a directory before
+that became register-and-exit, because those carry no arguments and nothing
+distinguishes them from an `apas --attach` in use. Those stay a manual step.
+
+`apas --headless -d <path>` survives as a way to run one project alone for
+debugging. Nothing spawns it, and a project with an external headless run is
+never given a second owner.
+
+## One instance per user per host
+
+Running `apas` in a project directory **registers that project and exits**. It
+does not open a terminal UI and does not start the project — projects are
+started from the web. A host runs one APAS instance per user, and by the time
+a launch gets there it already exists, because `ensure_daemon_running` started
+it.
+
+This is the existing `apas daemon` rule applied to the command people actually
+type. `detect_running_daemon` already reads a pid state file, verifies the
+process really is `apas`, and deletes a stale record; `apas daemon` already
+prints and returns when one is running. The gap was that plain `apas` went
+straight into `dual_pane` without asking, so typing it in a directory the
+daemon was already running produced two owners of one project, one `.apas`,
+and one set of worktrees — `is_headless_running_for` guards only the daemon's
+own spawns.
+
+Registration is all a launch needs to do: the daemon reads the shared registry
+(`list_registered_projects`) on every heartbeat and reports what it finds, so
+the project appears on the Machines page with no IPC and no start request.
+
+**Creating a project from a local directory is still a thing a launch does.**
+`apas` in a directory that is not yet a project creates and registers it. This
+rule governs how many instances run, not when a project comes into being, and
+the web's create flow only clones a repository into a *new* directory.
+
+**Headless workers are exempt.** They are `apas` processes, but the daemon's
+children rather than instances a user launched; applying the rule to them
+would stop the daemon running more than one project.
+
+`apas --attach` opens the terminal UI for a project already running here. It
+is a local view for when the web is unreachable, it renders little beyond pane
+names, and it is expected to be removed if nothing uses it.
+
+## The daemon is replaced only when asked
+
+Replacing the daemon used to be nearly free: it owned no long-lived children, so
+a **15-minute self-upgrade tick** was a good trade — unattended hosts stayed
+current and nothing running noticed. zoo-002 sitting nine versions behind was
+the problem it solved.
+
+Projects run **inside** the daemon now. Replacing it is the same act as stopping
+every project on the host and starting them again, so nothing does it on a
+schedule any more. **The tick is gone**, along with the `stat`-based gate it
+needed (`apas_binary_fingerprint`, `newer_installed_version`). Installing a
+binary to the shared path no longer propagates on its own.
+
+**A launch does not replace it either.** `apas` in a project directory, and
+`apas daemon`, both used to stop an older daemon and start a fresh one. That was
+invisible when the daemon owned nothing; now it ends every project on the host —
+and by `stop_daemon_process`'s SIGTERM/4s/SIGKILL, so nothing is saved, no
+resume manifest is written, and nothing comes back. Whoever types `apas` in a
+directory is a bystander to that work. Both paths now report that the running
+instance is older and point at the Machines page; `stop_daemon_process` is gone
+with its last caller. `plan_launch_daemon` holds the decision so it is testable
+away from the spawning, the way `plan_daemon_restart` does.
+
+**The requested restart is the whole upgrade path**, from the Machines list on
+desktop and mobile (`WebToServer::RebootDaemon { machine_id }` →
+`ServerToDaemon::RebootDaemon`). It is addressed by **machine**, not through a
+project: a daemon is per-machine, and a host running nothing still has one worth
+restarting. The server authorizes the machine against the requester's own daemon
+registrations — the same check `StartMachineProjectCli` uses — and reports an
+offline daemon rather than dropping the request.
+
+A requested restart **applies an available update first**, via
+`prepare_cli_restart`, so `check_for_update_available` syncs the git repo and
+pull/build/install all complete while the current daemon is still serving; a
+failure leaves that daemon working rather than the machine with none. It is what
+lets a CLI update roll out from a phone instead of an SSH session. A version
+that only touches the web frontend or docs skips the rebuild
+(`pending_update_needs_rebuild`). Progress past "requested" is deliberately not
+reported — the daemon replaces its own process image, so anything further would
+have to outlive the process that would report it.
+
+It upgrades only. Equal, older, or unparseable versions replace in place;
+an accidental downgrade across a cluster sharing one NFS home would be painful
+to unpick.
+
+**The cost of removing the tick is that a host nobody visits keeps its version
+forever** — exactly the zoo-002 problem, deliberately reaccepted. What makes it
+tolerable is that the machine lists now *show* it: each machine displays the
+version its daemon reports, and its restart control reads "Reboot to update"
+when that version is behind the newest one the client can see. The old failure
+was that nothing surfaced it.
+
+**It re-execs rather than spawn-and-exit**, which matters for three reasons:
+
+- the pid is preserved, so `daemon.json` stays correct and
+  `detect_running_daemon` is not briefly fooled into starting a second daemon,
+- the session is preserved, so it stays `setsid`-detached,
+- destructors do **not** run, so `RegistrationGuard` never withdraws the host
+  record or releases project claims. Spawn-and-exit would open a window where a
+  peer daemon sees those projects unclaimed and could spawn a duplicate CLI
+  against the same `.apas` and worktrees — the race the claim system exists to
+  prevent.
+
+**Stopping it stops its projects.** The signal handler is registered with
+`ctrlc`'s `termination` feature, so a SIGTERM sets the same shutdown flag a
+SIGINT does. Without that only SIGINT is handled, and a `setsid`-detached daemon
+essentially never receives one — the teardown that saves each project's pane
+roster and ends its agent subtrees would be unreachable, and nothing would look
+any different. A test fails if the feature is ever dropped, for the same reason
+one fails if `panic = "abort"` is ever set.
+
+**Claims are reconciled at daemon startup.** `reconcile_running_claims` claims
+every project this host is already running, because claims are otherwise only
+taken in `start_project` — so a restarted or self-upgraded daemon would come
+back owning nothing while its project CLIs kept running. During that gap a peer
+sees the projects unclaimed, and its `is_headless_running_for` only reads its
+*own* `/proc`, so a `StartProjectCli` there would spawn a second CLI against the
+same `.apas` and worktrees. A peer holding the claim for something running here
+is logged, not seized: that means two CLIs are already live for one project,
+which is exactly what the operator needs to see.
+
+Relatedly, `claim_project` adopts the **current pid** when refreshing a claim
+owned by this hostname. A claim written by a previous daemon carries that
+daemon's pid, and `refresh_own_claims` only refreshes claims whose pid matches
+the running process — so keeping the old pid left the claim un-refreshed, stale
+within `STALE_AFTER_SECS`, and free for a peer to take while we were actively
+running the project.
+
+**Pane hosts are untouched.** They own the PTYs in their own tmux sessions, so
+nothing about replacing the daemon's process image reaches them, and a
+replacement that lands inside their adoption grace picks the terminals back up.
+
+## Terminal-pane history: read the provider's transcript
+
+An agent pane is *observed* — the CLI parses its stream-json and knows every
+turn without cooperation. A terminal pane hosts the provider's real TUI on a
+pty, so there is nothing structured to parse, which is why terminal panes had
+no history and no usage counters.
+
+**Self-reporting via MCP was tried first and does not work.** A `record_turn`
+tool was added and the requirement stated in the MCP server's `initialize`
+instructions. Tested against both providers: each connects to the server and
+*will* call the tool when told to directly, but neither acts on the
+`initialize` instructions — an ordinary task ("what is 17 times 23?") recorded
+nothing at all. Those instructions are advisory and both clients treat them as
+such. Do not reach for that mechanism again expecting a guarantee.
+
+So the CLI reads the transcript each provider already writes. It needs no
+cooperation, cannot be skipped, and carries token usage the agent would
+otherwise have had to volunteer.
+
+**Locating the file differs by provider, and so does the confidence:**
+
+- **claude** — **the provider reports its own transcript.** Each Claude pane is
+  spawned with `--settings <pane file>` installing a `SessionStart` hook that
+  runs `apas session-hook`; Claude passes it `transcript_path` on stdin, and it
+  records that under
+  `${XDG_RUNTIME_DIR}/apas/panes/<project>/<pane>/claude-session.json` (0600,
+  written temp+rename so a poll cannot read a half-written file). The watcher
+  reads that file.
+
+  The deriving path — `--session-id <pane's session_id>` pinned at spawn, and
+  `~/.claude/projects/<cwd with / replaced by ->/<session-id>.jsonl` — remains
+  as the fallback, and both halves of it are wrong as soon as the user acts.
+  Claude Code can move a session into `.claude/worktrees/<name>` and then writes
+  under **that** directory's slug; and `/resume` onto another session appends to
+  **that session's** file, so the pinned id names a conversation the pane has
+  left. What used to cover the gap — follow the newest transcript in the
+  directory — cannot tell our pane switching files from an unrelated `claude`
+  running in the same directory, and on a live pane it published 607 records of
+  someone else's conversation while the pane's own sat unread in a worktree.
+
+  Three things were verified against Claude Code before building on it: the hook
+  fires on `startup` **and** `resume` carrying the absolute `transcript_path`;
+  `--settings` **merges** with the user's other settings layers rather than
+  replacing them, so the pane keeps its owner's model and theme; and the hook
+  process **inherits the provider's environment**, which is how `APAS_PANE_RUNTIME`
+  identifies the pane. A `claude` a person runs by hand has no such variable, so
+  it records nothing and can never be adopted.
+
+  This is deliberately unlike the `record_turn` MCP tool below, which asked the
+  *model* to cooperate and was abandoned: a hook is run by the client, not
+  chosen by the agent. Never substitute `--continue`: it can select another
+  pane's most recent cwd conversation and silently disconnect terminal output
+  from APAS's transcript watcher.
+- **codex** — cannot be given an APAS-chosen id at creation. On Linux, APAS first
+  checks the terminal's process group and its directly launched Codex app-server
+  child for an open user rollout. Codex 0.157 writes through that child in a
+  separate process group. Only direct `codex app-server` children qualify;
+  content-addressed native binaries also qualify when the child runs the exact
+  same executable as its TUI. Searching arbitrary descendants can adopt a
+  separate Codex session started by one of the agent's tools.
+
+  **Codex 0.159/0.160 can instead use a shared managed daemon.** Its rollout
+  descriptors belong to neither the TUI's group nor its children, which left all
+  three TLA–RS Codex conversations empty while their terminals worked. APAS
+  queries the user's existing Codex control socket for loaded-thread metadata
+  and each thread's live `codex_tui` MCP origin. That loopback listener must be
+  owned by the pane's process group, and the rollout's id, cwd and user-thread
+  metadata must agree. Shared cwd or daemon ancestry alone proves nothing.
+  Multiple matching user threads are ambiguous and never selected by recency.
+  Queries are batched across panes and bounded to two seconds per poll.
+  This reads client-maintained metadata; it neither invokes an MCP tool nor
+  asks the model to report itself, and it sends no prompt to the provider.
+
+  The last verified path survives brief descriptor/control-socket gaps; an
+  unambiguous newly owned rollout replaces it on resume/fork. Its
+  `session_meta.id` replaces the provisional pane UUID in `.apas`, so future
+  restores use `codex resume <id>` directly. An older pane keeps the picker
+  until its identity is verified; `--last` is never used because it can select
+  a sibling pane in the same cwd. Other platforms fall back to the newest user
+  rollout whose cwd matches, but that ambiguous fallback is not persisted as
+  pane identity. Restored panes still baseline existing turns instead of
+  replaying the whole file: repairing previously missing history requires a
+  separate bounded recovery, not resetting every pane's cursor.
+
+  Codex's rollout files, authentication and configuration stay in the user's
+  ordinary `CODEX_HOME`, which can be shared by the cluster. Its WAL-mode
+  SQLite runtime state cannot: APAS sets `CODEX_SQLITE_HOME` on every Codex
+  pane to the private host-local `/var/tmp/apas-codex-sqlite-<uid>` directory.
+  The launcher creates or tightens that directory to `0700` and rejects a
+  symlink, non-directory or path owned by another user. Never move this path
+  back under the NFS-mounted home; different hosts may run Codex concurrently.
+- **opencode** — OpenCode owns its `ses_*` identifiers, so APAS asks
+  `opencode session list --format json` for the newest session whose directory
+  exactly matches the pane cwd, then reads it with `opencode export <id>`.
+  Like Codex, two panes sharing a cwd are inherently ambiguous; sessions from
+  another directory are never selected.
+- **omp** — no `--session-id` exists, so the pane is pinned by its own
+  `--session-dir` instead (see "Terminal panes" below). The newest `.jsonl` in
+  that directory is unambiguous because nothing else writes there. OMP records
+  are Pi's, so `read_omp_turns` delegates to the Pi reader; a test parses a real
+  omp capture so a future divergence fails loudly instead of emptying the
+  conversation view.
+- **pi** — `--session-id <uuid>` pins the pane's identity at spawn, and Pi names
+  the session file after it:
+  `~/.pi/agent/sessions/--<cwd slug>--/<timestamp>_<uuid>.jsonl`. APAS finds
+  that exact id anywhere under the sessions root (honoring
+  `PI_CODING_AGENT_DIR` and `PI_CODING_AGENT_SESSION_DIR`), so sibling panes
+  and provider subprocesses sharing a cwd are never adopted. Pi writes the file
+  only once the session's first assistant message exists; before that the pane
+  simply has no history. In-TUI `/new` and `/resume` switches are deliberately
+  not followed: nothing distinguishes a deliberate switch from an oh-my-pi
+  subagent's session, and pinned identity is exact.
+
+Parsing keeps only real conversation. claude transcripts also carry `mode`,
+`ai-title`, `last-prompt` bookkeeping; codex carries `developer` messages (the
+harness's own injected context), `reasoning`, and tool calls; OpenCode exports
+typed reasoning/tool/synthetic parts; pi sessions are trees whose `custom` and
+`custom_message` extension entries (what the oh-my-pi package writes),
+thinking, tool results, shell executions, and compaction/branch summaries are
+not turns. None of those are turns, and rendering them would be noise. For pi,
+only the active parent chain is read, so an abandoned `/tree` branch never
+reappears in history. Tool-use-only turns with no text are skipped rather than
+recorded blank. In-progress OpenCode assistant messages are held until their
+completion timestamp arrives so APAS never advances its cursor over a partial
+reply.
+
+**Agent questions appear in the conversation view, and can be answered there.**
+The parser drops tool-use-only turns as noise — right for `Bash`, wrong for
+`AskUserQuestion`, which has no text either but is the one turn the human has
+to act on. Across the transcripts on one machine, 170 questions were recorded
+and 169 were being discarded, so a terminal pane could sit blocked on a
+question nobody could see. A question turn is now published as the `tool_use`
+block it already is, so the web's existing `AskUserQuestionCard` renders it
+with no new wire message, storage path, or renderer.
+
+Answering reuses the whole `AnswerQuestion` pipeline agent panes use (web →
+server → CLI); only the last hop differs, because a terminal pane has no
+stream-json control channel. The CLI writes **keystrokes** to the pty instead:
+`↑/↓` to navigate and `Enter` to select, which is the contract the picker
+prints in its own footer — verified by driving the real TUI (Claude Code
+2.1.233), where digits notably do *not* move the selection. The agent's options
+occupy positions 1..N with the TUI's own `Type something` / `Chat about this`
+beneath them, so stepping down by an option's index can only land on an option
+the agent offered.
+
+**The answer is confirmed by reading, never by writing.** A successful pty
+write proves only that bytes were accepted, so the acknowledgement is the
+`tool_result` the provider records, republished as `User` + `ToolResult` — the
+one variant the server's converter reads for tool results, which is exactly why
+ordinary non-assistant turns avoid it. A terminal pane has no structured echo,
+so the recorded answer arrives as prose (`The user answered: "Q"="A"`) and is
+parsed, letting the card settle on what the agent *took* rather than on what
+was clicked. Pending state is derived the same way — a question is open while
+its `tool_use` has no `tool_result` — which is what makes a blind write safe:
+a stale tab, a retransmit, or a question already answered in the terminal all
+send nothing.
+
+Terminal conversation sends need the same distinction. `UserInput` is the
+server's forwarding echo, and the optimistic bubble is local UI state. Neither
+proves that a provider recorded the prompt. A hidden OMP selector consumed a
+mobile prompt this way: it ignored the text and treated Enter as consent, while
+APAS displayed Working. The server now emits `TerminalConversationRecorded`
+with the original `client_msg_id` when its transcript correlation is consumed;
+only that observation starts Working and counts a prompt. The web keeps
+unconfirmed sends separately, scoped by session, pane and message id, and
+persists them for recovery across refreshes. After ten seconds it offers the
+raw terminal and draft recovery. Never automatically replay these PTY writes
+or infer receipt from matching chat text. A missing acknowledgement remains
+unconfirmed, including when a disconnect loses it. Provider menus are still
+opaque, so this does not make a blind Enter safe for answering them.
+
+**A pane blocked on that question is Pending answer, not Working or Idle.**
+The server caches one canonical pane status when `AskUserQuestion` arrives and
+reports it separately in pane/session summaries, so project lists, waiting-agent
+lists, pane selectors and conversation status bars all agree. Pending answer
+does not advance idle recency and takes presentation precedence over a cached
+provider usage limit: it names the action the human can take now. Merely routing
+answer bytes does not clear it; the matching transcript `tool_result` is the
+proof that moves the pane back to Working until the resumed turn completes.
+
+This whole path is Claude-specific today. Pi's `ask` tool comes from the oh-my-pi
+extension, and no Pi picker has been driven against a real TUI, so APAS does not
+publish Pi tool calls as answerable cards or write blind keystrokes for them;
+answering happens in the terminal view. OpenCode has no question interface
+either. Adding a provider means verifying its picker contract first, not
+assuming the Claude arrow-key one.
+
+**The conversation view is writable, and that is the point on mobile.** An
+xterm TUI on a phone is close to unusable — no modifier keys, tiny hit targets,
+scrolling that fights the page — so the conversation view plus its text box is
+the practical way to drive an agent from one. Text goes straight into the pty
+via the same `TerminalInput` path the xterm view uses; the TUI cannot tell the
+difference. **MCP is not and cannot be involved**: it is agent-pull, so a tool
+server can answer a call but can never push a turn into a live conversation.
+Multi-line text is sent as a bracketed paste (`ESC[200~ … ESC[201~`) so the TUI
+takes it atomically instead of treating the first newline as submit; single-line
+text is sent bare, since a TUI that never enabled DECSET 2004 would otherwise
+show the wrapper as literal keystrokes. The carriage return is a separate write.
+The caveat is that it is sent **blind** — unlike the terminal view you cannot
+see whether the agent is mid-turn or sitting in a menu, so the UI says where the
+live state is.
+
+**The web can render a terminal pane either way.** A per-pane toggle switches
+between the live pty (xterm.js) and the same structured conversation view an
+agent pane gets — the captured turns arrive as ordinary pane messages, so
+`MessagePane` renders them with no special casing. The two are not equivalent
+and the UI says so: the terminal is live and interactive, while the
+conversation is a *reading* of the transcript that lags by up to one poll,
+shows user/assistant turns plus the questions the agent asks, and sends typed
+messages and answers into the same live pty. The terminal stays
+mounted-but-hidden behind the conversation view, because unmounting would tear
+down the xterm instance and force a re-attach, losing scroll position and focus
+on every glance at the transcript.
+
+Each turn is then dressed as the stream message an agent pane would have sent
+(`conversation_turn_to_stream_messages`). That is the trick that made this
+cheap: no new wire message, no new storage path, no new renderer, and no server
+or web change at all. A turn carrying token counts emits a second `Result`
+message, because `ws_cli` reads usage only from `extra.usage` on that variant;
+Pi reports real per-turn cost in its session file and that number is used,
+while providers that report only tokens keep `total_cost_usd` at 0 rather than
+inventing a price.
+
+## Terminal panes (`kind: "terminal"`)
+
+New user-created Claude, Codex, OpenCode, Pi, OMP, and DeepSeek work uses
+`kind: "terminal"`. The structured `kind: "agent"` path is retained only for
+historical panes: the CLI runs the provider headlessly and parses stream-json
+into structured events. Missing `kind` still deserializes as `agent` so old
+`.apas` files remain readable; that compatibility default is not a creation
+default, and no `agent:*` profile appears in the supported launch catalogue.
+
+A **terminal pane** instead allocates a pty (`portable-pty`), execs the
+provider's *real interactive TUI*, and streams the raw bytes
+to xterm.js in the browser. Nothing is parsed, so nothing has to be kept in
+sync with a provider's output format — the point is to reuse the CLI as it
+ships.
+
+Only `claude`, `codex`, `opencode`, `pi`, and `omp` can host one
+(`terminal_pane::terminal_binary_for`). DeepSeek uses the Claude terminal with
+the supported Anthropic-compatible backend environment; Cursor Agent has no
+supported launch profile. OpenCode launches with `--auto`; a fresh mobile task
+uses `--prompt <instruction>`, while restoration uses `--continue`. Pi launches
+with the pane's id pinned as `--session-id <uuid>` and its initial instruction
+positional; restoration opens the exact retained session file with `--session
+<path>` and falls back to `--session-id` when Pi has not written it yet. APAS
+deliberately passes no trust flag for Pi: it has no permission prompts at all,
+and `--approve` would trust repository-controlled settings and extensions on
+the host's behalf. Pi is therefore the one hostable provider with no
+permission-bypass argument.
+
+**OMP pins a pane by directory, not by id.** `omp` has no `--session-id`, so a
+pane cannot pin an exact identity the way Pi does. It accepts `--session-dir`,
+which is stronger: the pane owns a private directory under
+`~/.omp/agent/sessions/apas-<conversation id>/`, so a sibling pane or a
+provider subprocess sharing a working directory can never select this pane's
+session, and `--continue` inside it is unambiguous without consulting recency.
+The directory is passed on **every** launch and must precede `--continue`, or
+that flag resolves against the shared default store. Unlike Pi, OMP does have
+approval prompts, so it is launched with `--auto-approve` like the others.
+Verified against omp 18.1.20: a run writes one flat `<ts>_<uuid>.jsonl` there,
+`--continue` appends to that same file, and the default store stays untouched.
+
+APAS does not install OpenCode, Pi, or OMP, choose their model provider, or
+authenticate them. Install and authenticate them on every intended project host
+before enabling the profile. The default executables are `opencode`, `pi`, and
+`omp`; override nonstandard installations with `apas config set
+opencode_path ...`, `apas config set pi_path ...`, and `apas config set
+omp_path ...`. Existing explicit cluster/project allowlists remain opt-in and
+must add `terminal:opencode:official:default`, `terminal:pi:official:default`,
+or `terminal:omp:official:default` through the normal policy controls.
+
+On Linux, a newly launched **terminal** pane uses a host-local copy of a
+native Claude, Codex, or OMP executable under
+`/var/lib/apas/users/<uid>/providers/` instead of mapping the provider binary
+from the NFS-mounted home directory. The APAS pane-host executable lives under
+`/var/lib/apas/users/<uid>/pane-host/`. These directories are per-host and
+persistent, not shared through the user's home directory.
+The configured `claude_path`, `codex_path`, and `omp_path` remain the source
+installations. Update Claude and Codex through their ordinary launchers
+outside APAS; APAS picks up a changed source executable for later pane
+launches. An in-pane provider update may instead target its host-local
+executable and must not be treated as updating the shared installation.
+APAS does not copy script/package-manager launchers whose adjacent dependencies
+or update mechanisms require their installation directory.
+
+An administrator must provision this directory **on every host** before the
+CLI can use it:
+
+```bash
+sudo install -d -o root -g root -m 0755 /var/lib/apas /var/lib/apas/users
+sudo install -d -o "$(id -u)" -g "$(id -g)" -m 0700 "/var/lib/apas/users/$(id -u)"
+```
+
+The CLI rejects symlinked, misowned, or non-private user storage. Until it is
+provisioned, it uses the existing host-local `/var/tmp/apas-providers-<uid>/`
+and `/var/tmp/apas-bin-<uid>/` directories, **not NFS**. Once provisioned,
+OMP's last verified local version migrates to the new store; the old files
+remain available to any running panes. Claude, Codex, and pane hosts copy
+fresh from their configured installations at their next launch. Use the UID
+rather than a username so a rename does not silently change binary ownership.
+
+For a **native OMP binary**, APAS checks for updates when launching a new OMP
+terminal pane and applies them to an isolated **host-local** candidate via
+OMP's own `omp update`, never to the shared configured installation. Script
+and package-manager launchers still run from their configured paths and must
+be updated with their package manager.
+Update checks for native OMP are throttled and run in the background, so the
+opening pane gets the last verified local executable without waiting on the
+network; a successful update is used by later pane launches. Existing panes
+continue running their old local image. Failed downloads or checks retain the
+last working copy. Do not replace this with `omp update` against
+`~/.local/bin/omp`: on NFS, removing an executable mapped by a live pane can
+kill it with SIGBUS.
+
+**Two different things share the oh-my-pi name; do not conflate them.**
+
+The npm package `oh-my-pi` is a **Pi extension, not an APAS provider**: it
+peer-depends on Pi and declares `pi.extensions` in its package. Install it into
+Pi globally (`pi install npm:oh-my-pi`) so APAS panes never hit Pi's
+project-trust prompt, or install it project-locally and answer `/trust` in the
+terminal view; APAS never does that on the user's behalf. Its published
+`oh-my-pi` bin is broken (it imports `../src/*.ts` files the tarball does not
+ship), so the `/oh-my-pi` slash command inside a Pi pane is the supported way to
+diagnose an install. Pi extension entries are excluded from conversation
+recovery, and APAS never adopts a subagent session as the pane's own.
+
+`omp` (<https://github.com/can1357/oh-my-pi>) is a **standalone agent and its
+own APAS provider**, `Provider::Omp`. It is Pi-derived — same session record
+shape, same `PI_CODING_AGENT_*` overrides — but it is a separate binary with
+its own store under `~/.omp`, role-based model selection (`--smol`/`--slow`/
+`--plan`), subagents, and an ACP mode. Installing it does nothing to a Pi pane,
+and installing the npm extension does nothing to an OMP pane.
+
+The desktop tab bar, mobile browser pane picker, native mobile task launcher,
+server authorization, and CLI local add-tab path all enforce this boundary.
+Existing agent panes can still run, receive messages, and reboot; creating or
+switching one to another structured-agent profile is rejected. Nothing creates
+one any more — managed team roles were the last thing that did, and they are
+gone with team mode.
+
+**What terminal panes do not get directly.** Fine-grained tool status and plan
+review are built on stream-json events, so a terminal pane has neither. Coarse
+working/idle state is reconstructed from user turns and provider-confirmed
+completion markers in the transcript. `PaneDiff` is *not* in the unavailable
+list despite the pane-kind boundary suggesting it should be: it is computed
+from git by `compute_pane_diff`, so it works for any pane with a worktree.
+
+**Conversation history and usage** are recovered by reading the provider's
+own transcript — see below.
+
+**Transport.** Raw pty bytes never touch `CliToServer::Output` or
+`StreamMessage` — those persist into `messages.jsonl` as chat records, and
+ANSI would both bloat the store and break the message renderer. They ride
+dedicated `Terminal*` messages, base64-encoded because a pty read splits
+both UTF-8 sequences and escape sequences:
+
+- `CliToServer::TerminalOutput` / `TerminalExited` / `TerminalState`
+- `ServerToWeb::TerminalOutput` / `TerminalSnapshot` / `TerminalExited` /
+  `TerminalState`
+- `WebToServer::TerminalInput` / `TerminalResize` / `TerminalAttach`
+- `ServerToCli::TerminalInput` / `TerminalResize`
+
+The server keeps a bounded in-memory state entry per `(session, pane)` with
+scrollback bytes, the newest sequence, truncation, PTY instance UUID,
+lifecycle (`unknown`, `running`, `disconnected`, or `exited`), and optional
+exit status. `TerminalAttach` is answered from that entry, including when it
+has lifecycle but no bytes, so reattach paints immediately and a process that
+exited before producing output still gets an accurate banner.
+
+**PTY lifetime is not WebSocket lifetime.** A transport-only CLI disconnect
+changes confirmed-running terminal entries to `disconnected` but retains their
+bounded presentation. When the same APAS process reconnects, it reports every
+configured terminal before draining queued output. Each spawned PTY has a UUID:
+a running report for the same UUID restores `running` without clearing bytes,
+while a different UUID replaces the entry and starts with fresh presentation.
+Output and exit events from an older UUID are ignored. An already-`exited`
+entry and its status stay exited across later transport cleanup. Explicit pane
+removal still deletes the entry.
+
+Retention is deliberately non-durable. Terminal bytes and lifecycle remain in
+the session manager only, obey `TERMINAL_SCROLLBACK_MAX_BYTES`, and are never
+written to SQLite or `messages.jsonl`; a server restart loses them and state is
+`unknown` until the CLI reconciles again.
+
+On the web side, frames bypass zustand entirely (`lib/terminalBus.ts`): a
+full-screen TUI repaints many times a second, and storing chunks in state
+would re-render every subscriber per frame. `TerminalPane` tracks the current
+PTY UUID and last rendered sequence locally. Same-instance snapshots at an
+already-rendered sequence update lifecycle without duplicating output;
+cumulative snapshots that cover missed frames and replacement UUIDs reset
+xterm before replay. Snapshot/live lifecycle is authoritative for the
+disconnected, unknown, and exited banners, including empty snapshots.
+
+Claude's fullscreen TUI captures the mouse and owns text selection, then sends
+the selected text to its terminal through OSC 52. The web terminal loads
+`@xterm/addon-clipboard` with a write-only browser provider so that copy reaches
+the user's clipboard without allowing a provider process to read it. Clipboard
+reads receive an empty reply. The terminal also leaves paste shortcuts to the
+browser and leaves copy shortcuts there when xterm owns a selection; Ctrl+C
+without a selection still reaches the provider as an interrupt.
+
+**Rolling deployment.** Deploy the server first, then web, then CLI. New fields
+are optional/defaulted, so a new server accepts legacy output and exit frames,
+and a new web treats a legacy snapshot as `unknown`. Metadata-less output is
+still rendered but never proves that a retained process is running across a
+reconnect. During rollback, an older server may ignore the new `TerminalState`
+variant while continuing to relay the backward-compatible output/exit frames;
+continuity then degrades to unknown/disconnected rather than a false confirmed
+running state.
+
+Native mobile launch advertises `mobile_task_launch_v2`. The version bump is
+intentional: v2 creates a terminal pane and passes the first instruction as a
+provider-native CLI prompt; a v1 CLI would otherwise accept the pane and drop
+that instruction. OpenCode additionally requires `terminal_opencode_v1`, Pi
+`terminal_pi_v1`, and OMP `terminal_omp_v1`, so a rolling server/web deployment
+refuses to route any of them to an older v2 CLI that can launch Claude/Codex but
+not that provider. The server
+asks the user to update/reconnect instead of pretending an older launch
+succeeded.
+
+Roll out OpenCode, Pi, and OMP support in this order: server first, web second,
+then upgrade and reconnect project CLIs so they advertise
+`terminal_opencode_v1`, `terminal_pi_v1`, and `terminal_omp_v1`. Install and
+authenticate the provider and opt the intended policies into its profile only
+after the host CLI has reconnected.
+
+### Persistent pane hosts and CLI lifecycle
+
+On supported Unix project hosts, each new Claude, Codex, OpenCode, or Pi
+terminal pane is owned by a hidden `apas pane-host` process in its own
+project-scoped tmux session. The replaceable project CLI is only its
+authenticated controller.
+This removes the CLI process from the provider's lifetime: a transport-only
+`Reconnect Server` leaves the CLI, pane hosts, PTYs, queues, and structured
+turns untouched, while `Reboot CLI` prepares the update first and then adopts
+the same hosted terminal processes after `exec`.
+
+**`Reboot CLI` replaces the whole instance, because the CLI *is* the daemon.**
+Projects run inside one process, so there is no smaller unit whose replacement
+changes the running version. The project-scoped button and the Machines page's
+`Reboot to update` therefore perform the same act, and one project's button
+restarts every project on the host — the resume manifest brings them all back,
+and pane hosts are separate processes `exec` never touches, so terminal agents
+are adopted rather than restarted.
+
+**That adoption depends on one guard: project teardown must skip terminal
+cleanup when `reboot_requested` is set.** `detach_for_reboot` only asks a host
+to release its controller and deliberately leaves the handle live, so a
+`shutdown()` afterwards still runs `terminate_tmux_host` — which kills the tmux
+session *and* deletes the runtime directory. Without the guard a reboot
+destroys the very hosts it is about to adopt, then finds no descriptor, starts
+fresh providers, and still reports the panes as live-adopted, losing whatever
+turn was in flight. The guard looks redundant because it once was: a reboot
+used to `exec` inside the project's own process and never reach teardown. It is
+load-bearing now that projects return to the daemon and the daemon execs
+afterwards. For a while it did not: a project's request
+restarted only that project's task, so `prepare_cli_restart` installed the new
+binary and the old code kept serving. The update looked prepared and never
+applied, and the machine stayed on its old version until someone used the
+Machines page. The project that asks is also special-cased into the resume
+manifest, since it ends its own task to make the request and finished tasks are
+otherwise excluded — the one project the user acted on was exactly the one that
+would not have come back.
+
+The feature is advertised only when Unix sockets, tmux, the installed
+`apas pane-host` subcommand, and secure runtime storage all validate. Otherwise
+terminal panes keep using the direct PTY implementation and the lifecycle menu
+warns that they must restart/resume. Existing direct PTYs are not migrated in
+place; after their first restart under a capable CLI they become host-backed.
+Structured `kind: "agent"` panes retain their existing restart/resume behavior
+and are never described as live-adopted.
+
+Pane-host state is host-local, volatile, and outside the project directory:
+
+- Root: `${XDG_RUNTIME_DIR}/apas/ph`, or `/tmp/apas-<uid>/apas/ph` when
+  `XDG_RUNTIME_DIR` is unavailable.
+- Logs: `${XDG_RUNTIME_DIR}/apas/pane-host-logs/<project>/<pane>-<runtime>.log`,
+  0600, info level, rotated once at 1 MiB and pruned after 14 days. A host's
+  stderr is the tmux pane it runs in, which vanishes with the process, and its
+  runtime directory is removed when it exits cleanly — so before this a host
+  that died left no trace anywhere. The log records start (pid, identity,
+  executable), adoption and detach, lease expiry, the provider's exit status,
+  panics, and **the fatal signal that killed it** (a handler writes one line
+  naming the signal, then restores the default disposition and re-raises).
+  The `TerminalState` the CLI reports for a dead host names this file.
+- Executable: a host runs from a content-addressed copy under
+  `/var/lib/apas/users/<uid>/pane-host/` when provisioned, or the former
+  `/var/tmp/apas-bin-<uid>/` on hosts awaiting setup, never directly from
+  `~/.local/bin/apas` when a local copy succeeds. Home is NFS and
+  every install replaces that file. A process on a local filesystem keeps its
+  unlinked executable alive; a process whose executable was unlinked on the
+  NFS server has nothing to fault code pages back in from and dies with
+  SIGBUS the first time memory pressure evicts one. A host sits idle for days
+  and is the process most exposed to that — the Codex pane in `apas` died
+  this way on 2026-09-02, eight minutes after a deploy, with no log anywhere.
+  Copies are shared by content, pruned a week after being superseded, and
+  verified to run before use; any failure falls back to the shared path.
+- Project/runtime directories are `0700`; `runtime.json`, `credential`, the
+  Unix socket, and reboot `handoff.json` are `0600`.
+- `runtime.json` contains identity, protocol, tmux session, and socket paths,
+  but no credential or terminal content. The random 256-bit credential is in a
+  separate owner-only file and is never sent to providers or the server.
+- Raw detached output remains only in the pane-host's bounded in-memory ring;
+  it is not written to `.apas`, SQLite, JSONL, or a spool file.
+
+**A host that is gone is reported as exited, not disconnected.** When the
+controller's socket to a host closes without an `Exited` frame, the CLI asks
+tmux whether the host's session still exists. If it does, the pane is
+`disconnected` (the host is alive and re-adoptable, and the web keeps its
+retained view). If it does not, the host process itself died, and the CLI
+reports `exited` with a status naming the tmux session and the log file, so
+the web offers a reboot instead of implying a transport outage that will heal.
+Before this, a dead host looked exactly like a CLI reconnect in progress, and
+stayed that way forever.
+
+**A launch whose handshake fails tears its host down.** The host spawns the
+provider *before* answering `Create` with `Adopted`, and the controller used
+to give it 5s and then fall back to a direct PTY — leaving the tmux session it
+had already started to go on and spawn its own provider. That put two agents
+on one conversation. The handshake now waits 30s, and on any failure after the
+tmux session exists the controller kills that session and removes its runtime
+directory before falling back.
+
+Unexpected controller loss keeps the provider alive for 600 seconds by
+default; an authenticated reboot handoff gets 900 seconds. Configure the
+bounded values with:
+
+```bash
+apas config set pane_host_adoption_grace_seconds 600  # allowed: 30..3600
+apas config set pane_host_reboot_grace_seconds 900    # allowed: 60..7200
+```
+
+Pane close, provider switch/reboot, project stop/suspension, and project
+deletion bypass grace: they tombstone the project, authenticate shutdown where
+possible, terminate the provider process group, kill the exact pane-host tmux
+session, and remove local runtime files. An unexpected orphan self-terminates
+when its lease expires.
+
+Operational inspection must not print `credential` contents. Safe checks are:
+
+```bash
+apas config path
+find "${XDG_RUNTIME_DIR:-/tmp/apas-$(id -u)}/apas/ph" -name runtime.json -type f -print
+tmux -L "apas-<full-project-uuid>" list-sessions
+ls "${XDG_RUNTIME_DIR:-/tmp/apas-$(id -u)}/apas/pane-host-logs/<project>/"
+journalctl --user --since '15 minutes ago' | grep -E 'pane-host|lifecycle|tmux-spawn'
+```
+
+The `tmux-spawn-<uuid>.scope` records in the user journal are systemd's view
+of each tmux pane: `Started … launched by process <pid>` when a host starts,
+and a `Consumed … CPU time, … memory peak` line the second every process in
+it is gone. That second line, with no `Stopping`/`Stopped` before it, is how a
+host that died on its own was dated when it had left no log.
+
+Use the web Machines/Admin project stop action for cleanup; the daemon can
+enumerate and terminate pane hosts even when the project CLI is absent. If
+manual recovery is unavoidable, first identify the exact session from its
+owner-only `runtime.json`, then use `tmux -L <socket> kill-session -t <session>`;
+never recursively delete a runtime root while a listed host is still alive.
+
+Roll out in this order: server/shared protocol, web lifecycle menu, then CLI
+and daemon. Old CLIs keep the legacy reboot control and never receive a
+reconnect disguised as reboot. Rollback disables new host creation; already
+running compatible hosts should be allowed to close normally or stopped by a
+new daemon. Forcing an old CLI/daemon to clean them up interrupts active
+terminal turns.
