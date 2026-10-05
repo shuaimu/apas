@@ -854,6 +854,12 @@ impl HostedProcess {
         let mut env = env.to_vec();
         let settings =
             crate::claude_session_hook::prepare(&provider, project_id, pane_id, &mut env);
+        let extension =
+            crate::omp_activity::prepare(&provider, project_id, pane_id, conversation_id, &mut env);
+        if let Some(extension) = extension {
+            command.arg("--extension");
+            command.arg(extension);
+        }
         let env: &[(String, String)] = &env;
         for arg in crate::terminal_pane::terminal_args_for(
             &provider,
@@ -1441,7 +1447,10 @@ mod tests {
         assert_ne!(newer, copy);
         assert!(copy.exists());
         prune_stale_files(copy.parent().unwrap(), Some(&newer), Duration::ZERO);
-        assert!(!copy.exists(), "superseded copy should be pruned once stale");
+        assert!(
+            !copy.exists(),
+            "superseded copy should be pruned once stale"
+        );
         assert!(newer.exists(), "the copy in use is never pruned");
 
         // A copy that cannot run here is not offered.

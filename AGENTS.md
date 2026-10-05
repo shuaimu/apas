@@ -1044,11 +1044,11 @@ otherwise have had to volunteer.
   Like Codex, two panes sharing a cwd are inherently ambiguous; sessions from
   another directory are never selected.
 - **omp** — no `--session-id` exists, so the pane is pinned by its own
-  `--session-dir` instead (see "Terminal panes" below). The newest `.jsonl` in
-  that directory is unambiguous because nothing else writes there. OMP records
-  are Pi's, so `read_omp_turns` delegates to the Pi reader; a test parses a real
-  omp capture so a future divergence fails loudly instead of emptying the
-  conversation view.
+  `--session-dir` instead (see "Terminal panes" below). New Linux panes report
+  their exact transcript through the pane-local activity extension below.
+  Already-running panes use the newest flat `.jsonl` in their private directory.
+  `PiTranscriptReader` reads both Pi and OMP records; a real OMP capture guards
+  their shared conversation format.
 - **pi** — `--session-id <uuid>` pins the pane's identity at spawn, and Pi names
   the session file after it:
   `~/.pi/agent/sessions/--<cwd slug>--/<timestamp>_<uuid>.jsonl`. APAS finds
@@ -1072,6 +1072,47 @@ reappears in history. Tool-use-only turns with no text are skipped rather than
 recorded blank. In-progress OpenCode assistant messages are held until their
 completion timestamp arrives so APAS never advances its cursor over a partial
 reply.
+
+**OMP activity is not conversation text.** A background `launch-completion`
+or `async-result` can resume work without another user message, and tool-only
+assistant rounds contain no displayable text. Inferring activity from chat
+left `OMP-mako-rs` Idle for days after an aborted turn, even while it continued
+running tools. The watcher now reconciles Working, Pending answer, and Idle
+independently of its chat cursor, including on restore and reconnect. Replaying
+old conversation is never needed to recover activity.
+
+New Linux OMP launches explicitly load APAS's embedded `--extension` in both
+direct and hosted PTYs. It observes provider lifecycle events, preserves
+Working when `agent_end.willContinue` schedules continuation, and reports an
+unresolved `ask` as Pending answer. Reporting starts before OMP creates its
+first JSONL, so initial reasoning is no longer invisible. Verified with real
+OMP 18.3.2 and 18.6.0 through Working → Pending answer → Working → Idle.
+These are client events, not model-chosen MCP calls; `stopReason: "stop"` can
+still carry executable tools and is not a substitute.
+
+The extension writes `omp-activity.json` by private temp-and-rename under the
+same host-local `apas/panes/<project>/<pane>` runtime tree as Claude's hook.
+Its launch generation, provider PID/start time, and exact session-directory
+scope must match; stale reports and inherited subagent environments cannot
+report for the parent. Reports contain no conversation or credentials.
+No global OMP settings or extensions are replaced.
+
+Existing pane hosts are adopted without restarting providers, so they keep
+using active-branch transcript evidence until their next normal provider
+launch. Tool-start/result pairs recover pending questions, and autonomous
+tool rounds recover Working. This evidence cannot reveal unrecorded streaming
+or queued recovery as precisely as the live extension. OMP's extension API
+also has no terminal-settle notification for potential background work
+cancelled without another lifecycle event; do not fabricate one from elapsed
+time or file inactivity.
+
+**A three-second poll must not hide a two-minute parse.** Pi/OMP parent chains
+are indexed once rather than repeatedly searching all preceding records.
+The old reader took 127.8 seconds on a live 158 MB transcript and blocked
+every other pane in that project's serial watcher. Parsed snapshots are now
+borrowed unchanged until file identity, size, or timestamps change; append,
+replacement, and truncation invalidate the cache. Only active-branch records
+are decoded, and tool payloads are not all retained in memory.
 
 **Agent questions appear in the conversation view, and can be answered there.**
 The parser drops tool-use-only turns as noise — right for `Bash`, wrong for
@@ -1127,12 +1168,12 @@ provider usage limit: it names the action the human can take now. Merely routing
 answer bytes does not clear it; the matching transcript `tool_result` is the
 proof that moves the pane back to Working until the resumed turn completes.
 
-This whole path is Claude-specific today. Pi's `ask` tool comes from the oh-my-pi
-extension, and no Pi picker has been driven against a real TUI, so APAS does not
-publish Pi tool calls as answerable cards or write blind keystrokes for them;
-answering happens in the terminal view. OpenCode has no question interface
-either. Adding a provider means verifying its picker contract first, not
-assuming the Claude arrow-key one.
+Answerable conversation cards and terminal answer keystrokes remain
+Claude-specific. OMP's built-in `ask` reports Pending answer, but its tool calls
+are not published as answerable cards. Pi's extension-provided `ask` also has
+no answerable card or keystroke bridge; answer these providers in the terminal
+view. OpenCode has no question interface either. Adding an answer path requires
+verifying that provider's picker contract first, not assuming Claude's.
 
 **The conversation view is writable, and that is the point on mobile.** An
 xterm TUI on a phone is close to unusable — no modifier keys, tiny hit targets,

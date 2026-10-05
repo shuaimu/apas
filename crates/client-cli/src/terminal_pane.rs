@@ -154,6 +154,19 @@ impl TerminalRuntimeHandle {
         }
     }
 
+    /// Cached PTY lifecycle without constructing or copying a status message.
+    pub fn lifecycle(&self) -> TerminalLifecycle {
+        let lifecycle = match self {
+            Self::Direct(handle) => &handle.lifecycle,
+            #[cfg(unix)]
+            Self::Hosted(handle) => &handle.lifecycle,
+        };
+        lifecycle
+            .lock()
+            .map(|state| state.0)
+            .unwrap_or(TerminalLifecycle::Unknown)
+    }
+
     pub fn state_message(&self, session_id: Uuid) -> CliToServer {
         match self {
             Self::Direct(handle) => handle.state_message(session_id),
@@ -213,8 +226,7 @@ pub struct HostedTerminalHandle {
 }
 
 #[cfg(unix)]
-type HostLivenessProbe =
-    Arc<dyn Fn(&crate::pane_host::RuntimeDescriptor) -> bool + Send + Sync>;
+type HostLivenessProbe = Arc<dyn Fn(&crate::pane_host::RuntimeDescriptor) -> bool + Send + Sync>;
 
 #[cfg(unix)]
 fn tmux_host_probe() -> HostLivenessProbe {
@@ -908,9 +920,20 @@ impl TerminalHandle {
         let mut hook_env = env.to_vec();
         let settings =
             crate::claude_session_hook::prepare(provider, session_id, pane_id, &mut hook_env);
+        let extension = crate::omp_activity::prepare(
+            provider,
+            session_id,
+            pane_id,
+            claude_session_id,
+            &mut hook_env,
+        );
         let env: &[(String, String)] = &hook_env;
 
         let mut cmd = CommandBuilder::new(binary_path);
+        if let Some(extension) = extension {
+            cmd.arg("--extension");
+            cmd.arg(extension);
+        }
         // Order matters: codex's resume marker is a subcommand (`codex
         // resume`) and its bypass flag follows it. The helper also prevents
         // treating OpenCode's initial instruction as its positional project
@@ -1344,7 +1367,8 @@ mod tests {
         // Resume: same directory, plus --continue. The directory must come
         // first, or --continue would resolve against the default store and
         // could pick up another pane's session.
-        let resumed = terminal_args_for(&Provider::Omp, conversation_id, true, Some("ignored"), None);
+        let resumed =
+            terminal_args_for(&Provider::Omp, conversation_id, true, Some("ignored"), None);
         assert_eq!(
             resumed,
             vec![
@@ -1634,7 +1658,9 @@ mod tests {
             host_probe: Arc::new(|_| true),
         };
 
-        handle.detach_for_reboot().expect("detach is written to the host");
+        handle
+            .detach_for_reboot()
+            .expect("detach is written to the host");
 
         assert!(
             !handle.shutting_down.load(Ordering::SeqCst),
@@ -1704,17 +1730,24 @@ mod tests {
                         status,
                         ..
                     } => exited_state = status,
-                    CliToServer::TerminalExited { pane_id, status, .. } => {
-                        exited_event = Some((pane_id, status))
-                    }
+                    CliToServer::TerminalExited {
+                        pane_id, status, ..
+                    } => exited_event = Some((pane_id, status)),
                     _ => {}
                 }
             }
 
             let status = exited_state.expect("dead host was not reported as exited");
-            assert!(status.contains("ph_920_dead"), "status names the tmux session: {status}");
-            assert!(status.contains("reboot the pane"), "status says what to do: {status}");
-            let (pane_id, event_status) = exited_event.expect("no TerminalExited for the dead host");
+            assert!(
+                status.contains("ph_920_dead"),
+                "status names the tmux session: {status}"
+            );
+            assert!(
+                status.contains("reboot the pane"),
+                "status says what to do: {status}"
+            );
+            let (pane_id, event_status) =
+                exited_event.expect("no TerminalExited for the dead host");
             assert_eq!(pane_id, 920);
             assert_eq!(event_status.as_deref(), Some(status.as_str()));
             assert!(lifecycle

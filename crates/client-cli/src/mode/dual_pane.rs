@@ -11,6 +11,7 @@ use shared::{
     ClaudeContentBlock, ClaudeStreamMessage, CliToServer, CodexStreamMessage, PaneType, Provider,
     ServerToCli,
 };
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -24,6 +25,7 @@ use uuid::Uuid;
 
 use crate::project::{get_or_create_project, save_project};
 use crate::terminal_pane::{terminal_binary_for, TerminalPanes, TerminalRuntimeHandle};
+use crate::transcript::{PiTranscriptReader, TranscriptActivity};
 use crate::tui::{PaneOutput, TuiCommand, TuiEvent};
 
 type ProjectPolicyState = Arc<Mutex<Option<shared::EffectiveProjectPolicy>>>;
@@ -671,27 +673,61 @@ fn initial_terminal_transcript_cursor(restored_at_watcher_start: bool, turn_coun
     }
 }
 
-/// Return a provider-confirmed working-state transition worth publishing.
+/// Reconcile provider activity separately from the conversation cursor.
 ///
-/// An active state is published on first observation so a CLI reconnect can
-/// restore a turn already in progress. Initial idle stays silent because idle
-/// is the server default, and clearing here could race fresh web input before
-/// Codex has written its task_started event.
-fn observe_codex_working_state(
-    states: &mut HashMap<u32, (bool, u64)>,
+/// Active and pending states are restored after reconnect without replaying
+/// history. A conversation batch can itself change server status, so reassert
+/// the final observed state after such a batch even when it has not changed.
+/// Initial idle stays silent unless the batch carried a status transition.
+fn observe_terminal_activity(
+    states: &mut HashMap<u32, (TranscriptActivity, u64)>,
     pane_id: u32,
-    observed: Option<bool>,
+    observed: Option<TranscriptActivity>,
     connection_generation: u64,
-) -> Option<bool> {
+    reconcile_conversation: bool,
+) -> Option<TranscriptActivity> {
     let observed = observed?;
-    match states.insert(pane_id, (observed, connection_generation)) {
-        None if observed => Some(true),
-        Some((previous, _)) if previous != observed => Some(observed),
-        Some((true, previous_generation)) if previous_generation != connection_generation => {
-            Some(true)
-        }
-        _ => None,
+    let previous = states.insert(pane_id, (observed, connection_generation));
+    if reconcile_conversation
+        || previous.is_some_and(|(activity, _)| activity != observed)
+        || (observed != TranscriptActivity::Idle
+            && previous.is_none_or(|(_, generation)| generation != connection_generation))
+    {
+        Some(observed)
+    } else {
+        None
     }
+}
+
+fn publish_terminal_activity(
+    states: &mut HashMap<u32, (TranscriptActivity, u64)>,
+    server_tx: &tokio_mpsc::Sender<CliToServer>,
+    session_id: Uuid,
+    pane_id: u32,
+    observed: Option<TranscriptActivity>,
+    connection_generation: u64,
+    reconcile_conversation: bool,
+) {
+    let Some(activity) = observe_terminal_activity(
+        states,
+        pane_id,
+        observed,
+        connection_generation,
+        reconcile_conversation,
+    ) else {
+        return;
+    };
+    let status = match activity {
+        TranscriptActivity::Working => Some("Working...".to_string()),
+        TranscriptActivity::PendingAnswer => Some(shared::PANE_STATUS_PENDING_ANSWER.to_string()),
+        TranscriptActivity::Idle => None,
+    };
+    let _ = server_tx.blocking_send(CliToServer::PaneStatus {
+        session_id,
+        pane_type: PaneType::Interactive,
+        pane_id: Some(pane_id),
+        status,
+    });
 }
 
 /// Consecutive unchanged polls of the tracked claude transcript before an
@@ -2924,7 +2960,6 @@ async fn run_inner(
         let pauses_for_turns = pane_pauses.clone();
         let stop_requests_for_turns = pane_stop_requests.clone();
         let connection_generation_for_turns = server_connection_generation.clone();
-        #[cfg(target_os = "linux")]
         let terminal_panes_for_turns = terminal_panes.clone();
         let opencode_for_turns = opencode_path.clone();
         let configured_opencode_for_turns = config.local.opencode_path.clone();
@@ -2952,10 +2987,10 @@ async fn run_inner(
             // through brief descriptor gaps. A newly observed open user
             // rollout replaces it when the TUI resumes or forks a session.
             let mut codex_paths: HashMap<u32, std::path::PathBuf> = HashMap::new();
-            // Explicit task lifecycle is tracked independently from the turn
-            // cursor so reconnect can restore an in-flight pane without
-            // replaying its existing conversation.
-            let mut codex_working: HashMap<u32, (bool, u64)> = HashMap::new();
+            // Activity survives chat-cursor baselining and is reasserted after
+            // reconnect. Pi/OMP snapshots also retain unchanged parsed history.
+            let mut provider_activities: HashMap<u32, (TranscriptActivity, u64)> = HashMap::new();
+            let mut pi_readers: HashMap<u32, PiTranscriptReader> = HashMap::new();
             // Per-pane claude transcript watch state (growth + idle tracking
             // for in-TUI session-switch detection).
             let mut claude_watch: HashMap<u32, ClaudeWatchState> = HashMap::new();
@@ -2965,25 +3000,30 @@ async fn run_inner(
             while !shutdown_for_turns.load(Ordering::SeqCst) {
                 thread::sleep(Duration::from_secs(3));
 
-                // Snapshot terminal panes: (pane_id, provider, conversation
-                // id, actual terminal cwd override, provider process group).
-                let panes: Vec<(u32, Provider, Uuid, Option<String>, Option<i32>)> = {
+                // Keep lifecycle separate from transcript activity: a stopped
+                // process must not be resurrected by its unfinished history.
+                let panes: Vec<(
+                    u32,
+                    Provider,
+                    Uuid,
+                    Option<String>,
+                    Option<i32>,
+                    Option<shared::TerminalLifecycle>,
+                )> = {
                     let Ok(metas) = metas_for_turns.lock() else {
                         continue;
                     };
                     let sessions = sessions_for_turns.lock().ok();
-                    #[cfg(target_os = "linux")]
                     let runtimes = terminal_panes_for_turns.lock().ok();
                     metas
                         .iter()
                         .filter(|(_, m)| m.kind.is_terminal())
                         .filter_map(|(id, m)| {
                             let sid = sessions.as_ref()?.get(id).copied()?;
+                            let runtime = runtimes.as_ref().and_then(|runtimes| runtimes.get(id));
                             #[cfg(target_os = "linux")]
-                            let process_group_id = runtimes
-                                .as_ref()
-                                .and_then(|runtimes| runtimes.get(id))
-                                .and_then(TerminalRuntimeHandle::process_group_id);
+                            let process_group_id =
+                                runtime.and_then(TerminalRuntimeHandle::process_group_id);
                             #[cfg(not(target_os = "linux"))]
                             let process_group_id = None;
                             Some((
@@ -2992,16 +3032,19 @@ async fn run_inner(
                                 sid,
                                 m.worktree_path.clone(),
                                 process_group_id,
+                                runtime.map(TerminalRuntimeHandle::lifecycle),
                             ))
                         })
                         .collect()
                 };
+                pi_readers.retain(|id, _| panes.iter().any(|(pane_id, ..)| pane_id == id));
+                provider_activities.retain(|id, _| panes.iter().any(|(pane_id, ..)| pane_id == id));
                 #[cfg(target_os = "linux")]
                 let mut codex_process_paths = HashMap::new();
                 #[cfg(target_os = "linux")]
                 if let Some(home) = home.as_deref() {
                     let mut daemon_panes = HashMap::new();
-                    for (_, provider, _, worktree, group) in &panes {
+                    for (_, provider, _, worktree, group, _) in &panes {
                         let (Provider::Codex, Some(group)) = (provider, group) else {
                             continue;
                         };
@@ -3017,14 +3060,14 @@ async fn run_inner(
                     match crate::transcript::codex_daemon::find_rollouts(home, &daemon_panes) {
                         Ok(paths) => {
                             codex_process_paths.extend(paths);
-                            for (pane_id, provider, _, _, _) in &panes {
+                            for (pane_id, provider, ..) in &panes {
                                 if *provider == Provider::Codex {
                                     transcript_discovery_errors.remove(pane_id);
                                 }
                             }
                         }
                         Err(error) => {
-                            for (pane_id, provider, _, _, group) in &panes {
+                            for (pane_id, provider, _, _, group, _) in &panes {
                                 if *provider == Provider::Codex
                                     && group.is_some_and(|group| daemon_panes.contains_key(&group))
                                 {
@@ -3040,11 +3083,48 @@ async fn run_inner(
                     }
                 }
 
-                for (pane_id, provider, mut conv_id, worktree_path, process_group_id) in panes {
+                for (pane_id, provider, mut conv_id, worktree_path, process_group_id, lifecycle) in
+                    panes
+                {
+                    let connection_generation =
+                        connection_generation_for_turns.load(Ordering::SeqCst);
+                    let omp_report = if provider == Provider::Omp {
+                        crate::omp_activity::reported_activity(
+                            session_id,
+                            pane_id,
+                            process_group_id,
+                        )
+                    } else {
+                        None
+                    };
+                    if matches!(
+                        lifecycle,
+                        Some(
+                            shared::TerminalLifecycle::Running
+                                | shared::TerminalLifecycle::Disconnected
+                        )
+                    ) {
+                        // OMP creates its first JSONL lazily. Publish live
+                        // activity even before that file exists, or while its
+                        // history is unreadable, without moving the chat cursor.
+                        publish_terminal_activity(
+                            &mut provider_activities,
+                            &server_tx_for_turns,
+                            session_id,
+                            pane_id,
+                            omp_report.as_ref().map(|report| report.activity),
+                            connection_generation,
+                            false,
+                        );
+                    }
                     let transcript_cwd =
                         terminal_transcript_cwd(&project_for_turns, worktree_path.as_deref());
-                    let mut provider_working = None;
-                    let (source, turns, verified_codex_session_id) = match provider {
+                    let mut provider_activity = None;
+                    let (source, turns, verified_codex_session_id): (
+                        String,
+                        Cow<'_, [crate::conversation::TurnRecord]>,
+                        Option<Uuid>,
+                    ) = match provider {
                         Provider::Codex => {
                             #[cfg(not(target_os = "linux"))]
                             let Some(home) = home.as_deref() else {
@@ -3095,10 +3175,16 @@ async fn run_inner(
                             else {
                                 continue;
                             };
-                            provider_working = working;
+                            provider_activity = working.map(|working| {
+                                if working {
+                                    TranscriptActivity::Working
+                                } else {
+                                    TranscriptActivity::Idle
+                                }
+                            });
                             (
                                 format!("codex:{}", path.display()),
-                                turns,
+                                Cow::Owned(turns),
                                 verified_session_id,
                             )
                         }
@@ -3138,7 +3224,11 @@ async fn run_inner(
                             ) {
                                 Ok(turns) => {
                                     transcript_discovery_errors.remove(&pane_id);
-                                    (format!("opencode:{opencode_session_id}"), turns, None)
+                                    (
+                                        format!("opencode:{opencode_session_id}"),
+                                        Cow::Owned(turns),
+                                        None,
+                                    )
                                 }
                                 Err(error) => {
                                     note_transcript_discovery_error(
@@ -3242,7 +3332,11 @@ async fn run_inner(
                             else {
                                 continue;
                             };
-                            (format!("claude:{}", path.display()), turns, None)
+                            (
+                                format!("claude:{}", path.display()),
+                                Cow::Owned(turns),
+                                None,
+                            )
                         }
                         Provider::Pi => {
                             let Some(home) = home.as_deref() else {
@@ -3256,32 +3350,60 @@ async fn run_inner(
                             else {
                                 continue;
                             };
-                            let Ok(turns) = crate::transcript::read_pi_turns(&path, pane_id) else {
+                            let Ok(snapshot) =
+                                pi_readers.entry(pane_id).or_default().read(&path, pane_id)
+                            else {
                                 continue;
                             };
-                            (format!("pi:{}", path.display()), turns, None)
+                            provider_activity = snapshot.activity;
+                            (
+                                format!("pi:{}", path.display()),
+                                Cow::Borrowed(&snapshot.turns),
+                                None,
+                            )
                         }
                         Provider::Omp => {
                             let Some(home) = home.as_deref() else {
                                 continue;
                             };
-                            // The pane owns its session directory, so the
-                            // newest file in it is unambiguous. OMP has no
-                            // `--session-id` to pin, but it cannot reach
-                            // another pane's directory either, which is the
-                            // property that actually matters here.
-                            let Some(path) =
-                                crate::transcript::find_omp_session_file(home, conv_id)
+                            let path = if let Some(report) = omp_report.as_ref() {
+                                Cow::Borrowed(report.transcript_path.as_path())
+                            } else {
+                                // Existing hosted processes have no extension;
+                                // their private directory still proves ownership.
+                                let Some(path) =
+                                    crate::transcript::find_omp_session_file(home, conv_id)
+                                else {
+                                    continue;
+                                };
+                                Cow::Owned(path)
+                            };
+                            let Ok(snapshot) =
+                                pi_readers.entry(pane_id).or_default().read(&path, pane_id)
                             else {
                                 continue;
                             };
-                            let Ok(turns) = crate::transcript::read_omp_turns(&path, pane_id)
-                            else {
-                                continue;
-                            };
-                            (format!("omp:{}", path.display()), turns, None)
+                            provider_activity = omp_report
+                                .as_ref()
+                                .map(|report| report.activity)
+                                .or(snapshot.activity);
+                            (
+                                format!("omp:{}", path.display()),
+                                Cow::Borrowed(&snapshot.turns),
+                                None,
+                            )
                         }
                         _ => continue,
+                    };
+                    provider_activity = match lifecycle {
+                        Some(shared::TerminalLifecycle::Exited) => {
+                            provider_activity.map(|_| TranscriptActivity::Idle)
+                        }
+                        Some(
+                            shared::TerminalLifecycle::Running
+                            | shared::TerminalLifecycle::Disconnected,
+                        ) => provider_activity,
+                        _ => None,
                     };
 
                     if let Some(verified_session_id) = verified_codex_session_id {
@@ -3381,7 +3503,9 @@ async fn run_inner(
                     let completion_was_on_new_turn = turns
                         .get(previous_cursor..)
                         .is_some_and(|new_turns| new_turns.iter().any(|turn| turn.completes_work));
-                    if completion_count > *completed && !completion_was_on_new_turn {
+                    let completion_without_new_turn =
+                        completion_count > *completed && !completion_was_on_new_turn;
+                    if completion_without_new_turn {
                         let _ = server_tx_for_turns.blocking_send(CliToServer::PaneStatus {
                             session_id,
                             pane_type: PaneType::Interactive,
@@ -3391,19 +3515,19 @@ async fn run_inner(
                     }
                     *completed = completion_count;
 
-                    if let Some(working) = observe_codex_working_state(
-                        &mut codex_working,
+                    let conversation_changed_status = completion_without_new_turn
+                        || turns[previous_cursor..]
+                            .iter()
+                            .any(|turn| !turn.is_assistant() || turn.completes_work);
+                    publish_terminal_activity(
+                        &mut provider_activities,
+                        &server_tx_for_turns,
+                        session_id,
                         pane_id,
-                        provider_working,
-                        connection_generation_for_turns.load(Ordering::SeqCst),
-                    ) {
-                        let _ = server_tx_for_turns.blocking_send(CliToServer::PaneStatus {
-                            session_id,
-                            pane_type: PaneType::Interactive,
-                            pane_id: Some(pane_id),
-                            status: working.then(|| "Working...".to_string()),
-                        });
-                    }
+                        provider_activity,
+                        connection_generation,
+                        conversation_changed_status,
+                    );
                 }
             }
         });
@@ -8308,48 +8432,104 @@ mod tests {
     }
 
     #[test]
-    fn an_active_codex_turn_is_republished_after_reconnect() {
+    fn an_active_terminal_turn_is_republished_after_reconnect() {
+        use crate::transcript::TranscriptActivity::{Idle, Working};
         let mut states = HashMap::new();
 
         assert_eq!(
-            super::observe_codex_working_state(&mut states, 293, Some(true), 1),
-            Some(true),
+            super::observe_terminal_activity(&mut states, 293, Some(Working), 1, false),
+            Some(Working),
             "an already-active restored pane must repopulate server status"
         );
         assert_eq!(
-            super::observe_codex_working_state(&mut states, 293, Some(true), 1),
+            super::observe_terminal_activity(&mut states, 293, Some(Working), 1, false),
             None,
             "unchanged transcript polls must not resend status"
         );
         assert_eq!(
-            super::observe_codex_working_state(&mut states, 293, Some(true), 2),
-            Some(true),
+            super::observe_terminal_activity(&mut states, 293, Some(Working), 2, false),
+            Some(Working),
             "an unchanged active turn must repopulate status after reconnect"
         );
         assert_eq!(
-            super::observe_codex_working_state(&mut states, 293, Some(false), 2),
-            Some(false),
+            super::observe_terminal_activity(&mut states, 293, Some(Idle), 2, false),
+            Some(Idle),
             "the provider completion must clear the recovered status"
         );
     }
 
     #[test]
-    fn an_initial_idle_codex_observation_cannot_clear_fresh_web_input() {
+    fn an_initial_idle_observation_cannot_clear_fresh_web_input() {
+        use crate::transcript::TranscriptActivity::{Idle, Working};
         let mut states = HashMap::new();
 
         assert_eq!(
-            super::observe_codex_working_state(&mut states, 293, Some(false), 1),
+            super::observe_terminal_activity(&mut states, 293, Some(Idle), 1, false),
             None,
             "idle is already the server default and should stay silent"
         );
         assert_eq!(
-            super::observe_codex_working_state(&mut states, 293, None, 1),
+            super::observe_terminal_activity(&mut states, 293, None, 1, false),
             None,
-            "legacy transcripts without lifecycle events stay compatible"
+            "a missing observation must not change status"
         );
         assert_eq!(
-            super::observe_codex_working_state(&mut states, 293, Some(true), 1),
-            Some(true)
+            super::observe_terminal_activity(&mut states, 293, Some(Working), 1, false),
+            Some(Working)
+        );
+    }
+
+    #[test]
+    fn a_pending_omp_question_is_restored_until_its_answer_is_observed() {
+        use crate::transcript::TranscriptActivity::{Idle, PendingAnswer, Working};
+        let mut states = HashMap::new();
+
+        assert_eq!(
+            super::observe_terminal_activity(&mut states, 131, Some(PendingAnswer), 1, false),
+            Some(PendingAnswer)
+        );
+        assert_eq!(
+            super::observe_terminal_activity(&mut states, 131, Some(PendingAnswer), 1, false),
+            None
+        );
+        assert_eq!(
+            super::observe_terminal_activity(&mut states, 131, Some(PendingAnswer), 2, false),
+            Some(PendingAnswer),
+            "reconnect must restore the pending question without replaying chat"
+        );
+        assert_eq!(
+            super::observe_terminal_activity(&mut states, 131, Some(Working), 2, false),
+            Some(Working)
+        );
+        assert_eq!(
+            super::observe_terminal_activity(&mut states, 131, Some(Idle), 2, false),
+            Some(Idle)
+        );
+    }
+
+    #[test]
+    fn autonomous_work_wins_over_an_earlier_completion_in_the_same_chat_batch() {
+        use crate::transcript::TranscriptActivity::Working;
+        let mut states = HashMap::new();
+        super::observe_terminal_activity(&mut states, 131, Some(Working), 1, false);
+
+        assert_eq!(
+            super::observe_terminal_activity(&mut states, 131, Some(Working), 1, true),
+            Some(Working),
+            "a completed turn followed by tool-only continuation must not leave the server idle"
+        );
+    }
+
+    #[test]
+    fn a_whole_turn_between_polls_still_clears_its_user_input_status() {
+        use crate::transcript::TranscriptActivity::Idle;
+        let mut states = HashMap::new();
+        super::observe_terminal_activity(&mut states, 131, Some(Idle), 1, false);
+
+        assert_eq!(
+            super::observe_terminal_activity(&mut states, 131, Some(Idle), 1, true),
+            Some(Idle),
+            "the previous idle observation cannot suppress completion of a newly forwarded turn"
         );
     }
 

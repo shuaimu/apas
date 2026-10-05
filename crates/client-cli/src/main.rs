@@ -17,6 +17,7 @@ mod daemon_registry;
 mod file_watcher;
 mod host_storage;
 mod mode;
+mod omp_activity;
 mod omp_local;
 mod pane_host;
 mod pane_identity;

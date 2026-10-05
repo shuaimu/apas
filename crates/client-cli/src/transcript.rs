@@ -43,7 +43,7 @@
 
 use anyhow::{Context, Result};
 use serde_json::Value;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use uuid::Uuid;
@@ -668,18 +668,101 @@ pub fn find_omp_session_file(home: &Path, conversation_id: Uuid) -> Option<PathB
     newest.map(|(_, path)| path)
 }
 
-/// OMP writes the same session records Pi does — `message` entries in an
-/// `id`/`parentId` tree, with `custom` extension entries alongside — so the Pi
-/// reader applies unchanged. Verified against a real omp 18.1.20 session.
-pub fn read_omp_turns(path: &Path, pane_id: u32) -> Result<Vec<TurnRecord>> {
-    read_pi_turns(path, pane_id)
+/// Best durable evidence on the active Pi/OMP branch, independent of visible
+/// conversation. Streaming reasoning and queued recovery are not journaled:
+/// a live provider report is more authoritative than this snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TranscriptActivity {
+    Working,
+    PendingAnswer,
+    Idle,
 }
 
-// Pi records a question only through extension tooling (the oh-my-pi package's
-// `ask`). Upstream Pi has no built-in structured question, and driving an
-// unverified picker with blind keystrokes would answer on the human's behalf,
-// so Pi questions are out of scope for now — matching OpenCode. The pane still
-// shows the assistant's own text, and tool calls never become turns.
+#[derive(Default)]
+pub struct PiSnapshot {
+    pub turns: Vec<TurnRecord>,
+    pub activity: Option<TranscriptActivity>,
+}
+
+#[derive(PartialEq, Eq)]
+struct PiFileStamp {
+    size: u64,
+    modified: std::time::SystemTime,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+    #[cfg(unix)]
+    changed: (i64, i64),
+}
+
+impl PiFileStamp {
+    fn new(metadata: &std::fs::Metadata) -> std::io::Result<Self> {
+        #[cfg(unix)]
+        use std::os::unix::fs::MetadataExt;
+        Ok(Self {
+            size: metadata.len(),
+            modified: metadata.modified()?,
+            #[cfg(unix)]
+            device: metadata.dev(),
+            #[cfg(unix)]
+            inode: metadata.ino(),
+            #[cfg(unix)]
+            changed: (metadata.ctime(), metadata.ctime_nsec()),
+        })
+    }
+}
+
+/// One pane's cached Pi/OMP transcript. Unchanged polls only stat the file and
+/// borrow its snapshot; metadata changes invalidate rather than imply work.
+#[derive(Default)]
+pub struct PiTranscriptReader {
+    path: PathBuf,
+    stamp: Option<PiFileStamp>,
+    pane_id: u32,
+    snapshot: PiSnapshot,
+}
+
+impl PiTranscriptReader {
+    pub fn read(&mut self, path: &Path, pane_id: u32) -> Result<&PiSnapshot> {
+        use std::io::Read;
+
+        let metadata = match std::fs::metadata(path) {
+            Ok(metadata) => metadata,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                self.stamp = None;
+                self.snapshot = PiSnapshot::default();
+                return Ok(&self.snapshot);
+            }
+            Err(err) => return Err(err).with_context(|| format!("stat {}", path.display())),
+        };
+        let stamp = PiFileStamp::new(&metadata)?;
+        if self.path != path || self.stamp.as_ref() != Some(&stamp) {
+            let mut file =
+                std::fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
+            // Stamp the opened inode before reading. An append/replacement
+            // racing this read will invalidate it on the next poll.
+            let stamp = PiFileStamp::new(&file.metadata()?)?;
+            let mut raw = Vec::new();
+            file.read_to_end(&mut raw)
+                .with_context(|| format!("read {}", path.display()))?;
+            self.snapshot = parse_pi_snapshot(&raw, pane_id);
+            self.path = path.to_path_buf();
+            self.stamp = Some(stamp);
+            self.pane_id = pane_id;
+        } else if self.pane_id != pane_id {
+            for turn in &mut self.snapshot.turns {
+                turn.pane_id = pane_id;
+            }
+            self.pane_id = pane_id;
+        }
+        Ok(&self.snapshot)
+    }
+}
+
+// Ask is lifecycle metadata only. Pi/OMP tool traffic never becomes a chat
+// turn or a question card, and this reader never drives the provider's UI.
 
 /// Pull the text out of a Pi content field: a bare string or an array of typed
 /// blocks. Thinking, tool-call, image, and tool-result blocks are not
@@ -706,49 +789,89 @@ fn pi_timestamp(entry: &Value, message: &Value) -> String {
         .unwrap_or_else(|| millis_timestamp(message.get("timestamp").and_then(Value::as_i64)))
 }
 
-/// Turns from a Pi session file, oldest first.
-///
-/// Pi sessions are trees: `/tree`, `/branch`, and `/fork` append entries whose
-/// `parentId` points back into the history, so file order alone would fold
-/// abandoned branches into the conversation. The active branch is the parent
-/// chain of the last entry carrying an id, which is the current leaf.
-///
-/// Only `message` entries with a real user or assistant role become turns. Pi
-/// also persists thinking blocks, tool results, shell executions, extension
-/// state (`custom` / `custom_message` — what the oh-my-pi orchestrator writes),
-/// compaction and branch summaries, labels, and model/thinking bookkeeping;
-/// none of that is conversation.
-pub fn parse_pi(raw: &str) -> Vec<TurnRecord> {
-    let entries: Vec<Value> = raw
-        .lines()
-        .filter(|line| !line.trim().is_empty())
-        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
-        .collect();
+#[derive(serde::Deserialize)]
+struct PiEntryLink<'a> {
+    #[serde(borrow)]
+    id: std::borrow::Cow<'a, str>,
+    #[serde(rename = "parentId", borrow)]
+    parent: Option<std::borrow::Cow<'a, str>>,
+}
 
-    let mut active: HashSet<&str> = HashSet::new();
-    let mut cursor = entries
-        .iter()
-        .rev()
-        .find_map(|entry| entry.get("id").and_then(Value::as_str));
-    while let Some(id) = cursor {
-        if !active.insert(id) {
+/// Follow the last valid entry's parent chain in linear time. Index only
+/// links and raw slices, not the potentially huge tool arguments/results.
+/// Full records are decoded one at a time on the selected branch.
+fn parse_pi_snapshot(raw: &[u8], pane_id: u32) -> PiSnapshot {
+    let entries: Vec<_> = raw
+        .split(|byte| *byte == b'\n')
+        .filter_map(|line| {
+            serde_json::from_slice::<PiEntryLink<'_>>(line)
+                .ok()
+                .map(|link| (link, line))
+        })
+        .collect();
+    let mut by_id = HashMap::with_capacity(entries.len());
+    for (index, (link, _)) in entries.iter().enumerate() {
+        by_id.entry(link.id.as_ref()).or_insert(index);
+    }
+    let mut active = Vec::new();
+    let mut visited = vec![false; entries.len()];
+    let mut cursor = entries.len().checked_sub(1);
+    while let Some(index) = cursor {
+        if visited[index] {
             break;
         }
-        cursor = entries
-            .iter()
-            .find(|entry| entry.get("id").and_then(Value::as_str) == Some(id))
-            .and_then(|entry| entry.get("parentId").and_then(Value::as_str));
+        visited[index] = true;
+        active.push(index);
+        cursor = entries[index]
+            .0
+            .parent
+            .as_deref()
+            .and_then(|parent| by_id.get(parent).copied());
     }
 
-    let mut out: Vec<TurnRecord> = Vec::new();
-    for entry in &entries {
-        if entry.get("type").and_then(Value::as_str) != Some("message") {
-            continue;
-        }
-        let Some(id) = entry.get("id").and_then(Value::as_str) else {
+    let mut snapshot = PiSnapshot::default();
+    let mut pending_asks = HashSet::new();
+    let mut halted = false;
+    // Do not search backward through all visible turns for every tool-only
+    // completion. Long autonomous runs may have no assistant text at all.
+    let mut last_assistant: Option<usize> = None;
+    for index in active.into_iter().rev() {
+        let Ok(entry) = serde_json::from_slice::<Value>(entries[index].1) else {
             continue;
         };
-        if !active.contains(id) {
+        let kind = entry.get("type").and_then(Value::as_str);
+        let custom_type = entry.get("customType").and_then(Value::as_str);
+        match (kind, custom_type) {
+            (Some("custom"), Some("session_exit")) => {
+                pending_asks.clear();
+                halted = true;
+                snapshot.activity = Some(TranscriptActivity::Idle);
+            }
+            (Some("custom"), Some("tool_execution_start")) => {
+                halted = false;
+                let data = entry.get("data").unwrap_or(&Value::Null);
+                if data.get("toolName").and_then(Value::as_str) == Some("ask") {
+                    if let Some(id) = data.get("toolCallId").and_then(Value::as_str) {
+                        pending_asks.insert(id.to_owned());
+                    }
+                }
+                snapshot.activity = Some(if pending_asks.is_empty() {
+                    TranscriptActivity::Working
+                } else {
+                    TranscriptActivity::PendingAnswer
+                });
+            }
+            (Some("custom_message"), Some("async-result" | "launch-completion")) => {
+                halted = false;
+                snapshot.activity = Some(if pending_asks.is_empty() {
+                    TranscriptActivity::Working
+                } else {
+                    TranscriptActivity::PendingAnswer
+                });
+            }
+            _ => {}
+        }
+        if kind != Some("message") {
             continue;
         }
         let message = entry.get("message").unwrap_or(&Value::Null);
@@ -757,15 +880,22 @@ pub fn parse_pi(raw: &str) -> Vec<TurnRecord> {
             .get("role")
             .and_then(Value::as_str)
             .unwrap_or_default();
+        let out = &mut snapshot.turns;
         match role {
             "user" => {
+                halted = false;
+                snapshot.activity = Some(if pending_asks.is_empty() {
+                    TranscriptActivity::Working
+                } else {
+                    TranscriptActivity::PendingAnswer
+                });
                 let text = pi_text(content);
                 if text.trim().is_empty() {
                     continue;
                 }
                 out.push(TurnRecord {
-                    ts: pi_timestamp(entry, message),
-                    pane_id: 0,
+                    ts: pi_timestamp(&entry, message),
+                    pane_id,
                     role: "user".to_string(),
                     text,
                     model: None,
@@ -779,21 +909,45 @@ pub fn parse_pi(raw: &str) -> Vec<TurnRecord> {
             }
             "assistant" => {
                 let text = pi_text(content);
-                // `stop` and other terminal reasons end the turn; `toolUse`
-                // continues into a tool call and `deferred`/`pending` mean the
-                // response is not finished yet.
-                let completes_work = message
-                    .get("stopReason")
+                let reason = message.get("stopReason").and_then(Value::as_str);
+                let has_tools = content.as_array().is_some_and(|blocks| {
+                    blocks
+                        .iter()
+                        .any(|block| block.get("type").and_then(Value::as_str) == Some("toolCall"))
+                });
+                let paused = message
+                    .get("stopDetails")
+                    .and_then(|details| details.get("type"))
                     .and_then(Value::as_str)
-                    .is_some_and(|reason| {
-                        !matches!(reason, "toolUse" | "tool_use" | "pending" | "deferred")
+                    == Some("pause_turn");
+                halted = matches!(reason, Some("error" | "aborted"));
+                let continuing = !halted
+                    && (matches!(
+                        reason,
+                        Some("toolUse" | "tool_use" | "pending" | "deferred")
+                    ) || (matches!(reason, Some("stop" | "length") | None) && has_tools)
+                        || (reason == Some("stop") && paused));
+                // Older OMP releases persist completedAt without stopReason.
+                let completes_work = halted
+                    || (!continuing
+                        && (matches!(reason, Some("stop" | "length"))
+                            || message.get("completedAt").is_some_and(Value::is_number)));
+                if completes_work {
+                    pending_asks.clear();
+                    snapshot.activity = Some(TranscriptActivity::Idle);
+                } else {
+                    snapshot.activity = Some(if pending_asks.is_empty() {
+                        TranscriptActivity::Working
+                    } else {
+                        TranscriptActivity::PendingAnswer
                     });
+                }
                 if text.trim().is_empty() {
-                    // Tool-call-only messages are not conversation, but a
-                    // terminal one still has to mark the turn complete.
+                    // A silent completion can finish the last visible response,
+                    // but executable tools/pause_turn must never mark it idle.
                     if completes_work {
-                        if let Some(turn) = out.iter_mut().rev().find(|turn| turn.is_assistant()) {
-                            turn.completes_work = true;
+                        if let Some(index) = last_assistant {
+                            out[index].completes_work = true;
                         }
                     }
                     continue;
@@ -809,8 +963,8 @@ pub fn parse_pi(raw: &str) -> Vec<TurnRecord> {
                     .and_then(|cost| cost.get("total"))
                     .and_then(Value::as_f64);
                 out.push(TurnRecord {
-                    ts: pi_timestamp(entry, message),
-                    pane_id: 0,
+                    ts: pi_timestamp(&entry, message),
+                    pane_id,
                     role: "assistant".to_string(),
                     text,
                     model: message
@@ -824,25 +978,26 @@ pub fn parse_pi(raw: &str) -> Vec<TurnRecord> {
                     question: None,
                     answer: None,
                 });
+                last_assistant = Some(out.len() - 1);
+            }
+            "toolResult" => {
+                if let Some(id) = message.get("toolCallId").and_then(Value::as_str) {
+                    pending_asks.remove(id);
+                }
+                // Aborted/error assistant records can be followed by synthetic
+                // result pairs; those do not restart the stopped run.
+                snapshot.activity = Some(if halted {
+                    TranscriptActivity::Idle
+                } else if pending_asks.is_empty() {
+                    TranscriptActivity::Working
+                } else {
+                    TranscriptActivity::PendingAnswer
+                });
             }
             _ => {}
         }
     }
-    out
-}
-
-/// Read a Pi session file and stamp every turn with the pane it belongs to.
-pub fn read_pi_turns(path: &Path, pane_id: u32) -> Result<Vec<TurnRecord>> {
-    let raw = match std::fs::read_to_string(path) {
-        Ok(raw) => raw,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(err) => return Err(err).with_context(|| format!("read {}", path.display())),
-    };
-    let mut turns = parse_pi(&raw);
-    for turn in &mut turns {
-        turn.pane_id = pane_id;
-    }
-    Ok(turns)
+    snapshot
 }
 
 /// Newest codex rollout whose `session_meta.cwd` matches `cwd`.
@@ -2048,7 +2203,9 @@ mod tests {
         // no reader of its own. This asserts that against a real capture
         // rather than an assumption: if OMP ever diverges, this fails instead
         // of the conversation view silently going empty.
-        let turns = parse_pi(OMP_REAL_SESSION);
+        let snapshot = parse_pi_snapshot(OMP_REAL_SESSION.as_bytes(), 0);
+        assert_eq!(snapshot.activity, Some(TranscriptActivity::Idle));
+        let turns = snapshot.turns;
         let roles: Vec<&str> = turns.iter().map(|t| t.role.as_str()).collect();
         assert_eq!(roles, vec!["user", "assistant", "user", "assistant"]);
         assert_eq!(turns[0].text, "Remember the word: ALBATROSS. Reply OK.");
@@ -2138,7 +2295,7 @@ mod tests {
             pi_assistant("a3", Some("u3"), "Kept reply", "stop", None),
         ]);
 
-        let turns = parse_pi(&raw);
+        let turns = parse_pi_snapshot(raw.as_bytes(), 0).turns;
         let texts: Vec<&str> = turns.iter().map(|turn| turn.text.as_str()).collect();
         assert_eq!(
             texts,
@@ -2181,7 +2338,7 @@ mod tests {
             pi_assistant("a2", Some("s1"), "Done", "stop", None),
         ]);
 
-        let turns = parse_pi(&raw);
+        let turns = parse_pi_snapshot(raw.as_bytes(), 0).turns;
         assert_eq!(turns.len(), 3);
         assert_eq!(turns[0].role, "user");
         assert_eq!(turns[1].text, "Working on it");
@@ -2220,7 +2377,7 @@ mod tests {
             ),
         ]);
 
-        let turns = parse_pi(&raw);
+        let turns = parse_pi_snapshot(raw.as_bytes(), 0).turns;
         let working = &turns[1];
         assert!(!working.completes_work, "a tool-use preamble is not idle");
         assert_eq!(working.input_tokens, Some(120));
@@ -2233,18 +2390,267 @@ mod tests {
     }
 
     #[test]
-    fn pi_tool_only_completion_carries_to_the_previous_assistant_turn() {
-        // A tool-call-only message has no text, so it is not a turn — but a
-        // terminal reason on it still has to leave the pane idle.
+    fn pi_silent_completion_carries_to_the_previous_assistant_turn() {
+        // A response without visible text can still complete the work, but
+        // this is not true of a response carrying executable tool calls.
         let raw = pi_session(&[
             pi_user("u1", None, "Check the logs"),
             pi_assistant("a1", Some("u1"), "On it", "toolUse", None),
             pi_assistant("a2", Some("a1"), "", "stop", None),
         ]);
 
-        let turns = parse_pi(&raw);
+        let turns = parse_pi_snapshot(raw.as_bytes(), 0).turns;
         assert_eq!(turns.len(), 2);
         assert!(turns[1].completes_work);
+    }
+
+    #[test]
+    fn omp_activity_recovers_after_abort_and_tracks_only_started_unanswered_asks() {
+        use TranscriptActivity::{Idle, PendingAnswer, Working};
+
+        let stages = [
+            (pi_user("u1", None, "Run it"), Working),
+            (pi_assistant("a1", Some("u1"), "Interrupted", "aborted", None), Idle),
+            (r#"{"type":"custom_message","id":"c1","parentId":"a1","customType":"launch-completion","content":"Background process finished"}"#.to_string(), Working),
+            (pi_message("a2", Some("c1"), serde_json::json!({
+                "role": "assistant", "stopReason": "stop",
+                "content": [{"type": "toolCall", "id": "bash1", "name": "bash", "arguments": {}}]
+            })), Working),
+            (r#"{"type":"custom","id":"s1","parentId":"a2","customType":"tool_execution_start","data":{"toolCallId":"bash1","toolName":"bash"}}"#.to_string(), Working),
+            (pi_message("r1", Some("s1"), serde_json::json!({
+                "role": "toolResult", "toolCallId": "bash1", "toolName": "bash", "content": []
+            })), Working),
+            (pi_message("a3", Some("r1"), serde_json::json!({
+                "role": "assistant", "stopReason": "toolUse",
+                "content": [{"type": "toolCall", "id": "ask1", "name": "ask", "arguments": {}}]
+            })), Working),
+            (r#"{"type":"custom","id":"s2","parentId":"a3","customType":"tool_execution_start","data":{"toolCallId":"ask1","toolName":"ask"}}"#.to_string(), PendingAnswer),
+            (r#"{"type":"custom_message","id":"c2","parentId":"s2","customType":"async-result","content":"Unrelated job finished"}"#.to_string(), PendingAnswer),
+            (pi_message("r2", Some("c2"), serde_json::json!({
+                "role": "toolResult", "toolCallId": "other", "toolName": "bash", "content": []
+            })), PendingAnswer),
+            (pi_message("r3", Some("r2"), serde_json::json!({
+                "role": "toolResult", "toolCallId": "ask1", "toolName": "ask",
+                "content": [{"type": "text", "text": "The recorded answer"}]
+            })), Working),
+            (pi_assistant("a4", Some("r3"), "Done", "stop", None), Idle),
+        ];
+        let mut raw = String::new();
+        for (entry, expected) in stages {
+            raw.push_str(&entry);
+            raw.push('\n');
+            assert_eq!(
+                parse_pi_snapshot(raw.as_bytes(), 131).activity,
+                Some(expected)
+            );
+        }
+        let turns = parse_pi_snapshot(raw.as_bytes(), 131).turns;
+        assert_eq!(
+            turns
+                .iter()
+                .map(|turn| turn.text.as_str())
+                .collect::<Vec<_>>(),
+            ["Run it", "Interrupted", "Done"]
+        );
+        assert!(turns
+            .iter()
+            .all(|turn| turn.question.is_none() && turn.answer.is_none()));
+    }
+
+    #[test]
+    fn omp_executable_stop_and_pause_turn_do_not_complete_visible_work() {
+        for message in [
+            serde_json::json!({
+                "role": "assistant", "stopReason": "stop",
+                "content": [{"type": "toolCall", "id": "call1", "name": "bash", "arguments": {}}]
+            }),
+            serde_json::json!({
+                "role": "assistant", "stopReason": "stop", "stopDetails": {"type": "pause_turn"},
+                "content": [{"type": "thinking", "thinking": "continue"}]
+            }),
+            serde_json::json!({
+                "role": "assistant", "stopReason": "length",
+                "content": [{"type": "toolCall", "id": "call1", "name": "bash", "arguments": {}}]
+            }),
+            serde_json::json!({
+                "role": "assistant", "completedAt": 1789358431986u64,
+                "content": [{"type": "toolCall", "id": "call1", "name": "bash", "arguments": {}}]
+            }),
+        ] {
+            let raw = pi_session(&[
+                pi_user("u1", None, "Continue"),
+                pi_assistant("a1", Some("u1"), "On it", "toolUse", None),
+                pi_message("a2", Some("a1"), message),
+            ]);
+            let snapshot = parse_pi_snapshot(raw.as_bytes(), 0);
+            assert_eq!(snapshot.activity, Some(TranscriptActivity::Working));
+            assert!(!snapshot.turns[1].completes_work);
+        }
+    }
+
+    #[test]
+    fn omp_tool_only_resume_recovers_working_without_a_user_or_custom_message() {
+        let mut entries = vec![
+            pi_user("u1", None, "Continue"),
+            pi_assistant("a1", Some("u1"), "Done", "stop", None),
+        ];
+        assert_eq!(
+            parse_pi_snapshot(pi_session(&entries).as_bytes(), 0).activity,
+            Some(TranscriptActivity::Idle)
+        );
+        entries.push(pi_message(
+            "a2",
+            Some("a1"),
+            serde_json::json!({
+                "role": "assistant", "stopReason": "toolUse",
+                "content": [{"type": "toolCall", "id": "call1", "name": "bash", "arguments": {}}]
+            }),
+        ));
+        let snapshot = parse_pi_snapshot(pi_session(&entries).as_bytes(), 0);
+        assert_eq!(snapshot.activity, Some(TranscriptActivity::Working));
+        assert_eq!(
+            snapshot
+                .turns
+                .iter()
+                .map(|turn| turn.text.as_str())
+                .collect::<Vec<_>>(),
+            ["Continue", "Done"]
+        );
+    }
+
+    #[test]
+    fn omp_abort_and_exit_clear_pending_asks_without_synthetic_result_resume() {
+        let initial = [
+            pi_user("u1", None, "Continue"),
+            r#"{"type":"custom","id":"s1","parentId":"u1","customType":"tool_execution_start","data":{"toolCallId":"ask1","toolName":"ask"}}"#.to_string(),
+        ];
+        for stopped in [
+            pi_assistant("end", Some("s1"), "", "aborted", None),
+            pi_assistant("end", Some("s1"), "", "error", None),
+            r#"{"type":"custom","id":"end","parentId":"s1","customType":"session_exit","data":{"kind":"signal"}}"#.to_string(),
+        ] {
+            let mut entries = initial.to_vec();
+            entries.push(stopped);
+            entries.push(pi_message("result", Some("end"), serde_json::json!({
+                "role": "toolResult", "toolCallId": "ask1", "toolName": "ask",
+                "content": [], "isError": true
+            })));
+            let snapshot = parse_pi_snapshot(pi_session(&entries).as_bytes(), 0);
+            assert_eq!(snapshot.activity, Some(TranscriptActivity::Idle));
+        }
+    }
+
+    #[test]
+    fn omp_activity_follows_the_selected_branch_not_abandoned_asks() {
+        let mut entries = vec![
+            pi_user("u1", None, "Start"),
+            pi_assistant("a1", Some("u1"), "Done", "stop", None),
+            r#"{"type":"custom","id":"ask","parentId":"a1","customType":"tool_execution_start","data":{"toolCallId":"ask1","toolName":"ask"}}"#.to_string(),
+            pi_user("branch", Some("a1"), "New branch"),
+        ];
+        let snapshot = parse_pi_snapshot(pi_session(&entries).as_bytes(), 0);
+        assert_eq!(snapshot.activity, Some(TranscriptActivity::Working));
+        entries.push(pi_assistant("a2", Some("branch"), "Finished", "stop", None));
+        let snapshot = parse_pi_snapshot(pi_session(&entries).as_bytes(), 0);
+        assert_eq!(snapshot.activity, Some(TranscriptActivity::Idle));
+        // Switching back through a bookkeeping leaf restores the old ask,
+        // without adopting the other branch's user/assistant messages.
+        entries
+            .push(r#"{"type":"label","id":"label","parentId":"ask","label":"resume"}"#.to_string());
+        let snapshot = parse_pi_snapshot(pi_session(&entries).as_bytes(), 0);
+        assert_eq!(snapshot.activity, Some(TranscriptActivity::PendingAnswer));
+        assert_eq!(
+            snapshot
+                .turns
+                .iter()
+                .map(|turn| turn.text.as_str())
+                .collect::<Vec<_>>(),
+            ["Start", "Done"]
+        );
+    }
+
+    #[test]
+    fn pi_reader_reuses_unchanged_turns_and_recovers_an_incomplete_append() {
+        use std::io::Write;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.jsonl");
+        std::fs::write(&path, pi_user("u1", None, "Start")).unwrap();
+        let mut reader = PiTranscriptReader::default();
+        let first = reader.read(&path, 131).unwrap();
+        assert_eq!(first.activity, Some(TranscriptActivity::Working));
+        let turns_ptr = first.turns.as_ptr();
+        let text_ptr = first.turns[0].text.as_ptr();
+        let same = reader.read(&path, 131).unwrap();
+        assert_eq!(same.turns.as_ptr(), turns_ptr);
+        assert_eq!(same.turns[0].text.as_ptr(), text_ptr);
+        let restamped = reader.read(&path, 132).unwrap();
+        assert_eq!(restamped.turns.as_ptr(), turns_ptr);
+        assert_eq!(restamped.turns[0].pane_id, 132);
+
+        let completed = pi_assistant("a1", Some("u1"), "Finished", "stop", None);
+        let split = completed.len() / 2;
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        write!(file, "\n{}", &completed[..split]).unwrap();
+        let partial = reader.read(&path, 132).unwrap();
+        assert_eq!(partial.activity, Some(TranscriptActivity::Working));
+        assert_eq!(
+            partial
+                .turns
+                .iter()
+                .map(|turn| turn.text.as_str())
+                .collect::<Vec<_>>(),
+            ["Start"]
+        );
+        file.write_all(completed[split..].as_bytes()).unwrap();
+        let finished = reader.read(&path, 132).unwrap();
+        assert_eq!(finished.activity, Some(TranscriptActivity::Idle));
+        assert_eq!(finished.turns[1].text, "Finished");
+        assert!(finished.turns.iter().all(|turn| turn.pane_id == 132));
+    }
+
+    #[test]
+    fn pi_reader_invalidates_replacement_rewrite_truncation_and_path_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.jsonl");
+        let replacement = dir.path().join("replacement.jsonl");
+        let original = pi_user("u1", None, "old");
+        let changed = pi_user("u2", None, "new");
+        std::fs::write(&path, &original).unwrap();
+        let mut reader = PiTranscriptReader::default();
+        assert_eq!(reader.read(&path, 1).unwrap().turns[0].text, "old");
+
+        let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+        std::fs::write(&replacement, &changed).unwrap();
+        std::fs::File::open(&replacement)
+            .unwrap()
+            .set_modified(modified)
+            .unwrap();
+        std::fs::rename(&replacement, &path).unwrap();
+        assert_eq!(reader.read(&path, 1).unwrap().turns[0].text, "new");
+
+        // A same-size rewrite is not an append, and still invalidates.
+        std::fs::write(&path, &original).unwrap();
+        std::fs::File::open(&path)
+            .unwrap()
+            .set_modified(modified + std::time::Duration::from_secs(1))
+            .unwrap();
+        assert_eq!(reader.read(&path, 1).unwrap().turns[0].text, "old");
+        std::fs::write(&path, "").unwrap();
+        let empty = reader.read(&path, 1).unwrap();
+        assert!(empty.turns.is_empty());
+        assert_eq!(empty.activity, None);
+
+        std::fs::write(&replacement, changed).unwrap();
+        assert_eq!(reader.read(&replacement, 2).unwrap().turns[0].text, "new");
+        assert_eq!(reader.read(&replacement, 2).unwrap().turns[0].pane_id, 2);
+        std::fs::remove_file(&replacement).unwrap();
+        assert!(reader.read(&replacement, 2).unwrap().turns.is_empty());
+        std::fs::write(&replacement, original).unwrap();
+        assert_eq!(reader.read(&replacement, 2).unwrap().turns[0].text, "old");
     }
 
     #[test]
@@ -2280,7 +2686,7 @@ mod tests {
 {"type":"message","id":"0430658b","parentId":"754a126b","timestamp":"2026-09-11T04:46:53.715Z","message":{"role":"toolResult","toolCallId":"call_mock","toolName":"bash","content":[{"type":"text","text":"hi\n"}],"isError":false,"timestamp":1789102013715}}
 {"type":"message","id":"61f5ef91","parentId":"0430658b","timestamp":"2026-09-11T04:46:53.722Z","message":{"role":"assistant","content":[{"type":"text","text":"The tool said hi."}],"api":"openai-completions","provider":"mock","model":"mock-1","usage":{"input":12,"output":7,"cacheRead":0,"cacheWrite":0,"reasoning":0,"totalTokens":19,"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"total":0}},"stopReason":"stop","timestamp":1789102013716,"responseId":"chatcmpl-mock","rawStopReason":"stop"}}"#;
 
-        let turns = parse_pi(raw);
+        let turns = parse_pi_snapshot(raw.as_bytes(), 0).turns;
         assert_eq!(
             turns.len(),
             2,
