@@ -90,6 +90,24 @@ discovered entries following known ones. Temporarily missing entries keep their
 saved positions without creating phantom projects. The Idle sessions view
 continues to use its own waiting/recency ordering.
 
+### Project list pane status
+
+Desktop sidebar rows and mobile All projects cards share `PaneStatusDots`,
+with one dot per pane: blue for Working, red for Pending answer, and gray for Idle.
+Pending answer takes precedence when both status flags are set. Stopped projects
+retain gray dots labeled Not running. Hover titles and accessible labels name each pane
+and its status; crowded rows wrap rather than hide panes.
+Desktop dots sit beside the activity label; mobile dots follow the hostname
+or project path.
+
+The dots use each displayed session's reported pane roster and canonical
+`is_working` / `awaiting_answer` flags, not the project's aggregate working
+state or inferred message history. An empty or unreported roster adds no
+placeholder dots. Mobile uses bootstrap pane details until a live roster arrives;
+an explicitly empty live roster clears the dots instead of restoring stale
+bootstrap panes. Desktop shared-project attribution stays on its own line so
+the activity label and pane statuses remain visible.
+
 ## Project Structure
 
 ```

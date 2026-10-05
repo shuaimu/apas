@@ -1,4 +1,4 @@
-import type { CliClient, MachineWithProjects, SessionInfo } from "@/lib/store";
+import type { CliClient, MachineWithProjects, SessionInfo, SessionPaneSummary } from "@/lib/store";
 
 /**
  * The project list the sidebar shows, derived once so the expanded list and
@@ -24,6 +24,7 @@ export interface ProjectEntry {
   ownerEmail?: string;
   shareRole?: ProjectRole;
   cliClientId?: string;
+  panes?: SessionPaneSummary[];
 }
 
 export interface RepoGroup {
@@ -94,6 +95,7 @@ export function buildProjectList(
         ownerEmail: session.ownerEmail,
         shareRole: session.shareRole,
         cliClientId: session.cliClientId,
+        panes: session.panes,
       });
     }
   }

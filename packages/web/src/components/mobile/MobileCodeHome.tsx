@@ -32,6 +32,7 @@ import {
   rebootLabelFor,
 } from "@/lib/daemonVersion";
 import { CreateInstanceModal } from "@/components/CreateInstanceModal";
+import { PaneStatusDots } from "@/components/PaneStatusDots";
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || "https://apas.mpaxos.com";
 const EMPTY_USAGE_LIMITS = new Map<string, UsageLimitsByProvider>();
@@ -747,7 +748,10 @@ export function MobileCodeHome({
                       {statusLabel(session, fullyLimitedSessionIds.has(session.id))}
                     </span>
                   </div>
-                  <p className="mt-2 truncate text-sm text-[#686873] dark:text-[#aaaab6]">{sessionTarget(session)}</p>
+                  <div className="mt-2 flex flex-wrap items-center gap-x-2 gap-y-1">
+                    <span className="min-w-0 truncate text-sm text-[#686873] dark:text-[#aaaab6]">{sessionTarget(session)}</span>
+                    <PaneStatusDots panes={session.panes} isActive={session.is_active === true} />
+                  </div>
                   {session.latest_summary && <p className="mt-2 line-clamp-2 text-sm leading-5">{session.latest_summary}</p>}
                   <div className="mt-2.5 flex items-center justify-between gap-2.5">
                     <span className="min-w-0 flex-1 truncate text-xs text-[#686873] dark:text-[#aaaab6]">{formatUpdatedAt(session.latest_update_at)}</span>

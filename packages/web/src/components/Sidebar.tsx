@@ -2,6 +2,7 @@
 
 import { useStore } from "@/lib/store";
 import { ThemePicker } from "@/components/ThemePicker";
+import { PaneStatusDots } from "@/components/PaneStatusDots";
 import { FolderOpen, RefreshCw, Share2, Users, X, Crown, Trash2, ChevronLeft, ChevronDown, ChevronRight, BarChart3, Server, Plus, LogOut, ArrowRightLeft, AlertTriangle, MoreHorizontal, GripVertical } from "lucide-react";
 import { CreateInstanceModal } from "./CreateInstanceModal";
 import Link from "next/link";
@@ -900,19 +901,21 @@ export function Sidebar({ onClose, onCollapse, width }: SidebarProps) {
                         />
                       )}
                     </div>
-                    <div className="text-xs text-gray-500 truncate">
-                      {project.isShared ? (
-                        <span className="flex items-center gap-1 text-blue-500">
-                          <Users className="w-3 h-3" />
-                          Shared by {project.ownerEmail}
-                        </span>
-                      ) : project.isActive ? (
-                        "Active"
-                      ) : project.createdAt ? (
-                        new Date(project.createdAt).toLocaleDateString()
-                      ) : (
-                        ""
-                      )}
+                    {project.isShared && (
+                      <div className="flex items-center gap-1 text-xs text-blue-500">
+                        <Users className="h-3 w-3 shrink-0" />
+                        <span className="truncate">Shared by {project.ownerEmail}</span>
+                      </div>
+                    )}
+                    <div className="flex items-center gap-2 text-xs text-gray-500">
+                      <span className="shrink-0">
+                        {project.isActive
+                          ? "Active"
+                          : project.createdAt
+                            ? new Date(project.createdAt).toLocaleDateString()
+                            : ""}
+                      </span>
+                      <PaneStatusDots panes={project.panes} isActive={project.isActive} />
                     </div>
                   </div>
                   <button
