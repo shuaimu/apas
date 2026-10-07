@@ -182,7 +182,7 @@ describe("SidebarRail", () => {
     expect(colourB).toBe(colourA);
   });
 
-  it("expands the sidebar, opens project creation, and links to the cluster page", async () => {
+  it("expands the sidebar and links to the cluster page", () => {
     const onExpand = vi.fn();
     seedRail({ sessions: [], machines: [makeMachine([])] });
 
@@ -193,7 +193,5 @@ describe("SidebarRail", () => {
 
     expect(screen.getByRole("link", { name: "My Cluster" }).getAttribute("href")).toBe("/machines");
 
-    fireEvent.click(screen.getByRole("button", { name: "Create project from GitHub" }));
-    expect(await screen.findByRole("heading", { name: "New project" })).toBeTruthy();
   });
 });

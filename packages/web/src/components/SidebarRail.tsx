@@ -80,8 +80,8 @@ export function SidebarRail({ onExpand }: SidebarRailProps) {
           type="button"
           onClick={() => setNewProjectOpen(true)}
           className="flex h-10 w-10 flex-shrink-0 items-center justify-center rounded-xl border border-dashed border-gray-300 text-gray-500 hover:border-emerald-500 hover:bg-emerald-50 hover:text-emerald-700 dark:border-gray-600 dark:text-gray-400 dark:hover:border-emerald-400 dark:hover:bg-emerald-950/40 dark:hover:text-emerald-300"
-          title="Create project from GitHub"
-          aria-label="Create project from GitHub"
+          title="New project"
+          aria-label="New project"
         >
           <Plus className="h-5 w-5" />
         </button>

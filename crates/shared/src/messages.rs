@@ -54,6 +54,8 @@ pub const TERMINAL_SUBMIT_SETTLE_MS: u64 = 100;
 /// project provisioning. Servers must never downgrade a member request when
 /// this capability is absent.
 pub const SHARED_PROJECT_PROVISIONING_CAPABILITY: &str = "shared_project_provisioning_v1";
+/// Existing-directory registration without cloning or starting a runtime.
+pub const LOCAL_PROJECT_REGISTRATION_CAPABILITY: &str = "local_project_registration_v1";
 /// Canonical non-working pane status used while an agent is blocked on a
 /// question only the human can answer. Keep the wire value stable: older web
 /// clients safely render it as an ordinary non-empty status, while newer ones
@@ -852,6 +854,12 @@ pub enum DaemonToServer {
         error: Option<String>,
     },
 
+    /// Confirmed host-local registration; the server still finalizes authority.
+    LocalProjectRegistered {
+        request_id: String,
+        result: LocalProjectRegistrationResult,
+    },
+
     /// Result of a marker-bound discard requested after server-side
     /// authorization disappeared during two-phase provisioning.
     ProjectProvisioningDiscarded {
@@ -924,6 +932,9 @@ pub enum ServerToDaemon {
         #[serde(default)]
         provisioning_mode: ProjectProvisioningMode,
     },
+
+    /// Register an existing directory in place, without starting its project.
+    RegisterLocalProject { path: String, request_id: String },
 
     /// Remove a not-yet-finalized checkout only when its local receipt matches
     /// both opaque IDs. No caller-supplied filesystem path is accepted.
@@ -1363,6 +1374,15 @@ pub enum WebToServer {
         base_path: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         request_id: Option<String>,
+    },
+
+    /// Owner-only registration of an existing directory on the selected host.
+    RegisterLocalProject {
+        machine_id: Uuid,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cluster_owner_user_id: Option<String>,
+        path: String,
+        request_id: String,
     },
 
     /// Compatibility tombstone for stale web clients. Upgraded servers must
@@ -1885,6 +1905,13 @@ pub enum ServerToWeb {
         error: Option<String>,
     },
 
+    /// Local registration result after canonical identity and policy finalize.
+    LocalProjectRegistered {
+        machine_id: Uuid,
+        request_id: String,
+        result: LocalProjectRegistrationResult,
+    },
+
     /// Forwarded from `CliToServer::ProjectFlagsChanged`. Web mirrors
     /// the latest Tech-Lead autonomy flags per session for the Overview
     /// toggles.
@@ -2279,6 +2306,14 @@ pub struct MachineProjectInfo {
     pub last_error: Option<String>,
 }
 
+/// A registration cannot simultaneously succeed and carry an error.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum LocalProjectRegistrationResult {
+    Registered { project: MachineProjectInfo },
+    Failed { error: String },
+}
+
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ProjectProvisioningMode {
@@ -2310,6 +2345,8 @@ pub struct MachineWithProjects {
     pub cluster_access: MachineClusterAccess,
     #[serde(default)]
     pub shared_provisioning_available: bool,
+    #[serde(default)]
+    pub local_project_registration_available: bool,
 }
 
 /// Pane type for dual-pane mode (legacy - kept for backward compatibility)
@@ -2500,7 +2537,9 @@ pub fn is_supported_deepseek_model(model: &str) -> bool {
 
 /// Whether a model is a DeepSeek identity APAS used to offer and no longer does.
 pub fn is_retired_deepseek_model(model: &str) -> bool {
-    model.trim().eq_ignore_ascii_case(DEEPSEEK_RETIRED_PRO_MODEL)
+    model
+        .trim()
+        .eq_ignore_ascii_case(DEEPSEEK_RETIRED_PRO_MODEL)
 }
 
 /// Resolve a supported, possibly differently-cased DeepSeek identity to the
@@ -2599,7 +2638,8 @@ pub fn supported_launch_profiles() -> Vec<LaunchProfile> {
 /// *should* be dropped.
 pub fn renamed_launch_profile_key(key: &str) -> Option<&'static str> {
     match key.trim() {
-        "terminal:claude:deepseek:deepseek-v4-flash" | "agent:claude:deepseek:deepseek-v4-flash" => {
+        "terminal:claude:deepseek:deepseek-v4-flash"
+        | "agent:claude:deepseek:deepseek-v4-flash" => {
             Some("terminal:claude:deepseek:deepseek-flash")
         }
         _ => None,
@@ -4709,8 +4749,14 @@ mod tests {
             .filter(|profile| profile.backend == "deepseek")
             .collect::<Vec<_>>();
         assert_eq!(deepseek_profiles.len(), 1);
-        assert_eq!(deepseek_profiles[0].key, "terminal:claude:deepseek:deepseek-flash");
-        assert_eq!(deepseek_profiles[0].model.as_deref(), Some(DEEPSEEK_FLASH_MODEL));
+        assert_eq!(
+            deepseek_profiles[0].key,
+            "terminal:claude:deepseek:deepseek-flash"
+        );
+        assert_eq!(
+            deepseek_profiles[0].model.as_deref(),
+            Some(DEEPSEEK_FLASH_MODEL)
+        );
         assert!(!supported_launch_profiles()
             .iter()
             .any(|profile| profile.key.contains("deepseek-v4-pro")));
@@ -4720,9 +4766,7 @@ mod tests {
     fn deepseek_allowlists_authorize_flash_and_never_retired_pro() {
         let flash_only = EffectiveProjectPolicy {
             team_available: false,
-            allowed_launch_profiles: vec![
-                "terminal:claude:deepseek:deepseek-flash".to_string()
-            ],
+            allowed_launch_profiles: vec!["terminal:claude:deepseek:deepseek-flash".to_string()],
             version: 1,
             project_suspended: false,
         };

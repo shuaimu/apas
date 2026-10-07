@@ -180,6 +180,7 @@ beforeEach(() => {
 afterEach(() => {
   routerPush.mockReset();
   window.localStorage.clear();
+  window.history.replaceState({}, "", "/machines");
   globalThis.fetch = originalFetch;
   act(() => {
     useStore.setState(initialStore, true);
@@ -568,5 +569,45 @@ describe("MachinesPage cluster administration", () => {
     expect(screen.queryByText("Cluster activity")).toBeNull();
     expect(screen.queryByRole("button", { name: /Restart daemon on host-box/ })).toBeNull();
     expect(screen.queryByRole("button", { name: "Reboot all daemons" })).toBeNull();
+  });
+});
+
+describe("registration completion navigation", () => {
+  it("overrides a remembered shared cluster and reveals the stopped target with an explicit Start", async () => {
+    const own = machineEntry();
+    own.clusterOwnerUserId = "owner";
+    own.clusterAccess = "owner";
+    const shared = { ...machineAt("shared", "shared-host"), clusterOwnerUserId: "guest-host", clusterAccess: "member" as const };
+    const actions = seedMachines([own, shared]);
+    localStorage.setItem("apas_mobile_cluster_owner", "guest-host");
+    window.history.replaceState({}, "", "/machines?cluster_owner=owner&machine=machine-1&project=project-stopped#project-machine-1-project-stopped");
+    const fallback = fetchMock.getMockImplementation()!;
+    fetchMock.mockImplementation((input: string | URL) => String(input).endsWith("/cluster/contexts")
+      ? Promise.resolve(apiResponse([
+        { owner_user_id: "owner", owner_email: "owner@example.com", access: "owner" },
+        { owner_user_id: "guest-host", owner_email: "shared@example.com", access: "member" },
+      ]))
+      : fallback(input));
+    render(<MachinesPage />);
+    await waitFor(() => expect((screen.getByLabelText("Selected cluster") as HTMLSelectElement).value).toBe("owner"));
+    expect(localStorage.getItem("apas_mobile_cluster_owner")).toBe("owner");
+    expect(screen.queryByText("shared-host")).toBeNull();
+    const row = document.getElementById("project-machine-1-project-stopped");
+    expect(row).toBeTruthy();
+    expect(document.activeElement).toBe(row);
+    expect(screen.getByRole("button", { name: "Start Stopped API on build-host" })).toBeTruthy();
+    expect(actions.startMachineProjectCli).not.toHaveBeenCalled();
+  });
+
+  it("distinguishes clone and local pending operations without treating paths as remotes", () => {
+    seedMachines();
+    act(() => useStore.setState({ pendingInstances: {
+      clone: { source: "clone", status: "pending", requestId: "clone", machineId: "machine-1", instanceName: "repo", gitRemote: "github.com/a/b", startedAt: 1 },
+      local: { source: "local", status: "pending", requestId: "local", machineId: "machine-1", path: "/plain/folder", startedAt: 2 },
+    } }));
+    render(<MachinesPage />);
+    expect(screen.getByText("Cloning github.com/a/b…")).toBeTruthy();
+    expect(screen.getByText("/plain/folder")).toBeTruthy();
+    expect(screen.getByText("Registering existing folder…")).toBeTruthy();
   });
 });

@@ -3,7 +3,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { createPortal } from "react-dom";
 import { X, FolderGit2 } from "lucide-react";
-import { useStore } from "@/lib/store";
+import { useStore, type MachineWithProjects } from "@/lib/store";
 
 interface CreateInstanceModalProps {
   open: boolean;
@@ -14,6 +14,8 @@ interface CreateInstanceModalProps {
   cloneUrl?: string;
   /** Limit targets to one owned/shared cluster context. */
   clusterOwnerUserId?: string;
+  /** Mobile bootstrap targets before the first pushed inventory arrives. */
+  machineOptions?: MachineWithProjects[];
 }
 
 function repoBasename(gitRemote: string): string {
@@ -44,19 +46,35 @@ function repoLabel(gitRemote: string): string {
     : gitRemote;
 }
 
-export function CreateInstanceModal({ open, onClose, gitRemote, cloneUrl, clusterOwnerUserId }: CreateInstanceModalProps) {
-  const machines = useStore((s) => s.machines);
+export function CreateInstanceModal({ open, onClose, gitRemote, cloneUrl, clusterOwnerUserId, machineOptions }: CreateInstanceModalProps) {
+  const inventory = useStore((s) => s.machines);
+  const machines = machineOptions ?? inventory;
   const createProjectInstance = useStore((s) => s.createProjectInstance);
-
+  const registerLocalProject = useStore((s) => s.registerLocalProject);
+  const dismissCreationOperation = useStore((s) => s.dismissCreationOperation);
+  const userId = useStore((s) => s.userId);
+  const [source, setSource] = useState<"clone" | "local">("clone");
+  const [path, setPath] = useState("");
+  const [requestId, setRequestId] = useState<string | null>(null);
+  const result = useStore((s) => requestId ? s.pendingInstances[requestId] : undefined);
+  const operation = result?.source === "local" ? result : undefined;
+  const pending = operation?.status === "pending";
+  const registered = operation?.status === "registered" ? operation.project : undefined;
   const fixedRemote = gitRemote?.trim() ?? "";
   const [url, setUrl] = useState(cloneUrl ?? (fixedRemote ? `https://${fixedRemote}.git` : ""));
   const [machineId, setMachineId] = useState("");
   const [mounted, setMounted] = useState(false);
-  const availableMachines = useMemo(
+  const contextMachines = useMemo(
     () => clusterOwnerUserId
       ? machines.filter((machine) => machine.clusterOwnerUserId === clusterOwnerUserId)
       : machines,
     [clusterOwnerUserId, machines],
+  );
+  const availableMachines = useMemo(
+    () => source === "local"
+      ? contextMachines.filter((machine) => machine.clusterAccess !== "member" && machine.localProjectRegistrationAvailable)
+      : contextMachines,
+    [contextMachines, source],
   );
   const selectedMachine = availableMachines.find((entry) => entry.machine.machineId === machineId);
   const sharedTarget = selectedMachine?.clusterAccess === "member";
@@ -70,24 +88,35 @@ export function CreateInstanceModal({ open, onClose, gitRemote, cloneUrl, cluste
 
   // Default the machine picker to the only machine (or first) when opened.
   useEffect(() => {
-    if (open && (!machineId || !availableMachines.some((entry) => entry.machine.machineId === machineId))) {
+    if (open && !pending && !registered && (!machineId || !availableMachines.some((entry) => entry.machine.machineId === machineId))) {
       setMachineId(availableMachines[0]?.machine.machineId ?? "");
     }
-  }, [open, availableMachines, machineId]);
+  }, [open, availableMachines, machineId, pending, registered]);
 
-  const canSubmit = useMemo(
-    () => instanceName.trim().length > 0
+  const validPath = (path.startsWith("/") || path.startsWith("~/")) && !path.includes("\0");
+  const canSubmit = !pending && !registered && !!selectedMachine && (source === "local"
+    ? validPath && !!selectedMachine.localProjectRegistrationAvailable && !sharedTarget
+    : instanceName.trim().length > 0
       && url.trim().length > 0
       && submittedRemote.length > 0
-      && machineId.length > 0
-      && !(sharedTarget && !selectedMachine?.sharedProvisioningAvailable),
-    [instanceName, url, submittedRemote, machineId, selectedMachine?.sharedProvisioningAvailable, sharedTarget],
-  );
+      && !(sharedTarget && !selectedMachine.sharedProvisioningAvailable));
+
+  const close = () => {
+    if (pending) return;
+    if (requestId) dismissCreationOperation(requestId);
+    setRequestId(null);
+    onClose();
+  };
 
   if (!open || !mounted) return null;
 
   const submit = () => {
     if (!canSubmit) return;
+    if (source === "local") {
+      if (requestId) dismissCreationOperation(requestId);
+      setRequestId(registerLocalProject(machineId, path, selectedMachine?.clusterOwnerUserId ?? userId ?? undefined));
+      return;
+    }
     const common: [string, string, string, string, string | undefined, string | undefined] = [
       machineId,
       submittedRemote,
@@ -101,16 +130,19 @@ export function CreateInstanceModal({ open, onClose, gitRemote, cloneUrl, cluste
       : createProjectInstance(...common);
     // Keep the modal (and the entered values) open if the send was dropped
     // (e.g. the socket is reconnecting); the store shows an error toast.
-    if (sent) onClose();
+    if (sent) close();
   };
 
   return createPortal(
     <div
       className="fixed inset-0 z-[100] flex items-center justify-center bg-black/50"
-      onClick={onClose}
+      onClick={close}
     >
       <div
-        className="mx-4 w-full max-w-md rounded-lg bg-white shadow-xl dark:bg-gray-800"
+        role="dialog"
+        aria-modal="true"
+        aria-label={fixedRemote ? "New instance" : "New project"}
+        className="mx-4 max-h-[90dvh] w-full max-w-md overflow-y-auto rounded-lg bg-white shadow-xl dark:bg-gray-800"
         onClick={(e) => e.stopPropagation()}
       >
         <div className="flex items-center justify-between border-b border-gray-200 p-4 dark:border-gray-700">
@@ -119,7 +151,9 @@ export function CreateInstanceModal({ open, onClose, gitRemote, cloneUrl, cluste
             {fixedRemote ? "New instance" : "New project"}
           </h3>
           <button
-            onClick={onClose}
+            onClick={close}
+            disabled={pending}
+            aria-label="Close new project"
             className="rounded p-1 hover:bg-gray-200 dark:hover:bg-gray-700"
           >
             <X className="h-5 w-5" />
@@ -127,8 +161,34 @@ export function CreateInstanceModal({ open, onClose, gitRemote, cloneUrl, cluste
         </div>
 
         <div className="space-y-3 p-4">
+          {!fixedRemote && !registered && (
+            <div role="group" aria-label="Project source" className="flex gap-2">
+              {(["clone", "local"] as const).map((value) => (
+                <button key={value} type="button" aria-pressed={source === value} disabled={pending}
+                  onClick={() => setSource(value)}
+                  className={`rounded border px-3 py-2 text-sm ${source === value ? "border-emerald-600 bg-emerald-50 text-emerald-800 dark:bg-emerald-950 dark:text-emerald-200" : "border-gray-300 dark:border-gray-600"}`}>
+                  {value === "clone" ? "Clone from GitHub" : "Existing folder"}
+                </button>
+              ))}
+            </div>
+          )}
+          {registered ? (
+            <div role="status" className="space-y-3">
+              <p className="font-medium">Folder registered</p>
+              <p className="break-all font-mono text-sm">{registered.path}</p>
+              <p className="text-sm text-gray-500">
+                {registered.isRunning ? "This project was already running; its runtime is unchanged." : "The project is stopped. Use Start on Machines when you are ready. Saved agents only run when you explicitly start the project."}
+              </p>
+              <a className="inline-block rounded bg-emerald-600 px-3 py-2 text-sm text-white"
+                href={`/machines?cluster_owner=${encodeURIComponent(operation?.clusterOwnerUserId || "owned")}&machine=${encodeURIComponent(operation!.machineId)}&project=${encodeURIComponent(registered.projectId)}#project-${encodeURIComponent(operation!.machineId)}-${encodeURIComponent(registered.projectId)}`}>
+                View on Machines
+              </a>
+            </div>
+          ) : <>
           <p className="text-sm text-gray-500 dark:text-gray-400">
-            {fixedRemote ? (
+            {source === "local" ? (
+              <>Register an existing folder in place on your APAS machine, not an upload from this browser. Files and existing APAS configuration are preserved. Nothing is cloned or started.</>
+            ) : fixedRemote ? (
               <>Clone <span className="font-medium text-gray-700 dark:text-gray-300">{repoLabel(fixedRemote)}</span> into a new project on a chosen machine and check out a fresh branch.</>
             ) : (
               <>Clone a GitHub repository into a new project on a chosen machine. The project and branch names are derived automatically.</>
@@ -137,13 +197,16 @@ export function CreateInstanceModal({ open, onClose, gitRemote, cloneUrl, cluste
 
           {availableMachines.length === 0 ? (
             <div className="rounded border border-amber-300 bg-amber-50 p-3 text-sm text-amber-700 dark:border-amber-700 dark:bg-amber-900/20 dark:text-amber-300">
-              No machines are running the apas daemon. Run <code>apas daemon</code> on a machine to create instances.
+              {source === "local"
+                ? "Existing folders require a connected, updated daemon on a machine you own. Shared-cluster members cannot register host folders. Select your own cluster explicitly to use this source."
+                : <>No machines are running the apas daemon. Run <code>apas daemon</code> on a machine to create instances.</>}
             </div>
           ) : (
             <>
               <Field label="Machine">
                 <select
                   value={machineId}
+                  disabled={pending}
                   onChange={(e) => setMachineId(e.target.value)}
                   className="w-full rounded border border-gray-300 bg-white px-3 py-2 text-sm dark:border-gray-600 dark:bg-gray-700"
                 >
@@ -160,6 +223,19 @@ export function CreateInstanceModal({ open, onClose, gitRemote, cloneUrl, cluste
                 </select>
               </Field>
 
+              {source === "local" ? (
+                <>
+                  <Field label={`Folder path on ${selectedMachine?.machine.hostname || "selected machine"}`}>
+                    <input type="text" value={path} onChange={(event) => setPath(event.target.value)}
+                      disabled={pending} placeholder="~/work/my-project" aria-describedby="local-folder-help"
+                      className="w-full rounded border border-gray-300 bg-white px-3 py-2 font-mono text-xs dark:border-gray-600 dark:bg-gray-700" />
+                  </Field>
+                  <p id="local-folder-help" className="text-xs text-gray-500">
+                    Use an absolute path or ~/ relative to the daemon user&apos;s home on {selectedMachine?.machine.hostname}. The folder must already exist. Registration does not start projects or agents; Start is a separate action on Machines.
+                  </p>
+                  {path && !validPath && <p role="alert" className="text-sm text-red-600">Use an absolute path or a path starting with ~/.</p>}
+                </>
+              ) : <>
               <Field label="Clone URL">
                 <input
                   type="text"
@@ -181,24 +257,30 @@ export function CreateInstanceModal({ open, onClose, gitRemote, cloneUrl, cluste
                   Creates <span className="font-mono">~/apas_projects/{instanceName}</span> on branch <span className="font-mono">{branch}</span> (auto-suffixed if either exists).
                 </p>
               )}
+              </>}
             </>
           )}
+          {source === "local" && availableMachines.length > 0 && <p className="text-xs text-gray-500">Only your connected machines with local-folder support are listed. Shared, offline, and older daemons are unavailable.</p>}
+          </>}
+          {pending && <p role="status" className="text-sm">Registering folder on the selected machine… Waiting for confirmed registration.</p>}
+          {source === "local" && operation?.error && <p role="alert" className="text-sm text-red-600 dark:text-red-400">{operation.error}</p>}
         </div>
 
         <div className="flex justify-end gap-2 border-t border-gray-200 p-4 dark:border-gray-700">
           <button
-            onClick={onClose}
+            onClick={close}
+            disabled={pending}
             className="rounded px-3 py-1.5 text-sm text-gray-600 hover:bg-gray-100 dark:text-gray-300 dark:hover:bg-gray-700"
           >
-            Cancel
+            {registered ? "Close" : "Cancel"}
           </button>
-          <button
+          {!registered && <button
             onClick={submit}
             disabled={!canSubmit}
             className="rounded bg-emerald-600 px-3 py-1.5 text-sm font-medium text-white hover:bg-emerald-700 disabled:cursor-not-allowed disabled:opacity-50"
           >
-            Create &amp; start
-          </button>
+            {source === "local" ? pending ? "Registering…" : "Register folder" : "Create & start"}
+          </button>}
         </div>
       </div>
     </div>,

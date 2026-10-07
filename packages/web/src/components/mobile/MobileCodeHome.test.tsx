@@ -78,7 +78,6 @@ describe("MobileCodeHome", () => {
     expect(options.getAttribute("aria-expanded")).toBe("true");
     expect(screen.getByRole("menuitem", { name: "Account" })).toBeTruthy();
     expect(screen.getByRole("menuitem", { name: "New task" })).toBeTruthy();
-    expect(screen.getByRole("menuitem", { name: /Create project from GitHub/ })).toBeTruthy();
     fireEvent.keyDown(document, { key: "Escape" });
     expect(screen.queryByRole("menu", { name: "Session options" })).toBeNull();
     expect(options.getAttribute("aria-expanded")).toBe("false");
@@ -727,8 +726,6 @@ describe("MobileCodeHome", () => {
     fireEvent.click(await screen.findByRole("button", { name: "Machines" }));
     expect(await screen.findByText(/Shared projects run on the owner/)).toBeTruthy();
     expect(screen.queryByRole("button", { name: /Reboot the daemon on owner-host/ })).toBeNull();
-    fireEvent.click(screen.getByRole("button", { name: "More options" }));
-    expect(screen.getByRole("menuitem", { name: /Create project from GitHub/ })).toBeTruthy();
   });
 
   it("retains the selected shared cluster after mobile navigation remounts the home", async () => {
@@ -785,5 +782,38 @@ describe("MobileCodeHome", () => {
     expect(screen.getByText(/No running projects/)).toBeTruthy();
     fireEvent.click(screen.getByRole("button", { name: "Manage machines and projects" }));
     expect(props.onManageMachines).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("mobile local-folder targets", () => {
+  it("uses the bootstrap capability before pushed inventory exists", async () => {
+    stubBootstrap({ sessions: [], machines: [{
+      machine: { machine_id: "local-machine", hostname: "local-host", last_seen: new Date().toISOString() },
+      projects: [], cluster_owner_user_id: "owner", cluster_access: "owner",
+      local_project_registration_available: true,
+    }] });
+    renderHome({ active: true });
+    await waitFor(() => expect(localStorage.getItem("apas_mobile_cluster_owner")).toBe("owner"));
+    fireEvent.click(screen.getByRole("button", { name: "More options" }));
+    fireEvent.click(screen.getByRole("menuitem", { name: "New project" }));
+    fireEvent.click(screen.getByRole("button", { name: "Existing folder" }));
+    expect(screen.getByLabelText("Folder path on local-host")).toBeTruthy();
+    expect(screen.queryByLabelText("Clone URL")).toBeNull();
+    fireEvent.change(screen.getByLabelText("Folder path on local-host"), { target: { value: "/plain/folder" } });
+    expect((screen.getByRole("button", { name: "Register folder" }) as HTMLButtonElement).disabled).toBe(false);
+  });
+
+  it("defaults an older bootstrap to unavailable", async () => {
+    stubBootstrap({ sessions: [], machines: [{
+      machine: { machine_id: "older", hostname: "older-host" },
+      projects: [], cluster_owner_user_id: "owner", cluster_access: "owner",
+    }] });
+    renderHome({ active: true });
+    await waitFor(() => expect(localStorage.getItem("apas_mobile_cluster_owner")).toBe("owner"));
+    fireEvent.click(screen.getByRole("button", { name: "More options" }));
+    fireEvent.click(screen.getByRole("menuitem", { name: "New project" }));
+    fireEvent.click(screen.getByRole("button", { name: "Existing folder" }));
+    expect(screen.queryByLabelText(/Folder path on/)).toBeNull();
+    expect((screen.getByRole("button", { name: "Register folder" }) as HTMLButtonElement).disabled).toBe(true);
   });
 });

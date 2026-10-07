@@ -79,6 +79,7 @@ interface MobileMachineSummary {
   cluster_owner_user_id?: string;
   cluster_access?: "owner" | "member";
   shared_provisioning_available?: boolean;
+  local_project_registration_available?: boolean;
 }
 
 interface MobileBootstrapResponse {
@@ -117,6 +118,7 @@ function adaptMachine(entry: MachineWithProjects): MobileMachineSummary {
     cluster_owner_user_id: entry.clusterOwnerUserId,
     cluster_access: entry.clusterAccess,
     shared_provisioning_available: entry.sharedProvisioningAvailable,
+    local_project_registration_available: entry.localProjectRegistrationAvailable ?? false,
   };
 }
 
@@ -559,7 +561,7 @@ export function MobileCodeHome({
                 <button
                   type="button"
                   role="menuitem"
-                  aria-label="Create project from GitHub"
+                  aria-label="New project"
                   onClick={() => {
                     setActionsOpen(false);
                     setCreateProjectOpen(true);
@@ -889,6 +891,19 @@ export function MobileCodeHome({
         open={createProjectOpen}
         onClose={() => setCreateProjectOpen(false)}
         clusterOwnerUserId={selectedClusterOwner && selectedClusterOwner !== "owned" ? selectedClusterOwner : undefined}
+        machineOptions={machines.map((entry) => ({
+          machine: {
+            machineId: entry.machine.machine_id,
+            hostname: entry.machine.hostname,
+            os: entry.machine.os ?? "",
+            arch: entry.machine.arch ?? "",
+          },
+          projects: [],
+          clusterOwnerUserId: entry.cluster_owner_user_id,
+          clusterAccess: entry.cluster_access ?? "owner",
+          sharedProvisioningAvailable: entry.shared_provisioning_available ?? false,
+          localProjectRegistrationAvailable: entry.local_project_registration_available ?? false,
+        }))}
       />
     </section>
   );

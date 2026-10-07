@@ -11,7 +11,7 @@
  */
 
 import Link from "next/link";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import { ArrowLeft, FolderOpen, Play, Plus, RefreshCw, RotateCcw, Square } from "lucide-react";
 import { useStore } from "@/lib/store";
@@ -161,6 +161,15 @@ export default function MachinesPage() {
   const [newMemberMachineIds, setNewMemberMachineIds] = useState<string[]>([]);
   const [newMemberDefaultProfile, setNewMemberDefaultProfile] = useState("");
   const [createOpen, setCreateOpen] = useState(false);
+  const [registrationTarget, setRegistrationTarget] = useState<{ machineId: string; projectId: string } | null>(null);
+  const revealedRegistration = useRef(false);
+
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    const machineId = params.get("machine");
+    const projectId = params.get("project");
+    if (machineId && projectId) setRegistrationTarget({ machineId, projectId });
+  }, []);
 
   const selectedCluster = clusters.find((cluster) => cluster.owner_user_id === selectedClusterId);
   const sharedView = selectedCluster?.access === "member";
@@ -172,6 +181,14 @@ export default function MachinesPage() {
     }),
     [machines, selectedClusterId, sharedView],
   );
+
+  useEffect(() => {
+    if (!registrationTarget || revealedRegistration.current) return;
+    const row = document.getElementById(`project-${encodeURIComponent(registrationTarget.machineId)}-${encodeURIComponent(registrationTarget.projectId)}`);
+    row?.scrollIntoView?.({ block: "center" });
+    row?.focus();
+    if (row) revealedRegistration.current = true;
+  }, [registrationTarget, visibleMachines]);
 
   // Both sources, for the same reason the mobile list uses both: the server
   // catches a fleet uniformly behind a newer deployment, the machines catch a
@@ -250,6 +267,14 @@ export default function MachinesPage() {
       setClusters(next);
       setSelectedClusterId((current) => {
         const stored = typeof window === "undefined" ? null : localStorage.getItem(MOBILE_CLUSTER_STORAGE_KEY);
+        const requested = new URLSearchParams(window.location.search).get("cluster_owner");
+        const requestedOwner = requested === "owned"
+          ? next.find((cluster) => cluster.access === "owner")?.owner_user_id
+          : next.find((cluster) => cluster.owner_user_id === requested && cluster.access === "owner")?.owner_user_id;
+        if (requestedOwner) {
+          localStorage.setItem(MOBILE_CLUSTER_STORAGE_KEY, requestedOwner);
+          return requestedOwner;
+        }
         return current
           || next.find((cluster) => cluster.owner_user_id === stored)?.owner_user_id
           || next.find((cluster) => cluster.access === "owner")?.owner_user_id
@@ -408,7 +433,7 @@ export default function MachinesPage() {
             disabled={sharedView && !visibleMachines.some((machine) => machine.sharedProvisioningAvailable)}
             className="inline-flex items-center gap-1 rounded bg-emerald-600 px-3 py-2 text-sm font-medium text-white disabled:cursor-not-allowed disabled:opacity-50"
           >
-            <Plus className="h-4 w-4" /> Create project from GitHub
+            <Plus className="h-4 w-4" /> New project
           </button>
         </div>
 
@@ -491,17 +516,17 @@ export default function MachinesPage() {
             </div>}
 
             <div className="divide-y divide-gray-200 dark:divide-gray-800">
-              {Object.values(pendingInstances).filter((pending) => pending.machineId === machine.machineId).map((pending) => (
+              {Object.values(pendingInstances).filter((pending) => pending.machineId === machine.machineId && pending.status !== "registered").map((pending) => (
                 <div key={pending.requestId} className="flex items-center justify-between px-4 py-3">
                   <div>
-                    <div className="text-sm font-medium">{pending.instanceName}</div>
-                    <div className="text-xs text-gray-500">Cloning {pending.gitRemote}…</div>
+                    <div className="text-sm font-medium">{pending.source === "clone" ? pending.instanceName : pending.path}</div>
+                    <div className="text-xs text-gray-500">{pending.source === "clone" ? `Cloning ${pending.gitRemote}…` : pending.error || "Registering existing folder…"}</div>
                   </div>
-                  <span className="rounded bg-amber-100 px-2 py-1 text-xs text-amber-700 dark:bg-amber-900/30 dark:text-amber-300">Creating…</span>
+                  <span className="rounded bg-amber-100 px-2 py-1 text-xs text-amber-700 dark:bg-amber-900/30 dark:text-amber-300">{pending.source === "clone" ? "Creating…" : pending.status === "pending" ? "Registering…" : pending.status === "unconfirmed" ? "Unconfirmed" : "Failed"}</span>
                 </div>
               ))}
               {projects.map((project) => (
-                <div key={project.projectId} className="flex flex-col gap-3 px-4 py-3 md:flex-row md:items-center md:justify-between">
+                <div key={project.projectId} id={`project-${encodeURIComponent(machine.machineId)}-${encodeURIComponent(project.projectId)}`} tabIndex={-1} className={`flex flex-col gap-3 px-4 py-3 md:flex-row md:items-center md:justify-between ${registrationTarget?.machineId === machine.machineId && registrationTarget.projectId === project.projectId ? "bg-emerald-50 dark:bg-emerald-950/30" : ""}`}>
                   <div className="min-w-0">
                     <div className="truncate text-sm font-medium">{project.name || project.path.split("/").pop() || project.path}</div>
                     <div className="truncate text-xs text-gray-500">{project.path}</div>

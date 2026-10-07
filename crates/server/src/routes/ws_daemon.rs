@@ -103,6 +103,9 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     Ok(DaemonToServer::ProjectInstanceCreated { .. }) => {
                         tracing::warn!("Daemon sent project-instance result before register");
                     }
+                    Ok(DaemonToServer::LocalProjectRegistered { .. }) => {
+                        tracing::warn!("Daemon sent local-registration result before register");
+                    }
                     Ok(DaemonToServer::ProjectProvisioningDiscarded { .. }) => {
                         tracing::warn!("Daemon sent provisioning-discard result before register");
                     }
@@ -128,6 +131,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
 
     // Channel for async server->daemon commands.
     let (tx, mut rx) = mpsc::channel::<ServerToDaemon>(64);
+    let connection_sender = tx.clone();
     let registered_msg = register_daemon_session(
         &state.sessions,
         machine_id,
@@ -145,7 +149,12 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
         .await
         .is_err()
     {
-        state.sessions.unregister_daemon(&machine_id);
+        if state
+            .sessions
+            .is_daemon_connection(&machine_id, &connection_sender)
+        {
+            state.sessions.unregister_daemon(&machine_id);
+        }
         return;
     }
 
@@ -167,7 +176,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
             incoming = receiver.next() => {
                 match incoming {
                     Some(Ok(Message::Text(text))) => {
-                        if !state.sessions.is_daemon_connected(&machine_id) {
+                        if !state.sessions.is_daemon_connection(&machine_id, &connection_sender) {
                             break;
                         }
                         let parsed: Result<DaemonToServer, _> = serde_json::from_str(&text);
@@ -198,7 +207,12 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
         }
     }
 
-    state.sessions.unregister_daemon(&machine_id);
+    if state
+        .sessions
+        .is_daemon_connection(&machine_id, &connection_sender)
+    {
+        state.sessions.unregister_daemon(&machine_id);
+    }
     tracing::info!("Daemon disconnected: {}", machine_id);
 }
 
@@ -274,6 +288,9 @@ async fn apply_registered_daemon_message(
             state
                 .sessions
                 .update_daemon_machine_info(machine_id, machine);
+        }
+        DaemonToServer::LocalProjectRegistered { request_id, result } => {
+            super::local_projects::registered(state, machine_id, request_id, result).await;
         }
         DaemonToServer::ProjectInstanceCreated {
             request_id,

@@ -452,6 +452,10 @@ impl DaemonState {
                 return;
             }
         };
+        self.apply_project_inventory(discovered);
+    }
+
+    fn apply_project_inventory(&mut self, discovered: Vec<crate::project::RegisteredProject>) {
         let mut seen = HashSet::new();
 
         for project in discovered {
@@ -494,6 +498,36 @@ impl DaemonState {
         for project_id in stale_ids {
             self.projects.remove(&project_id);
         }
+    }
+
+    async fn register_local_project(
+        &mut self,
+        path: String,
+    ) -> Result<(MachineProjectInfo, Vec<MachineProjectInfo>)> {
+        #[cfg(test)]
+        let config_dir = crate::config::Config::config_dir()?;
+        let (registered, inventory) = tokio::task::spawn_blocking(move || {
+            #[cfg(test)]
+            {
+                crate::config::test_config::with_config_dir(&config_dir, || {
+                    crate::project::register_local_project(&path)
+                })
+            }
+            #[cfg(not(test))]
+            crate::project::register_local_project(&path)
+        })
+        .await
+        .context("Local folder registration worker failed")??;
+        self.apply_project_inventory(inventory);
+        let projects = self.snapshot_projects();
+        let project = projects
+            .iter()
+            .find(|project| {
+                project.project_id == registered.project_id && project.path == registered.path
+            })
+            .cloned()
+            .context("Registered project is missing from machine inventory; retry")?;
+        Ok((project, projects))
     }
 
     fn reap_exited_processes(&mut self) {
@@ -1320,6 +1354,7 @@ async fn run_connection(
             shared::PROJECT_POLICY_CAPABILITY.to_string(),
             shared::PANE_HOST_CLEANUP_ACK_CAPABILITY.to_string(),
             shared::SHARED_PROJECT_PROVISIONING_CAPABILITY.to_string(),
+            shared::LOCAL_PROJECT_REGISTRATION_CAPABILITY.to_string(),
         ],
     };
     ws_sender
@@ -1502,6 +1537,26 @@ async fn run_connection(
                                 };
                                 let text = serde_json::to_string(&update)?;
                                 ws_sender.send(Message::Text(text.into())).await?;
+                            }
+                            ServerToDaemon::RegisterLocalProject { path, request_id } => {
+                                let result = match state.register_local_project(path).await {
+                                    Ok((project, projects)) => {
+                                        // The server finalizes identity/placement only against
+                                        // inventory confirmed by this authenticated daemon.
+                                        let heartbeat = DaemonToServer::Heartbeat { projects };
+                                        ws_sender
+                                            .send(Message::Text(serde_json::to_string(&heartbeat)?.into()))
+                                            .await?;
+                                        shared::LocalProjectRegistrationResult::Registered { project }
+                                    }
+                                    Err(error) => shared::LocalProjectRegistrationResult::Failed {
+                                        error: format!("{error:#}"),
+                                    },
+                                };
+                                let ack = DaemonToServer::LocalProjectRegistered { request_id, result };
+                                ws_sender
+                                    .send(Message::Text(serde_json::to_string(&ack)?.into()))
+                                    .await?;
                             }
                             ServerToDaemon::CreateProjectInstance {
                                 git_remote,
@@ -1862,6 +1917,115 @@ mod containment_tests {
 }
 
 #[cfg(test)]
+mod local_registration_tests {
+    use super::*;
+
+    fn state() -> DaemonState {
+        DaemonState::new(MachineInfo {
+            machine_id: Uuid::new_v4(),
+            hostname: "local-registration-test".into(),
+            os: "linux".into(),
+            arch: "x86_64".into(),
+            daemon_version: None,
+            deepseek_backend: None,
+            last_seen: None,
+        })
+    }
+
+    #[test]
+    fn registration_reports_stopped_inventory_without_launching_saved_panes() {
+        crate::project::test_support::with_isolated_config(|| {
+            let runtime = tokio::runtime::Runtime::new().unwrap();
+            runtime.block_on(async {
+                let dir = tempfile::tempdir().unwrap();
+                let mut metadata = crate::project::ProjectMetadata::new();
+                metadata.deadloop_claude_session_id = Some(Uuid::new_v4());
+                metadata.migrate_legacy();
+                let bytes = serde_json::to_vec(&metadata).unwrap();
+                std::fs::write(dir.path().join(".apas"), &bytes).unwrap();
+                let mut state = state();
+                let (project, inventory) = state
+                    .register_local_project(dir.path().to_str().unwrap().to_string())
+                    .await
+                    .unwrap();
+                assert_eq!(project.project_id, metadata.id.to_string());
+                assert!(!project.is_running);
+                assert!(project.pid.is_none());
+                assert!(project.memory_kb.is_none());
+                assert_eq!(inventory.len(), 1);
+                assert_eq!(inventory[0].project_id, project.project_id);
+                assert!(state.running.is_empty());
+                assert!(state.sessions.is_empty());
+                assert_eq!(std::fs::read(dir.path().join(".apas")).unwrap(), bytes);
+            });
+        });
+    }
+
+    #[test]
+    fn repeated_registration_preserves_running_task_and_error_state() {
+        crate::project::test_support::with_isolated_config(|| {
+            let runtime = tokio::runtime::Runtime::new().unwrap();
+            runtime.block_on(async {
+                let dir = tempfile::tempdir().unwrap();
+                let path = dir.path().to_str().unwrap().to_string();
+                let mut state = state();
+                let (project, _) = state.register_local_project(path.clone()).await.unwrap();
+                let shutdown = Arc::new(AtomicBool::new(false));
+                let handle = tokio::spawn(std::future::pending::<()>());
+                let task_id = handle.id();
+                state.running.insert(
+                    project.project_id.clone(),
+                    RunningProject {
+                        shutdown: shutdown.clone(),
+                        handle,
+                    },
+                );
+                state
+                    .projects
+                    .get_mut(&project.project_id)
+                    .unwrap()
+                    .last_error = Some("retained diagnostic".into());
+                let (repeated, inventory) = state.register_local_project(path).await.unwrap();
+                assert_eq!(repeated.project_id, project.project_id);
+                assert!(repeated.is_running);
+                assert_eq!(repeated.pid, Some(std::process::id()));
+                assert_eq!(repeated.last_error.as_deref(), Some("retained diagnostic"));
+                assert_eq!(inventory.len(), 1);
+                assert_eq!(state.running.len(), 1);
+                assert_eq!(state.running[&project.project_id].handle.id(), task_id);
+                assert!(!shutdown.load(Ordering::Relaxed));
+                state.running[&project.project_id].handle.abort();
+            });
+        });
+    }
+
+    #[test]
+    fn registration_error_keeps_existing_inventory_and_files() {
+        crate::project::test_support::with_isolated_config(|| {
+            let runtime = tokio::runtime::Runtime::new().unwrap();
+            runtime.block_on(async {
+                let good = tempfile::tempdir().unwrap();
+                let bad = tempfile::tempdir().unwrap();
+                std::fs::write(bad.path().join(".apas"), b"corrupt").unwrap();
+                let mut state = state();
+                let (project, _) = state
+                    .register_local_project(good.path().to_str().unwrap().into())
+                    .await
+                    .unwrap();
+                assert!(state
+                    .register_local_project(bad.path().to_str().unwrap().into())
+                    .await
+                    .is_err());
+                assert_eq!(state.projects.len(), 1);
+                assert!(state.projects.contains_key(&project.project_id));
+                assert!(state.running.is_empty());
+                assert_eq!(std::fs::read(bad.path().join(".apas")).unwrap(), b"corrupt");
+            });
+        });
+    }
+}
+
+#[cfg(test)]
 mod requested_restart_tests {
     use super::{DaemonState, ProjectEntry, RunningProject};
     use std::path::PathBuf;
@@ -1982,7 +2146,11 @@ mod requested_restart_tests {
 
         let resume = state.resume_projects_after_requested_restart("requester");
         let ids: Vec<&str> = resume.iter().map(|p| p.project_id.as_str()).collect();
-        assert_eq!(ids, vec!["requester"], "only the requester is special-cased");
+        assert_eq!(
+            ids,
+            vec!["requester"],
+            "only the requester is special-cased"
+        );
     }
 }
 

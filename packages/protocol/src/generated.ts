@@ -30,7 +30,8 @@ export type PaneMode = "deadloop" | "interactive";
 /**
  * Provider for a pane
  */
-export type Provider = ("codex" | "deepseek" | "opencode" | "cursor-agent") | "claude" | "minimax" | "glm" | "pi";
+export type Provider =
+  ("codex" | "deepseek" | "opencode" | "cursor-agent") | "claude" | "minimax" | "glm" | "pi" | "omp";
 export type CodeEventKind =
   | "instruction"
   | "agent_status"
@@ -220,6 +221,13 @@ export type ServerToWeb =
       [k: string]: unknown;
     }
   | {
+      client_msg_id?: string | null;
+      pane_id: number;
+      session_id: string;
+      type: "terminal_conversation_recorded";
+      [k: string]: unknown;
+    }
+  | {
       is_paused: boolean;
       session_id: string;
       type: "deadloop_status";
@@ -255,7 +263,7 @@ export type ServerToWeb =
       /**
        * Provider for a pane
        */
-      provider?: ("codex" | "deepseek" | "opencode" | "cursor-agent") | "claude" | "minimax" | "glm" | "pi";
+      provider?: ("codex" | "deepseek" | "opencode" | "cursor-agent") | "claude" | "minimax" | "glm" | "pi" | "omp";
       type: "usage_limits";
       [k: string]: unknown;
     }
@@ -298,6 +306,13 @@ export type ServerToWeb =
       project_id?: string | null;
       request_id?: string | null;
       type: "project_instance_created";
+      [k: string]: unknown;
+    }
+  | {
+      machine_id: string;
+      request_id: string;
+      result: LocalProjectRegistrationResult;
+      type: "local_project_registered";
       [k: string]: unknown;
     }
   | {
@@ -514,6 +529,20 @@ export type ClaudeContentBlock =
  * Messages sent from server to web client
  */
 export type ProjectAccessChange = "transferred" | "revoked" | "deleted";
+/**
+ * A registration cannot simultaneously succeed and carry an error.
+ */
+export type LocalProjectRegistrationResult =
+  | {
+      project: MachineProjectInfo;
+      status: "registered";
+      [k: string]: unknown;
+    }
+  | {
+      error: string;
+      status: "failed";
+      [k: string]: unknown;
+    };
 /**
  * Messages sent from web client to server
  */
@@ -802,6 +831,14 @@ export type WebToServer =
       [k: string]: unknown;
     }
   | {
+      cluster_owner_user_id?: string | null;
+      machine_id: string;
+      path: string;
+      request_id: string;
+      type: "register_local_project";
+      [k: string]: unknown;
+    }
+  | {
       api_base_url?: string | null;
       api_key?: string | null;
       clear_api_key?: boolean;
@@ -1058,6 +1095,7 @@ export interface MobileLaunchProfile {
 export interface MachineWithProjects {
   cluster_access?: "owner" | "member";
   cluster_owner_user_id?: string | null;
+  local_project_registration_available?: boolean;
   machine: MachineInfo;
   projects: MachineProjectInfo[];
   shared_provisioning_available?: boolean;

@@ -12,6 +12,7 @@ type StoreState = ReturnType<typeof useStore.getState>;
 type MockWs = {
   send: ReturnType<typeof vi.fn>;
   onmessage?: (event: MessageEvent) => void;
+  onclose?: (event: CloseEvent) => void;
 };
 
 /** Connect through the global WebSocket mock and return the live socket. */
@@ -53,7 +54,7 @@ describe("pending instance creation", () => {
     expect(showToast).toHaveBeenCalledTimes(1);
     expect(String(showToast.mock.calls[0][0])).toContain("my-instance");
 
-    const pending = Object.values(useStore.getState().pendingInstances);
+    const pending = Object.values(useStore.getState().pendingInstances).filter((operation) => operation.source === "clone");
     expect(pending).toHaveLength(1);
     expect(pending[0].instanceName).toBe("my-instance");
     expect(pending[0].machineId).toBe("machine-1");
@@ -95,7 +96,7 @@ describe("pending instance creation", () => {
     useStore.getState().createProjectInstance("m1", "github.com/a/b", "first", "apas/x");
     useStore.getState().createProjectInstance("m1", "github.com/a/c", "second", "apas/y");
 
-    const all = Object.values(useStore.getState().pendingInstances);
+    const all = Object.values(useStore.getState().pendingInstances).filter((operation) => operation.source === "clone");
     expect(all).toHaveLength(2);
     const first = all.find((p) => p.instanceName === "first")!;
 
@@ -106,7 +107,7 @@ describe("pending instance creation", () => {
       project_id: "proj-1",
     });
 
-    const left = Object.values(useStore.getState().pendingInstances);
+    const left = Object.values(useStore.getState().pendingInstances).filter((operation) => operation.source === "clone");
     expect(left).toHaveLength(1);
     expect(left[0].instanceName).toBe("second");
   });
@@ -147,5 +148,78 @@ describe("pending instance creation", () => {
 
     expect(ok).toBe(false);
     expect(useStore.getState().pendingInstances).toEqual({});
+  });
+});
+
+describe("local-folder registration feedback", () => {
+  it("isolates mixed operations by request, machine and source and never starts or attaches", async () => {
+    const ws = await connected();
+    const listMachines = vi.fn();
+    useStore.setState({ listMachines, showToast: vi.fn() });
+    const sessions = useStore.getState().sessions;
+    const sessionId = useStore.getState().sessionId;
+    const local = useStore.getState().registerLocalProject("m1", "~/plain folder", "owner");
+    expect(lastSent(ws)).toEqual({
+      type: "register_local_project", machine_id: "m1", path: "~/plain folder",
+      cluster_owner_user_id: "owner", request_id: local,
+    });
+    useStore.getState().createProjectInstance("m1", "github.com/a/b", "clone", "apas/clone");
+    const clone = String(lastSent(ws).request_id);
+    const registered = { status: "registered", project: { project_id: "p1", path: "/home/owner/plain folder", is_running: false } };
+    deliver(ws, { type: "local_project_registered", request_id: local, machine_id: "forged", result: registered });
+    deliver(ws, { type: "local_project_registered", request_id: clone, machine_id: "m1", result: registered });
+    deliver(ws, { type: "local_project_registered", request_id: "unknown", machine_id: "m1", result: registered });
+    deliver(ws, { type: "project_instance_created", request_id: local, machine_id: "m1", project_id: "p1" });
+    deliver(ws, { type: "project_instance_created", request_id: clone, machine_id: "forged", project_id: "p2" });
+    expect(useStore.getState().pendingInstances[local].status).toBe("pending");
+    expect(useStore.getState().pendingInstances[clone].status).toBe("pending");
+    expect(listMachines).not.toHaveBeenCalled();
+    ws.send.mockClear();
+    deliver(ws, { type: "local_project_registered", request_id: local, machine_id: "m1", result: registered });
+    expect(useStore.getState().pendingInstances[local]).toMatchObject({
+      source: "local", status: "registered", path: "~/plain folder",
+      project: { projectId: "p1", path: "/home/owner/plain folder", isRunning: false },
+    });
+    expect(listMachines).toHaveBeenCalledTimes(1);
+    expect(ws.send).not.toHaveBeenCalled();
+    expect(useStore.getState().sessions).toBe(sessions);
+    expect(useStore.getState().sessionId).toBe(sessionId);
+    deliver(ws, { type: "local_project_registered", request_id: local, machine_id: "m1", result: { status: "failed", error: "stale" } });
+    expect(useStore.getState().pendingInstances[local].status).toBe("registered");
+    deliver(ws, { type: "project_instance_created", request_id: clone, machine_id: "m1", project_id: "p2" });
+    expect(useStore.getState().pendingInstances[clone]).toBeUndefined();
+    expect(useStore.getState().pendingInstances[local].status).toBe("registered");
+  });
+
+  it("retains failed results until dismissal and allows an independent retry", async () => {
+    const ws = await connected();
+    const id = useStore.getState().registerLocalProject("m1", "/existing");
+    deliver(ws, { type: "local_project_registered", machine_id: "m1", request_id: id, result: { status: "failed", error: "Registry permission denied" } });
+    expect(useStore.getState().pendingInstances[id]).toMatchObject({ status: "failed", path: "/existing", error: "Registry permission denied" });
+    const retry = useStore.getState().registerLocalProject("m1", "/existing");
+    expect(retry).not.toBe(id);
+    useStore.getState().dismissCreationOperation(id);
+    expect(useStore.getState().pendingInstances[id]).toBeUndefined();
+    expect(useStore.getState().pendingInstances[retry].status).toBe("pending");
+  });
+
+  it("makes a lost connection unconfirmed without replaying writes or accepting late results", async () => {
+    const ws = await connected();
+    const id = useStore.getState().registerLocalProject("m1", "/existing");
+    ws.send.mockClear();
+    ws.onclose?.(new CloseEvent("close", { code: 1000 }));
+    expect(useStore.getState().pendingInstances[id]).toMatchObject({ status: "unconfirmed", path: "/existing" });
+    expect(ws.send).not.toHaveBeenCalled();
+    deliver(ws, { type: "local_project_registered", machine_id: "m1", request_id: id, result: { status: "registered", project: { project_id: "p1", path: "/existing", is_running: false } } });
+    expect(useStore.getState().pendingInstances[id].status).toBe("unconfirmed");
+  });
+
+  it("defaults older machine capability to false", async () => {
+    const ws = await connected();
+    deliver(ws, { type: "machines", machines: [
+      { machine: { machine_id: "old", hostname: "old", os: "linux", arch: "x64" }, projects: [] },
+      { machine: { machine_id: "new", hostname: "new", os: "linux", arch: "x64" }, projects: [], local_project_registration_available: true },
+    ] });
+    expect(useStore.getState().machines.map((machine) => machine.localProjectRegistrationAvailable)).toEqual([false, true]);
   });
 });

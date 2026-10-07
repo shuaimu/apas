@@ -1047,6 +1047,38 @@
       ]
     },
     {
+      "description": "Owner-only registration of an existing directory on the selected host.",
+      "type": "object",
+      "properties": {
+        "cluster_owner_user_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "machine_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "path": {
+          "type": "string"
+        },
+        "request_id": {
+          "type": "string"
+        },
+        "type": {
+          "type": "string",
+          "const": "register_local_project"
+        }
+      },
+      "required": [
+        "type",
+        "machine_id",
+        "path",
+        "request_id"
+      ]
+    },
+    {
       "description": "Compatibility tombstone for stale web clients. Upgraded servers must\nreject this inbound mutation and must never forward its credential.",
       "type": "object",
       "properties": {
@@ -1771,6 +1803,11 @@
           "description": "Pi coding agent (`pi`): terminal-only in APAS. See\n`terminal_pane::terminal_binary_for`.",
           "type": "string",
           "const": "pi"
+        },
+        {
+          "description": "Oh My Pi (`omp`): a standalone Pi-derived agent, terminal-only in APAS.\nUnlike Pi it has no `--session-id`, so a pane is pinned by giving it a\nprivate `--session-dir` instead; see `terminal_pane::omp_session_args`.",
+          "type": "string",
+          "const": "omp"
         }
       ]
     }

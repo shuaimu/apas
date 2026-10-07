@@ -129,15 +129,24 @@ export interface SessionPaneSummary {
   usage_limited?: UsageLimitedStatus & { resets_at?: string };
 }
 
-/** A `create_project_instance` still in flight. */
-export interface PendingInstance {
+/** Request-keyed creation feedback. Local terminal results survive until dismissed. */
+export type CreationOperation = {
   requestId: string;
   machineId: string;
+  startedAt: number;
+} & ({
+  source: "clone";
+  status: "pending";
   instanceName: string;
   gitRemote: string;
-  /** Epoch ms, so the UI can show how long the clone has been running. */
-  startedAt: number;
-}
+} | {
+  source: "local";
+  status: "pending" | "registered" | "failed" | "unconfirmed";
+  path: string;
+  clusterOwnerUserId?: string;
+  project?: MachineProject;
+  error?: string;
+});
 
 export interface UsageLimitWindow {
   utilization: number; // 0.0 to 1.0+
@@ -205,6 +214,7 @@ export interface MachineWithProjects {
   clusterOwnerUserId?: string;
   clusterAccess?: "owner" | "member";
   sharedProvisioningAvailable?: boolean;
+  localProjectRegistrationAvailable?: boolean;
 }
 
 // Map tool_use_id (e.g. "toolu_01Xwe...") to human-readable tool name (e.g. "Read", "Bash")
@@ -806,6 +816,8 @@ interface AppState {
     basePath?: string,
     clusterOwnerUserId?: string,
   ) => boolean;
+  registerLocalProject: (machineId: string, path: string, clusterOwnerUserId?: string) => string;
+  dismissCreationOperation: (requestId: string) => void;
   setMachineDeepseekConfig: (
     machineId: string,
     apiKey?: string,
@@ -915,12 +927,8 @@ interface AppState {
   >;
   /** Server-authoritative effective policy per attached session. */
   projectPolicies: Record<string, EffectiveProjectPolicy>;
-  /** Instance creations we have sent but not yet heard back about, keyed by
-   *  request_id. The daemon clones the repo before acking, which can take
-   *  tens of seconds, so this is what the machines page renders as a
-   *  "Creating…" row — otherwise the click produces no visible effect at all
-   *  until the ack lands. Cleared by `project_instance_created`. */
-  pendingInstances: Record<string, PendingInstance>;
+  /** Clone placeholders and retained local-registration progress/results. */
+  pendingInstances: Record<string, CreationOperation>;
   /** Push new Tech-Lead autonomy flags to the CLI. */
   updateProjectFlags: (flags: {
     autoApproveTodos: boolean;
@@ -1327,6 +1335,14 @@ export const useStore = create<AppState>((set, get) => ({
       storeDebugLog("WebSocket disconnected", event.code, event.reason);
       clearInterval(heartbeatHandle);
       set({ connected: false, ws: null, cliClients: [], isAttached: false });
+      set((state) => ({
+        pendingInstances: Object.fromEntries(Object.entries(state.pendingInstances).map(([id, operation]) => [
+          id,
+          operation.source === "local" && operation.status === "pending"
+            ? { ...operation, status: "unconfirmed" as const, error: "Connection lost before confirmation. Your folder is retained. Reconnect and retry manually to confirm registration." }
+            : operation,
+        ])),
+      }));
 
       // Auto-reconnect with exponential backoff (unless intentionally disconnected)
       if (event.code !== 1000) {
@@ -1817,6 +1833,8 @@ export const useStore = create<AppState>((set, get) => ({
       pendingInstances: {
         ...state.pendingInstances,
         [requestId]: {
+          source: "clone",
+          status: "pending",
           requestId,
           machineId,
           instanceName,
@@ -1827,6 +1845,43 @@ export const useStore = create<AppState>((set, get) => ({
     }));
     showToast(`Creating ${instanceName} — cloning, this can take a minute`, "info");
     return true;
+  },
+
+  registerLocalProject: (machineId, path, clusterOwnerUserId) => {
+    const requestId = crypto.randomUUID();
+    const operation: CreationOperation = {
+      source: "local", status: "pending", requestId, machineId, path,
+      clusterOwnerUserId, startedAt: Date.now(),
+    };
+    set((state) => ({ pendingInstances: { ...state.pendingInstances, [requestId]: operation } }));
+    try {
+      const { ws } = get();
+      if (!ws || ws.readyState !== WebSocket.OPEN) throw new Error("Not connected. Reconnect and try again.");
+      ws.send(JSON.stringify({
+        type: "register_local_project",
+        machine_id: machineId,
+        cluster_owner_user_id: clusterOwnerUserId,
+        path,
+        request_id: requestId,
+      }));
+    } catch (cause) {
+      set((state) => ({
+        pendingInstances: {
+          ...state.pendingInstances,
+          [requestId]: { ...operation, status: "failed", error: cause instanceof Error ? cause.message : "Could not send registration. Try again." },
+        },
+      }));
+    }
+    return requestId;
+  },
+
+  dismissCreationOperation: (requestId) => {
+    set((state) => {
+      if (state.pendingInstances[requestId]?.status === "pending") return state;
+      const next = { ...state.pendingInstances };
+      delete next[requestId];
+      return { pendingInstances: next };
+    });
   },
 
   setMachineDeepseekConfig: (
@@ -4014,6 +4069,7 @@ export function handleServerMessage(
           clusterOwnerUserId: item.cluster_owner_user_id as string | undefined,
           clusterAccess: (item.cluster_access as "owner" | "member" | undefined) || "owner",
           sharedProvisioningAvailable: Boolean(item.shared_provisioning_available),
+          localProjectRegistrationAvailable: Boolean(item.local_project_registration_available),
         };
       });
 
@@ -4436,6 +4492,37 @@ export function handleServerMessage(
       break;
     }
 
+    case "local_project_registered": {
+      const requestId = data.request_id as string;
+      const operation = get().pendingInstances[requestId];
+      if (!operation || operation.source !== "local" || operation.status !== "pending" || operation.machineId !== data.machine_id) break;
+      const result = data.result as { status: string; error?: string; project?: Record<string, unknown> } | undefined;
+      if (result?.status === "failed" && typeof result.error === "string") {
+        set((state) => ({ pendingInstances: {
+          ...state.pendingInstances,
+          [requestId]: { ...operation, status: "failed", error: result.error },
+        } }));
+      } else if (result?.status === "registered" && result.project
+        && typeof result.project.project_id === "string" && typeof result.project.path === "string"
+        && typeof result.project.is_running === "boolean") {
+        const project = result.project;
+        set((state) => ({ pendingInstances: {
+          ...state.pendingInstances,
+          [requestId]: { ...operation, status: "registered", project: {
+            projectId: project.project_id as string,
+            name: project.name as string | undefined,
+            path: project.path as string,
+            isRunning: project.is_running as boolean,
+            pid: project.pid as number | undefined,
+            memoryKb: project.memory_kb as number | undefined,
+            lastError: project.last_error as string | undefined,
+          } },
+        } }));
+        get().listMachines();
+      }
+      break;
+    }
+
     case "project_instance_created": {
       const error = data.error as string | undefined;
       const requestId = data.request_id as string | undefined;
@@ -4444,6 +4531,7 @@ export function handleServerMessage(
       // Correlating by request_id matters when several creations overlap —
       // clearing the whole map would strand the others as permanent spinners.
       const pending = requestId ? get().pendingInstances[requestId] : undefined;
+      if (!pending || pending.source !== "clone" || pending.machineId !== data.machine_id) break;
       if (requestId) {
         set((state) => {
           const next = { ...state.pendingInstances };

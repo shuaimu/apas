@@ -20,12 +20,16 @@
   "license": "ISC",
   "packageManager": "pnpm@10.28.0",
   "overrides": {
+    "@tailwindcss/typography": {
+      "postcss-selector-parser": "7.1.6"
+    },
     "vite": {
       "esbuild": "0.28.1"
     }
   },
   "pnpm": {
     "overrides": {
+      "@tailwindcss/typography>postcss-selector-parser": "7.1.6",
       "vite>esbuild": "0.28.1",
       "js-yaml@>=4.0.0 <4.3.2": ">=4.3.2"
     }

@@ -660,8 +660,8 @@ export function Sidebar({ onClose, onCollapse, width }: SidebarProps) {
             <button
               onClick={() => setNewInstanceRepo({})}
               className="inline-flex items-center gap-1 rounded px-2 py-1 text-xs font-semibold text-emerald-700 hover:bg-emerald-50 dark:text-emerald-300 dark:hover:bg-emerald-950/40"
-              title="Create project from GitHub"
-              aria-label="Create project from GitHub"
+              title="New project"
+              aria-label="New project"
             >
               <Plus className="h-4 w-4" />
               New project

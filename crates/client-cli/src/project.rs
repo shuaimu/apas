@@ -1,9 +1,9 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use shared::PaneConfig;
 use std::fs::OpenOptions;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use uuid::Uuid;
@@ -133,8 +133,7 @@ impl ProjectMetadata {
         }
     }
 
-    /// Construct metadata with an identity already reserved by the server.
-    /// Used only by authenticated two-phase shared provisioning.
+    /// Construct zero-pane metadata with an existing or reserved identity.
     pub fn with_id_and_name(id: Uuid, name: Option<String>) -> Self {
         let mut metadata = Self::new();
         metadata.id = id;
@@ -307,6 +306,201 @@ fn register_project_at_registry_path(
         registry.projects.sort_by(|a, b| a.path.cmp(&b.path));
 
         write_project_registry(&path, &registry)
+    })
+}
+
+/// Register an existing directory without migrating metadata or starting a runtime.
+/// Return the committed inventory from the same lock transaction as the registration.
+pub fn register_local_project(input: &str) -> Result<(RegisteredProject, Vec<RegisteredProject>)> {
+    let dir = resolve_local_project_path(input)?;
+    // Unlike ordinary CLI discovery, adoption must not perform best-effort
+    // legacy migration or interpret an unreadable registry as an empty one.
+    let registry_path = crate::config::Config::config_dir()?.join(USER_PROJECTS_FILE);
+    register_local_project_at_registry_path(&registry_path, &dir)
+}
+
+fn resolve_local_project_path(input: &str) -> Result<PathBuf> {
+    let path = if let Some(relative) = input.strip_prefix("~/") {
+        dirs::home_dir()
+            .context("Could not determine daemon user's home directory")?
+            .join(relative)
+    } else {
+        let path = PathBuf::from(input);
+        anyhow::ensure!(
+            path.is_absolute(),
+            "Folder path must be absolute or begin with ~/"
+        );
+        path
+    };
+    let canonical = std::fs::canonicalize(&path)
+        .with_context(|| format!("Resolve existing folder {}", path.display()))?;
+    anyhow::ensure!(
+        canonical.is_dir(),
+        "Not a directory: {}",
+        canonical.display()
+    );
+    anyhow::ensure!(
+        canonical.to_str().is_some(),
+        "Folder path is not valid UTF-8"
+    );
+    Ok(canonical)
+}
+
+/// Missing is distinct from inaccessible, malformed, or unsafe. O_NOFOLLOW
+/// also closes the check/open symlink race; O_NONBLOCK prevents a raced FIFO
+/// from hanging the daemon before we can check the opened file's type.
+fn read_registration_file(path: &Path) -> Result<Option<Vec<u8>>> {
+    let stat = match std::fs::symlink_metadata(path) {
+        Ok(stat) => stat,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err).with_context(|| format!("Inspect {}", path.display())),
+    };
+    anyhow::ensure!(
+        stat.is_file(),
+        "Not a regular metadata file: {}",
+        path.display()
+    );
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let mut file = options
+        .open(path)
+        .with_context(|| format!("Open {}", path.display()))?;
+    anyhow::ensure!(
+        file.metadata()?.is_file(),
+        "Not a regular metadata file: {}",
+        path.display()
+    );
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)
+        .with_context(|| format!("Read {}", path.display()))?;
+    Ok(Some(bytes))
+}
+
+fn read_local_registration_registry(path: &Path) -> Result<ProjectRegistry> {
+    let (source, bytes) = match read_registration_file(path)? {
+        Some(bytes) => (path.to_path_buf(), bytes),
+        None => {
+            let legacy = legacy_project_registry_path()?;
+            match read_registration_file(&legacy)? {
+                Some(bytes) => (legacy, bytes),
+                None => return Ok(ProjectRegistry::default()),
+            }
+        }
+    };
+    // Keep both existing registry formats, but reject truncated/empty files
+    // and objects missing `projects` instead of overwriting them.
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum RegistryFormat {
+        Wrapped { projects: Vec<RegisteredProject> },
+        Array(Vec<RegisteredProject>),
+    }
+    let parsed: RegistryFormat = serde_json::from_slice(&bytes)
+        .with_context(|| format!("Parse project registry {}", source.display()))?;
+    let projects = match parsed {
+        RegistryFormat::Wrapped { projects } | RegistryFormat::Array(projects) => projects,
+    };
+    Ok(ProjectRegistry { projects })
+}
+
+fn check_local_registration_conflicts(
+    registry: &ProjectRegistry,
+    dir: &Path,
+    id: Uuid,
+) -> Result<()> {
+    for entry in &registry.projects {
+        let same_path = normalize_project_path(Path::new(&entry.path)) == dir;
+        let same_id = Uuid::parse_str(&entry.project_id).ok() == Some(id);
+        anyhow::ensure!(
+            !same_path || same_id,
+            "Folder {} is already registered with a different project identity ({})",
+            dir.display(),
+            entry.project_id
+        );
+        anyhow::ensure!(
+            !same_id || same_path,
+            "Project {} is already registered at a different folder ({})",
+            id,
+            entry.path
+        );
+    }
+    Ok(())
+}
+
+fn register_local_project_at_registry_path(
+    registry_path: &Path,
+    dir: &Path,
+) -> Result<(RegisteredProject, Vec<RegisteredProject>)> {
+    with_project_registry_lock(registry_path, true, || {
+        let mut registry = read_local_registration_registry(registry_path)?;
+        let metadata_path = dir.join(APAS_FILE);
+        let parse_metadata = |bytes: &[u8]| -> Result<ProjectMetadata> {
+            serde_json::from_slice(bytes)
+                .with_context(|| format!("Parse project metadata {}", metadata_path.display()))
+        };
+        let metadata = match read_registration_file(&metadata_path)? {
+            Some(bytes) => parse_metadata(&bytes)?,
+            None => {
+                let metadata = match find_registered_project_by_path_in_registry(&registry, dir) {
+                    Some(existing) => ProjectMetadata::with_id_and_name(
+                        Uuid::parse_str(&existing.project_id)
+                            .context("Registered folder has an invalid project identity")?,
+                        existing.name,
+                    ),
+                    None => {
+                        let mut metadata = ProjectMetadata::new();
+                        metadata.name = dir
+                            .file_name()
+                            .and_then(|name| name.to_str())
+                            .map(String::from);
+                        metadata
+                    }
+                };
+                check_local_registration_conflicts(&registry, dir, metadata.id)?;
+                // Publish a fully written file without replacing anything,
+                // including a dangling symlink or another creator's identity.
+                let mut staged = tempfile::NamedTempFile::new_in(dir)
+                    .context("Create project metadata staging file")?;
+                serde_json::to_writer_pretty(&mut staged, &metadata)?;
+                staged.as_file().sync_all()?;
+                match staged.persist_noclobber(&metadata_path) {
+                    Ok(_) => {
+                        std::fs::File::open(dir)?.sync_all()?;
+                        metadata
+                    }
+                    Err(err) if err.error.kind() == std::io::ErrorKind::AlreadyExists => {
+                        let bytes = read_registration_file(&metadata_path)?
+                            .context("Project metadata disappeared during registration; retry")?;
+                        parse_metadata(&bytes)?
+                    }
+                    Err(err) => {
+                        return Err(err.error).context("Publish project metadata");
+                    }
+                }
+            }
+        };
+        check_local_registration_conflicts(&registry, dir, metadata.id)?;
+        let project = RegisteredProject {
+            project_id: metadata.id.to_string(),
+            name: metadata.name,
+            path: dir
+                .to_str()
+                .context("Folder path is not valid UTF-8")?
+                .to_string(),
+        };
+        registry
+            .projects
+            .retain(|entry| normalize_project_path(Path::new(&entry.path)) != dir);
+        registry.projects.push(project.clone());
+        registry.projects.sort_by(|a, b| a.path.cmp(&b.path));
+        write_project_registry(registry_path, &registry)
+            .with_context(|| format!("Persist project registry {}", registry_path.display()))?;
+        Ok((project, registry.projects))
     })
 }
 
@@ -833,6 +1027,329 @@ mod tests {
         crate::config::Config::config_dir()
             .expect("config dir")
             .join(USER_PROJECTS_FILE)
+    }
+
+    #[test]
+    fn local_registration_preserves_plain_files_and_recovers_missing_metadata() {
+        with_isolated_config(|| {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join("notes.txt"), b"user contents\n").unwrap();
+            let input = dir.path().to_str().unwrap();
+            let (first, inventory) = register_local_project(input).unwrap();
+            assert_eq!(inventory.len(), 1);
+            assert_eq!(
+                first.path,
+                std::fs::canonicalize(dir.path()).unwrap().to_str().unwrap()
+            );
+            let metadata: ProjectMetadata =
+                serde_json::from_slice(&std::fs::read(dir.path().join(APAS_FILE)).unwrap())
+                    .unwrap();
+            assert!(metadata.panes.is_empty());
+            assert!(!dir.path().join(".git").exists());
+            assert!(!dir.path().join(".gitignore").exists());
+            assert_eq!(
+                std::fs::read(dir.path().join("notes.txt")).unwrap(),
+                b"user contents\n"
+            );
+            std::fs::remove_file(dir.path().join(APAS_FILE)).unwrap();
+            let (recovered, inventory) = register_local_project(input).unwrap();
+            assert_eq!(recovered.project_id, first.project_id);
+            assert_eq!(recovered.name, first.name);
+            assert_eq!(inventory.len(), 1);
+        });
+    }
+
+    #[test]
+    fn local_registration_resolves_home_paths_and_rejects_invalid_targets() {
+        with_isolated_config(|| {
+            let home = dirs::home_dir().unwrap();
+            let dir = home.join("work/My Project $literal");
+            std::fs::create_dir_all(&dir).unwrap();
+            let (project, _) = register_local_project("~/work/My Project $literal").unwrap();
+            assert_eq!(
+                project.path,
+                std::fs::canonicalize(&dir).unwrap().to_str().unwrap()
+            );
+            let file = home.join("file");
+            std::fs::write(&file, b"retained").unwrap();
+            for input in [
+                "",
+                " ",
+                "relative/path",
+                "~other/path",
+                "~",
+                file.to_str().unwrap(),
+            ] {
+                assert!(register_local_project(input).is_err(), "{input:?}");
+            }
+            let missing = home.join("missing");
+            assert!(register_local_project(missing.to_str().unwrap()).is_err());
+            assert!(!missing.exists());
+            assert_eq!(std::fs::read(file).unwrap(), b"retained");
+        });
+    }
+
+    #[test]
+    fn local_registration_preserves_existing_metadata_bytes_and_legacy_configuration() {
+        with_isolated_config(|| {
+            let dir = tempfile::tempdir().unwrap();
+            let mut metadata = ProjectMetadata::with_name("Retained name".into());
+            metadata.prompt = Some("saved prompt".into());
+            metadata.team_enabled = true;
+            metadata.auto_approve_todos = true;
+            metadata.disallowed_tab_types = vec!["agent:claude".into()];
+            metadata.deadloop_claude_session_id = Some(Uuid::new_v4());
+            metadata.migrate_legacy();
+            let mut value = serde_json::to_value(&metadata).unwrap();
+            value["future_configuration"] = serde_json::json!({"keep": [1, 2, 3]});
+            let bytes =
+                format!(" \n{}\n", serde_json::to_string_pretty(&value).unwrap()).into_bytes();
+            std::fs::write(dir.path().join(APAS_FILE), &bytes).unwrap();
+            for _ in 0..2 {
+                let (registered, _) = register_local_project(dir.path().to_str().unwrap()).unwrap();
+                assert_eq!(registered.project_id, metadata.id.to_string());
+                assert_eq!(registered.name, metadata.name);
+                assert_eq!(std::fs::read(dir.path().join(APAS_FILE)).unwrap(), bytes);
+            }
+            // A legacy-only file must not be migrated/reformatted on adoption either.
+            value["panes"] = serde_json::json!([]);
+            let legacy = serde_json::to_vec(&value).unwrap();
+            std::fs::write(dir.path().join(APAS_FILE), &legacy).unwrap();
+            register_local_project(dir.path().to_str().unwrap()).unwrap();
+            assert_eq!(std::fs::read(dir.path().join(APAS_FILE)).unwrap(), legacy);
+        });
+    }
+
+    #[test]
+    fn local_registration_rejects_corrupt_metadata_and_registry_without_replacing_them() {
+        with_isolated_config(|| {
+            let dir = tempfile::tempdir().unwrap();
+            let metadata_path = dir.path().join(APAS_FILE);
+            std::fs::write(&metadata_path, b"{broken metadata").unwrap();
+            assert!(register_local_project(dir.path().to_str().unwrap()).is_err());
+            assert_eq!(std::fs::read(&metadata_path).unwrap(), b"{broken metadata");
+            std::fs::remove_file(&metadata_path).unwrap();
+            let registry_path = preferred_registry_path();
+            for bytes in [b"{broken registry".as_slice(), b"", b"{}", b"null"] {
+                std::fs::write(&registry_path, bytes).unwrap();
+                assert!(register_local_project(dir.path().to_str().unwrap()).is_err());
+                assert_eq!(std::fs::read(&registry_path).unwrap(), bytes);
+                assert!(!metadata_path.exists());
+            }
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_registration_allows_directory_aliases_but_rejects_unsafe_metadata() {
+        use std::os::unix::fs::symlink;
+        with_isolated_config(|| {
+            let root = tempfile::tempdir().unwrap();
+            let dir = root.path().join("project");
+            let alias = root.path().join("alias");
+            std::fs::create_dir(&dir).unwrap();
+            symlink(&dir, &alias).unwrap();
+            let (first, _) = register_local_project(alias.to_str().unwrap()).unwrap();
+            let (second, inventory) = register_local_project(dir.to_str().unwrap()).unwrap();
+            assert_eq!(first.project_id, second.project_id);
+            assert_eq!(inventory.len(), 1);
+            let metadata = dir.join(APAS_FILE);
+            let target = root.path().join("retained");
+            std::fs::rename(&metadata, &target).unwrap();
+            let original = std::fs::read(&target).unwrap();
+            symlink(&target, &metadata).unwrap();
+            assert!(register_local_project(dir.to_str().unwrap()).is_err());
+            assert_eq!(std::fs::read(&target).unwrap(), original);
+            std::fs::remove_file(&metadata).unwrap();
+            let missing = root.path().join("absent");
+            symlink(&missing, &metadata).unwrap();
+            assert!(register_local_project(dir.to_str().unwrap()).is_err());
+            assert!(!missing.exists());
+            std::fs::remove_file(&metadata).unwrap();
+            std::fs::create_dir(&metadata).unwrap();
+            assert!(register_local_project(dir.to_str().unwrap()).is_err());
+            assert!(metadata.is_dir());
+            std::fs::remove_dir(&metadata).unwrap();
+            let fifo = std::ffi::CString::new(metadata.to_str().unwrap()).unwrap();
+            assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+            assert!(register_local_project(dir.to_str().unwrap()).is_err());
+        });
+    }
+
+    #[test]
+    fn concurrent_local_registration_creates_one_identity() {
+        with_isolated_config(|| {
+            let dir = tempfile::tempdir().unwrap();
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(12));
+            let workers: Vec<_> = (0..12)
+                .map(|_| {
+                    let path = dir.path().to_str().unwrap().to_string();
+                    let barrier = barrier.clone();
+                    let config_dir = crate::config::Config::config_dir().unwrap();
+                    std::thread::spawn(move || {
+                        barrier.wait();
+                        crate::config::test_config::with_config_dir(&config_dir, || {
+                            register_local_project(&path).unwrap().0.project_id
+                        })
+                    })
+                })
+                .collect();
+            let ids: Vec<_> = workers
+                .into_iter()
+                .map(|worker| worker.join().unwrap())
+                .collect();
+            assert!(ids.iter().all(|id| id == &ids[0]));
+            let registry = list_registered_projects().unwrap();
+            assert_eq!(registry.len(), 1);
+            assert_eq!(registry[0].project_id, ids[0]);
+            assert_eq!(read_project_id(dir.path()).unwrap().to_string(), ids[0]);
+        });
+    }
+
+    #[test]
+    fn local_registration_rejects_unreadable_registry_and_invalid_recovered_identity() {
+        with_isolated_config(|| {
+            let dir = tempfile::tempdir().unwrap();
+            let registry_path = preferred_registry_path();
+            std::fs::create_dir(&registry_path).unwrap();
+            assert!(register_local_project(dir.path().to_str().unwrap()).is_err());
+            assert!(registry_path.is_dir());
+            assert!(!dir.path().join(APAS_FILE).exists());
+            std::fs::remove_dir(&registry_path).unwrap();
+            let bytes = serde_json::to_vec(&ProjectRegistry {
+                projects: vec![RegisteredProject {
+                    project_id: "invalid-identity".into(),
+                    name: Some("Retain this entry".into()),
+                    path: dir.path().to_str().unwrap().into(),
+                }],
+            })
+            .unwrap();
+            std::fs::write(&registry_path, &bytes).unwrap();
+            assert!(register_local_project(dir.path().to_str().unwrap()).is_err());
+            assert_eq!(std::fs::read(&registry_path).unwrap(), bytes);
+            assert!(!dir.path().join(APAS_FILE).exists());
+        });
+    }
+
+    #[test]
+    fn local_registration_rejects_both_identity_conflicts_atomically() {
+        with_isolated_config(|| {
+            let first = tempfile::tempdir().unwrap();
+            let second = tempfile::tempdir().unwrap();
+            register_local_project(first.path().to_str().unwrap()).unwrap();
+            let original_metadata = std::fs::read(first.path().join(APAS_FILE)).unwrap();
+            let registry_path = preferred_registry_path();
+            let original_registry = std::fs::read(&registry_path).unwrap();
+            // Same identity at another directory must not relocate it.
+            std::fs::write(second.path().join(APAS_FILE), &original_metadata).unwrap();
+            assert!(register_local_project(second.path().to_str().unwrap()).is_err());
+            assert_eq!(std::fs::read(&registry_path).unwrap(), original_registry);
+            assert_eq!(
+                std::fs::read(second.path().join(APAS_FILE)).unwrap(),
+                original_metadata
+            );
+            // Same directory with another identity must not replace it.
+            let different = serde_json::to_vec(&ProjectMetadata::new()).unwrap();
+            std::fs::write(first.path().join(APAS_FILE), &different).unwrap();
+            assert!(register_local_project(first.path().to_str().unwrap()).is_err());
+            assert_eq!(std::fs::read(&registry_path).unwrap(), original_registry);
+            assert_eq!(
+                std::fs::read(first.path().join(APAS_FILE)).unwrap(),
+                different
+            );
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_registry_persistence_keeps_metadata_for_manual_retry() {
+        with_isolated_config(|| {
+            let root = tempfile::tempdir().unwrap();
+            let dir = root.path().join("project");
+            std::fs::create_dir(&dir).unwrap();
+            // The registry and its lock fit NAME_MAX, but the existing atomic
+            // writer's UUID-suffixed staging filename does not. This induces
+            // a real write failure after metadata publication, even as root.
+            let registry_path = root.path().join(format!("{}.json", "r".repeat(230)));
+            assert!(register_local_project_at_registry_path(&registry_path, &dir).is_err());
+            let retained = std::fs::read(dir.join(APAS_FILE)).unwrap();
+            let metadata: ProjectMetadata = serde_json::from_slice(&retained).unwrap();
+            let (registered, _) = register_local_project(dir.to_str().unwrap()).unwrap();
+            assert_eq!(registered.project_id, metadata.id.to_string());
+            assert_eq!(std::fs::read(dir.join(APAS_FILE)).unwrap(), retained);
+        });
+    }
+
+    fn git_output(dir: &Path, args: &[&str]) -> Vec<u8> {
+        let output = std::process::Command::new("git")
+            .current_dir(dir)
+            .args(args)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "git {args:?}: {:?}", output.stderr);
+        output.stdout
+    }
+
+    #[test]
+    fn local_registration_leaves_dirty_git_checkouts_and_all_origins_unchanged() {
+        with_isolated_config(|| {
+            for origin in [
+                Some("https://github.com/example/repo.git"),
+                Some("ssh://git.example.test/repo"),
+                None,
+            ] {
+                let dir = tempfile::tempdir().unwrap();
+                git_output(dir.path(), &["init", "-b", "retained-branch"]);
+                std::fs::write(dir.path().join("tracked.txt"), b"committed\n").unwrap();
+                std::fs::write(dir.path().join(".gitignore"), b"ignored-local\n").unwrap();
+                git_output(dir.path(), &["add", "."]);
+                git_output(
+                    dir.path(),
+                    &[
+                        "-c",
+                        "user.name=Test",
+                        "-c",
+                        "user.email=test@example.test",
+                        "-c",
+                        "commit.gpgsign=false",
+                        "commit",
+                        "-m",
+                        "initial",
+                    ],
+                );
+                if let Some(origin) = origin {
+                    git_output(dir.path(), &["remote", "add", "origin", origin]);
+                }
+                std::fs::write(dir.path().join("tracked.txt"), b"dirty user change\n").unwrap();
+                std::fs::write(dir.path().join("untracked.txt"), b"untracked\n").unwrap();
+                let head = git_output(dir.path(), &["rev-parse", "HEAD"]);
+                let branch = git_output(dir.path(), &["symbolic-ref", "HEAD"]);
+                let config = std::fs::read(dir.path().join(".git/config")).unwrap();
+                let index = std::fs::read(dir.path().join(".git/index")).unwrap();
+                register_local_project(dir.path().to_str().unwrap()).unwrap();
+                assert_eq!(git_output(dir.path(), &["rev-parse", "HEAD"]), head);
+                assert_eq!(git_output(dir.path(), &["symbolic-ref", "HEAD"]), branch);
+                assert_eq!(
+                    std::fs::read(dir.path().join(".git/config")).unwrap(),
+                    config
+                );
+                assert_eq!(std::fs::read(dir.path().join(".git/index")).unwrap(), index);
+                assert_eq!(
+                    std::fs::read(dir.path().join("tracked.txt")).unwrap(),
+                    b"dirty user change\n"
+                );
+                assert_eq!(
+                    std::fs::read(dir.path().join("untracked.txt")).unwrap(),
+                    b"untracked\n"
+                );
+                assert_eq!(
+                    std::fs::read(dir.path().join(".gitignore")).unwrap(),
+                    b"ignored-local\n"
+                );
+            }
+        });
     }
 
     fn write_legacy_registry(content: &str) -> PathBuf {

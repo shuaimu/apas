@@ -209,6 +209,12 @@ Do not restore the package without an actual configuration need and clean
 audits. Keep both lockfiles patched and verify both complete dependency graphs,
 including development dependencies, before deployment.
 
+Typography currently pins the vulnerable `postcss-selector-parser` 6.x line.
+The scoped npm and pnpm overrides select 7.1.6; both lockfiles also carry
+patched `source-map-js` and `sharp` resolutions. Do not remove those fixes
+without clean full-graph audits or use the audit tool's forced typography
+downgrade as a substitute.
+
 ### CLI build target (static musl)
 
 The shipped CLI is a **static musl** binary so a self-update rebuild never
@@ -245,6 +251,51 @@ token = "your-token"
 [local]
 claude_path = "claude"
 ```
+
+### Project creation from the web
+
+General **New project** actions in the desktop sidebar, collapsed rail, mobile
+home, and Machines page offer **Clone from GitHub** and **Existing folder**.
+Repository-group **New instance** remains clone-specific.
+
+- **Clone from GitHub** keeps the existing clone, new-branch, and **Create &
+  start** behavior, including shared-cluster provisioning policy.
+- **Existing folder** registers a directory in place and does not start it.
+  The path belongs to the selected machine, not the browser: use an absolute
+  path or `~/` relative to the daemon's OS user. The directory must exist.
+  GitHub checkouts, other Git hosts, repositories without an origin, and plain
+  non-Git directories all work. Nothing clones, initializes Git, switches
+  branches, edits remotes, or changes source files or `.gitignore`.
+
+Only the machine's authenticated owner can register a local folder. Project
+access, cluster membership, and permission to provision public clones do not
+grant this authority. The target must be connected and advertise
+`local_project_registration_v1`; absent capability means unavailable, including
+on older daemons. Deploy server → web → CLI before using the flow.
+
+Missing `.apas` metadata is created with zero panes, recovering a registered
+identity for that canonical path when one exists. Valid existing metadata keeps
+its exact bytes, identity, name, pane configuration, policy, and unknown fields.
+Malformed, unreadable, symlinked, or non-regular metadata is rejected, never
+repaired or deleted. Directory symlink aliases and repeat requests reuse the
+same identity; conflicting ID/path registrations fail under the registry lock
+instead of retargeting another project. A failed registry write retains newly
+created metadata so a manual retry can complete without changing identity.
+
+Filesystem registration alone is not success. The server binds the result to
+the requesting connection and exact daemon, finalizes canonical identity and
+direct hosting placement through `authorize_project_registration` under the
+project-operation guard, resolves policy, and checks the reported inventory.
+Existing ownership and policy are preserved; unavailable or unauthorized
+identities fail without deleting local files. No session is fabricated.
+
+The modal retains progress, errors, and the canonical success path. A lost
+connection leaves registration unconfirmed rather than replaying the request.
+**View on Machines** selects the owning cluster and target project even when a
+shared cluster was previously selected. Use the existing **Start** control
+there explicitly; saved panes only launch on that action. An already-running
+project remains running unchanged. Registered-only projects have no session,
+so they do not appear in the sidebar or mobile session list before Start.
 
 ### Project Identification
 Each project directory gets a `.apas` file with project metadata and restored
@@ -353,10 +404,9 @@ is deliberately separate from `Output` / `StreamMessage` — see "Terminal panes
 under Key Concepts for why.
 
 `WebToServer::UpdateProjectFlags` carries the project policy flags from the web
-to the server. The server **rejects the whole message from anyone who is neither the
-project owner nor the operator of the cluster hosting it**
-(`ws_web::can_manage_project_settings`) — this is the only authority gate in the
-WebSocket layer, everything else there authorizes on session *access* alone.
+to the server. The server **rejects the whole message from anyone who is neither
+the project owner nor the operator of the cluster hosting it**
+(`ws_web::can_manage_project_settings`).
 It then forwards `ServerToCli::UpdateProjectFlags` to the CLI for `.apas`
 persistence; the CLI emits `CliToServer::ProjectFlagsChanged`, and the server
 broadcasts `ServerToWeb::ProjectFlagsChanged`. The CLI also re-broadcasts the
@@ -639,10 +689,11 @@ allowlist or the legacy `NULL = all current and future machines` value. Machine
 projection, runtime access, project creation, and project-provisioning
 finalization all enforce that allowlist. The membership may also name the launch
 profile applied to projects that member creates; provisioning snapshots it and
-creates a one-profile project policy override. New projects are created from the
-web by entering a GitHub clone URL and choosing one of the member's visible
-machines. Invitation tables and endpoints remain only for compatibility with
-older clients and outstanding links.
+creates a one-profile project policy override. Members create projects from the
+web with a public GitHub clone URL and one of their allowed machines. Only the
+machine owner can instead register an existing local folder; membership does
+not grant that capability. Invitation tables and endpoints remain only for
+compatibility with older clients and outstanding links.
 
 ### Project shares and cluster shares are independent
 
@@ -843,9 +894,9 @@ Registration is all a launch needs to do: the daemon reads the shared registry
 the project appears on the Machines page with no IPC and no start request.
 
 **Creating a project from a local directory is still a thing a launch does.**
-`apas` in a directory that is not yet a project creates and registers it. This
-rule governs how many instances run, not when a project comes into being, and
-the web's create flow only clones a repository into a *new* directory.
+`apas` in a directory that is not yet a project creates and registers it.
+The web's **Existing folder** flow now offers register-only creation to machine
+owners too. Neither path implicitly starts the project.
 
 **Headless workers are exempt.** They are `apas` processes, but the daemon's
 children rather than instances a user launched; applying the rule to them

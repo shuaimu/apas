@@ -12,6 +12,7 @@ pub mod auth;
 mod authz;
 mod cluster;
 mod health;
+mod local_projects;
 mod mobile;
 mod mobile_auth;
 mod mobile_notifications;

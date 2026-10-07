@@ -209,6 +209,18 @@ pub(crate) mod test_config {
         ConfigDirGuard { previous, dir }
     }
 
+    /// Carry an isolated config directory into a blocking worker thread.
+    pub(crate) fn with_config_dir<T>(path: &Path, operation: impl FnOnce() -> T) -> T {
+        struct Restore(Option<PathBuf>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                OVERRIDE.with(|slot| *slot.borrow_mut() = self.0.take());
+            }
+        }
+        let _restore = Restore(OVERRIDE.with(|slot| slot.borrow_mut().replace(path.to_path_buf())));
+        operation()
+    }
+
     pub(super) fn current() -> Option<PathBuf> {
         OVERRIDE.with(|slot| slot.borrow().clone())
     }

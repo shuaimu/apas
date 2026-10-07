@@ -10,6 +10,9 @@ use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
 
+mod local_projects;
+pub(crate) use local_projects::PendingLocalProjectRegistration;
+
 fn normalize_machine_hostname(raw: &str) -> String {
     raw.trim().to_ascii_lowercase()
 }
@@ -96,6 +99,9 @@ pub struct SessionManager {
     /// Correlated daemon acknowledgements used to make project deletion wait
     /// for host-local pane-runtime cleanup.
     daemon_stop_waiters: DashMap<Uuid, oneshot::Sender<(String, bool, usize, Option<String>)>>,
+    /// Volatile, connection-bound local registration requests. Daemon wire IDs
+    /// are generated here rather than trusting browser correlation IDs.
+    local_project_requests: DashMap<String, PendingLocalProjectRegistration>,
     /// Protocol capabilities negotiated by each authenticated web socket.
     web_capabilities: DashMap<Uuid, HashSet<String>>,
     /// Map of machine ID -> machine metadata
@@ -338,6 +344,7 @@ impl SessionManager {
             daemon_users: DashMap::new(),
             daemon_capabilities: DashMap::new(),
             daemon_stop_waiters: DashMap::new(),
+            local_project_requests: DashMap::new(),
             web_capabilities: DashMap::new(),
             machine_infos: DashMap::new(),
             machine_projects: DashMap::new(),
@@ -1250,6 +1257,8 @@ impl SessionManager {
         mut machine: MachineInfo,
         projects: Vec<MachineProjectInfo>,
     ) {
+        self.fail_local_project_requests_for_machine(&machine_id);
+        self.daemon_capabilities.remove(&machine_id);
         let existing_deepseek = self
             .machine_infos
             .get(&machine_id)
@@ -1277,6 +1286,7 @@ impl SessionManager {
         let owner = self.daemon_users.get(machine_id).map(|entry| *entry);
         self.daemon_senders.remove(machine_id);
         self.daemon_capabilities.remove(machine_id);
+        self.fail_local_project_requests_for_machine(machine_id);
         // Keep machine metadata/project snapshot to avoid UI flicker during transient daemon reconnects.
         if let Some(mut machine) = self.machine_infos.get_mut(machine_id) {
             machine.last_seen = Some(chrono::Utc::now().to_rfc3339());
@@ -1779,6 +1789,11 @@ impl SessionManager {
                 &machine_id,
                 shared::SHARED_PROJECT_PROVISIONING_CAPABILITY,
             ),
+            local_project_registration_available: self.is_daemon_connected(&machine_id)
+                && self.daemon_supports_capability(
+                    &machine_id,
+                    shared::LOCAL_PROJECT_REGISTRATION_CAPABILITY,
+                ),
         }
     }
 
@@ -1851,6 +1866,7 @@ impl SessionManager {
                             .map(|owner| owner.to_string()),
                         cluster_access: shared::MachineClusterAccess::Member,
                         shared_provisioning_available: false,
+                        local_project_registration_available: false,
                     })
                 }
             })
@@ -1883,6 +1899,7 @@ impl SessionManager {
                         machine_id,
                         shared::SHARED_PROJECT_PROVISIONING_CAPABILITY,
                     ),
+                    local_project_registration_available: false,
                 })
             })
             .collect()
@@ -1962,6 +1979,12 @@ impl SessionManager {
     }
 
     pub fn set_web_user(&self, connection_id: Uuid, user_id: Uuid) {
+        if self
+            .get_web_user(&connection_id)
+            .is_some_and(|previous| previous != user_id)
+        {
+            self.clear_local_project_requests_for_web(&connection_id);
+        }
         self.web_users.insert(connection_id, user_id);
     }
 
@@ -1976,6 +1999,7 @@ impl SessionManager {
         self.web_senders.remove(connection_id);
         self.web_users.remove(connection_id);
         self.web_capabilities.remove(connection_id);
+        self.clear_local_project_requests_for_web(connection_id);
         // Remove this connection from any sessions it was viewing
         for mut session in self.sessions.iter_mut() {
             session.web_connection_ids.retain(|id| id != connection_id);

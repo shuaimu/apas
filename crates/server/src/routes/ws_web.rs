@@ -428,6 +428,7 @@ pub(crate) async fn list_accessible_machines_for_user(
                 machine.machine.deepseek_backend = None;
                 machine.cluster_owner_user_id = Some(cluster.owner_user_id.clone());
                 machine.cluster_access = shared::MachineClusterAccess::Member;
+                machine.local_project_registration_available = false;
                 machine.shared_provisioning_available = state.sessions.daemon_supports_capability(
                     &machine.machine.machine_id,
                     shared::SHARED_PROJECT_PROVISIONING_CAPABILITY,
@@ -3252,6 +3253,21 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     .await
                     .unwrap_or(false);
                 if !still_active {
+                    if let Ok(WebToServer::RegisterLocalProject {
+                        machine_id,
+                        request_id,
+                        ..
+                    }) = &parsed
+                    {
+                        super::local_projects::send_failure(
+                            &state,
+                            &connection_id,
+                            *machine_id,
+                            request_id.clone(),
+                            "Mobile device session is expired or revoked",
+                        )
+                        .await;
+                    }
                     state
                         .sessions
                         .send_to_web(
@@ -3270,15 +3286,32 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     .as_ref()
                     .is_ok_and(|message| !is_read_only_message(message))
             {
-                state
-                    .sessions
-                    .send_to_web(
+                let error = "This mobile build is read-only because its protocol version is incompatible. Update the app to make changes.";
+                if let Ok(WebToServer::RegisterLocalProject {
+                    machine_id,
+                    request_id,
+                    ..
+                }) = &parsed
+                {
+                    super::local_projects::send_failure(
+                        &state,
                         &connection_id,
-                        ServerToWeb::Error {
-                            message: "This mobile build is read-only because its protocol version is incompatible. Update the app to make changes.".to_string(),
-                        },
+                        *machine_id,
+                        request_id.clone(),
+                        error,
                     )
                     .await;
+                } else {
+                    state
+                        .sessions
+                        .send_to_web(
+                            &connection_id,
+                            ServerToWeb::Error {
+                                message: error.to_string(),
+                            },
+                        )
+                        .await;
+                }
                 continue;
             }
             match parsed {
@@ -4332,6 +4365,22 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             )
                             .await;
                     }
+                }
+                Ok(WebToServer::RegisterLocalProject {
+                    machine_id,
+                    cluster_owner_user_id,
+                    path,
+                    request_id,
+                }) => {
+                    super::local_projects::register(
+                        &state,
+                        &connection_id,
+                        machine_id,
+                        cluster_owner_user_id.as_deref(),
+                        path,
+                        request_id,
+                    )
+                    .await;
                 }
                 Ok(WebToServer::CreateProjectInstance {
                     machine_id,
@@ -5963,9 +6012,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                 None => {
                                     let inferred = infer_panes_from_messages(sid, &messages);
                                     if !inferred.is_empty() {
-                                        state
-                                            .sessions
-                                            .set_session_panes(&sid, inferred.clone());
+                                        state.sessions.set_session_panes(&sid, inferred.clone());
                                     }
                                     (inferred, false)
                                 }
