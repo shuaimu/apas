@@ -19,6 +19,7 @@ import type {
 } from "@/lib/store";
 import { writeSelectedPane } from "@/lib/mobileSelectedPane";
 import { compareRecentlyIdle } from "@/lib/idlePaneOrdering";
+import { buildProjectList } from "@/lib/projectList";
 import {
   paneUsageLimit,
   usageLimitedLabel,
@@ -63,6 +64,8 @@ interface MobileSessionSummary {
 
 interface MobileMachineProject {
   project_id: string;
+  name?: string;
+  path?: string;
   is_running?: boolean;
 }
 
@@ -113,6 +116,8 @@ function adaptMachine(entry: MachineWithProjects): MobileMachineSummary {
     },
     projects: entry.projects.map((project) => ({
       project_id: project.projectId,
+      name: project.name,
+      path: project.path,
       is_running: project.isRunning,
     })),
     cluster_owner_user_id: entry.clusterOwnerUserId,
@@ -211,6 +216,8 @@ export interface MobileCodeHomeProps {
   /// was until the page was reloaded by hand. The server already broadcasts
   /// this on every daemon heartbeat; this list is that broadcast.
   liveMachines?: MachineWithProjects[];
+  /// Distinguishes a received empty roster from the pre-WebSocket bootstrap.
+  machineListReceived: boolean;
   /// Ask for a machine list now, so the first paint does not wait for the next
   /// heartbeat.
   onRefreshMachines?: () => void;
@@ -235,6 +242,7 @@ export function MobileCodeHome({
   onRebootDaemon,
   serverVersion,
   liveMachines,
+  machineListReceived,
   onRefreshMachines,
   usageLimits = EMPTY_USAGE_LIMITS,
 }: MobileCodeHomeProps) {
@@ -254,10 +262,10 @@ export function MobileCodeHome({
   // out, and an empty machines tab reads as "no machines" rather than "not yet".
   const machines = useMemo(
     () =>
-      liveMachines && liveMachines.length > 0
-        ? liveMachines.map(adaptMachine)
+      machineListReceived
+        ? (liveMachines ?? []).map(adaptMachine)
         : bootstrapMachines,
-    [liveMachines, bootstrapMachines],
+    [liveMachines, machineListReceived, bootstrapMachines],
   );
   // Both sources: the server catches a fleet that is uniformly behind a newer
   // deployment, the machines catch a rollout part-way through the cluster.
@@ -298,6 +306,29 @@ export function MobileCodeHome({
   const visibleMachines = useMemo(
     () => machines.filter((entry) => (entry.cluster_owner_user_id || "owned") === selectedClusterOwner),
     [machines, selectedClusterOwner],
+  );
+  const registeredInventory = useMemo<MachineWithProjects[]>(
+    () => machines.map((entry) => ({
+      machine: {
+        machineId: entry.machine.machine_id,
+        hostname: entry.machine.hostname,
+        os: entry.machine.os ?? "",
+        arch: entry.machine.arch ?? "",
+        daemonVersion: entry.machine.daemon_version ?? undefined,
+        lastSeen: entry.machine.last_seen ?? undefined,
+      },
+      projects: (entry.projects ?? []).map((project) => ({
+        projectId: project.project_id,
+        name: project.name,
+        path: project.path ?? "",
+        isRunning: project.is_running === true,
+      })),
+      clusterOwnerUserId: entry.cluster_owner_user_id,
+      clusterAccess: entry.cluster_access,
+      sharedProvisioningAvailable: entry.shared_provisioning_available,
+      localProjectRegistrationAvailable: entry.local_project_registration_available,
+    })),
+    [machines],
   );
 
   useEffect(() => {
@@ -349,7 +380,8 @@ export function MobileCodeHome({
   const sessions = useMemo(() => {
     const legacyById = new Map(legacySessions.map((session) => [session.id, session]));
     if (!remoteSessions) return legacySessions.map(adaptSession);
-    return remoteSessions.map((session) => {
+    const remoteIds = new Set(remoteSessions.map((session) => session.id));
+    return [...remoteSessions.map((session) => {
       const live = legacyById.get(session.id);
       if (!live) return session;
       return {
@@ -365,8 +397,17 @@ export function MobileCodeHome({
         working_dir: live.workingDir ?? session.working_dir,
         panes: live.panes ?? session.panes,
       };
-    });
+    }), ...legacySessions.filter((session) => !remoteIds.has(session.id)).map(adaptSession)];
   }, [legacySessions, remoteSessions]);
+
+  const registeredProjects = useMemo(() => {
+    const sessionProjectIds = new Set([
+      ...sessions.map((session) => session.project_id || session.id),
+      ...legacySessions.map((session) => session.projectId || session.id),
+    ]);
+    return buildProjectList([], [], registeredInventory)
+      .filter((project) => project.sessionId === null && !sessionProjectIds.has(project.projectId));
+  }, [registeredInventory, sessions, legacySessions]);
 
   const filteredSessions = useMemo(
     () => filter === "all" ? [...sessions].sort(compareSessionRecency) : [],
@@ -723,7 +764,7 @@ export function MobileCodeHome({
               </p>
             </div>
           )
-        ) : filteredSessions.length > 0 ? (
+        ) : filteredSessions.length > 0 || registeredProjects.length > 0 ? (
           <div className="space-y-2.5">
             {filteredSessions.map((session) => {
               const name = session.project_name || "Coding session";
@@ -766,6 +807,33 @@ export function MobileCodeHome({
                 </button>
               );
             })}
+            {registeredProjects.map((project) => (
+              <article
+                key={project.projectId}
+                aria-label={`Registered project ${project.name}`}
+                className="rounded-2xl border border-[#dedee7] bg-white p-3.5 shadow-sm dark:border-[#383842] dark:bg-[#1b1b21]"
+              >
+                <div className="flex items-center justify-between gap-2.5">
+                  <span className="min-w-0 flex-1 truncate text-base font-bold">{project.name}</span>
+                  <span className={`shrink-0 rounded-full px-2.5 py-1 text-[0.7rem] font-bold ${
+                    project.isActive
+                      ? "bg-emerald-100 text-emerald-700 dark:bg-emerald-950/60 dark:text-emerald-300"
+                      : "bg-[#efeff5] text-[#686873] dark:bg-[#25252d] dark:text-[#aaaab6]"
+                  }`}>
+                    {project.isActive ? "Running" : "Stopped"}
+                  </span>
+                </div>
+                <p className="mt-2 truncate text-sm text-[#686873] dark:text-[#aaaab6]">{project.hostname}</p>
+                <p className="mt-1 break-all text-sm text-[#686873] dark:text-[#aaaab6]">{project.workingDir}</p>
+                <a
+                  href={project.machinesHref}
+                  aria-label={`View ${project.name} on Machines`}
+                  className="mt-2.5 inline-flex min-h-11 items-center gap-1 rounded-xl px-2 text-sm font-semibold text-[#6d5efc] hover:underline focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#6d5efc]"
+                >
+                  View on Machines <ChevronRight aria-hidden="true" className="h-4 w-4" />
+                </a>
+              </article>
+            ))}
           </div>
         ) : (
           <div className="flex h-full min-h-52 flex-col items-center justify-center px-5 text-center">

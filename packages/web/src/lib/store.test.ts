@@ -28,6 +28,7 @@ describe('useStore', () => {
       paneLastCreatedAt: new Map(),
       reconnectWatermarks: new Map(),
       machines: [],
+      machineListReceived: false,
       projectFlags: {},
       projectPolicies: {},
       toasts: [],
@@ -63,14 +64,22 @@ describe('useStore', () => {
     });
   });
 
-  describe('initial state', () => {
-    it('should have correct initial values', () => {
-      const state = useStore.getState();
-      expect(state.connected).toBe(false);
-      expect(state.sessionId).toBeNull();
-      expect(state.ws).toBeNull();
-      expect(state.cliClients).toEqual([]);
-      expect(state.messages).toEqual([]);
+  describe('machine inventory freshness', () => {
+    it('keeps an empty live roster authoritative and clears that authority on logout', () => {
+      handleServerMessage({
+        type: 'machines',
+        machines: [{
+          machine: { machine_id: 'host', hostname: 'builder', os: 'linux', arch: 'x64' },
+          projects: [{ project_id: 'registered', path: '/work/project', is_running: false }],
+        }],
+      }, useStore.setState, useStore.getState);
+      expect(useStore.getState().machineListReceived).toBe(true);
+
+      handleServerMessage({ type: 'machines', machines: [] }, useStore.setState, useStore.getState);
+      expect(useStore.getState()).toMatchObject({ machines: [], machineListReceived: true });
+
+      useStore.getState().logout();
+      expect(useStore.getState()).toMatchObject({ machines: [], machineListReceived: false });
     });
   });
 

@@ -133,6 +133,64 @@ describe("SidebarRail", () => {
     expect(attachSession).toHaveBeenCalledWith("s-apas");
   });
 
+  it("offers one keyboard-focusable Machines link for duplicate owned registrations without attaching or starting", () => {
+    const owned = {
+      ...makeMachine([{ projectId: "p-q-index", name: "q-index", path: "/work/q-index", isRunning: false }]),
+      clusterOwnerUserId: "owner-1",
+      clusterAccess: "owner" as const,
+    };
+    const attachSession = seedRail({
+      sessions: [],
+      machines: [
+        owned,
+        { ...owned, machine: { ...owned.machine, machineId: "machine-2" } },
+        { ...makeMachine([{ projectId: "p-member", path: "/work/member-only", isRunning: false }]), clusterAccess: "member" },
+      ],
+      unreadSessions: new Set(["p-q-index"]),
+    });
+    const start = vi.fn();
+    act(() => useStore.setState({ startMachineProjectCli: start }));
+    render(<SidebarRail onExpand={vi.fn()} />);
+
+    const link = screen.getByRole("link", { name: "View q-index on Machines — Stopped" });
+    const destination = new URL(link.getAttribute("href")!, "https://apas.test");
+    expect(destination.pathname).toBe("/machines");
+    expect(destination.searchParams.get("cluster_owner")).toBe("owner-1");
+    expect(destination.searchParams.get("machine")).toMatch(/^machine-[12]$/);
+    expect(destination.searchParams.get("project")).toBe("p-q-index");
+    expect(screen.queryByRole("link", { name: /member-only/ })).toBeNull();
+    expect(link.getAttribute("aria-current")).toBeNull();
+    expect(link.querySelector('[data-testid="rail-unread-dot"]')).toBeNull();
+    expect(link.querySelector('[data-testid="rail-active-dot"]')).toBeNull();
+    link.focus();
+    expect(document.activeElement).toBe(link);
+    link.addEventListener("click", (event) => event.preventDefault(), { once: true });
+    fireEvent.click(link);
+    expect(attachSession).not.toHaveBeenCalled();
+    expect(start).not.toHaveBeenCalled();
+  });
+
+  it("keeps identity and switches to the arriving real session with normal current selection", () => {
+    const attachSession = seedRail({
+      sessions: [],
+      machines: [makeMachine([{ projectId: "p-q-index", path: "/work/q-index", isRunning: true }])],
+    });
+    render(<SidebarRail onExpand={vi.fn()} />);
+    const registered = screen.getByRole("link", { name: "View q-index on Machines — Running" });
+    const colour = registered.style.backgroundColor;
+    expect(registered.querySelector('[data-testid="rail-active-dot"]')).not.toBeNull();
+    act(() => useStore.setState({
+      sessions: [makeSession({ id: "s-q-index", projectId: "p-q-index", workingDir: "/work/q-index" })],
+      sessionId: "s-q-index",
+    }));
+    expect(screen.queryByRole("link", { name: /View q-index on Machines/ })).toBeNull();
+    const current = screen.getByRole("button", { name: "Open q-index" });
+    expect(current.style.backgroundColor).toBe(colour);
+    expect(current.getAttribute("aria-current")).toBe("page");
+    fireEvent.click(current);
+    expect(attachSession).toHaveBeenCalledWith("s-q-index");
+  });
+
   it("marks the current project, running projects, and unread activity", () => {
     seedRail({
       sessions: [

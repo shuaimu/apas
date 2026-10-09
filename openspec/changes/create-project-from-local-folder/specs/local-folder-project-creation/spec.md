@@ -107,8 +107,18 @@ Successful local-folder registration SHALL make the project discoverable through
 
 #### Scenario: Discover a folder added from the sidebar or mobile home
 - **WHEN** local registration succeeds for a project that has no session yet
-- **THEN** the completion view offers a way to open the selected machine's project inventory and its existing Start control
-- **AND** it does not fabricate a session or start agents merely to insert a sidebar row
+- **THEN** the project appears in desktop sidebar/rail and mobile All projects as registered and stopped
+- **AND** the entry and completion view offer navigation to the owning machine inventory and its existing Start control
+- **AND** no session is fabricated and no project or agent is started merely to display the entry
+
+#### Scenario: Deduplicate registration and later session reports
+- **WHEN** several owned machines report the same stable project ID, or a real session later arrives for that ID
+- **THEN** machine registration contributes at most one project-list entry
+- **AND** a real session replaces the sessionless representation while retaining its normal attachment and pane-status behavior
+
+#### Scenario: Shared compute alone does not add sessionless projects
+- **WHEN** a shared-cluster member receives machine inventory without a corresponding authorized project session
+- **THEN** that inventory alone does not create a project entry or a session attachment target
 
 ### Requirement: Completion and failures are correlated and recoverable
 

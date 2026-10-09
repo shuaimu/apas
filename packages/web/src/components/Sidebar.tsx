@@ -855,9 +855,9 @@ export function Sidebar({ onClose, onCollapse, width }: SidebarProps) {
               >
                 {renderDropIndicator({ groupKey: group.key, projectId: project.projectId })}
                 <div
-                  onClick={() => handleProjectClick(project.id)}
-                  className={`w-full flex items-center gap-2 px-3 py-2 rounded-lg text-left text-sm transition-colors cursor-pointer ${
-                    sessionId === project.id
+                  onClick={project.sessionId !== null ? () => handleProjectClick(project.sessionId) : undefined}
+                  className={`w-full flex items-center gap-2 px-3 py-2 rounded-lg text-left text-sm transition-colors ${project.sessionId !== null ? "cursor-pointer" : ""} ${
+                    project.sessionId !== null && sessionId === project.sessionId
                       ? "bg-blue-100 dark:bg-blue-900 text-blue-700 dark:text-blue-300"
                       : "hover:bg-gray-200 dark:hover:bg-gray-800"
                   }`}
@@ -894,7 +894,7 @@ export function Sidebar({ onClose, onCollapse, width }: SidebarProps) {
                       <span className="truncate">
                         {truncatePath(project.workingDir, width ? Math.max(12, Math.floor((width - 56) / 7.5)) : 22)}
                       </span>
-                      {unreadSessions.has(project.id) && sessionId !== project.id && (
+                      {project.sessionId !== null && unreadSessions.has(project.sessionId) && sessionId !== project.sessionId && (
                         <span
                           className="inline-block w-2 h-2 rounded-full bg-blue-500 flex-shrink-0 animate-pulse"
                           title="New activity since you last viewed this session"
@@ -909,19 +909,31 @@ export function Sidebar({ onClose, onCollapse, width }: SidebarProps) {
                     )}
                     <div className="flex items-center gap-2 text-xs text-gray-500">
                       <span className="shrink-0">
-                        {project.isActive
+                        {project.sessionId === null
+                          ? project.isActive ? "Running" : "Stopped"
+                          : project.isActive
                           ? "Active"
                           : project.createdAt
                             ? new Date(project.createdAt).toLocaleDateString()
                             : ""}
                       </span>
-                      <PaneStatusDots panes={project.panes} isActive={project.isActive} />
+                      {project.sessionId !== null && <PaneStatusDots panes={project.panes} isActive={project.isActive} />}
                     </div>
+                    {project.sessionId === null && (
+                      <Link
+                        href={project.machinesHref}
+                        onClick={() => onClose?.()}
+                        aria-label={`View ${project.name} on Machines`}
+                        className="inline-block rounded text-xs text-blue-600 hover:underline focus-visible:outline-2 focus-visible:outline-blue-500 dark:text-blue-400"
+                      >
+                        View on Machines
+                      </Link>
+                    )}
                   </div>
-                  <button
+                  {project.sessionId !== null && <button
                     onClick={(e) => handleShareClick(
                       e,
-                      project.id,
+                      project.sessionId,
                       project.projectId,
                       projectRole(project),
                     )}
@@ -933,7 +945,7 @@ export function Sidebar({ onClose, onCollapse, width }: SidebarProps) {
                     ) : (
                       <MoreHorizontal className="w-4 h-4" />
                     )}
-                  </button>
+                  </button>}
                 </div>
               </div>
                       ))}

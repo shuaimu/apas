@@ -35,3 +35,10 @@
 - [x] 5.2 Exercise the real daemon/server registration path against disposable GitHub-origin, other-origin/no-origin, and plain directories; observe canonical registry entries, zero new panes, preserved files/Git state, explicit failures, and duplicate/alias identity reuse.
 - [x] 5.3 Smoke the actual desktop and mobile web surfaces: register a local folder, inspect pending/error/success states, follow View on Machines to its stopped project, then explicitly start a disposable empty project and open its authorized zero-pane workspace. Also exercise the unchanged GitHub clone path. Do not use production projects or start real provider agents for this smoke.
 - [x] 5.4 After smoke proof, update the canonical `AGENTS.md` project-creation guidance with machine-local path semantics, owner-only authority, metadata preservation, explicit Start behavior, and capability-based rollout requirements.
+
+## 6. Correct registered-project visibility
+
+- [x] 6.1 Merge owned machine registrations into the shared project-list projection using stable project identity and explicit absent session identity; deduplicate hosts and later sessions, retain authority boundaries, and reuse scoped Machines navigation.
+- [x] 6.2 Show registered/stopped entries in the desktop sidebar and collapsed rail with accessible navigation to explicit Start; preserve real-session selection, unread state, ordering, and project actions.
+- [x] 6.3 Show the same registered/stopped entries in mobile All projects from bootstrap and live inventory, without changing existing session recency, Idle sessions, or attachment behavior.
+- [ ] 6.4 Run integrated web checks and real browser smoke, update the canonical runbook after proof, and deploy the web-only correction. Verify q-index is visible while it remains stopped and existing production runtimes are unchanged.

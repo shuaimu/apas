@@ -67,11 +67,13 @@ export function SidebarRail({ onExpand }: SidebarRailProps) {
             )}
             {group.projects.map((project) => (
               <ProjectIcon
-                key={project.id}
+                key={project.projectId}
                 project={project}
-                selected={sessionId === project.id}
-                unread={unreadSessions.has(project.id) && sessionId !== project.id}
-                onOpen={() => attachSession(project.id)}
+                selected={project.sessionId !== null && sessionId === project.sessionId}
+                unread={project.sessionId !== null && unreadSessions.has(project.sessionId) && sessionId !== project.sessionId}
+                onOpen={() => {
+                  if (project.sessionId !== null) attachSession(project.sessionId);
+                }}
               />
             ))}
           </Fragment>
@@ -124,28 +126,23 @@ function ProjectIcon({
     project.hostname,
     project.workingDir !== project.name ? project.workingDir : undefined,
     project.isShared && project.ownerEmail ? `Shared by ${project.ownerEmail}` : undefined,
-    project.isActive ? "Active" : undefined,
+    project.sessionId === null ? project.isActive ? "Running" : "Stopped" : project.isActive ? "Active" : undefined,
     unread ? "New activity" : undefined,
   ]
     .filter(Boolean)
     .join("\n");
 
-  return (
-    <button
-      type="button"
-      onClick={onOpen}
-      title={tooltip}
-      aria-label={`Open ${project.name}`}
-      aria-current={selected ? "page" : undefined}
-      // Colour keyed on the stable project id, so the same project keeps its
-      // colour across sessions; two same-named projects still differ.
-      style={{ backgroundColor: `hsl(${projectHue(project.projectId)} 55% 45%)` }}
-      className={`relative flex h-10 w-10 flex-shrink-0 items-center justify-center text-sm font-bold text-white transition-[border-radius,box-shadow] duration-150 hover:rounded-lg ${
-        selected
-          ? "rounded-lg ring-2 ring-blue-500 ring-offset-2 ring-offset-gray-50 dark:ring-offset-gray-800"
-          : "rounded-xl"
-      }`}
-    >
+  const iconProps = {
+    title: tooltip,
+    style: { backgroundColor: `hsl(${projectHue(project.projectId)} 55% 45%)` },
+    className: `relative flex h-10 w-10 flex-shrink-0 items-center justify-center text-sm font-bold text-white transition-[border-radius,box-shadow] duration-150 hover:rounded-lg ${
+      selected
+        ? "rounded-lg ring-2 ring-blue-500 ring-offset-2 ring-offset-gray-50 dark:ring-offset-gray-800"
+        : "rounded-xl"
+    }`,
+  };
+  const contents = (
+    <>
       <span aria-hidden="true">{projectInitials(project.name)}</span>
       {project.isActive && (
         <span
@@ -161,6 +158,15 @@ function ProjectIcon({
           className="absolute -right-0.5 -top-0.5 h-3 w-3 animate-pulse rounded-full border-2 border-gray-50 bg-blue-500 dark:border-gray-800"
         />
       )}
+    </>
+  );
+  return project.sessionId === null ? (
+    <Link {...iconProps} href={project.machinesHref} aria-label={`View ${project.name} on Machines — ${project.isActive ? "Running" : "Stopped"}`}>
+      {contents}
+    </Link>
+  ) : (
+    <button {...iconProps} type="button" onClick={onOpen} aria-label={`Open ${project.name}`} aria-current={selected ? "page" : undefined}>
+      {contents}
     </button>
   );
 }

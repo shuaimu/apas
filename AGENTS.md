@@ -294,8 +294,22 @@ connection leaves registration unconfirmed rather than replaying the request.
 **View on Machines** selects the owning cluster and target project even when a
 shared cluster was previously selected. Use the existing **Start** control
 there explicitly; saved panes only launch on that action. An already-running
-project remains running unchanged. Registered-only projects have no session,
-so they do not appear in the sidebar or mobile session list before Start.
+project remains running unchanged.
+
+**Registration is enough to appear in project lists.** The expanded desktop
+sidebar, collapsed rail, and mobile **All projects** include registered projects
+from owned-machine inventory before their first session. They show **Stopped**
+or **Running** from that inventory and link to **View on Machines**, never to a
+fabricated session. Opening the link does not start the project. A real session,
+when one arrives, replaces registration-only navigation; duplicate registrations
+across hosts collapse by stable project ID. A running placement is preferred for
+machine navigation, otherwise the host choice is stable across heartbeat order.
+
+Member-only cluster inventory does not seed these entries: compute visibility
+does not grant project-content access. Existing authorized shared sessions remain
+visible. Mobile uses bootstrap inventory until the first live machine list;
+an explicitly empty live list clears registrations rather than resurrecting
+stale bootstrap entries. **Idle sessions** still lists sessions only.
 
 ### Project Identification
 Each project directory gets a `.apas` file with project metadata and restored

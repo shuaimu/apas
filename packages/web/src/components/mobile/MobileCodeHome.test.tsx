@@ -1,6 +1,6 @@
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import type { SessionInfo } from "@/lib/store";
+import type { MachineWithProjects, SessionInfo } from "@/lib/store";
 import { readSelectedPane } from "@/lib/mobileSelectedPane";
 import { MobileCodeHome, type MobileCodeHomeProps } from "./MobileCodeHome";
 
@@ -24,6 +24,7 @@ function renderHomeWith(overrides: Partial<MobileCodeHomeProps> = {}) {
   const props: MobileCodeHomeProps = {
     active: false,
     connected: true,
+    machineListReceived: false,
     legacySessions: [],
     token: "token",
     onAccount: vi.fn(),
@@ -44,6 +45,7 @@ function renderHome(overrides: Partial<MobileCodeHomeProps> = {}) {
   const props: MobileCodeHomeProps = {
     active: false,
     connected: true,
+    machineListReceived: false,
     legacySessions: [
       session({ id: "session-a", workingDir: "/workspace/alpha", hostname: "builder-a" }),
       session({ id: "session-b", workingDir: "/workspace/beta", hostname: "builder-b", status: "completed", isActive: false }),
@@ -637,6 +639,7 @@ describe("MobileCodeHome", () => {
     });
     const { rerender, props } = renderHomeWith({
       active: true,
+      machineListReceived: true,
       liveMachines: [
         {
           machine: { machineId: "machine-a", hostname: "zoo-005", os: "linux", arch: "x64", daemonVersion: "26.08.74" },
@@ -750,6 +753,7 @@ describe("MobileCodeHome", () => {
     const props: MobileCodeHomeProps = {
       active: true,
       connected: true,
+      machineListReceived: false,
       legacySessions: [],
       token: "token",
       onAccount: vi.fn(),
@@ -782,6 +786,191 @@ describe("MobileCodeHome", () => {
     expect(screen.getByText(/No running projects/)).toBeTruthy();
     fireEvent.click(screen.getByRole("button", { name: "Manage machines and projects" }));
     expect(props.onManageMachines).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("mobile registered projects", () => {
+  const registeredProject = {
+    projectId: "project-q-index",
+    name: "q-index",
+    path: "/workspace/q-index",
+    isRunning: false,
+  };
+  const inventory: MachineWithProjects = {
+    machine: { machineId: "machine-q", hostname: "builder-q", os: "linux", arch: "x64" },
+    projects: [registeredProject],
+    clusterOwnerUserId: "owner-q",
+    clusterAccess: "owner",
+  };
+  const bootstrapInventory = {
+    machine: { machine_id: "machine-q", hostname: "builder-q" },
+    projects: [{
+      project_id: registeredProject.projectId,
+      name: registeredProject.name,
+      path: registeredProject.path,
+      is_running: false,
+    }],
+    cluster_owner_user_id: "owner-q",
+    cluster_access: "owner",
+  };
+
+  it("shows a bootstrap registration with owner-scoped navigation, not a session action", async () => {
+    stubBootstrap({ sessions: [], machines: [bootstrapInventory] });
+    const home = renderHomeWith({ active: true, liveMachines: [] });
+    const card = await screen.findByRole("article", { name: "Registered project q-index" });
+    expect(within(card).getByText("/workspace/q-index")).toBeTruthy();
+    expect(within(card).getByText("builder-q")).toBeTruthy();
+    expect(within(card).getByText("Stopped")).toBeTruthy();
+    expect(within(card).queryByText("No recent activity")).toBeNull();
+    expect(within(card).queryByRole("button")).toBeNull();
+    const link = within(card).getByRole("link", { name: "View q-index on Machines" });
+    const target = new URL(link.getAttribute("href")!, "https://apas.test");
+    expect(target.pathname).toBe("/machines");
+    expect(Object.fromEntries(target.searchParams)).toEqual({
+      cluster_owner: "owner-q", machine: "machine-q", project: "project-q-index",
+    });
+    link.focus();
+    expect(document.activeElement).toBe(link);
+    // Leave navigation to the browser, without allowing jsdom to leave the test.
+    link.addEventListener("click", (event) => event.preventDefault(), { once: true });
+    fireEvent.click(link);
+    expect(home.props.onOpenSession).not.toHaveBeenCalled();
+    expect(home.props.onRebootDaemon).not.toHaveBeenCalled();
+    expect(fetch).toHaveBeenCalledTimes(1);
+
+    fireEvent.click(screen.getByRole("button", { name: "Idle sessions" }));
+    expect(screen.queryByRole("article", { name: "Registered project q-index" })).toBeNull();
+    expect(screen.getByText("No idle sessions")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "All projects" }));
+    expect(screen.getByRole("article", { name: "Registered project q-index" })).toBeTruthy();
+  });
+
+  it("takes live registration metadata and removes bootstrap entries after an empty live roster", async () => {
+    stubBootstrap({ sessions: [], machines: [bootstrapInventory] });
+    const home = renderHomeWith({ active: true });
+    await screen.findByRole("article", { name: "Registered project q-index" });
+
+    home.rerender({
+      ...home.props,
+      machineListReceived: true,
+      liveMachines: [{
+        ...inventory,
+        machine: { ...inventory.machine, hostname: "new-host" },
+        projects: [{ ...registeredProject, name: "live-name", path: "/new/path", isRunning: true }],
+      }],
+    });
+    const card = screen.getByRole("article", { name: "Registered project live-name" });
+    expect(within(card).getByText("/new/path")).toBeTruthy();
+    expect(within(card).getByText("new-host")).toBeTruthy();
+    expect(within(card).getByText("Running")).toBeTruthy();
+    expect(screen.queryByRole("article", { name: "Registered project q-index" })).toBeNull();
+
+    home.rerender({ ...home.props, machineListReceived: true, liveMachines: [] });
+    expect(screen.queryByRole("article")).toBeNull();
+    expect(screen.queryByRole("link", { name: /on Machines/ })).toBeNull();
+    expect(screen.getByText("No coding sessions yet")).toBeTruthy();
+  });
+
+  it("deduplicates multi-host registrations and transitions to a newly arrived real session", async () => {
+    stubBootstrap({
+      sessions: [{ id: "existing-session", project_name: "existing", status: "ended", is_active: false }],
+      machines: [],
+    });
+    const machines = [
+      inventory,
+      { ...inventory, machine: { ...inventory.machine, machineId: "second-host", hostname: "builder-two" } },
+    ];
+    const home = renderHomeWith({ active: true, machineListReceived: true, liveMachines: machines });
+    await screen.findByRole("button", { name: "Open existing" });
+    expect(screen.getAllByRole("article", { name: "Registered project q-index" })).toHaveLength(1);
+    // A completed bootstrap must not hide a subsequently arriving live session.
+    home.rerender({
+      ...home.props,
+      legacySessions: [session({
+        id: "real-session",
+        projectId: registeredProject.projectId,
+        workingDir: registeredProject.path,
+        hostname: "builder-q",
+        panes: [{ pane_id: 7, kind: "terminal", provider: "codex", is_working: false }],
+      })],
+    });
+    expect(screen.queryByRole("article", { name: "Registered project q-index" })).toBeNull();
+    const sessionCard = screen.getByRole("button", { name: "Open q-index" });
+    expect(screen.getAllByRole("button", { name: "Open q-index" })).toHaveLength(1);
+    fireEvent.click(sessionCard);
+    expect(home.props.onOpenSession).toHaveBeenCalledWith("real-session", "q-index");
+    fireEvent.click(screen.getByRole("button", { name: "Idle sessions" }));
+    expect(screen.getByRole("button", { name: "Open Terminal 7 in q-index" })).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "All projects" }));
+    home.rerender(home.props);
+    expect(screen.queryByRole("button", { name: "Open q-index" })).toBeNull();
+    expect(screen.getAllByRole("article", { name: "Registered project q-index" })).toHaveLength(1);
+    home.rerender({
+      ...home.props,
+      liveMachines: machines.map((machine) => ({ ...machine, projects: [] })),
+    });
+    expect(screen.queryByRole("article")).toBeNull();
+  });
+
+  it("does not duplicate bootstrap sessions or legacy session-as-project identities", async () => {
+    stubBootstrap({
+      sessions: [{
+        id: "bootstrap-session",
+        project_id: registeredProject.projectId,
+        project_name: "q-index",
+        status: "ended",
+        is_active: false,
+      }],
+      machines: [bootstrapInventory],
+    });
+    const home = renderHomeWith({
+      active: true,
+      machineListReceived: true,
+      liveMachines: [{
+        ...inventory,
+        projects: [registeredProject, { projectId: "legacy-session", path: "/workspace/legacy", isRunning: false }],
+      }],
+      legacySessions: [session({ id: "legacy-session", workingDir: "/workspace/legacy", isActive: false })],
+    });
+    await screen.findByRole("button", { name: "Open q-index" });
+    expect(screen.getByRole("button", { name: "Open legacy" })).toBeTruthy();
+    expect(screen.queryByRole("article")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Open q-index" }));
+    expect(home.props.onOpenSession).toHaveBeenCalledWith("bootstrap-session", "q-index");
+  });
+
+  it("never turns member-only bootstrap or live inventory into All projects membership", async () => {
+    stubBootstrap({
+      sessions: [],
+      machines: [{ ...bootstrapInventory, cluster_access: "member" }],
+    });
+    const home = renderHomeWith({ active: true });
+    await waitFor(() => expect(localStorage.getItem("apas_mobile_cluster_owner")).toBe("owner-q"));
+    expect(screen.queryByRole("article")).toBeNull();
+    expect(screen.queryByRole("button", { name: "Open q-index" })).toBeNull();
+    home.rerender({
+      ...home.props,
+      machineListReceived: true,
+      liveMachines: [{ ...inventory, clusterAccess: "member" }],
+    });
+    expect(screen.queryByRole("article")).toBeNull();
+    expect(screen.queryByRole("link", { name: /on Machines/ })).toBeNull();
+    expect(home.props.onOpenSession).not.toHaveBeenCalled();
+
+    home.rerender({
+      ...home.props,
+      machineListReceived: true,
+      liveMachines: [{ ...inventory, clusterAccess: "member" }],
+      legacySessions: [session({
+        id: "shared-session",
+        projectId: registeredProject.projectId,
+        workingDir: registeredProject.path,
+        isShared: true,
+      })],
+    });
+    expect(screen.queryByRole("article")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Open q-index" }));
+    expect(home.props.onOpenSession).toHaveBeenCalledWith("shared-session", "q-index");
   });
 });
 

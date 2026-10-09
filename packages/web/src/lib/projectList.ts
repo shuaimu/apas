@@ -1,4 +1,5 @@
 import type { CliClient, MachineWithProjects, SessionInfo, SessionPaneSummary } from "@/lib/store";
+import { machineProjectHref } from "./machineProjectTarget";
 
 /**
  * The project list the sidebar shows, derived once so the expanded list and
@@ -8,9 +9,7 @@ import type { CliClient, MachineWithProjects, SessionInfo, SessionPaneSummary } 
 
 export type ProjectRole = "owner" | "user";
 
-export interface ProjectEntry {
-  /** Representative session id — what `attachSession` takes. */
-  id: string;
+interface ProjectDetails {
   /** Stable `.apas` identity; falls back to the session id for legacy rows. */
   projectId: string;
   name: string;
@@ -26,6 +25,12 @@ export interface ProjectEntry {
   cliClientId?: string;
   panes?: SessionPaneSummary[];
 }
+
+/** Only session-backed entries may be attached or carry session actions. */
+export type ProjectEntry = ProjectDetails & (
+  | { sessionId: string; machinesHref?: never }
+  | { sessionId: null; machinesHref: string }
+);
 
 export interface RepoGroup {
   key: string;
@@ -53,10 +58,9 @@ export function repoDisplayLabel(remote: string): string {
     : remote;
 }
 
-// Merge CLI clients (active) and sessions (historical) into a unified project
-// list. Deduplicate by project_id (the stable .apas id) so moving a project
-// directory doesn't show up as a second project. Falls back to id for legacy
-// rows. Sorted active first, then by creation date (newest first).
+// Sessions provide history and attachment; owned machine inventory also
+// provides projects that have never run. Deduplicate by stable project ID,
+// retaining the real session whenever one exists.
 export function buildProjectList(
   sessions: SessionInfo[],
   cliClients: CliClient[],
@@ -82,7 +86,7 @@ export function buildProjectList(
     const existing = projectMap.get(projectKey);
     if (!existing || (session.isActive && !existing.isActive)) {
       projectMap.set(projectKey, {
-        id: session.id,
+        sessionId: session.id,
         projectId: projectKey,
         name,
         workingDir,
@@ -105,7 +109,7 @@ export function buildProjectList(
   for (const client of cliClients) {
     if (client.activeSession) {
       for (const project of projectMap.values()) {
-        if (project.id === client.activeSession) {
+        if (project.sessionId === client.activeSession) {
           project.isActive = true;
           project.cliClientId = client.id;
           break;
@@ -114,16 +118,37 @@ export function buildProjectList(
     }
   }
 
-  // Also mark projects as active if daemon reports them as running.
-  // Daemon's project_id is the .apas id, so match against the project key.
-  for (const machine of machines) {
+  // Inventory order can change between heartbeats. Pick a stable navigation
+  // target, preferring a running placement if its session has not arrived yet.
+  const orderedMachines = [...machines].sort((a, b) =>
+    a.machine.hostname.localeCompare(b.machine.hostname)
+    || a.machine.machineId.localeCompare(b.machine.machineId),
+  );
+  for (const machine of orderedMachines) {
     for (const mp of machine.projects) {
-      if (mp.isRunning) {
-        const project = projectMap.get(mp.projectId);
-        if (project) {
-          project.isActive = true;
-        }
+      const existing = projectMap.get(mp.projectId);
+      if (existing && existing.sessionId !== null) {
+        if (mp.isRunning) existing.isActive = true;
+        continue;
       }
+      // A shared compute grant is not a project-content grant. Real sessions
+      // above already passed the server's project-access projection.
+      if (machine.clusterAccess === "member") continue;
+      if (existing && (existing.isActive || !mp.isRunning)) continue;
+
+      projectMap.set(mp.projectId, {
+        sessionId: null,
+        projectId: mp.projectId,
+        name: mp.name?.trim() || mp.path.split("/").pop() || `Project ${mp.projectId.slice(0, 8)}`,
+        workingDir: mp.path,
+        hostname: machine.machine.hostname,
+        isActive: mp.isRunning,
+        machinesHref: machineProjectHref({
+          machineId: machine.machine.machineId,
+          projectId: mp.projectId,
+          clusterOwnerUserId: machine.clusterOwnerUserId,
+        }),
+      });
     }
   }
 

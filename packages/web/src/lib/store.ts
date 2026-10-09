@@ -754,6 +754,8 @@ interface AppState {
 
   // Daemon-reported machines
   machines: MachineWithProjects[];
+  // An empty live inventory is authoritative, not a missing bootstrap.
+  machineListReceived: boolean;
 
   // Auth actions
   login: (
@@ -1164,6 +1166,7 @@ export const useStore = create<AppState>((set, get) => ({
   deadloopStatus: null,
   usageLimits: new Map(),
   machines: [],
+  machineListReceived: false,
 
   // The server still returns `cluster_role` for older clients, but it confers
   // nothing: an account administers the virtual cluster it hosts, and system
@@ -1236,6 +1239,7 @@ export const useStore = create<AppState>((set, get) => ({
       sessions: [],
       workingPanesBySession: new Map(),
       machines: [],
+      machineListReceived: false,
       paneModes: {},
       paneWorkSummaries: {},
       projectPolicies: {},
@@ -1436,6 +1440,7 @@ export const useStore = create<AppState>((set, get) => ({
       cliLifecycleOperations: {},
       cliLifecycleLatestBySession: {},
       machines: [],
+      machineListReceived: false,
       paneModes: {},
       isAttached: false,
       reconnectAttempts: 0,
@@ -4101,7 +4106,7 @@ export function handleServerMessage(
             },
           };
         });
-        return { machines: merged };
+        return { machines: merged, machineListReceived: true };
       });
       break;
     }

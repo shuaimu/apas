@@ -228,6 +228,69 @@ describe("Sidebar project list", () => {
     expect(onClose).toHaveBeenCalledOnce();
   });
 
+  it("shows owned registrations once and navigates without inventing a session or starting a runtime", () => {
+    const owned = {
+      ...makeMachine([{ projectId: "p-q-index", name: "q-index", path: "/repo/q-index", isRunning: false }]),
+      clusterOwnerUserId: "owner-1",
+      clusterAccess: "owner" as const,
+    };
+    const attachSession = seedSidebarState({
+      sessions: [],
+      machines: [
+        owned,
+        { ...owned, machine: { ...owned.machine, machineId: "machine-2" } },
+        { ...makeMachine([{ projectId: "p-member", path: "/repo/member-only", isRunning: false }]), clusterAccess: "member" },
+      ],
+    });
+    const start = vi.fn();
+    act(() => useStore.setState({ startMachineProjectCli: start, unreadSessions: new Set(["p-q-index"]) }));
+    const onClose = vi.fn();
+    const { container } = render(<Sidebar onClose={onClose} />);
+
+    const link = screen.getByRole("link", { name: "View q-index on Machines" });
+    const destination = new URL(link.getAttribute("href")!, "https://apas.test");
+    expect(destination.pathname).toBe("/machines");
+    expect(destination.searchParams.get("cluster_owner")).toBe("owner-1");
+    expect(destination.searchParams.get("machine")).toMatch(/^machine-[12]$/);
+    expect(destination.searchParams.get("project")).toBe("p-q-index");
+    expect(screen.getByText("Stopped")).toBeTruthy();
+    expect(container.querySelectorAll('[data-project-id="p-q-index"]')).toHaveLength(1);
+    expect(container.querySelector('[data-project-id="p-member"]')).toBeNull();
+    expect(container.querySelector(".bg-blue-100")).toBeNull();
+    expect(screen.queryByTitle("New activity since you last viewed this session")).toBeNull();
+    expect(screen.queryByTitle("Manage project access")).toBeNull();
+    link.focus();
+    expect(document.activeElement).toBe(link);
+    // Keep jsdom on the page while exercising the native navigation action.
+    link.addEventListener("click", (event) => event.preventDefault(), { once: true });
+    fireEvent.click(link);
+    expect(onClose).toHaveBeenCalledOnce();
+    expect(attachSession).not.toHaveBeenCalled();
+    expect(start).not.toHaveBeenCalled();
+  });
+
+  it("replaces registration navigation with normal session selection when history arrives", () => {
+    const attachSession = seedSidebarState({
+      sessions: [],
+      machines: [makeMachine([{ projectId: "p-q-index", path: "/repo/q-index", isRunning: true }])],
+    });
+    const { container } = render(<Sidebar />);
+    expect(screen.getByText("Running")).toBeTruthy();
+    expect(screen.getByRole("link", { name: "View q-index on Machines" })).toBeTruthy();
+
+    act(() => useStore.setState({
+      sessions: [makeSession({ id: "s-q-index", projectId: "p-q-index", workingDir: "/repo/q-index" })],
+      sessionId: "s-q-index",
+    }));
+    expect(container.querySelectorAll('[data-project-id="p-q-index"]')).toHaveLength(1);
+    expect(screen.queryByRole("link", { name: "View q-index on Machines" })).toBeNull();
+    const row = projectRow("/repo/q-index");
+    expect(row.classList.contains("bg-blue-100")).toBe(true);
+    expect(screen.getByTitle("Manage project access")).toBeTruthy();
+    fireEvent.click(row);
+    expect(attachSession).toHaveBeenCalledWith("s-q-index");
+  });
+
   it("renders a repo header per group, including the no-remote bucket", () => {
     seedSidebarState({
       sessions: [

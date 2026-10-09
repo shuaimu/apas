@@ -4,6 +4,7 @@ import { useEffect, useMemo, useState } from "react";
 import { createPortal } from "react-dom";
 import { X, FolderGit2 } from "lucide-react";
 import { useStore, type MachineWithProjects } from "@/lib/store";
+import { machineProjectHref } from "@/lib/machineProjectTarget";
 
 interface CreateInstanceModalProps {
   open: boolean;
@@ -180,7 +181,7 @@ export function CreateInstanceModal({ open, onClose, gitRemote, cloneUrl, cluste
                 {registered.isRunning ? "This project was already running; its runtime is unchanged." : "The project is stopped. Use Start on Machines when you are ready. Saved agents only run when you explicitly start the project."}
               </p>
               <a className="inline-block rounded bg-emerald-600 px-3 py-2 text-sm text-white"
-                href={`/machines?cluster_owner=${encodeURIComponent(operation?.clusterOwnerUserId || "owned")}&machine=${encodeURIComponent(operation!.machineId)}&project=${encodeURIComponent(registered.projectId)}#project-${encodeURIComponent(operation!.machineId)}-${encodeURIComponent(registered.projectId)}`}>
+                href={machineProjectHref({ machineId: operation!.machineId, projectId: registered.projectId, clusterOwnerUserId: operation?.clusterOwnerUserId })}>
                 View on Machines
               </a>
             </div>

@@ -4,7 +4,7 @@ See `proposal.md` for motivation and the local-folder delta specification for th
 
 All general creation entry points use `packages/web/src/components/CreateInstanceModal.tsx`. Its current `createProjectInstance` store action sends a clone request; the daemon's `DaemonState::create_instance` creates a destination, clones, changes branches, removes failed clones, and starts owner-created projects. None of those side effects is suitable for adopting an existing folder.
 
-The sidebar and mobile project lists are session-based. Merely registering a directory does not create a session or a sidebar row. `/machines` already displays daemon project inventory and provides explicit Start controls. The directory registration flow must make that distinction visible rather than start saved agents as a workaround.
+The sidebar and mobile project lists were session-based. The first implementation made registration discoverable only through `/machines`; registering `q-index` proved that returning to All projects still looked like failure. Merge owned machine inventory into the project lists without inventing a session. `/machines` remains the explicit Start surface.
 
 Shared-cluster provisioning deliberately confines guests to newly allocated clone destinations and preserves requester ownership through a separate provisioning flow. Machine visibility is not permission to import the owner's arbitrary existing files.
 
@@ -69,13 +69,22 @@ Keep the local form open through completion: retain entered values on send failu
 
 **Alternative rejected:** only showing the existing three-second "created and starting" toast. It misstates the result and leaves a sessionless project undiscoverable from the creation entry point.
 
+### 5. Represent registered projects without fabricating sessions
+
+Use the stable project ID to deduplicate inventory across machines and against existing sessions. A project-list entry carries either a real session ID or an explicit absent session plus an owner-scoped Machines link. Session-backed entries retain their existing metadata, pane status, ordering, and authorized attachment behavior. Machine-only entries show their registered name/path and Stopped state, with navigation to the existing Start control; a running inventory report is presented truthfully while its session is still arriving.
+
+Only owned machine inventory may add sessionless entries. Shared-machine compute visibility alone must not become project-content or attachment authority. Repeated reports and the later arrival of a real session must leave one project entry, not a registration placeholder beside it. Choose a deterministic representative machine for navigation only; visiting its inventory never starts or attaches a project.
+
+Apply the same projection to expanded and collapsed desktop lists and to mobile All projects, including bootstrap inventory before live machine reports arrive. Preserve mobile session recency and Idle sessions behavior. Reuse the creation result's owner/machine/project navigation convention rather than adding another start path.
+
+
 ## Risks / Trade-offs
 
 - **Existing project startup could restore agents** → registration-only completion with explicit Start controls; preserve any already-running runtime.
 - **Alias paths, repeated clicks, or partial writes could split identity** → canonical-path and ID checks, serialized/rechecked metadata creation, and retry using retained APAS metadata.
 - **A registration helper may silently mutate files or swallow errors** → inspect and reuse lower-level metadata/registry primitives; require durable confirmation before success.
 - **Machine-local permissions vary** → let the daemon report concrete filesystem failures; do not use browser/server filesystem guesses or shell interpolation.
-- **Registered folders lack sessions** → completion links to the owner machine inventory rather than broadening session-based sidebar models.
+- **Registered folders lack sessions** → list their stable project identity separately from session identity and link to explicit machine management; never start agents or fabricate sessions for visibility.
 - **Shared users cannot import existing host folders** → intentionally retain the existing shared clone flow; directory-scoped guest grants are outside this change.
 - **Rolling upgrades expose mixed capabilities** → default unsupported capability to false and enforce it server-side.
 
@@ -84,3 +93,5 @@ Keep the local form open through completion: retain entered values on send failu
 Implement and verify the protocol, daemon operation, server authorization, and web flow as one change. Update the canonical runbook after behavioral smoke proof. No database migration or provider restart is required for the feature itself.
 
 When deployment is separately requested, roll out server first, web second, then gracefully update/reconnect daemons. Existing web clients continue cloning; new web clients offer local registration only for upgraded owner machines. Rollback hides/refuses local registration when capability projection disappears. Existing `.apas` files and normal registry entries remain usable by the CLI; do not remove user directories or their metadata during rollback.
+
+The registered-project visibility correction is web-only. Verify desktop, rail, and mobile behavior, then deploy the web frontend without restarting the server, daemons, projects, or providers.

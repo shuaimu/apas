@@ -6,6 +6,18 @@ export interface MachineProjectTarget {
   isRunning: boolean;
 }
 
+/** Inspect one registered placement; visiting this URL never starts it. */
+export function machineProjectHref(target: {
+  machineId: string;
+  projectId: string;
+  clusterOwnerUserId?: string;
+}): string {
+  const owner = encodeURIComponent(target.clusterOwnerUserId || "owned");
+  const machine = encodeURIComponent(target.machineId);
+  const project = encodeURIComponent(target.projectId);
+  return `/machines?cluster_owner=${owner}&machine=${machine}&project=${project}#project-${machine}-${project}`;
+}
+
 function normalizeComparablePath(path: string | undefined): string | null {
   if (!path) return null;
   const trimmed = path.trim();

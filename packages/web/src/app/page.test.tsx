@@ -25,6 +25,8 @@ const storeMock = vi.hoisted(() => {
     serverVersion: null,
     sessionId: null,
     sessions: [],
+    machines: [],
+    machineListReceived: false,
     setUserEmail: vi.fn(),
     token: null,
     userEmail: null,
