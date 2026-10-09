@@ -42,3 +42,10 @@
 - [x] 6.2 Show registered/stopped entries in the desktop sidebar and collapsed rail with accessible navigation to explicit Start; preserve real-session selection, unread state, ordering, and project actions.
 - [x] 6.3 Show the same registered/stopped entries in mobile All projects from bootstrap and live inventory, without changing existing session recency, Idle sessions, or attachment behavior.
 - [x] 6.4 Run integrated web checks and real browser smoke, update the canonical runbook after proof, and deploy the web-only correction. Verify q-index is visible while it remains stopped and existing production runtimes are unchanged.
+
+## 7. Preserve the selected registration machine
+
+- [x] 7.1 Add nullable owner-scoped preferred-machine persistence with guarded migration, update it only on successful authenticated local registration, and project it authoritatively through bootstrap and live/heartbeat inventory without trusting daemon-supplied preference.
+- [x] 7.2 Carry the optional field through generated contracts and web adapters; prefer actual runtime/session placement, then the saved registration machine, and retain deterministic legacy fallback and existing access boundaries across desktop/rail/mobile.
+- [x] 7.3 Run integrated backend/shared/web checks and exercise real persistence, reload/heartbeat behavior, and desktop/mobile host navigation using disposable local fixtures. Update the canonical runbook after smoke proof.
+- [ ] 7.4 Back up production database and deployed server/web artifacts, set only q-index's existing placement to zoo-005, deploy server then web, and verify persisted selection and all three UI surfaces while q-index stays stopped and daemons/providers retain their process identities.

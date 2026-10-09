@@ -12,6 +12,8 @@ Shared-cluster provisioning deliberately confines guests to newly allocated clon
 
 Daemon heartbeats update only in-memory machine inventory. The existing web Start gate additionally requires a durable hosting placement and canonical project policy. Register-only adoption therefore needs server finalization before it can truthfully offer a usable Start control.
 
+The first visibility correction selected an alphabetically stable inventory host. Shared registry reports put q-index on zoo-002 even though its owner registered it on zoo-005. The live database stores cluster placement but no machine for direct registrations; neither a row edit nor a fake historical session is a valid correction without adding durable machine-selection support.
+
 ## Goals / Non-Goals
 
 **Goals:** reuse APAS project metadata, registry, machine inventory, and lifecycle controls; add one non-destructive daemon operation; preserve clone compatibility; provide complete local-registration feedback on desktop and mobile.
@@ -73,9 +75,18 @@ Keep the local form open through completion: retain entered values on send failu
 
 Use the stable project ID to deduplicate inventory across machines and against existing sessions. A project-list entry carries either a real session ID or an explicit absent session plus an owner-scoped Machines link. Session-backed entries retain their existing metadata, pane status, ordering, and authorized attachment behavior. Machine-only entries show their registered name/path and Stopped state, with navigation to the existing Start control; a running inventory report is presented truthfully while its session is still arriving.
 
-Only owned machine inventory may add sessionless entries. Shared-machine compute visibility alone must not become project-content or attachment authority. Repeated reports and the later arrival of a real session must leave one project entry, not a registration placeholder beside it. Choose a deterministic representative machine for navigation only; visiting its inventory never starts or attaches a project.
+Only owned machine inventory may add sessionless entries. Shared-machine compute visibility alone must not become project-content or attachment authority. Repeated reports and the later arrival of a real session must leave one project entry, not a registration placeholder beside it. Prefer a reported running placement, then the explicitly selected registration machine within authorized inventory. Keep deterministic ordering only as the fallback for legacy registrations or an unavailable preferred machine; visiting inventory never starts or attaches a project.
 
 Apply the same projection to expanded and collapsed desktop lists and to mobile All projects, including bootstrap inventory before live machine reports arrive. Preserve mobile session recency and Idle sessions behavior. Reuse the creation result's owner/machine/project navigation convention rather than adding another start path.
+
+### 6. Persist registration-machine intent separately from runtime placement
+
+Add nullable `preferred_machine_id` to `project_cluster_placements`, scoped by project and hosting-cluster owner. Persist the authenticated pending request's selected machine only after successful local-registration finalization. Repeating registration explicitly on another eligible owned machine updates that preference; ordinary daemon inventory and session registration must not overwrite it. This is a navigation preference, not an exclusive runtime claim or an access grant.
+
+Expose the server-derived optional `preferred_machine_id` in project inventory. Daemon-reported values are not authoritative. Both mobile bootstrap and WebSocket inventory, including heartbeat broadcasts and server restarts, must agree with the saved preference. Reuse the existing machine projection/cache conventions and avoid per-project database queries or blocking work in the async runtime.
+
+The web carries the field through snake-case wire and camel-case store adapters and uses the shared project-list projection on all three surfaces. Running placement outranks a stopped preferred host; real sessions retain their existing selection and attachment behavior. A missing preference remains compatible with older servers and daemons. Never fabricate a session, set `is_running`, hardcode q-index, or rename another machine to influence selection.
+
 
 
 ## Risks / Trade-offs
@@ -90,8 +101,8 @@ Apply the same projection to expanded and collapsed desktop lists and to mobile 
 
 ## Migration Plan
 
-Implement and verify the protocol, daemon operation, server authorization, and web flow as one change. Update the canonical runbook after behavioral smoke proof. No database migration or provider restart is required for the feature itself.
+Implement and verify the protocol, daemon operation, server authorization, and web flow as one change. Update the canonical runbook after behavioral smoke proof. The host-selection correction adds a nullable database column using the existing guarded migration convention; existing registrations remain unset until explicitly registered again or deliberately backfilled. No provider restart is required.
 
 When deployment is separately requested, roll out server first, web second, then gracefully update/reconnect daemons. Existing web clients continue cloning; new web clients offer local registration only for upgraded owner machines. Rollback hides/refuses local registration when capability projection disappears. Existing `.apas` files and normal registry entries remain usable by the CLI; do not remove user directories or their metadata during rollback.
 
-The registered-project visibility correction is web-only. Verify desktop, rail, and mobile behavior, then deploy the web frontend without restarting the server, daemons, projects, or providers.
+The first registered-project visibility correction was web-only. The approved host-selection follow-up requires server then web deployment; old daemons keep reporting their existing inventory. Before production mutation, back up the database and deployed artifacts. Set only q-index's existing owner-scoped placement to zoo-005, verify the exact row and actual desktop/rail/mobile destinations, and leave q-index stopped with unchanged metadata. Preserve all daemon, pane-host, and provider processes through the server transport reconnect.

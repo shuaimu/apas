@@ -11,6 +11,7 @@ The web's new-project flow only offers GitHub cloning, so users cannot add an ex
 - Keep local-directory adoption restricted to the machine's owning account. Shared-cluster membership alone must not authorize importing arbitrary files from another account's machine; the existing shared GitHub-clone flow remains available under its current rules.
 - Report path, permission, offline-machine, unsupported-daemon, and registration errors in the creation flow. Confirm both local registration and server project/hosting placement before success so the existing Start control is usable; starting remains a separate explicit operation.
 - Include registered, never-started projects in desktop and mobile project lists as stopped entries. Keep session identity absent until a real session exists, and link these entries to their owner-scoped machine inventory for explicit Start.
+- Persist the machine explicitly selected for successful local registration. When shared inventory reports the same stopped project from several hosts, desktop and mobile navigation must prefer that machine rather than an alphabetically chosen host; actual running placement and real-session navigation remain authoritative.
 - Keep GitHub cloning and its current ownership, policy, request-correlation, and lifecycle behavior unchanged.
 
 ## Capabilities
@@ -26,7 +27,7 @@ None. Existing project-access, workspace, and lifecycle requirements remain in f
 ## Impact
 
 - Web: shared project-creation form, source-neutral entry points, machine filtering, pending-operation state, operation feedback, and registered-project visibility in the desktop sidebar/rail and mobile All projects.
-- Protocol/server: an explicit local-registration request/result, generated protocol artifacts, daemon capability advertisement, machine-owner authorization, authenticated result correlation, and canonical project/placement finalization without starting a runtime.
+- Protocol/server/database: an explicit local-registration request/result, generated protocol artifacts, daemon capability advertisement, machine-owner authorization, authenticated result correlation, canonical project/placement finalization, and a nullable preferred machine on each project/cluster placement without starting a runtime.
 - CLI daemon: reuse project metadata and registry primitives behind a non-destructive existing-directory registration operation; report the project through the normal machine inventory.
 - Verification: filesystem-preservation and identity-boundary regressions, authorization/protocol coverage, and browser smoke scenarios for all three directory types and the unchanged GitHub flow.
-- Documentation: update the canonical runbook's web project-creation guidance during implementation. No provider integration, dependency upgrade, host configuration change, or deployment is part of this proposal.
+- Documentation: update the canonical runbook's web project-creation guidance during implementation. The separately approved host-selection correction includes server/web deployment and a backed-up database correction selecting zoo-005 for q-index, without starting q-index or restarting daemons/providers. No provider integration, dependency upgrade, or host configuration change is included.

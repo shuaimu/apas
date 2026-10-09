@@ -108,6 +108,9 @@ pub struct SessionManager {
     machine_infos: DashMap<Uuid, MachineInfo>,
     /// Map of machine ID -> project list
     machine_projects: DashMap<Uuid, Vec<MachineProjectInfo>>,
+    /// DB-authoritative navigation preferences, scoped by cluster owner.
+    /// Separate from raw inventory so untrusted heartbeat fields cannot replace them.
+    project_machine_preferences: DashMap<Uuid, HashMap<String, Uuid>>,
     /// Cached shared-project access refs per user. Populated when the web
     /// layer computes accessible machines (e.g., on `ListMachines`). Used by
     /// the heartbeat-driven `broadcast_machines_update_for_user` so pushed
@@ -348,6 +351,7 @@ impl SessionManager {
             web_capabilities: DashMap::new(),
             machine_infos: DashMap::new(),
             machine_projects: DashMap::new(),
+            project_machine_preferences: DashMap::new(),
             shared_project_refs: DashMap::new(),
             shared_cluster_machine_access: DashMap::new(),
             recent_input_ids: DashMap::new(),
@@ -1726,6 +1730,42 @@ impl SessionManager {
         }
     }
 
+    pub(crate) fn set_project_machine_preferences(
+        &self,
+        owner: Uuid,
+        preferences: HashMap<String, Uuid>,
+    ) {
+        self.project_machine_preferences.insert(owner, preferences);
+    }
+
+    pub(crate) fn set_project_preferred_machine(
+        &self,
+        owner: Uuid,
+        project_id: String,
+        machine_id: Uuid,
+    ) {
+        self.project_machine_preferences
+            .entry(owner)
+            .or_default()
+            .insert(project_id, machine_id);
+    }
+
+    pub(crate) fn apply_project_machine_preferences(
+        &self,
+        machine_id: &Uuid,
+        projects: &mut [MachineProjectInfo],
+    ) {
+        let preferences = self
+            .daemon_owner(machine_id)
+            .and_then(|owner| self.project_machine_preferences.get(&owner));
+        for project in projects {
+            // Always overwrite the wire field, including when no preference exists.
+            project.preferred_machine_id = preferences
+                .as_ref()
+                .and_then(|preferences| preferences.get(&project.project_id).copied());
+        }
+    }
+
     pub fn get_machines_for_user(&self, user_id: &Uuid) -> Vec<MachineWithProjects> {
         self.machine_infos
             .iter()
@@ -1755,6 +1795,7 @@ impl SessionManager {
             .get(&machine_id)
             .map(|p| p.clone())
             .unwrap_or_default();
+        self.apply_project_machine_preferences(&machine_id, &mut projects);
 
         // Enrich is_running from active CLI sessions on the same host
         for session_entry in self.sessions.iter() {
@@ -1837,6 +1878,7 @@ impl SessionManager {
                     .get(&machine_id)
                     .map(|p| p.clone())
                     .unwrap_or_default();
+                self.apply_project_machine_preferences(&machine_id, &mut projects);
 
                 // Enrich running status from active sessions.
                 if let Some(active_dirs) = active_dirs_by_host.get(&host_key) {
@@ -1888,6 +1930,7 @@ impl SessionManager {
                     .map(|projects| projects.clone())
                     .unwrap_or_default();
                 projects.retain(|project| project_ids.contains(&project.project_id));
+                self.apply_project_machine_preferences(machine_id, &mut projects);
                 Some(MachineWithProjects {
                     machine,
                     projects,
@@ -2772,11 +2815,71 @@ mod tests {
             project_id: project_id.to_string(),
             name: Some(project_id.to_string()),
             path: path.to_string(),
+            preferred_machine_id: None,
             is_running: false,
             pid: None,
             memory_kb: None,
             last_error: None,
         }
+    }
+
+    #[test]
+    fn authoritative_preferences_survive_raw_heartbeats_in_every_machine_projection() {
+        let mgr = SessionManager::new();
+        let owner = Uuid::new_v4();
+        let other_owner = Uuid::new_v4();
+        let machine_id = Uuid::new_v4();
+        let other_machine = Uuid::new_v4();
+        let preferred = Uuid::new_v4();
+        let forged = Uuid::new_v4();
+        mgr.set_project_machine_preferences(
+            owner,
+            HashMap::from([("project".to_string(), preferred)]),
+        );
+        let mut raw = test_project("project", "/shared/project");
+        raw.preferred_machine_id = Some(forged);
+        for (id, user, host) in [
+            (machine_id, owner, "owner-host"),
+            (other_machine, other_owner, "other-host"),
+        ] {
+            let (tx, _rx) = mpsc::channel(16);
+            mgr.register_daemon(id, user, tx, test_machine(id, host), vec![raw.clone()]);
+        }
+        let web = Uuid::new_v4();
+        let (tx, mut rx) = mpsc::channel(16);
+        mgr.register_web(web, tx);
+        mgr.set_web_user(web, owner);
+        for claimed in [None, Some(forged)] {
+            raw.preferred_machine_id = claimed;
+            raw.is_running = true;
+            raw.pid = Some(123);
+            mgr.update_daemon_projects(&machine_id, vec![raw.clone()]);
+            let ServerToWeb::Machines { machines } = rx.try_recv().unwrap() else {
+                panic!("expected synchronous inventory broadcast");
+            };
+            assert_eq!(machines[0].projects[0].preferred_machine_id, Some(preferred));
+            assert!(machines[0].projects[0].is_running);
+            assert_eq!(machines[0].projects[0].pid, Some(123));
+        }
+        assert_eq!(mgr.get_machines_for_user(&other_owner)[0].projects[0].preferred_machine_id, None);
+        let shared = mgr.get_machines_for_project_refs(
+            &HashSet::new(),
+            &HashSet::from(["/shared/project".to_string()]),
+        );
+        assert_eq!(shared.len(), 2);
+        for machine in shared {
+            assert_eq!(
+                machine.projects[0].preferred_machine_id,
+                (machine.machine.machine_id == machine_id).then_some(preferred)
+            );
+        }
+        let redacted = mgr.get_redacted_shared_cluster_machines(&HashMap::from([(
+            machine_id,
+            HashSet::from(["project".to_string()]),
+        )]));
+        assert_eq!(redacted[0].projects[0].preferred_machine_id, Some(preferred));
+        mgr.set_project_machine_preferences(owner, HashMap::new());
+        assert_eq!(mgr.get_machines_for_user(&owner)[0].projects[0].preferred_machine_id, None);
     }
 
     fn sorted_pane_statuses(

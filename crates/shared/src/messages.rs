@@ -2293,6 +2293,10 @@ pub struct MachineProjectInfo {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
     pub path: String,
+    /// Server-persisted navigation preference within this machine's cluster.
+    /// This is neither a runtime placement lock nor an access grant.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preferred_machine_id: Option<Uuid>,
     #[serde(default)]
     pub is_running: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -3456,6 +3460,22 @@ impl ServerToWeb {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn machine_project_preference_is_optional_for_legacy_inventory() {
+        let mut project: MachineProjectInfo = serde_json::from_value(serde_json::json!({
+            "project_id": "legacy",
+            "path": "/legacy"
+        }))
+        .unwrap();
+        assert_eq!(project.preferred_machine_id, None);
+        assert!(serde_json::to_value(&project).unwrap().get("preferred_machine_id").is_none());
+        let machine_id = Uuid::new_v4();
+        project.preferred_machine_id = Some(machine_id);
+        let decoded: MachineProjectInfo =
+            serde_json::from_value(serde_json::to_value(project).unwrap()).unwrap();
+        assert_eq!(decoded.preferred_machine_id, Some(machine_id));
+    }
 
     #[test]
     fn reboot_pane_docs_do_not_describe_fresh_sessions() {

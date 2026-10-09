@@ -67,6 +67,7 @@ export function buildProjectList(
   machines: MachineWithProjects[],
 ): ProjectEntry[] {
   const projectMap = new Map<string, ProjectEntry>();
+  const preferredInventoryProjects = new Set<string>();
 
   // Sort sessions by date (newest first) so we keep the most recent per project
   const sortedSessions = [...sessions].sort((a, b) => {
@@ -118,8 +119,8 @@ export function buildProjectList(
     }
   }
 
-  // Inventory order can change between heartbeats. Pick a stable navigation
-  // target, preferring a running placement if its session has not arrived yet.
+  // Inventory order can change between heartbeats. Prefer running placements,
+  // then the saved registration host, then the deterministic legacy fallback.
   const orderedMachines = [...machines].sort((a, b) =>
     a.machine.hostname.localeCompare(b.machine.hostname)
     || a.machine.machineId.localeCompare(b.machine.machineId),
@@ -134,7 +135,12 @@ export function buildProjectList(
       // A shared compute grant is not a project-content grant. Real sessions
       // above already passed the server's project-access projection.
       if (machine.clusterAccess === "member") continue;
-      if (existing && (existing.isActive || !mp.isRunning)) continue;
+      const isPreferred = mp.preferredMachineId === machine.machine.machineId;
+      if (existing && (
+        existing.isActive
+        || (!mp.isRunning && (preferredInventoryProjects.has(mp.projectId) || !isPreferred))
+      )) continue;
+      if (isPreferred) preferredInventoryProjects.add(mp.projectId);
 
       projectMap.set(mp.projectId, {
         sessionId: null,

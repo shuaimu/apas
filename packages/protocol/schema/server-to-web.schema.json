@@ -1838,6 +1838,14 @@
           "format": "uint32",
           "minimum": 0
         },
+        "preferred_machine_id": {
+          "description": "Server-persisted navigation preference within this machine's cluster.\nThis is neither a runtime placement lock nor an access grant.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "uuid"
+        },
         "project_id": {
           "type": "string"
         }

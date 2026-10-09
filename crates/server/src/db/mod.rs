@@ -560,6 +560,7 @@ impl Database {
                 cluster_owner_user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
                 created_by_user_id TEXT NOT NULL REFERENCES users(id),
                 source TEXT NOT NULL,
+                preferred_machine_id TEXT,
                 created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 PRIMARY KEY (project_id, cluster_owner_user_id)
             )
@@ -567,6 +568,19 @@ impl Database {
         )
         .execute(&self.pool)
         .await?;
+        let placement_columns = sqlx::query("PRAGMA table_info(project_cluster_placements)")
+            .fetch_all(&self.pool)
+            .await?;
+        if !placement_columns
+            .iter()
+            .any(|column| column.get::<String, _>("name") == "preferred_machine_id")
+        {
+            sqlx::query(
+                "ALTER TABLE project_cluster_placements ADD COLUMN preferred_machine_id TEXT",
+            )
+            .execute(&self.pool)
+            .await?;
+        }
         sqlx::query(
             "CREATE INDEX IF NOT EXISTS idx_project_cluster_placements_cluster ON project_cluster_placements(cluster_owner_user_id, project_id)",
         )

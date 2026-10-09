@@ -42,6 +42,7 @@ fn project(id: &str) -> MachineProjectInfo {
         project_id: id.to_string(),
         name: Some("Plain folder".to_string()),
         path: format!("/plain/{id}"),
+        preferred_machine_id: None,
         is_running: false,
         pid: None,
         memory_kb: None,
@@ -202,6 +203,7 @@ async fn owner_registration_finalizes_identity_without_starting_or_creating_sess
     };
     assert_eq!(confirmed.project_id, project.project_id);
     assert_eq!(confirmed.path, project.path);
+    assert_eq!(confirmed.preferred_machine_id, Some(f.machine));
     assert!(!confirmed.is_running);
     assert!(f.daemon.try_recv().is_err());
     let canonical = f
@@ -244,6 +246,151 @@ async fn owner_registration_finalizes_identity_without_starting_or_creating_sess
     );
     assert_eq!(shared_refs.len(), 1);
     assert!(!shared_refs[0].local_project_registration_available);
+}
+
+#[tokio::test]
+async fn local_reselection_survives_server_restart_refresh_and_mobile_bootstrap() {
+    let mut f = Fixture::new().await;
+    let mut snapshot = project("reselected");
+    snapshot.preferred_machine_id = Some(Uuid::new_v4());
+    let first_machine = f.machine;
+    let wire = f.dispatch("first").await;
+    f.success(wire, snapshot.clone()).await;
+    assert!(matches!(
+        f.result("first").await,
+        LocalProjectRegistrationResult::Registered { project }
+            if project.preferred_machine_id == Some(first_machine)
+    ));
+
+    f.machine = Uuid::new_v4();
+    f.daemon = connect_daemon(&f.state, f.owner, f.machine);
+    let wire = f.dispatch("second").await;
+    let ((), refresh) = tokio::join!(
+        f.success(wire, snapshot.clone()),
+        f.state.refresh_project_machine_preferences(f.owner),
+    );
+    refresh.unwrap();
+    assert!(matches!(
+        f.result("second").await,
+        LocalProjectRegistrationResult::Registered { project }
+            if project.preferred_machine_id == Some(f.machine)
+    ));
+    assert_eq!(
+        f.state.db.list_project_machine_preferences(&f.owner.to_string())
+            .await.unwrap().get("reselected"),
+        Some(&f.machine)
+    );
+    for machine in f.state.sessions.get_machines_for_user(&f.owner) {
+        assert_eq!(machine.projects[0].preferred_machine_id, Some(f.machine));
+        assert!(!machine.projects[0].is_running);
+    }
+    assert!(f.daemon.try_recv().is_err());
+    assert!(f.state.db.get_sessions_for_user(&f.owner.to_string()).await.unwrap().is_empty());
+
+    let db = Database::new(&f.state.config.database.path).await.unwrap();
+    db.run_migrations().await.unwrap();
+    let restarted = AppState::new(db, f.state.config.clone());
+    // The daemon handshake hydrates this cache before its first synchronous push.
+    restarted.refresh_project_machine_preferences(f.owner).await.unwrap();
+    let (_connection, mut web) = connect_web(&restarted, f.owner);
+    let (tx, _daemon) = mpsc::channel(64);
+    restarted.sessions.register_daemon(
+        f.machine, f.owner, tx, machine(f.machine), vec![snapshot.clone()],
+    );
+    let ServerToWeb::Machines { machines } = web.try_recv().unwrap() else {
+        panic!("expected initial restart inventory");
+    };
+    assert_eq!(machines[0].projects[0].preferred_machine_id, Some(f.machine));
+
+    // An operational DB-only backfill becomes visible through explicit refresh,
+    // and subsequent raw heartbeat metadata cannot undo it.
+    restarted.db.set_project_preferred_machine("reselected", &f.owner.to_string(), first_machine)
+        .await.unwrap();
+    let refreshed = super::super::ws_web::list_accessible_machines_for_user(&restarted, &f.owner).await;
+    assert_eq!(refreshed[0].projects[0].preferred_machine_id, Some(first_machine));
+    restarted.sessions.update_daemon_projects(&f.machine, vec![snapshot]);
+    let ServerToWeb::Machines { machines } = web.try_recv().unwrap() else {
+        panic!("expected heartbeat inventory");
+    };
+    assert_eq!(machines[0].projects[0].preferred_machine_id, Some(first_machine));
+    assert!(!machines[0].projects[0].is_running);
+
+    let claims = crate::routes::auth::Claims {
+        sub: f.owner.to_string(),
+        exp: (chrono::Utc::now() + chrono::Duration::hours(1)).timestamp() as usize,
+        device_session_id: None,
+        token_kind: None,
+        credential_version: None,
+    };
+    let token = jsonwebtoken::encode(
+        &jsonwebtoken::Header::default(),
+        &claims,
+        &jsonwebtoken::EncodingKey::from_secret(restarted.config.auth.jwt_secret.as_bytes()),
+    ).unwrap();
+    let mut headers = axum::http::HeaderMap::new();
+    headers.insert(axum::http::header::AUTHORIZATION, format!("Bearer {token}").parse().unwrap());
+    let axum::Json(bootstrap) =
+        super::super::mobile::bootstrap(axum::extract::State(restarted), headers).await.unwrap();
+    assert_eq!(bootstrap.machines[0].projects[0].preferred_machine_id, Some(first_machine));
+}
+
+#[tokio::test]
+async fn failed_wrong_machine_stale_and_policy_rejected_results_preserve_selection() {
+    for reason in ["failed", "wrong-machine", "stale", "policy", "inventory"] {
+        let mut f = Fixture::new().await;
+        let snapshot = project("preserved");
+        let wire = f.dispatch("selected").await;
+        f.success(wire, snapshot.clone()).await;
+        assert!(matches!(f.result("selected").await, LocalProjectRegistrationResult::Registered { .. }));
+        let selected = f.machine;
+        f.machine = Uuid::new_v4();
+        f.daemon = connect_daemon(&f.state, f.owner, f.machine);
+        let wire = f.dispatch(reason).await;
+        match reason {
+            "wrong-machine" => {
+                registered(&f.state, &selected, wire.clone(), LocalProjectRegistrationResult::Registered {
+                    project: snapshot.clone(),
+                }).await;
+                assert!(f.state.sessions.pending_local_project_registration(&wire, &f.machine).is_some());
+                registered(&f.state, &f.machine, wire, LocalProjectRegistrationResult::Failed {
+                    error: "cancelled".to_string(),
+                }).await;
+                failure(f.result(reason).await);
+            }
+            "stale" => {
+                f.state.sessions.unregister_daemon(&f.machine);
+                failure(f.result(reason).await);
+                f.daemon = connect_daemon(&f.state, f.owner, f.machine);
+                f.success(wire, snapshot).await;
+            }
+            "policy" => {
+                f.state.sessions.set_daemon_capabilities(
+                    f.machine, vec![shared::LOCAL_PROJECT_REGISTRATION_CAPABILITY.to_string()],
+                );
+                f.success(wire, snapshot).await;
+                assert!(failure(f.result(reason).await).contains("project policy"));
+            }
+            "inventory" => {
+                registered(&f.state, &f.machine, wire, LocalProjectRegistrationResult::Registered {
+                    project: snapshot,
+                }).await;
+                assert!(failure(f.result(reason).await).contains("inventory"));
+            }
+            _ => {
+                registered(&f.state, &f.machine, wire, LocalProjectRegistrationResult::Failed {
+                    error: "directory unavailable".to_string(),
+                }).await;
+                failure(f.result(reason).await);
+            }
+        }
+        assert_eq!(
+            f.state.db.list_project_machine_preferences(&f.owner.to_string())
+                .await.unwrap().get("preserved"),
+            Some(&selected),
+            "{reason} must not replace successful selection"
+        );
+        assert!(f.daemon.try_recv().is_err());
+    }
 }
 
 #[tokio::test]
@@ -626,6 +773,9 @@ async fn foreign_suspended_and_deleting_identities_fail_without_cleanup_or_owner
             .authorize_project_registration(id, &owner.to_string())
             .await
             .unwrap();
+        let preferred = Uuid::new_v4();
+        assert!(f.state.db.set_project_preferred_machine(id, &owner.to_string(), preferred)
+            .await.unwrap());
         if id == "suspended" {
             f.state
                 .db
@@ -656,6 +806,10 @@ async fn foreign_suspended_and_deleting_identities_fail_without_cleanup_or_owner
                 .unwrap()
                 .owner_user_id,
             owner.to_string()
+        );
+        assert_eq!(
+            f.state.db.list_project_machine_preferences(&owner.to_string()).await.unwrap().get(id),
+            Some(&preferred)
         );
         assert!(f
             .state
@@ -921,6 +1075,11 @@ async fn websocket_no_git_registration_is_ready_for_a_subsequent_explicit_start(
 #[tokio::test]
 async fn policy_resolution_failure_retains_registration_and_is_manually_retryable() {
     let mut f = Fixture::new().await;
+    let previous = Uuid::new_v4();
+    f.state.db.authorize_project_registration("policy-failure", &f.owner.to_string())
+        .await.unwrap();
+    assert!(f.state.db.set_project_preferred_machine("policy-failure", &f.owner.to_string(), previous)
+        .await.unwrap());
     let pool = sqlx::SqlitePool::connect_with(
         sqlx::sqlite::SqliteConnectOptions::new().filename(f.dir.join("server.db")),
     )
@@ -934,6 +1093,10 @@ async fn policy_resolution_failure_retains_registration_and_is_manually_retryabl
     let wire = f.dispatch("policy-failure").await;
     f.success(wire, snapshot.clone()).await;
     assert!(failure(f.result("policy-failure").await).contains("project_policy_overrides"));
+    assert_eq!(
+        f.state.db.list_project_machine_preferences(&f.owner.to_string()).await.unwrap().get("policy-failure"),
+        Some(&previous)
+    );
     assert_eq!(
         f.state
             .db
@@ -963,6 +1126,10 @@ async fn policy_resolution_failure_retains_registration_and_is_manually_retryabl
         f.result("manual-retry").await,
         LocalProjectRegistrationResult::Registered { .. }
     ));
+    assert_eq!(
+        f.state.db.list_project_machine_preferences(&f.owner.to_string()).await.unwrap().get("policy-failure"),
+        Some(&f.machine)
+    );
     assert!(f.daemon.try_recv().is_err());
     pool.close().await;
 }

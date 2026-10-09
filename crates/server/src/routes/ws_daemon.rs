@@ -129,6 +129,18 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
         }
     }
 
+    // Hydrate persisted preferences before register_daemon's synchronous first
+    // broadcast. Raw daemon registration/heartbeats never supply this metadata.
+    if let Err(error) = state.refresh_project_machine_preferences(user_id).await {
+        tracing::warn!(%user_id, %error, "Could not load project machine preferences");
+        let text = serde_json::to_string(&registration_failed(
+            "Could not load project machine preferences",
+        ))
+        .unwrap();
+        let _ = sender.send(Message::Text(text.into())).await;
+        return;
+    }
+
     // Channel for async server->daemon commands.
     let (tx, mut rx) = mpsc::channel::<ServerToDaemon>(64);
     let connection_sender = tx.clone();
@@ -549,6 +561,7 @@ mod tests {
             project_id: project_id.to_string(),
             name: Some(project_id.to_string()),
             path: path.to_string(),
+            preferred_machine_id: None,
             is_running,
             pid: is_running.then_some(1234),
             memory_kb: None,

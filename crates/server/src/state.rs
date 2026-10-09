@@ -38,6 +38,8 @@ pub struct AppState {
     pub pane_work_summaries: Arc<PaneWorkSummaryService>,
     mobile_task_launch_gates: Arc<DashMap<Uuid, Arc<Mutex<()>>>>,
     project_mutation_gates: Arc<DashMap<String, Arc<RwLock<()>>>>,
+    /// Serialize DB reads/publication with successful local reselections per owner.
+    project_machine_preference_gates: Arc<DashMap<Uuid, Arc<Mutex<()>>>>,
 }
 
 impl AppState {
@@ -71,7 +73,34 @@ impl AppState {
             pane_work_summaries,
             mobile_task_launch_gates: Arc::new(DashMap::new()),
             project_mutation_gates: Arc::new(DashMap::new()),
+            project_machine_preference_gates: Arc::new(DashMap::new()),
         }
+    }
+
+    pub(crate) async fn project_machine_preference_guard(
+        &self,
+        owner: Uuid,
+    ) -> OwnedMutexGuard<()> {
+        self.project_machine_preference_gates
+            .entry(owner)
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
+            .lock_owned()
+            .await
+    }
+
+    pub(crate) async fn refresh_project_machine_preferences(
+        &self,
+        owner: Uuid,
+    ) -> anyhow::Result<()> {
+        let _guard = self.project_machine_preference_guard(owner).await;
+        let preferences = self
+            .db
+            .list_project_machine_preferences(&owner.to_string())
+            .await?;
+        self.sessions
+            .set_project_machine_preferences(owner, preferences);
+        Ok(())
     }
 
     pub async fn mobile_task_launch_guard(&self, request_id: Uuid) -> OwnedMutexGuard<()> {

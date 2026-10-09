@@ -207,6 +207,12 @@ async fn finalize(
         .await,
         "The registered project is not authorized for an explicit Start"
     );
+    // Refreshes and other successful registrations share this owner-scoped
+    // gate through DB commit and cache publication; an older refresh cannot
+    // overwrite a newer selection.
+    let _preference_guard = state
+        .project_machine_preference_guard(pending.user_id)
+        .await;
     // Recheck after the asynchronous DB work, and acknowledge the current raw
     // inventory rather than trusting stale runtime fields in the result.
     authorize_target(state, &pending.connection_id, &pending.machine_id, None).await?;
@@ -225,12 +231,33 @@ async fn finalize(
             .local_project_registration_is_current(pending),
         "The registration connection changed; retry manually"
     );
-    state
+    let mut registered = state
         .sessions
         .registered_local_project(&pending.machine_id, &project.project_id, &project.path)
         .ok_or_else(|| {
             anyhow::anyhow!("The registered project left the machine inventory; retry manually")
-        })
+        })?;
+    anyhow::ensure!(
+        state
+            .db
+            .set_project_preferred_machine(
+                &project.project_id,
+                &pending.user_id.to_string(),
+                pending.machine_id,
+            )
+            .await?,
+        "The registered project placement is no longer active"
+    );
+    state.sessions.set_project_preferred_machine(
+        pending.user_id,
+        project.project_id,
+        pending.machine_id,
+    );
+    registered.preferred_machine_id = Some(pending.machine_id);
+    state
+        .sessions
+        .broadcast_machines_update_for_user(&pending.user_id);
+    Ok(registered)
 }
 
 pub(super) async fn registered(

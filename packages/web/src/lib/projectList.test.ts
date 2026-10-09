@@ -96,13 +96,48 @@ describe("registered project visibility", () => {
       .toBe("machine-b");
   });
 
+  it("prefers the saved stopped host regardless of report order, but running inventory wins", () => {
+    const first = registration("machine-002", "zoo-002");
+    const preferred = registration("machine-005", "zoo-005");
+    for (const entry of [first, preferred]) entry.projects[0].preferredMachineId = "machine-005";
+    for (const machines of [[first, preferred], [preferred, first]]) {
+      const [project] = buildProjectList([], [], machines);
+      expect(project).toMatchObject({ hostname: "zoo-005", sessionId: null, isActive: false });
+      expect(new URL(project.machinesHref!, "https://apas.invalid").searchParams.get("machine"))
+        .toBe("machine-005");
+    }
+    first.projects[0].isRunning = true;
+    for (const machines of [[first, preferred], [preferred, first]]) {
+      const [project] = buildProjectList([], [], machines);
+      expect(project).toMatchObject({ hostname: "zoo-002", sessionId: null, isActive: true });
+      expect(new URL(project.machinesHref!, "https://apas.invalid").searchParams.get("machine"))
+        .toBe("machine-002");
+    }
+  });
+
+  it("falls back when the saved host is absent and never grants member inventory access", () => {
+    const first = registration("machine-002", "zoo-002");
+    const second = registration("machine-003", "zoo-003");
+    const member = { ...registration("machine-005", "zoo-005"), clusterAccess: "member" as const };
+    for (const entry of [first, second, member]) entry.projects[0].preferredMachineId = "machine-005";
+    expect(buildProjectList([], [], [member])).toEqual([]);
+    for (const machines of [[second, first], [member, second, first]]) {
+      const [project] = buildProjectList([], [], machines);
+      expect(project).toMatchObject({ hostname: "zoo-002", sessionId: null, isActive: false });
+      expect(new URL(project.machinesHref!, "https://apas.invalid").searchParams.get("machine"))
+        .toBe("machine-002");
+    }
+  });
+
   it("replaces registration with the real active session rather than inventing an attachment id", () => {
     const inventory = registration("machine-a", "alpha");
+    inventory.projects[0].preferredMachineId = "machine-a";
     const history: SessionInfo = {
       id: "history-session",
       projectId: "registered-project",
       workingDir: "/work/q-index",
       status: "inactive",
+      hostname: "session-host",
       createdAt: "2026-10-09T01:00:00Z",
     };
     const active: SessionInfo = {
@@ -119,6 +154,7 @@ describe("registered project visibility", () => {
     expect(projects.map((project) => project.sessionId)).toEqual(["actual-session"]);
     expect(projects[0]).toMatchObject({
       isActive: true,
+      hostname: "session-host",
       gitRemote: "github.com/example/q-index",
       panes: [{ pane_id: 42, is_working: true }],
     });

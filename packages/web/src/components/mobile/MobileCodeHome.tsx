@@ -67,6 +67,7 @@ interface MobileMachineProject {
   name?: string;
   path?: string;
   is_running?: boolean;
+  preferred_machine_id?: string;
 }
 
 interface MobileMachineSummary {
@@ -119,6 +120,7 @@ function adaptMachine(entry: MachineWithProjects): MobileMachineSummary {
       name: project.name,
       path: project.path,
       is_running: project.isRunning,
+      preferred_machine_id: project.preferredMachineId,
     })),
     cluster_owner_user_id: entry.clusterOwnerUserId,
     cluster_access: entry.clusterAccess,
@@ -322,6 +324,7 @@ export function MobileCodeHome({
         name: project.name,
         path: project.path ?? "",
         isRunning: project.is_running === true,
+        preferredMachineId: project.preferred_machine_id,
       })),
       clusterOwnerUserId: entry.cluster_owner_user_id,
       clusterAccess: entry.cluster_access,

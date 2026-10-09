@@ -845,6 +845,51 @@ describe("mobile registered projects", () => {
     expect(screen.getByRole("article", { name: "Registered project q-index" })).toBeTruthy();
   });
 
+  it("keeps the preferred stopped host from bootstrap through reordered live heartbeats", async () => {
+    const bootstrapMachines = ["002", "005"].map((suffix) => ({
+      ...bootstrapInventory,
+      machine: { machine_id: `machine-${suffix}`, hostname: `zoo-${suffix}` },
+      projects: [{ ...bootstrapInventory.projects[0], preferred_machine_id: "machine-005" }],
+    }));
+    stubBootstrap({ sessions: [], machines: bootstrapMachines });
+    const home = renderHomeWith({ active: true });
+    await screen.findByRole("article", { name: "Registered project q-index" });
+    const expectPreferredCard = () => {
+      const cards = screen.getAllByRole("article", { name: "Registered project q-index" });
+      expect(cards).toHaveLength(1);
+      const card = cards[0];
+      expect(within(card).getByText("zoo-005")).toBeTruthy();
+      expect(within(card).queryByText("zoo-002")).toBeNull();
+      expect(within(card).getByText("Stopped")).toBeTruthy();
+      const link = within(card).getByRole("link", { name: "View q-index on Machines" });
+      expect(new URL(link.getAttribute("href")!, "https://apas.test").searchParams.get("machine"))
+        .toBe("machine-005");
+      expect(within(card).queryByRole("button")).toBeNull();
+    };
+    expectPreferredCard();
+    const liveMachines = ["005", "002"].map((suffix) => ({
+      ...inventory,
+      machine: { ...inventory.machine, machineId: `machine-${suffix}`, hostname: `zoo-${suffix}` },
+      projects: [{ ...registeredProject, preferredMachineId: "machine-005" }],
+    }));
+    for (const machines of [liveMachines, [...liveMachines].reverse()]) {
+      home.rerender({ ...home.props, machineListReceived: true, liveMachines: machines });
+      expectPreferredCard();
+    }
+    home.rerender({
+      ...home.props,
+      machineListReceived: true,
+      liveMachines: liveMachines.filter((entry) => entry.machine.machineId === "machine-002"),
+    });
+    const fallback = screen.getByRole("article", { name: "Registered project q-index" });
+    expect(within(fallback).getByText("zoo-002")).toBeTruthy();
+    const link = within(fallback).getByRole("link", { name: "View q-index on Machines" });
+    expect(new URL(link.getAttribute("href")!, "https://apas.test").searchParams.get("machine"))
+      .toBe("machine-002");
+    expect(home.props.onOpenSession).not.toHaveBeenCalled();
+    expect(home.props.onRebootDaemon).not.toHaveBeenCalled();
+  });
+
   it("takes live registration metadata and removes bootstrap entries after an empty live roster", async () => {
     stubBootstrap({ sessions: [], machines: [bootstrapInventory] });
     const home = renderHomeWith({ active: true });
@@ -942,7 +987,10 @@ describe("mobile registered projects", () => {
   it("never turns member-only bootstrap or live inventory into All projects membership", async () => {
     stubBootstrap({
       sessions: [],
-      machines: [{ ...bootstrapInventory, cluster_access: "member" }],
+      machines: [{
+        ...bootstrapInventory, cluster_access: "member",
+        projects: [{ ...bootstrapInventory.projects[0], preferred_machine_id: "machine-q" }],
+      }],
     });
     const home = renderHomeWith({ active: true });
     await waitFor(() => expect(localStorage.getItem("apas_mobile_cluster_owner")).toBe("owner-q"));
@@ -951,7 +999,10 @@ describe("mobile registered projects", () => {
     home.rerender({
       ...home.props,
       machineListReceived: true,
-      liveMachines: [{ ...inventory, clusterAccess: "member" }],
+      liveMachines: [{
+        ...inventory, clusterAccess: "member",
+        projects: [{ ...registeredProject, preferredMachineId: "machine-q" }],
+      }],
     });
     expect(screen.queryByRole("article")).toBeNull();
     expect(screen.queryByRole("link", { name: /on Machines/ })).toBeNull();

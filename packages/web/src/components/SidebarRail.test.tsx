@@ -135,7 +135,8 @@ describe("SidebarRail", () => {
 
   it("offers one keyboard-focusable Machines link for duplicate owned registrations without attaching or starting", () => {
     const owned = {
-      ...makeMachine([{ projectId: "p-q-index", name: "q-index", path: "/work/q-index", isRunning: false }]),
+      ...makeMachine([{ projectId: "p-q-index", name: "q-index", path: "/work/q-index", isRunning: false, preferredMachineId: "machine-005" }]),
+      machine: { machineId: "machine-002", hostname: "zoo-002", os: "linux", arch: "x64" },
       clusterOwnerUserId: "owner-1",
       clusterAccess: "owner" as const,
     };
@@ -143,7 +144,7 @@ describe("SidebarRail", () => {
       sessions: [],
       machines: [
         owned,
-        { ...owned, machine: { ...owned.machine, machineId: "machine-2" } },
+        { ...owned, machine: { ...owned.machine, machineId: "machine-005", hostname: "zoo-005" } },
         { ...makeMachine([{ projectId: "p-member", path: "/work/member-only", isRunning: false }]), clusterAccess: "member" },
       ],
       unreadSessions: new Set(["p-q-index"]),
@@ -156,7 +157,7 @@ describe("SidebarRail", () => {
     const destination = new URL(link.getAttribute("href")!, "https://apas.test");
     expect(destination.pathname).toBe("/machines");
     expect(destination.searchParams.get("cluster_owner")).toBe("owner-1");
-    expect(destination.searchParams.get("machine")).toMatch(/^machine-[12]$/);
+    expect(destination.searchParams.get("machine")).toBe("machine-005");
     expect(destination.searchParams.get("project")).toBe("p-q-index");
     expect(screen.queryByRole("link", { name: /member-only/ })).toBeNull();
     expect(link.getAttribute("aria-current")).toBeNull();

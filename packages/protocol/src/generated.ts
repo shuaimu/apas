@@ -1138,6 +1138,11 @@ export interface MachineProjectInfo {
   name?: string | null;
   path: string;
   pid?: number | null;
+  /**
+   * Server-persisted navigation preference within this machine's cluster.
+   * This is neither a runtime placement lock nor an access grant.
+   */
+  preferred_machine_id?: string | null;
   project_id: string;
   [k: string]: unknown;
 }

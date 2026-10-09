@@ -230,7 +230,8 @@ describe("Sidebar project list", () => {
 
   it("shows owned registrations once and navigates without inventing a session or starting a runtime", () => {
     const owned = {
-      ...makeMachine([{ projectId: "p-q-index", name: "q-index", path: "/repo/q-index", isRunning: false }]),
+      ...makeMachine([{ projectId: "p-q-index", name: "q-index", path: "/repo/q-index", isRunning: false, preferredMachineId: "machine-005" }]),
+      machine: { machineId: "machine-002", hostname: "zoo-002", os: "linux", arch: "x64" },
       clusterOwnerUserId: "owner-1",
       clusterAccess: "owner" as const,
     };
@@ -238,7 +239,7 @@ describe("Sidebar project list", () => {
       sessions: [],
       machines: [
         owned,
-        { ...owned, machine: { ...owned.machine, machineId: "machine-2" } },
+        { ...owned, machine: { ...owned.machine, machineId: "machine-005", hostname: "zoo-005" } },
         { ...makeMachine([{ projectId: "p-member", path: "/repo/member-only", isRunning: false }]), clusterAccess: "member" },
       ],
     });
@@ -251,7 +252,9 @@ describe("Sidebar project list", () => {
     const destination = new URL(link.getAttribute("href")!, "https://apas.test");
     expect(destination.pathname).toBe("/machines");
     expect(destination.searchParams.get("cluster_owner")).toBe("owner-1");
-    expect(destination.searchParams.get("machine")).toMatch(/^machine-[12]$/);
+    expect(destination.searchParams.get("machine")).toBe("machine-005");
+    expect(screen.getByText("zoo-005")).toBeTruthy();
+    expect(screen.queryByText("zoo-002")).toBeNull();
     expect(destination.searchParams.get("project")).toBe("p-q-index");
     expect(screen.getByText("Stopped")).toBeTruthy();
     expect(container.querySelectorAll('[data-project-id="p-q-index"]')).toHaveLength(1);

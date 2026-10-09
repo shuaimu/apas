@@ -582,6 +582,51 @@ impl Database {
         Ok(changed)
     }
 
+    /// Bulk owner-scoped preferences; daemon inventory is never authoritative.
+    pub async fn list_project_machine_preferences(
+        &self,
+        cluster_owner_user_id: &str,
+    ) -> Result<std::collections::HashMap<String, uuid::Uuid>> {
+        let rows = sqlx::query_as::<_, (String, String)>(
+            r#"SELECT project_id, preferred_machine_id
+               FROM project_cluster_placements
+               WHERE cluster_owner_user_id = ? AND preferred_machine_id IS NOT NULL"#,
+        )
+        .bind(cluster_owner_user_id)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|(project_id, machine_id)| {
+                Ok((project_id, uuid::Uuid::parse_str(&machine_id)?))
+            })
+            .collect()
+    }
+
+    /// Set only an existing, active placement after local registration checks.
+    /// Ordinary project/session registration deliberately never calls this.
+    pub async fn set_project_preferred_machine(
+        &self,
+        project_id: &str,
+        cluster_owner_user_id: &str,
+        machine_id: uuid::Uuid,
+    ) -> Result<bool> {
+        Ok(sqlx::query(
+            r#"UPDATE project_cluster_placements SET preferred_machine_id = ?
+               WHERE project_id = ? AND cluster_owner_user_id = ?
+                 AND EXISTS (SELECT 1 FROM projects p
+                             WHERE p.id = project_id AND p.lifecycle_status = 'active')
+                 AND EXISTS (SELECT 1 FROM users u
+                             WHERE u.id = cluster_owner_user_id AND u.account_status = 'active')"#,
+        )
+        .bind(machine_id.to_string())
+        .bind(project_id)
+        .bind(cluster_owner_user_id)
+        .execute(&self.pool)
+        .await?
+        .rows_affected()
+            > 0)
+    }
+
     pub async fn project_is_placed_in_cluster(
         &self,
         project_id: &str,
@@ -633,7 +678,8 @@ impl Database {
         project_id: &str,
     ) -> Result<Vec<ProjectClusterPlacement>> {
         Ok(sqlx::query_as::<_, ProjectClusterPlacement>(
-            r#"SELECT project_id, cluster_owner_user_id, created_by_user_id, source, created_at
+            r#"SELECT project_id, cluster_owner_user_id, created_by_user_id, source,
+                      preferred_machine_id, created_at
                FROM project_cluster_placements WHERE project_id = ?
                ORDER BY created_at, cluster_owner_user_id"#,
         )
@@ -966,6 +1012,70 @@ mod tests {
         })
         .await
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn preferred_machine_migrates_and_survives_reopen_without_crossing_owners() {
+        let dir = std::env::temp_dir().join(format!("apas-machine-preference-{}", uuid::Uuid::new_v4()));
+        let path = dir.join("apas.db").to_string_lossy().into_owned();
+        let db = Database::new(&path).await.unwrap();
+        // Simulate the pre-column schema, then exercise the guarded migration twice.
+        sqlx::query(
+            r#"CREATE TABLE project_cluster_placements (
+                project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+                cluster_owner_user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                created_by_user_id TEXT NOT NULL REFERENCES users(id),
+                source TEXT NOT NULL,
+                created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (project_id, cluster_owner_user_id)
+            )"#,
+        )
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        db.run_migrations().await.unwrap();
+        for id in ["owner", "other", "unplaced"] {
+            user(&db, id, &format!("{id}@preference.test")).await;
+        }
+        db.authorize_project_registration("project", "owner").await.unwrap();
+        db.add_project_cluster_placement("project", "other", "other", "test")
+            .await
+            .unwrap();
+        assert!(db
+            .list_project_cluster_placements("project")
+            .await
+            .unwrap()
+            .iter()
+            .all(|placement| placement.preferred_machine_id.is_none()));
+        let first = uuid::Uuid::new_v4();
+        let second = uuid::Uuid::new_v4();
+        assert!(db.set_project_preferred_machine("project", "owner", first).await.unwrap());
+        assert!(db.set_project_preferred_machine("project", "other", second).await.unwrap());
+        assert!(!db.set_project_preferred_machine("project", "unplaced", first).await.unwrap());
+        // Ordinary daemon/session authorization must not erase local navigation intent.
+        db.authorize_project_registration("project", "owner").await.unwrap();
+        db.pool.close().await;
+        drop(db);
+
+        let reopened = Database::new(&path).await.unwrap();
+        reopened.run_migrations().await.unwrap();
+        for (owner, expected) in [("owner", first), ("other", second)] {
+            let preferences = reopened.list_project_machine_preferences(owner).await.unwrap();
+            assert_eq!(preferences.len(), 1);
+            assert_eq!(preferences.get("project"), Some(&expected));
+        }
+        assert!(reopened.list_project_machine_preferences("unplaced").await.unwrap().is_empty());
+        assert!(reopened.set_project_preferred_machine("project", "owner", second).await.unwrap());
+        assert_eq!(
+            reopened.list_project_machine_preferences("owner").await.unwrap().get("project"),
+            Some(&second)
+        );
+        assert_eq!(
+            reopened.list_project_machine_preferences("other").await.unwrap().get("project"),
+            Some(&second)
+        );
+        reopened.pool.close().await;
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[tokio::test]

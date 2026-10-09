@@ -302,8 +302,20 @@ from owned-machine inventory before their first session. They show **Stopped**
 or **Running** from that inventory and link to **View on Machines**, never to a
 fabricated session. Opening the link does not start the project. A real session,
 when one arrives, replaces registration-only navigation; duplicate registrations
-across hosts collapse by stable project ID. A running placement is preferred for
-machine navigation, otherwise the host choice is stable across heartbeat order.
+across hosts collapse by stable project ID. A reported running placement wins;
+otherwise a stopped registration prefers the machine explicitly selected during
+successful registration. Alphabetical host order is only the fallback when no
+preference exists or the preferred machine is absent from authorized inventory.
+
+The preference is nullable `project_cluster_placements.preferred_machine_id`,
+scoped by project and hosting-cluster owner. It is navigation intent, not a runtime
+claim or access grant. Explicit successful registration on another owned machine
+can change it; ordinary daemon/session registration and raw heartbeat fields
+cannot. The server supplies it to bootstrap and live inventory from an
+owner-scoped cache, hydrated at daemon connection and refreshed by ListMachines
+or mobile bootstrap. A deliberate database correction therefore takes effect on
+refresh without starting a project. The nullable migration and optional wire
+field require server then web deployment, not daemon/provider restarts.
 
 Member-only cluster inventory does not seed these entries: compute visibility
 does not grant project-content access. Existing authorized shared sessions remain

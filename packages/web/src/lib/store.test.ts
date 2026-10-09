@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { handleServerMessage, launchProfileKey, storeDebugLog, useStore, paneWatermarksToRecord, type Message, type CliClient, type TeamRecord, type SessionCacheEntry } from './store';
+import { buildProjectList } from './projectList';
 
 describe('useStore', () => {
   beforeEach(() => {
@@ -65,6 +66,27 @@ describe('useStore', () => {
   });
 
   describe('machine inventory freshness', () => {
+    it('keeps the saved navigation host through repeated machine reports without creating sessions', () => {
+      const reports = ['002', '005'].map((suffix) => ({
+        machine: { machine_id: `machine-${suffix}`, hostname: `zoo-${suffix}`, os: 'linux', arch: 'x64' },
+        cluster_owner_user_id: 'owner',
+        cluster_access: 'owner',
+        projects: [{
+          project_id: 'registered', name: 'q-index', path: '/work/q-index',
+          is_running: false, preferred_machine_id: 'machine-005',
+        }],
+      }));
+      for (const machines of [reports, [...reports].reverse()]) {
+        handleServerMessage({ type: 'machines', machines }, useStore.setState, useStore.getState);
+        const state = useStore.getState();
+        const [project] = buildProjectList(state.sessions, state.cliClients, state.machines);
+        expect(project).toMatchObject({ hostname: 'zoo-005', isActive: false, sessionId: null });
+        expect(new URL(project.machinesHref!, 'https://apas.test').searchParams.get('machine'))
+          .toBe('machine-005');
+        expect(state.sessions).toEqual([]);
+      }
+    });
+
     it('keeps an empty live roster authoritative and clears that authority on logout', () => {
       handleServerMessage({
         type: 'machines',

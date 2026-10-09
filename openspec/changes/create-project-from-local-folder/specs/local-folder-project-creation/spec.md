@@ -120,6 +120,30 @@ Successful local-folder registration SHALL make the project discoverable through
 - **WHEN** a shared-cluster member receives machine inventory without a corresponding authorized project session
 - **THEN** that inventory alone does not create a project entry or a session attachment target
 
+### Requirement: Registration preserves the selected machine for project navigation
+
+Successful local registration SHALL durably retain the authenticated selected machine on the project's hosting-cluster placement. Desktop sidebar, collapsed rail, and mobile All projects SHALL prefer that machine among authorized inventory reports when the project has no actual running placement or real session. The preference SHALL NOT grant access, create a session, start a runtime, or prevent an explicit start on another authorized host.
+
+#### Scenario: Shared inventory reports a newly registered stopped project
+- **WHEN** registration succeeds on zoo-005 and the same stable project ID is also reported by zoo-002
+- **THEN** the stopped project entry names zoo-005 and its Machines link targets zoo-005
+- **AND** browser reload, heartbeat updates, and a server restart retain that result
+
+#### Scenario: Repeat registration deliberately selects another host
+- **WHEN** the owner successfully registers the same identity on another eligible owned machine
+- **THEN** the persisted preference follows that explicit selection without creating another project
+- **AND** rejected or unrelated daemon results do not replace the preference
+
+#### Scenario: Actual runtime placement differs from the registration preference
+- **WHEN** the project is running on another authorized host or has a real session
+- **THEN** project navigation follows the existing running-placement or real-session behavior rather than mislabeling it as running on the preferred host
+
+#### Scenario: Legacy preference is absent or its machine is unavailable
+- **WHEN** a project has no saved preference or the preferred machine is absent from authorized inventory
+- **THEN** the existing deterministic inventory fallback remains available without granting access to the missing machine
+- **AND** no other machine is persisted as the preference merely because inventory order changes
+
+
 ### Requirement: Completion and failures are correlated and recoverable
 
 The web SHALL show a pending local-registration operation scoped to its request and target machine, then report confirmed success or an actionable failure. Blank or unsupported relative paths, missing paths, non-directories, unreadable or unwritable required metadata, offline daemons, and unsupported daemon versions SHALL not be presented as successful registration. Results from another machine or an unrelated request SHALL NOT complete the operation. Failure SHALL NOT delete existing directory contents or overwrite existing metadata; retry after a partial APAS-only write SHALL reuse that identity.

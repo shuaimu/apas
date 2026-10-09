@@ -242,6 +242,7 @@ pub struct ProjectClusterPlacement {
     pub cluster_owner_user_id: String,
     pub created_by_user_id: String,
     pub source: String,
+    pub preferred_machine_id: Option<String>,
     pub created_at: Option<String>,
 }
 

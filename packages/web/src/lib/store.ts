@@ -202,6 +202,7 @@ export interface MachineProject {
   name?: string;
   path: string;
   isRunning: boolean;
+  preferredMachineId?: string;
   pid?: number;
   /** Resident-set size in KiB, reported by daemon in heartbeat. */
   memoryKb?: number;
@@ -4067,6 +4068,7 @@ export function handleServerMessage(
             name: project.name as string | undefined,
             path: project.path as string,
             isRunning: Boolean(project.is_running),
+            preferredMachineId: project.preferred_machine_id as string | undefined,
             pid: project.pid as number | undefined,
             memoryKb: project.memory_kb as number | undefined,
             lastError: project.last_error as string | undefined,

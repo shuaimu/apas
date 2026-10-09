@@ -768,6 +768,7 @@ impl DaemonState {
                 project_id: project_id.clone(),
                 name: project.name.clone(),
                 path: project.path.to_string_lossy().to_string(),
+                preferred_machine_id: None,
                 is_running: running_here || external.is_some(),
                 pid,
                 memory_kb,

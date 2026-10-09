@@ -451,9 +451,6 @@ pub(crate) async fn list_accessible_machines_for_user(
         host_path_refs.clone(),
         wildcard_paths.clone(),
     );
-    if host_path_refs.is_empty() && wildcard_paths.is_empty() {
-        return machines;
-    }
 
     let owner_machine_ids: HashSet<Uuid> = machines.iter().map(|m| m.machine.machine_id).collect();
     for machine in state
@@ -464,6 +461,21 @@ pub(crate) async fn list_accessible_machines_for_user(
             continue;
         }
         machines.push(machine);
+    }
+    let owners: HashSet<Uuid> = machines
+        .iter()
+        .filter_map(|machine| state.sessions.daemon_owner(&machine.machine.machine_id))
+        .collect();
+    for owner in owners {
+        if let Err(error) = state.refresh_project_machine_preferences(owner).await {
+            tracing::warn!(%owner, %error, "Could not refresh project machine preferences");
+        }
+    }
+    for machine in &mut machines {
+        state.sessions.apply_project_machine_preferences(
+            &machine.machine.machine_id,
+            &mut machine.projects,
+        );
     }
 
     machines
@@ -583,6 +595,7 @@ mod machine_access_tests {
             project_id: project_id.to_string(),
             name: Some(project_id.to_string()),
             path: path.to_string(),
+            preferred_machine_id: None,
             is_running: false,
             pid: None,
             memory_kb: None,
