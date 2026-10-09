@@ -41,4 +41,4 @@
 - [x] 6.1 Merge owned machine registrations into the shared project-list projection using stable project identity and explicit absent session identity; deduplicate hosts and later sessions, retain authority boundaries, and reuse scoped Machines navigation.
 - [x] 6.2 Show registered/stopped entries in the desktop sidebar and collapsed rail with accessible navigation to explicit Start; preserve real-session selection, unread state, ordering, and project actions.
 - [x] 6.3 Show the same registered/stopped entries in mobile All projects from bootstrap and live inventory, without changing existing session recency, Idle sessions, or attachment behavior.
-- [ ] 6.4 Run integrated web checks and real browser smoke, update the canonical runbook after proof, and deploy the web-only correction. Verify q-index is visible while it remains stopped and existing production runtimes are unchanged.
+- [x] 6.4 Run integrated web checks and real browser smoke, update the canonical runbook after proof, and deploy the web-only correction. Verify q-index is visible while it remains stopped and existing production runtimes are unchanged.
