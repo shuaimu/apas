@@ -7,17 +7,19 @@ use tower_http::trace::TraceLayer;
 
 use crate::state::AppState;
 
-mod admin;
+pub(crate) mod admin;
 pub mod auth;
 mod authz;
-mod cluster;
+pub(crate) mod cluster;
 mod health;
+mod jobs;
+pub(crate) mod job_policy;
 mod local_projects;
 mod mobile;
-mod mobile_auth;
+pub(crate) mod mobile_auth;
 mod mobile_notifications;
-mod projects;
-mod share;
+pub(crate) mod projects;
+pub(crate) mod share;
 pub mod system_admin;
 mod ws_cli;
 mod ws_daemon;
@@ -32,6 +34,8 @@ pub fn create_router(state: AppState) -> Router {
         .allow_headers(Any);
 
     Router::new()
+        .merge(jobs::router())
+        .merge(job_policy::router())
         // Health check
         .route("/health", get(health::health_check))
         // Auth routes

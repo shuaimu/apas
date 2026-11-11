@@ -14,7 +14,7 @@ See proposal.md — Why. What already exists matters more than what is missing:
 
 - A pending question is visible and answerable from the conversation view, on a phone, without touching the xterm view.
 - A pane blocked on that question is visibly Pending answer everywhere pane activity is shown, rather than being collapsed into Working or Idle.
-- Reuse the existing card, queue, retransmit, and wire messages; the only genuinely new mechanism is keystroke delivery.
+- Reuse the existing card, stream envelopes, authorization, and status presentation. Claude keeps its existing answer transport; OMP receives a separate structured command and never enters the keystroke encoder.
 - Never report an answer as delivered on the strength of having written bytes at a pty.
 
 **Non-Goals:**
@@ -45,6 +45,14 @@ See proposal.md — Why. What already exists matters more than what is missing:
 6. **One answer, one delivery.** The pane sends keystrokes for a `tool_use_id` at most once. Combined with decision 4 this makes the web's existing retransmit safe: a retransmitted answer for a still-pending question is refused as already delivered, and one for an answered question is refused as settled.
 
 7. **Pending answer is an additive pane-status classification.** The existing status string continues to carry detailed working text and now uses one canonical Pending answer value for a blocked question. Session summaries add a defaulted `awaiting_answer` flag per pane; `is_working` excludes that value, and idle recency excludes it too. This keeps rolling compatibility while letting list snapshots heal missed live frames. The server sets Pending answer when it receives the question and returns the pane to Working only when the matching transcript `tool_result` arrives—not merely when answer bytes are queued. Web surfaces give Pending answer visual and ordering precedence over ordinary idle and usage-limited states.
+
+8. **OMP answers use the native dialog, not the terminal keyboard.** An isolated OMP 18.8.7 TUI verified that its pending `ask` arguments are durable and its shared `ctx.ui.askDialog` can be mediated by a pane-local extension. A structured submission produces OMP's own tool result and resumes the agent. Extend the existing embedded activity extension, retaining the native picker; enable the bridge only for a validated main-agent dialog. Preflight captures arguments, not execution identity: several calls can be prepared before one executes. Bind the exact call from `tool_execution_start`, whether it arrives before or after the dialog opens, and disable remote answering if overlapping executions are ambiguous.
+
+9. **OMP has a lossless, scoped answer contract.** Native question IDs, option arrays, and custom text remain separate. A required session, pane, opaque scoped tool ID, dialog generation, and request ID identify every answer/cancel. The server authorizes runtime access and claims the exact pending decision; the CLI validates the live provider generation, PID start time, transcript scope, and active dialog. Private bounded local IPC carries the response. Native acceptance acknowledges submission, while only the observed native result confirms the answer. No automatic answer replay.
+
+10. **Question recovery is independent of the prose cursor.** OMP question/result records are separate zero-usage turns. Reconcile pending identity and live bridge metadata on restore, reconnect, and branch changes without replaying old prose or billing usage twice. The web upserts repeated OMP question metadata by pane and tool ID. Native terminal answers, cancellation, and invalidation override submitted UI state; an unavailable question never appears successfully answered. Pi's similarly shaped extension tools remain outside this bridge.
+
+11. **The terminal is the compatibility fallback.** Missing or unsupported native UI APIs, old loaded extensions, and failed bridge setup must leave native interaction usable. Deploy server, then web, then CLI. Existing providers are not silently restarted to load the new extension. The interception seam is version-sensitive, so native runtime verification is required in addition to behavioral regression tests.
 
 ## Risks / Trade-offs
 

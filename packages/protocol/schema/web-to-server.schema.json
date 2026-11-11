@@ -4,6 +4,50 @@
   "description": "Messages sent from web client to server",
   "oneOf": [
     {
+      "type": "object",
+      "properties": {
+        "after_seq": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "job_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "project_id": {
+          "type": "string"
+        },
+        "type": {
+          "type": "string",
+          "const": "subscribe_job"
+        }
+      },
+      "required": [
+        "type",
+        "project_id",
+        "job_id",
+        "after_seq"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "job_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "type": {
+          "type": "string",
+          "const": "unsubscribe_job"
+        }
+      },
+      "required": [
+        "type",
+        "job_id"
+      ]
+    },
+    {
       "description": "Authenticate with JWT token",
       "type": "object",
       "properties": {
@@ -1230,6 +1274,54 @@
       ]
     },
     {
+      "description": "Lossless OMP submission. Scope and correlation are required, unlike the\nlegacy Claude answer path.",
+      "type": "object",
+      "properties": {
+        "answers": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/OmpQuestionAnswer"
+          }
+        },
+        "cancel": {
+          "type": "boolean",
+          "default": false
+        },
+        "dialog_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "pane_id": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "request_id": {
+          "type": "string"
+        },
+        "session_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "tool_use_id": {
+          "type": "string"
+        },
+        "type": {
+          "type": "string",
+          "const": "answer_omp_question"
+        }
+      },
+      "required": [
+        "type",
+        "session_id",
+        "pane_id",
+        "tool_use_id",
+        "dialog_id",
+        "request_id"
+      ]
+    },
+    {
       "description": "Ask the CLI for the current `git diff` between the pane's worktree\nbranch and the project's HEAD. Returns via `ServerToWeb::PaneDiff`.\nPhase 1.2a.",
       "type": "object",
       "properties": {
@@ -1697,6 +1789,31 @@
         "terminal_bridge_ready",
         "terminal_bridge_rejected_message",
         "terminal_bridge_crash"
+      ]
+    },
+    "OmpQuestionAnswer": {
+      "description": "A native OMP answer. Question identity and selections must not be flattened\ninto question text or comma-separated labels.",
+      "type": "object",
+      "properties": {
+        "customInput": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "id": {
+          "type": "string"
+        },
+        "selectedOptions": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "required": [
+        "id",
+        "selectedOptions"
       ]
     },
     "PaneCleanupAction": {

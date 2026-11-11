@@ -16,6 +16,8 @@ import { useMobileStore } from "@/state/store";
 import { clearCredentials } from "@/security/credentials";
 import { publishTerminalMessage } from "@/terminal/events";
 import { startNotificationAndLinkRuntime, stopNotificationAndLinkRuntime } from "@/notifications";
+import { acceptJobsBootstrap, setJobEnvironment, startJobsRuntime, stopJobsRuntime, purgeJobAccess } from "@/jobs/runtime";
+import { queryClient } from "@/query/client";
 
 let supervisor: ConnectionSupervisor | null = null;
 let cleanup: (() => void) | null = null;
@@ -31,15 +33,15 @@ export function startConnectionRuntime(): ConnectionSupervisor {
       const allowed = new Set(value.sessions.map((session) => session.id));
       await removeInaccessibleSessions(allowed);
       await replaceSessionSummaries(value.sessions);
+      await acceptJobsBootstrap(value);
     },
     setPhase: useMobileStore.getState().setConnection,
     setMutationsAllowed: useMobileStore.getState().setServerMutationsAllowed,
     setNegotiatedCapabilities: useMobileStore.getState().setNegotiatedCapabilities,
     applyBootstrap: (value) => {
       useMobileStore.getState().applyBootstrap(value);
-      if (value.features.notifications || value.features.deep_links) {
-        startNotificationAndLinkRuntime();
-      }
+      startJobsRuntime();
+      startNotificationAndLinkRuntime();
     },
     onMessage: (message) => {
       if (handlePaneWorkSummaryMessage(message)) return;
@@ -74,6 +76,9 @@ export function startConnectionRuntime(): ConnectionSupervisor {
     isAuthenticationLoss: (error) => error instanceof ApiError && [401, 403].includes(error.status),
     onAuthenticationLost: () => {
       void (async () => {
+        await stopJobsRuntime();
+        await purgeJobAccess();
+        queryClient.clear();
         await clearCredentials({ preserveInstallation: true });
         await wipeCache();
         useMobileStore.getState().reset();
@@ -82,9 +87,11 @@ export function startConnectionRuntime(): ConnectionSupervisor {
   });
   const networkSubscription = NetInfo.addEventListener((state) => {
     supervisor?.setNetworkOnline(Boolean(state.isConnected && state.isInternetReachable !== false));
+    setJobEnvironment({ online: Boolean(state.isConnected && state.isInternetReachable !== false) });
   });
   const appSubscription = AppState.addEventListener("change", (state) => {
     supervisor?.setForeground(state === "active");
+    setJobEnvironment({ foreground: state === "active" });
   });
   cleanup = () => {
     networkSubscription();
@@ -97,6 +104,7 @@ export function startConnectionRuntime(): ConnectionSupervisor {
 export function stopConnectionRuntime(): void {
   supervisor?.stop();
   supervisor = null;
+  void stopJobsRuntime();
   cleanup?.();
   stopNotificationAndLinkRuntime();
   cleanup = null;

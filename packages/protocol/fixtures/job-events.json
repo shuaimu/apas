@@ -1,0 +1,16 @@
+{
+  "events": [{
+    "id": "7c6d2400-7b4b-455d-b732-7f066dab7a24",
+    "job_id": "06974c2c-cd7d-446b-aac3-e0f550e739f6",
+    "run_id": "37642b7c-2d81-46c6-976f-2874e85919e6",
+    "seq": 3,
+    "kind": "recovery_required",
+    "summary": "Execution ownership must be reconciled.",
+    "created_at": "2026-11-08T00:00:00Z",
+    "detail": null
+  }],
+  "next_seq": 3,
+  "high_watermark": 5,
+  "has_more": true,
+  "resync_required": false
+}

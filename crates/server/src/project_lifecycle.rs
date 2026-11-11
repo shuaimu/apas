@@ -22,11 +22,22 @@ pub async fn cleanup_project(state: &AppState, project_id: &str) -> Result<()> {
         .iter()
         .filter_map(|id| Uuid::parse_str(id).ok())
         .collect::<Vec<_>>();
-
-    state
-        .sessions
-        .confirm_project_runtime_stopped(project_id)
-        .await?;
+    // Stop independent runtime families together. An offline job must retain
+    // the deletion manifest, not prevent reachable interactive hosts stopping.
+    let (jobs_stopped, interactive_stopped) = tokio::join!(
+        async {
+            crate::jobs::cancel_project_jobs(state, project_id, "project_deleting").await?;
+            crate::jobs::reconcile_authority(state).await?;
+            crate::jobs::project_jobs_stopped(state, project_id).await
+        },
+        state.sessions.confirm_project_runtime_stopped(project_id),
+    );
+    let jobs_stopped = jobs_stopped?;
+    interactive_stopped?;
+    anyhow::ensure!(
+        jobs_stopped,
+        "project cleanup awaits positive durable job stop and purge evidence"
+    );
     state
         .sessions
         .purge_project_state(project_id, &affected_user_ids)
@@ -47,22 +58,24 @@ pub async fn cleanup_project(state: &AppState, project_id: &str) -> Result<()> {
     Ok(())
 }
 
-/// Shield cleanup from an HTTP client disconnect and retry transient storage
-/// failures a bounded number of times. Durable `deleting` rows are recovered
-/// again on the next server start if all attempts fail.
+/// Keep the durable deleting manifest scheduled until every stop, host purge
+/// and storage cleanup succeeds. Startup recovery reschedules interrupted work.
 pub fn schedule_project_cleanup(state: AppState, project_id: String) {
+    if state.jobs.cleanup_scheduled.insert(project_id.clone(), ()).is_some() {
+        return;
+    }
     tokio::spawn(async move {
-        for attempt in 0..3_u64 {
+        let mut delay_seconds = 1_u64;
+        loop {
             match cleanup_project(&state, &project_id).await {
-                Ok(()) => return,
+                Ok(()) => {
+                    state.jobs.cleanup_scheduled.remove(&project_id);
+                    return;
+                }
                 Err(_) => {
-                    tracing::warn!(
-                        attempt = attempt + 1,
-                        "project deletion cleanup remains incomplete"
-                    );
-                    if attempt < 2 {
-                        tokio::time::sleep(Duration::from_secs(1 << attempt)).await;
-                    }
+                    tracing::warn!("project deletion cleanup remains incomplete");
+                    tokio::time::sleep(Duration::from_secs(delay_seconds)).await;
+                    delay_seconds = (delay_seconds * 2).min(30);
                 }
             }
         }

@@ -3,6 +3,7 @@ import Ajv2020 from "ajv/dist/2020.js";
 import codeEventSchema from "../schema/code-event.schema.json" with { type: "json" };
 import serverToWebSchema from "../schema/server-to-web.schema.json" with { type: "json" };
 import webToServerSchema from "../schema/web-to-server.schema.json" with { type: "json" };
+import jobSchema from "../schema/jobs.schema.json" with { type: "json" };
 
 const ajv = new Ajv2020({ allErrors: true, strict: false });
 ajv.addFormat("uuid", /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i);
@@ -16,6 +17,9 @@ ajv.addFormat("double", { type: "number", validate: Number.isFinite });
 const validateWebToServer = ajv.compile(webToServerSchema) as ValidateFunction;
 const validateServerToWeb = ajv.compile(serverToWebSchema) as ValidateFunction;
 const validateCodeEventValue = ajv.compile(codeEventSchema) as ValidateFunction;
+const jobValidators = new Map<JobContractKind, ValidateFunction>();
+
+export type JobContractKind = keyof typeof jobSchema.properties;
 
 export interface ValidationResult {
   valid: boolean;
@@ -37,4 +41,18 @@ export function validateServerMessage(value: unknown): ValidationResult {
 
 export function validateCodeEvent(value: unknown): ValidationResult {
   return result(validateCodeEventValue, value);
+}
+
+/** Validate the exact REST contract, not just a truthy response body. */
+export function validateJobContract(kind: JobContractKind, value: unknown): ValidationResult {
+  let validator = jobValidators.get(kind);
+  if (!validator) {
+    validator = ajv.compile({
+      $schema: jobSchema.$schema,
+      $defs: jobSchema.$defs,
+      ...jobSchema.properties[kind],
+    }) as ValidateFunction;
+    jobValidators.set(kind, validator);
+  }
+  return result(validator, value);
 }

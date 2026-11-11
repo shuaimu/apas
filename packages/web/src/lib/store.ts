@@ -1,4 +1,9 @@
 import { create } from "zustand";
+import {
+  isOmpQuestionInput, loadOmpQuestionStates, mergeOmpQuestionMessages,
+  ompQuestionKey, parseOmpQuestionResult, saveOmpQuestionStates,
+  type AnswerOmpQuestionMessage, type AnswerOmpQuestionRequest, type OmpQuestionState,
+} from "./ompQuestions";
 import { loadTerminalDeliveries, saveTerminalDeliveries, type PendingDelivery } from "./terminalDelivery";
 import {
   decodeBase64,
@@ -41,6 +46,8 @@ export interface Message {
   content: string;
   timestamp: Date;
   outputType?: OutputType;
+  sessionId?: string;
+  paneId?: number;
 }
 
 export interface CliClient {
@@ -225,7 +232,7 @@ export type OutputType =
   | { type: "text" }
   | { type: "code"; language?: string }
   | { type: "tool_use"; tool: string; input: unknown; toolUseId?: string }
-  | { type: "tool_result"; tool: string; success: boolean }
+  | { type: "tool_result"; tool: string; success: boolean; toolUseId?: string }
   | { type: "approval_request"; toolCallId: string; tool: string; description: string }
   | { type: "system" }
   | { type: "error" };
@@ -664,6 +671,7 @@ interface AppState {
   // form flips to the read-only submitted state immediately after the user
   // clicks Submit, instead of waiting for the round-trip tool_result.
   answeredQuestions: Map<string, Record<string, string>>;
+  ompQuestions: Map<string, OmpQuestionState>;
 
   // Transient toast notifications surfaced at the top of the viewport.
   // Auto-dismiss is the Toaster component's job (timer on mount).
@@ -780,6 +788,7 @@ interface AppState {
   approve: (toolCallId: string) => void;
   reject: (toolCallId: string) => void;
   answerQuestion: (toolUseId: string, answers: Record<string, string>) => void;
+  answerOmpQuestion: (request: AnswerOmpQuestionRequest) => void;
   showToast: (message: string, kind?: ToastKind) => void;
   dismissToast: (id: string) => void;
   clearMessages: () => void;
@@ -1145,6 +1154,7 @@ export const useStore = create<AppState>((set, get) => ({
   teamRecords: [],
   planReviewPending: [],
   answeredQuestions: loadAnsweredQuestions(),
+  ompQuestions: loadOmpQuestionStates(),
   toasts: [],
   sessionCache: new Map(),
   unreadSessions: new Set(),
@@ -1194,7 +1204,8 @@ export const useStore = create<AppState>((set, get) => ({
 
   logout: () => {
     saveTerminalDeliveries([]);
-    set({ pendingTerminalDeliveries: [] });
+    saveOmpQuestionStates(new Map());
+    set({ pendingTerminalDeliveries: [], ompQuestions: new Map() });
     localStorage.removeItem("apas_token");
     localStorage.removeItem("apas_user_id");
     localStorage.removeItem("apas_user_email");
@@ -1319,7 +1330,7 @@ export const useStore = create<AppState>((set, get) => ({
       ws.send(JSON.stringify({
         type: "authenticate",
         token,
-        capabilities: ["project_policy_v1", "pane_work_summary_v1", "cli_lifecycle_v1"],
+        capabilities: ["project_policy_v1", "pane_work_summary_v1", "cli_lifecycle_v1", "autonomous_jobs_v1"],
         client_kind: "web",
         app_version: process.env.NEXT_PUBLIC_WEB_UI_VERSION || "development",
         protocol_version: 1,
@@ -1340,6 +1351,16 @@ export const useStore = create<AppState>((set, get) => ({
       storeDebugLog("WebSocket disconnected", event.code, event.reason);
       clearInterval(heartbeatHandle);
       set({ connected: false, ws: null, cliClients: [], isAttached: false });
+      set((state) => {
+        const ompQuestions = new Map(state.ompQuestions);
+        for (const [key, question] of ompQuestions) {
+          if (question.phase === "submitting") ompQuestions.set(key, {
+            ...question, phase: "uncertain", error: "Connection lost. Check the terminal; this submission will not be replayed.",
+          });
+        }
+        saveOmpQuestionStates(ompQuestions);
+        return { ompQuestions };
+      });
       set((state) => ({
         pendingInstances: Object.fromEntries(Object.entries(state.pendingInstances).map(([id, operation]) => [
           id,
@@ -1705,6 +1726,8 @@ export const useStore = create<AppState>((set, get) => ({
           ([sessionId]) => !removedSessionIds.has(sessionId),
         ),
       );
+      const ompQuestions = new Map([...state.ompQuestions].filter(([, question]) => !removedSessionIds.has(question.sessionId)));
+      saveOmpQuestionStates(ompQuestions);
       for (const id of removedSessionIds) {
         sessionCache.delete(id);
         teamRecordsBySession.delete(id);
@@ -1726,6 +1749,7 @@ export const useStore = create<AppState>((set, get) => ({
           (session) => (session.projectId ?? session.id) !== projectId,
         ),
         sessionCache,
+        ompQuestions,
         teamRecordsBySession,
         paneWorkSummaries,
         cliLifecycleInventories,
@@ -2031,6 +2055,7 @@ export const useStore = create<AppState>((set, get) => ({
   },
 
   answerQuestion: (toolUseId: string, answers: Record<string, string>) => {
+    if (toolUseId.startsWith("omp:")) return;
     const { ws, sessionId, showToast } = get();
     const canSend = ws && ws.readyState === WebSocket.OPEN;
     if (canSend) {
@@ -2079,6 +2104,54 @@ export const useStore = create<AppState>((set, get) => ({
       savePendingAnswers(next);
       return { answeredQuestions: alreadyAnswered, pendingAnswers: next };
     });
+  },
+
+  answerOmpQuestion: (request) => {
+    const { sessionId, paneId, toolUseId, dialogId, answers, cancel = false } = request;
+    const key = ompQuestionKey(sessionId, paneId, toolUseId);
+    const current = get().ompQuestions.get(key);
+    if (!sessionId || !Number.isInteger(paneId) || !dialogId || !current ||
+        current.dialogId !== dialogId || current.phase !== "pending") return;
+    const requestId = generateId();
+    const ws = get().ws;
+    const canSend = ws?.readyState === WebSocket.OPEN;
+    const update: OmpQuestionState = {
+      ...current, requestId, phase: canSend ? "submitting" : "uncertain",
+      error: canSend ? undefined : "Not connected. Answer in the terminal; this submission will not be replayed.",
+    };
+    set((state) => {
+      const ompQuestions = new Map(state.ompQuestions);
+      ompQuestions.set(key, update);
+      saveOmpQuestionStates(ompQuestions);
+      return { ompQuestions };
+    });
+    if (!canSend || !ws) return;
+    try {
+      ws.send(JSON.stringify({
+        type: "answer_omp_question", session_id: sessionId, pane_id: paneId,
+        tool_use_id: toolUseId, dialog_id: dialogId, request_id: requestId,
+        answers: cancel ? [] : answers, cancel,
+      } satisfies AnswerOmpQuestionMessage));
+    } catch {
+      set((state) => {
+        const ompQuestions = new Map(state.ompQuestions);
+        const latest = ompQuestions.get(key);
+        if (!latest || latest.requestId !== requestId || latest.result) return {};
+        ompQuestions.set(key, { ...latest, phase: "uncertain", error: "Delivery is uncertain. Answer in the terminal." });
+        saveOmpQuestionStates(ompQuestions);
+        return { ompQuestions };
+      });
+    }
+    setTimeout(() => {
+      set((state) => {
+        const latest = state.ompQuestions.get(key);
+        if (!latest || latest.requestId !== requestId || latest.phase !== "submitting") return {};
+        const ompQuestions = new Map(state.ompQuestions);
+        ompQuestions.set(key, { ...latest, phase: "uncertain", error: "No acknowledgement received. Check the terminal; this submission will not be replayed." });
+        saveOmpQuestionStates(ompQuestions);
+        return { ompQuestions };
+      });
+    }, 15_000);
   },
 
   showToast: (message: string, kind: ToastKind = "info") => {
@@ -2150,7 +2223,6 @@ export const useStore = create<AppState>((set, get) => ({
     const { ws, sessionId } = get();
     if (!sessionId) return;
     if (!ws || ws.readyState !== WebSocket.OPEN) return;
-    if (paneId < 0) return; // skip the Overview pseudo-tab sentinel
     ws.send(
       JSON.stringify({
         type: "get_session_messages",
@@ -3067,6 +3139,15 @@ if (typeof window !== "undefined") {
         paneLastCreatedAt: seededPane,
       };
     });
+    // Native results in cached history remain authoritative even when catchup
+    // starts after them. Cached bridge metadata alone never enables an answer.
+    for (const snapshot of diskCache.values()) {
+      for (const messages of [snapshot.messages, ...Object.values(snapshot.paneMessages)]) {
+        for (const message of messages) {
+          if (message.outputType?.type === "tool_result") reconcileOmpQuestion(useStore.setState, message);
+        }
+      }
+    }
     // Race fix: if `attachSession` already fired for the current
     // session before IDB hydration completed, it read an empty
     // sessionCache and set paneMessages / messages to []. Now that
@@ -3280,7 +3361,7 @@ function appendToCachedSession(
       const current = existing.paneMessages[key] || [];
       next = {
         ...existing,
-        paneMessages: { ...existing.paneMessages, [key]: [...current, message] },
+        paneMessages: { ...existing.paneMessages, [key]: mergeOmpQuestionMessages(current, message) },
         isDualPane: true,
         cachedAt: Date.now(),
         lastCreatedAt: nextLastCreatedAt,
@@ -3300,6 +3381,40 @@ function appendToCachedSession(
   });
 }
 
+function reconcileOmpQuestion(
+  set: (partial: Partial<AppState> | ((state: AppState) => Partial<AppState>)) => void,
+  message: Message,
+) {
+  const { sessionId, paneId, outputType: output } = message;
+  if (!sessionId || paneId === undefined || !output || !("toolUseId" in output) || !output.toolUseId) return;
+  const toolUseId = output.toolUseId;
+  const input = output.type === "tool_use" && isOmpQuestionInput(output.input) ? output.input : undefined;
+  const result = output.type === "tool_result" ? parseOmpQuestionResult(message.content) : undefined;
+  if (!input && !result) return;
+  const key = ompQuestionKey(sessionId, paneId, toolUseId);
+  set((state) => {
+    const previous = state.ompQuestions.get(key);
+    const timestamp = message.timestamp.getTime();
+    const dialogId = typeof input?.omp?.dialog_id === "string" ? input.omp.dialog_id : undefined;
+    const reopened = !!dialogId && previous?.result?.status === "unavailable" &&
+      timestamp >= (previous.updatedAt ?? 0);
+    if (previous?.result && !reopened && (!result || (result.status === "unavailable" && previous.result.status !== "unavailable"))) return {};
+    if ((input || result?.status === "unavailable") && previous?.updatedAt !== undefined && previous.updatedAt > timestamp) return {};
+    const next: OmpQuestionState = result
+      ? { sessionId, paneId, toolUseId, phase: result.status, result, updatedAt: message.timestamp.getTime() }
+      : {
+          ...(reopened ? {} : previous), sessionId, paneId, toolUseId,
+          dialogId,
+          phase: reopened ? "pending" : previous?.phase ?? "pending",
+          updatedAt: timestamp,
+        };
+    const ompQuestions = new Map(state.ompQuestions);
+    ompQuestions.set(key, next);
+    saveOmpQuestionStates(ompQuestions);
+    return { ompQuestions };
+  });
+}
+
 /// Dispatch a message to either the current-session state (real-time
 /// view) or the cached snapshot for another session (background tab),
 /// and mark the session unread when it's a background tab so the
@@ -3313,6 +3428,13 @@ function routeMessage(
   rawPaneId: number | string | undefined,
   serverCreatedAt?: string,
 ) {
+  message = {
+    ...message, sessionId: msgSessionId,
+    paneId: normalizePaneId(rawPaneType, normalizeRawPaneId(rawPaneId)) ?? undefined,
+    ...(serverCreatedAt && message.outputType && "toolUseId" in message.outputType && message.outputType.toolUseId?.startsWith("omp:")
+      ? { timestamp: new Date(serverCreatedAt) } : {}),
+  };
+  reconcileOmpQuestion(set, message);
   const { sessionId: currentSessionId } = get();
   if (!msgSessionId || msgSessionId === currentSessionId) {
     addMessageWithPaneRouting(set, get, message, rawPaneType, rawPaneId);
@@ -3347,7 +3469,7 @@ function addMessageWithPaneRouting(
     const key = paneKey(paneId);
     set((state) => {
       const current = state.paneMessages[key] || [];
-      const newPaneMessages = { ...state.paneMessages, [key]: [...current, message] };
+      const newPaneMessages = { ...state.paneMessages, [key]: mergeOmpQuestionMessages(current, message) };
       return {
         paneMessages: newPaneMessages,
         // Legacy compat
@@ -3579,7 +3701,7 @@ function flushPendingAnswers(
   const ws = state.ws;
   const currentSid = state.sessionId;
   if (!ws || ws.readyState !== WebSocket.OPEN || !currentSid) return;
-  const toFlush = state.pendingAnswers.filter((p) => p.sessionId === currentSid);
+  const toFlush = state.pendingAnswers.filter((p) => p.sessionId === currentSid && !p.toolUseId.startsWith("omp:"));
   if (toFlush.length === 0) return;
   // No TTL. An AskUserQuestion answer is unreconciled history: retransmit
   // it on every reconnect for as long as it's still pending, no matter how
@@ -3820,6 +3942,25 @@ export function handleServerMessage(
   get: () => AppState
 ) {
   switch (data.type) {
+    case "mutation_ack": {
+      if (data.mutation !== "question" || typeof data.request_id !== "string") break;
+      set((state) => {
+        const entry = [...state.ompQuestions].find(([, question]) =>
+          question.requestId === data.request_id && question.sessionId === data.session_id &&
+          question.paneId === data.pane_id);
+        if (!entry || entry[1].result) return {};
+        const [key, question] = entry;
+        const ompQuestions = new Map(state.ompQuestions);
+        ompQuestions.set(key, {
+          ...question,
+          phase: data.accepted === true ? "accepted" : data.question_pending === true ? "pending" : "uncertain",
+          error: typeof data.error === "string" ? data.error : undefined,
+        });
+        saveOmpQuestionStates(ompQuestions);
+        return { ompQuestions };
+      });
+      break;
+    }
     case "authenticated":
       set({
         connected: true,
@@ -4673,9 +4814,13 @@ export function handleServerMessage(
           // compare by reference do not re-render on every roster broadcast.
           return Object.keys(kept).length === Object.keys(record).length ? record : kept;
         };
+        const ompQuestions = new Map([...state.ompQuestions].filter(([, question]) =>
+          question.sessionId !== curSid || liveKeys.has(paneKey(question.paneId))));
+        saveOmpQuestionStates(ompQuestions);
 
         const patch: Partial<AppState> = {
           paneConfigs: merged,
+          ompQuestions,
           // An empty roster is a real answer, not the absence of one.
           paneListReceived: true,
           paneModes,
@@ -4934,8 +5079,9 @@ export function handleServerMessage(
             const toolUseId = resultData.tool_use_id as string;
             outputType = {
               type: "tool_result",
-              tool: toolNameMap.get(toolUseId) || toolUseId,
+              tool: parseOmpQuestionResult(resultData.content) ? "AskUserQuestion" : toolNameMap.get(toolUseId) || toolUseId,
               success: !resultData.is_error,
+              toolUseId,
             };
             displayContent = resultData.content as string || content;
             // A tool_result for an AskUserQuestion in the loaded history means
@@ -4946,7 +5092,7 @@ export function handleServerMessage(
             // with no TTL (it stops as soon as history shows the question
             // closed). Recover the submitted answers for the card's state
             // only when the result actually carries them (a cancel doesn't).
-            if (toolUseId && toolNameMap.get(toolUseId) === "AskUserQuestion") {
+            if (toolUseId && !toolUseId.startsWith("omp:") && toolNameMap.get(toolUseId) === "AskUserQuestion") {
               const resultObj =
                 resultData.tool_use_result &&
                 typeof resultData.tool_use_result === "object"
@@ -4999,6 +5145,8 @@ export function handleServerMessage(
           content: displayContent,
           timestamp: new Date(m.created_at as string || Date.now()),
           outputType,
+          sessionId: responseSessionId,
+          paneId: normalizePaneId(m.pane_type as string | undefined, m.pane_id as number | undefined) ?? undefined,
         };
       });
 
@@ -5012,6 +5160,7 @@ export function handleServerMessage(
         const rawPaneType = m.pane_type as string | undefined;
         const paneId = normalizePaneId(rawPaneType, m.pane_id as number | undefined);
         const msg = parsedMessages[i];
+        reconcileOmpQuestion(set, msg);
         if (paneId) {
           if (!paneMsgBuckets[paneId]) paneMsgBuckets[paneId] = [];
           paneMsgBuckets[paneId].push(msg);
@@ -5068,7 +5217,7 @@ export function handleServerMessage(
               const existingIds = new Set(existing.map((m) => m.id));
               const tail = msgs.filter((m) => !existingIds.has(m.id));
               if (tail.length > 0) {
-                newPaneMessages[paneId] = [...existing, ...tail];
+                newPaneMessages[paneId] = mergeOmpQuestionMessages([...existing, ...tail]);
               }
             }
             const existingMainIds = new Set(state.messages.map((m) => m.id));
@@ -5124,7 +5273,7 @@ export function handleServerMessage(
               const cur = newPaneMessages[paneId] || [];
               const curIds = new Set(cur.map((m) => m.id));
               const tail = msgs.filter((m) => !curIds.has(m.id));
-              if (tail.length > 0) newPaneMessages[paneId] = [...cur, ...tail];
+              if (tail.length > 0) newPaneMessages[paneId] = mergeOmpQuestionMessages([...cur, ...tail]);
             }
             const cache = new Map(state.sessionCache);
             cache.set(targetSid, {
@@ -5168,7 +5317,7 @@ export function handleServerMessage(
           set((state) => {
             const newPaneMessages = { ...state.paneMessages };
             for (const [paneId, msgs] of Object.entries(paneMsgBuckets)) {
-              newPaneMessages[paneId] = [...msgs, ...(newPaneMessages[paneId] || [])];
+              newPaneMessages[paneId] = mergeOmpQuestionMessages([...msgs, ...(newPaneMessages[paneId] || [])]);
             }
 
             const updates: Partial<AppState> = {
@@ -5232,7 +5381,7 @@ export function handleServerMessage(
           const existing = existingPaneMessages[paneId] || [];
           if (existing.length === 0) {
             // First load for this pane — accept the server snapshot.
-            newPaneMessages[paneId] = msgs;
+            newPaneMessages[paneId] = mergeOmpQuestionMessages(msgs);
             newPaneHasMore[paneId] = hasMore;
           } else if (msgs.length > 0) {
             // Sliding-window reconcile: overwrite the recent range with the
@@ -5242,7 +5391,7 @@ export function handleServerMessage(
               msgs[0].timestamp,
             );
             const kept = existing.filter((m) => m.timestamp < windowOldest);
-            newPaneMessages[paneId] = [...kept, ...msgs];
+            newPaneMessages[paneId] = mergeOmpQuestionMessages([...kept, ...msgs]);
             // There's older history to page if we kept anything below the
             // slice, or the server flags more before it.
             newPaneHasMore[paneId] = kept.length > 0 ? true : hasMore;
@@ -5536,7 +5685,7 @@ export function handleServerMessage(
             for (const block of content) {
               if (block.type === "tool_result") {
                 const toolUseId = block.tool_use_id as string | undefined;
-                if (toolUseId && toolNameMap.get(toolUseId) === "AskUserQuestion") {
+                if (toolUseId && !toolUseId.startsWith("omp:") && toolNameMap.get(toolUseId) === "AskUserQuestion") {
                   const capturedId = toolUseId;
                   set((state) => {
                     const patch: Partial<AppState> = {};
@@ -5572,8 +5721,9 @@ export function handleServerMessage(
                 timestamp: new Date(),
                 outputType: {
                   type: "tool_result",
-                  tool: toolNameMap.get(toolUseId) || toolUseId,
+                  tool: parseOmpQuestionResult(block.content) ? "AskUserQuestion" : toolNameMap.get(toolUseId) || toolUseId,
                   success: !(block.is_error as boolean),
+                  toolUseId,
                 },
               };
               routeMessage(set, get, toolResultMessage, msgSessionId, paneType, paneId, serverCreatedAt);

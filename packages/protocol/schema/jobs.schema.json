@@ -1,0 +1,1996 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "JobProtocolContract",
+  "type": "object",
+  "properties": {
+    "admission_request": {
+      "$ref": "#/$defs/JobAdmissionRequest"
+    },
+    "answer_request": {
+      "$ref": "#/$defs/JobAnswerRequest"
+    },
+    "artifact": {
+      "$ref": "#/$defs/JobArtifactContent"
+    },
+    "bootstrap": {
+      "$ref": "#/$defs/MobileJobsBootstrap"
+    },
+    "deployment_policy": {
+      "$ref": "#/$defs/JobPolicy"
+    },
+    "detail": {
+      "$ref": "#/$defs/JobDetail"
+    },
+    "error": {
+      "$ref": "#/$defs/JobApiError"
+    },
+    "events": {
+      "$ref": "#/$defs/JobEventsResponse"
+    },
+    "list": {
+      "$ref": "#/$defs/JobListResponse"
+    },
+    "mutation_request": {
+      "$ref": "#/$defs/JobMutationRequest"
+    },
+    "policy": {
+      "$ref": "#/$defs/EffectiveJobPolicy"
+    },
+    "policy_management": {
+      "$ref": "#/$defs/JobPolicyManagement"
+    },
+    "policy_override": {
+      "$ref": "#/$defs/JobPolicyOverride"
+    },
+    "preview": {
+      "$ref": "#/$defs/JobPreview"
+    },
+    "preview_request": {
+      "$ref": "#/$defs/JobPreviewRequest"
+    },
+    "project_list": {
+      "$ref": "#/$defs/ProjectJobListResponse"
+    },
+    "receipt": {
+      "$ref": "#/$defs/JobMutationReceipt"
+    },
+    "review": {
+      "$ref": "#/$defs/JobReview"
+    },
+    "targets": {
+      "$ref": "#/$defs/JobTargetsResponse"
+    }
+  },
+  "required": [
+    "preview_request",
+    "preview",
+    "admission_request",
+    "mutation_request",
+    "answer_request",
+    "targets",
+    "list",
+    "project_list",
+    "detail",
+    "events",
+    "receipt",
+    "review",
+    "artifact",
+    "error",
+    "policy",
+    "policy_management",
+    "deployment_policy",
+    "policy_override",
+    "bootstrap"
+  ],
+  "$defs": {
+    "EffectiveJobPolicy": {
+      "type": "object",
+      "properties": {
+        "digest": {
+          "type": "string"
+        },
+        "policy": {
+          "$ref": "#/$defs/JobPolicy"
+        },
+        "requested": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/JobPolicyOverride"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "sources": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/JobPolicySource"
+          }
+        }
+      },
+      "required": [
+        "policy",
+        "digest",
+        "sources"
+      ]
+    },
+    "JobAdmissionRequest": {
+      "type": "object",
+      "properties": {
+        "fingerprint": {
+          "type": "string"
+        },
+        "preview_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "request_id": {
+          "type": "string",
+          "format": "uuid"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "request_id",
+        "preview_id",
+        "fingerprint"
+      ]
+    },
+    "JobAllowedActions": {
+      "type": "object",
+      "properties": {
+        "admit": {
+          "type": "boolean"
+        },
+        "answer": {
+          "type": "boolean"
+        },
+        "cancel": {
+          "type": "boolean"
+        },
+        "manage_policy": {
+          "type": "boolean"
+        },
+        "retry": {
+          "type": "boolean"
+        },
+        "retry_publication": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "admit",
+        "answer",
+        "cancel",
+        "retry",
+        "retry_publication",
+        "manage_policy"
+      ]
+    },
+    "JobAnswerRequest": {
+      "type": "object",
+      "properties": {
+        "answers": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/JobQuestionAnswer"
+          }
+        },
+        "epoch": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "expected_version": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "request_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "run_id": {
+          "type": "string",
+          "format": "uuid"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "request_id",
+        "run_id",
+        "epoch",
+        "expected_version",
+        "answers"
+      ]
+    },
+    "JobApiError": {
+      "type": "object",
+      "properties": {
+        "code": {
+          "type": "string"
+        },
+        "error": {
+          "type": "string"
+        },
+        "request_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "uuid"
+        },
+        "retryable": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "error",
+        "code",
+        "retryable"
+      ]
+    },
+    "JobArtifact": {
+      "type": "object",
+      "properties": {
+        "content_type": {
+          "type": "string"
+        },
+        "expires_at": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "kind": {
+          "$ref": "#/$defs/JobArtifactKind"
+        },
+        "run_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "sha256": {
+          "type": "string"
+        },
+        "size_bytes": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "truncated": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "id",
+        "run_id",
+        "kind",
+        "sha256",
+        "size_bytes",
+        "content_type",
+        "truncated"
+      ]
+    },
+    "JobArtifactContent": {
+      "type": "object",
+      "properties": {
+        "artifact": {
+          "$ref": "#/$defs/JobArtifact"
+        },
+        "expired": {
+          "type": "boolean"
+        },
+        "next_cursor": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "text": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "artifact",
+        "text",
+        "expired"
+      ]
+    },
+    "JobArtifactKind": {
+      "type": "string",
+      "enum": [
+        "candidate",
+        "diff",
+        "check_log",
+        "worker_log",
+        "verification",
+        "publication"
+      ]
+    },
+    "JobCheckResult": {
+      "type": "object",
+      "properties": {
+        "argv": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "elapsed_seconds": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "exit_code": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int32"
+        },
+        "log_artifact_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "uuid"
+        },
+        "name": {
+          "type": "string"
+        },
+        "status": {
+          "$ref": "#/$defs/JobCheckStatus"
+        }
+      },
+      "required": [
+        "name",
+        "argv",
+        "status",
+        "elapsed_seconds"
+      ]
+    },
+    "JobCheckStatus": {
+      "type": "string",
+      "enum": [
+        "passed",
+        "failed",
+        "timed_out",
+        "missing",
+        "cancelled"
+      ]
+    },
+    "JobDetail": {
+      "type": "object",
+      "properties": {
+        "high_watermark": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "job": {
+          "$ref": "#/$defs/JobSummary"
+        },
+        "policy_digest": {
+          "type": "string"
+        },
+        "publication": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/JobPublication"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "questions": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/JobQuestion"
+          }
+        },
+        "runs": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/JobRun"
+          }
+        },
+        "task": {
+          "$ref": "#/$defs/JobTaskSpec"
+        }
+      },
+      "required": [
+        "job",
+        "task",
+        "runs",
+        "questions",
+        "high_watermark",
+        "policy_digest"
+      ]
+    },
+    "JobDiffFile": {
+      "type": "object",
+      "properties": {
+        "additions": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "artifact_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "uuid"
+        },
+        "binary": {
+          "type": "boolean"
+        },
+        "deletions": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "path": {
+          "type": "string"
+        },
+        "unavailable_reason": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "path",
+        "additions",
+        "deletions",
+        "binary"
+      ]
+    },
+    "JobEvent": {
+      "type": "object",
+      "properties": {
+        "created_at": {
+          "type": "string"
+        },
+        "detail": true,
+        "id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "job_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "kind": {
+          "$ref": "#/$defs/JobEventKind"
+        },
+        "run_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "uuid"
+        },
+        "seq": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "summary": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "job_id",
+        "seq",
+        "kind",
+        "summary",
+        "created_at"
+      ]
+    },
+    "JobEventKind": {
+      "type": "string",
+      "enum": [
+        "admitted",
+        "phase_changed",
+        "progress",
+        "subagent",
+        "question",
+        "answer_confirmed",
+        "usage",
+        "verification",
+        "publication",
+        "cancellation_requested",
+        "stopped",
+        "failed",
+        "recovery_required"
+      ]
+    },
+    "JobEventsResponse": {
+      "type": "object",
+      "properties": {
+        "events": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/JobEvent"
+          }
+        },
+        "has_more": {
+          "type": "boolean"
+        },
+        "high_watermark": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "next_seq": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "resync_required": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "events",
+        "next_seq",
+        "high_watermark",
+        "has_more",
+        "resync_required"
+      ]
+    },
+    "JobLimits": {
+      "type": "object",
+      "properties": {
+        "attempts": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "cpu_millis": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "elapsed_seconds": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "memory_bytes": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "model_concurrency": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "model_output_tokens": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "output_bytes": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "pids": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "spend_micro_usd": {
+          "description": "Reported-spend threshold, not a promise about the provider's final invoice.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "workspace_bytes": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "elapsed_seconds",
+        "spend_micro_usd",
+        "attempts",
+        "cpu_millis",
+        "memory_bytes",
+        "workspace_bytes",
+        "output_bytes",
+        "pids",
+        "model_concurrency",
+        "model_output_tokens"
+      ]
+    },
+    "JobListResponse": {
+      "type": "object",
+      "properties": {
+        "jobs": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/JobSummary"
+          }
+        },
+        "next_cursor": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "jobs"
+      ]
+    },
+    "JobModelApi": {
+      "type": "string",
+      "enum": [
+        "openai_responses",
+        "anthropic_messages"
+      ]
+    },
+    "JobModelProfile": {
+      "type": "object",
+      "properties": {
+        "api": {
+          "$ref": "#/$defs/JobModelApi"
+        },
+        "key": {
+          "type": "string"
+        },
+        "label": {
+          "type": "string"
+        },
+        "model": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "key",
+        "label",
+        "model",
+        "api"
+      ]
+    },
+    "JobMutationKind": {
+      "type": "string",
+      "enum": [
+        "admit",
+        "answer",
+        "cancel",
+        "retry",
+        "retry_publication"
+      ]
+    },
+    "JobMutationReceipt": {
+      "type": "object",
+      "properties": {
+        "error_code": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "job_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "uuid"
+        },
+        "message": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "operation": {
+          "$ref": "#/$defs/JobMutationKind"
+        },
+        "request_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "run_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "uuid"
+        },
+        "status": {
+          "$ref": "#/$defs/JobReceiptStatus"
+        }
+      },
+      "required": [
+        "request_id",
+        "operation",
+        "status"
+      ]
+    },
+    "JobMutationRequest": {
+      "type": "object",
+      "properties": {
+        "expected_version": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "request_id": {
+          "type": "string",
+          "format": "uuid"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "request_id",
+        "expected_version"
+      ]
+    },
+    "JobPolicy": {
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "limits": {
+          "$ref": "#/$defs/JobLimits"
+        },
+        "max_active_cluster": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "max_active_machine": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "max_active_project": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "max_queued_project": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "model_profiles": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "publish_enabled": {
+          "type": "boolean"
+        },
+        "verification_profiles": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "worker_profiles": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "enabled",
+        "worker_profiles",
+        "model_profiles",
+        "verification_profiles",
+        "publish_enabled",
+        "limits",
+        "max_active_project",
+        "max_active_machine",
+        "max_active_cluster",
+        "max_queued_project"
+      ]
+    },
+    "JobPolicyDocument": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/JobPolicy"
+        },
+        {
+          "$ref": "#/$defs/JobPolicyOverride"
+        }
+      ]
+    },
+    "JobPolicyManagement": {
+      "type": "object",
+      "properties": {
+        "can_manage": {
+          "type": "boolean"
+        },
+        "effective": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/EffectiveJobPolicy"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "inherited": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/EffectiveJobPolicy"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "requested": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/JobPolicyDocument"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "unavailable_reasons": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "required": [
+        "unavailable_reasons",
+        "can_manage"
+      ]
+    },
+    "JobPolicyOverride": {
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "limits": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/JobLimits"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "max_active_cluster": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        },
+        "max_active_machine": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        },
+        "max_active_project": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        },
+        "max_queued_project": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        },
+        "model_profiles": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "string"
+          }
+        },
+        "publish_enabled": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "verification_profiles": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "string"
+          }
+        },
+        "worker_profiles": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "JobPolicySource": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "revision": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "scope": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "scope",
+        "id",
+        "revision"
+      ]
+    },
+    "JobPreview": {
+      "type": "object",
+      "properties": {
+        "cluster_owner_user_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "expires_at": {
+          "type": "string"
+        },
+        "fingerprint": {
+          "type": "string"
+        },
+        "hostname": {
+          "type": "string"
+        },
+        "id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "limits": {
+          "$ref": "#/$defs/JobLimits"
+        },
+        "machine_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "policy_digest": {
+          "type": "string"
+        },
+        "project_id": {
+          "type": "string"
+        },
+        "task": {
+          "$ref": "#/$defs/JobTaskSpec"
+        }
+      },
+      "required": [
+        "id",
+        "project_id",
+        "fingerprint",
+        "expires_at",
+        "task",
+        "machine_id",
+        "cluster_owner_user_id",
+        "hostname",
+        "limits",
+        "policy_digest"
+      ]
+    },
+    "JobPreviewRequest": {
+      "type": "object",
+      "properties": {
+        "acceptance_criteria": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "base_ref": {
+          "type": "string"
+        },
+        "instruction": {
+          "type": "string"
+        },
+        "limits": {
+          "$ref": "#/$defs/JobLimits"
+        },
+        "machine_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "model_profile": {
+          "type": "string"
+        },
+        "source_url": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "verification_profile": {
+          "type": "string"
+        },
+        "worker_profile": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "instruction",
+        "acceptance_criteria",
+        "machine_id",
+        "worker_profile",
+        "verification_profile",
+        "model_profile",
+        "base_ref",
+        "limits"
+      ]
+    },
+    "JobPublication": {
+      "type": "object",
+      "properties": {
+        "base_sha": {
+          "type": "string"
+        },
+        "branch": {
+          "type": "string"
+        },
+        "draft": {
+          "type": "boolean"
+        },
+        "head_sha": {
+          "type": "string"
+        },
+        "number": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "observed_at": {
+          "type": "string"
+        },
+        "repository": {
+          "type": "string"
+        },
+        "state": {
+          "type": "string"
+        },
+        "url": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "repository",
+        "number",
+        "url",
+        "branch",
+        "base_sha",
+        "head_sha",
+        "draft",
+        "state",
+        "observed_at"
+      ]
+    },
+    "JobQuestion": {
+      "type": "object",
+      "properties": {
+        "answers": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "$ref": "#/$defs/JobQuestionAnswer"
+          }
+        },
+        "confirmed_at": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "created_at": {
+          "type": "string"
+        },
+        "dialog_id": {
+          "type": "string"
+        },
+        "epoch": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "questions": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/JobQuestionItem"
+          }
+        },
+        "run_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "state": {
+          "$ref": "#/$defs/JobQuestionState"
+        },
+        "tool_call_id": {
+          "type": "string"
+        },
+        "version": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "id",
+        "run_id",
+        "epoch",
+        "version",
+        "dialog_id",
+        "tool_call_id",
+        "state",
+        "questions",
+        "created_at"
+      ]
+    },
+    "JobQuestionAnswer": {
+      "type": "object",
+      "properties": {
+        "custom_input": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "id": {
+          "type": "string"
+        },
+        "selected_option_ids": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "selected_option_ids"
+      ]
+    },
+    "JobQuestionItem": {
+      "type": "object",
+      "properties": {
+        "header": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "id": {
+          "type": "string"
+        },
+        "multi": {
+          "type": "boolean"
+        },
+        "options": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/JobQuestionOption"
+          }
+        },
+        "question": {
+          "type": "string"
+        },
+        "recommended": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "id",
+        "question",
+        "options",
+        "multi"
+      ]
+    },
+    "JobQuestionOption": {
+      "type": "object",
+      "properties": {
+        "description": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "id": {
+          "type": "string"
+        },
+        "label": {
+          "type": "string"
+        },
+        "preview": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "id",
+        "label"
+      ]
+    },
+    "JobQuestionState": {
+      "type": "string",
+      "enum": [
+        "pending",
+        "answer_accepted",
+        "answer_delivered",
+        "confirmed",
+        "uncertain",
+        "cancelled"
+      ]
+    },
+    "JobReceiptStatus": {
+      "type": "string",
+      "enum": [
+        "pending",
+        "accepted",
+        "completed",
+        "rejected"
+      ]
+    },
+    "JobReview": {
+      "type": "object",
+      "properties": {
+        "base_sha": {
+          "type": "string"
+        },
+        "candidate_sha": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "files": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/JobDiffFile"
+          }
+        },
+        "job_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "next_cursor": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "publication": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/JobPublication"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "reason": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "run_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "verification": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/JobVerification"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "job_id",
+        "run_id",
+        "base_sha",
+        "files"
+      ]
+    },
+    "JobRun": {
+      "type": "object",
+      "properties": {
+        "attempt": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "candidate_sha": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "ended_at": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "epoch": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "job_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "reason": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "started_at": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "state": {
+          "$ref": "#/$defs/JobState"
+        },
+        "stop_evidence": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/JobStopEvidence"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "usage": {
+          "$ref": "#/$defs/JobUsage"
+        },
+        "worker_version": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "id",
+        "job_id",
+        "attempt",
+        "epoch",
+        "state",
+        "usage"
+      ]
+    },
+    "JobState": {
+      "type": "string",
+      "enum": [
+        "queued",
+        "preparing",
+        "running",
+        "needs_input",
+        "verifying",
+        "publishing",
+        "review_ready",
+        "blocked",
+        "recovery_required",
+        "cancelling",
+        "cancelled",
+        "failed"
+      ]
+    },
+    "JobStopEvidence": {
+      "type": "object",
+      "properties": {
+        "boot_id": {
+          "type": "string"
+        },
+        "container_id": {
+          "type": "string"
+        },
+        "descendants_stopped": {
+          "type": "boolean"
+        },
+        "reason": {
+          "type": "string"
+        },
+        "stopped_at": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "boot_id",
+        "container_id",
+        "stopped_at",
+        "reason",
+        "descendants_stopped"
+      ]
+    },
+    "JobSummary": {
+      "type": "object",
+      "properties": {
+        "allowed_actions": {
+          "$ref": "#/$defs/JobAllowedActions"
+        },
+        "attention_count": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "cluster_owner_user_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "created_at": {
+          "type": "string"
+        },
+        "current_run_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "hostname": {
+          "type": "string"
+        },
+        "id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "limits": {
+          "$ref": "#/$defs/JobLimits"
+        },
+        "machine_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "project_id": {
+          "type": "string"
+        },
+        "project_name": {
+          "type": "string"
+        },
+        "reason": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "state": {
+          "$ref": "#/$defs/JobState"
+        },
+        "state_version": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "title": {
+          "type": "string"
+        },
+        "updated_at": {
+          "type": "string"
+        },
+        "usage": {
+          "$ref": "#/$defs/JobUsage"
+        }
+      },
+      "required": [
+        "id",
+        "project_id",
+        "project_name",
+        "title",
+        "state",
+        "state_version",
+        "current_run_id",
+        "cluster_owner_user_id",
+        "machine_id",
+        "hostname",
+        "created_at",
+        "updated_at",
+        "usage",
+        "limits",
+        "attention_count",
+        "allowed_actions"
+      ]
+    },
+    "JobTarget": {
+      "type": "object",
+      "properties": {
+        "allowed_actions": {
+          "$ref": "#/$defs/JobAllowedActions"
+        },
+        "available": {
+          "type": "boolean"
+        },
+        "cluster_owner_user_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "hostname": {
+          "type": "string"
+        },
+        "machine_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "policy": {
+          "$ref": "#/$defs/EffectiveJobPolicy"
+        },
+        "profiles": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/JobWorkerProfile"
+          }
+        },
+        "project_id": {
+          "type": "string"
+        },
+        "unavailable_reasons": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "required": [
+        "project_id",
+        "machine_id",
+        "cluster_owner_user_id",
+        "hostname",
+        "profiles",
+        "available",
+        "unavailable_reasons",
+        "policy",
+        "allowed_actions"
+      ]
+    },
+    "JobTargetsResponse": {
+      "type": "object",
+      "properties": {
+        "project_id": {
+          "type": "string"
+        },
+        "targets": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/JobTarget"
+          }
+        },
+        "unavailable_reasons": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "required": [
+        "project_id",
+        "targets",
+        "unavailable_reasons"
+      ]
+    },
+    "JobTaskSpec": {
+      "type": "object",
+      "properties": {
+        "acceptance_criteria": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "base_ref": {
+          "type": "string"
+        },
+        "base_sha": {
+          "type": "string"
+        },
+        "instruction": {
+          "type": "string"
+        },
+        "model_profile": {
+          "type": "string"
+        },
+        "repository": {
+          "type": "string"
+        },
+        "source_url": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "verification_profile": {
+          "type": "string"
+        },
+        "verification_profile_digest": {
+          "type": "string"
+        },
+        "worker_profile": {
+          "type": "string"
+        },
+        "worker_profile_digest": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "instruction",
+        "acceptance_criteria",
+        "repository",
+        "base_ref",
+        "base_sha",
+        "worker_profile",
+        "worker_profile_digest",
+        "verification_profile",
+        "verification_profile_digest",
+        "model_profile"
+      ]
+    },
+    "JobUsage": {
+      "type": "object",
+      "properties": {
+        "elapsed_seconds": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "estimated": {
+          "type": "boolean"
+        },
+        "input_tokens": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "output_tokens": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "spend_micro_usd": {
+          "description": "None is unknown, not zero.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "elapsed_seconds",
+        "input_tokens",
+        "output_tokens",
+        "estimated"
+      ]
+    },
+    "JobVerification": {
+      "type": "object",
+      "properties": {
+        "base_sha": {
+          "type": "string"
+        },
+        "candidate_sha": {
+          "type": "string"
+        },
+        "checks": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/JobCheckResult"
+          }
+        },
+        "completed_at": {
+          "type": "string"
+        },
+        "image_digest": {
+          "type": "string"
+        },
+        "profile_digest": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "candidate_sha",
+        "base_sha",
+        "profile_digest",
+        "image_digest",
+        "checks",
+        "completed_at"
+      ]
+    },
+    "JobVerificationProfile": {
+      "type": "object",
+      "properties": {
+        "digest": {
+          "type": "string"
+        },
+        "image": {
+          "type": "string"
+        },
+        "key": {
+          "type": "string"
+        },
+        "label": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "key",
+        "label",
+        "digest",
+        "image"
+      ]
+    },
+    "JobWorkerProfile": {
+      "type": "object",
+      "properties": {
+        "digest": {
+          "type": "string"
+        },
+        "image": {
+          "type": "string"
+        },
+        "key": {
+          "type": "string"
+        },
+        "label": {
+          "type": "string"
+        },
+        "limits": {
+          "$ref": "#/$defs/JobLimits"
+        },
+        "model_profiles": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/JobModelProfile"
+          }
+        },
+        "omp_version": {
+          "type": "string"
+        },
+        "ready": {
+          "type": "boolean"
+        },
+        "unavailable_reasons": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "verification_profiles": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/JobVerificationProfile"
+          }
+        }
+      },
+      "required": [
+        "key",
+        "label",
+        "digest",
+        "image",
+        "omp_version",
+        "model_profiles",
+        "verification_profiles",
+        "limits",
+        "ready",
+        "unavailable_reasons"
+      ]
+    },
+    "MobileJobsBootstrap": {
+      "type": "object",
+      "properties": {
+        "available": {
+          "type": "boolean"
+        },
+        "jobs": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/JobSummary"
+          }
+        },
+        "next_cursor": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "unavailable_reasons": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "required": [
+        "available",
+        "jobs",
+        "unavailable_reasons"
+      ]
+    },
+    "ProjectJobListResponse": {
+      "type": "object",
+      "properties": {
+        "jobs": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ProjectJobSummary"
+          }
+        },
+        "next_cursor": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "jobs"
+      ]
+    },
+    "ProjectJobSummary": {
+      "type": "object",
+      "properties": {
+        "allowed_actions": {
+          "$ref": "#/$defs/JobAllowedActions"
+        },
+        "attention_count": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "cluster_owner_user_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "created_at": {
+          "type": "string"
+        },
+        "current_run_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "description": {
+          "type": "string"
+        },
+        "hostname": {
+          "type": "string"
+        },
+        "id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "limits": {
+          "$ref": "#/$defs/JobLimits"
+        },
+        "machine_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "project_id": {
+          "type": "string"
+        },
+        "project_name": {
+          "type": "string"
+        },
+        "reason": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "state": {
+          "$ref": "#/$defs/JobState"
+        },
+        "state_version": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "title": {
+          "type": "string"
+        },
+        "updated_at": {
+          "type": "string"
+        },
+        "usage": {
+          "$ref": "#/$defs/JobUsage"
+        }
+      },
+      "required": [
+        "id",
+        "project_id",
+        "project_name",
+        "title",
+        "state",
+        "state_version",
+        "current_run_id",
+        "cluster_owner_user_id",
+        "machine_id",
+        "hostname",
+        "created_at",
+        "updated_at",
+        "usage",
+        "limits",
+        "attention_count",
+        "allowed_actions",
+        "description"
+      ]
+    }
+  }
+}

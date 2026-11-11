@@ -10,6 +10,8 @@ use std::time::Duration;
 
 mod models;
 mod shared_cluster;
+pub mod jobs;
+pub mod job_policy;
 
 pub use models::*;
 
@@ -117,6 +119,18 @@ impl Database {
         )
         .execute(&self.pool)
         .await?;
+
+        let user_columns = sqlx::query("PRAGMA table_info(users)")
+            .fetch_all(&self.pool)
+            .await?;
+        if !user_columns
+            .iter()
+            .any(|column| column.get::<&str, _>("name") == "last_login_at")
+        {
+            sqlx::query("ALTER TABLE users ADD COLUMN last_login_at TEXT")
+                .execute(&self.pool)
+                .await?;
+        }
 
         let _ =
             sqlx::query("ALTER TABLE users ADD COLUMN cluster_role TEXT NOT NULL DEFAULT 'user'")
@@ -1139,6 +1153,8 @@ impl Database {
         .await?;
 
         self.migrate_legacy_project_access_once().await?;
+        self.migrate_jobs().await?;
+        self.migrate_job_policy().await?;
 
         tracing::info!("Database migrations completed");
         Ok(())
@@ -2352,11 +2368,20 @@ impl Database {
                FROM mobile_notification_deliveries d
                JOIN mobile_notification_events e ON e.id = d.event_id
                JOIN mobile_push_tokens t ON t.id = d.push_token_id
+               JOIN mobile_device_sessions ds ON ds.id = t.device_session_id AND ds.user_id = e.user_id
+               JOIN mobile_notification_preferences prefs ON prefs.installation_id = t.installation_id
                JOIN users u ON u.id = e.user_id
                LEFT JOIN projects p ON p.id = e.project_id
                WHERE d.status IN ('queued', 'retry')
                  AND datetime(d.next_attempt_at) <= datetime('now')
                  AND t.retired_at IS NULL AND u.account_status = 'active'
+                 AND ds.revoked_at IS NULL AND datetime(ds.expires_at) > datetime('now')
+                 AND CASE e.category
+                   WHEN 'decision' THEN prefs.decisions
+                   WHEN 'failure' THEN prefs.failures
+                   WHEN 'pull_request' THEN prefs.pull_requests
+                   WHEN 'completion' THEN prefs.completions
+                   ELSE 0 END = 1
                  AND (e.project_id IS NULL OR p.lifecycle_status = 'active')
                ORDER BY d.id LIMIT ?"#,
         )
@@ -2540,6 +2565,26 @@ impl Database {
         .await?)
     }
 
+    pub async fn record_user_login(&self, user_id: &str) -> Result<()> {
+        sqlx::query(
+            "UPDATE users SET last_login_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?",
+        )
+        .bind(user_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn get_cluster_user(&self, user_id: &str) -> Result<Option<ClusterUserSummary>> {
+        Ok(sqlx::query_as::<_, ClusterUserSummary>(
+            r#"SELECT id, email, cluster_role, account_status, created_at, last_login_at
+               FROM users WHERE id = ?"#,
+        )
+        .bind(user_id)
+        .fetch_optional(&self.pool)
+        .await?)
+    }
+
     pub async fn list_cluster_users(
         &self,
         search: Option<&str>,
@@ -2549,7 +2594,7 @@ impl Database {
         let pattern = format!("%{}%", search.unwrap_or_default().trim());
         Ok(sqlx::query_as::<_, ClusterUserSummary>(
             r#"
-            SELECT id, email, cluster_role, account_status, created_at
+            SELECT id, email, cluster_role, account_status, created_at, last_login_at
             FROM users
             WHERE (? = '%%' OR lower(email) LIKE lower(?))
             ORDER BY email
@@ -3325,12 +3370,19 @@ impl Database {
             .bind(new_owner_user_id)
             .execute(&mut *tx)
             .await?;
+        // Membership foreign keys name accounts, while the audit below retains
+        // the actual non-account system administrator.
+        let invited_by = if actor_user_id == SYSTEM_ADMIN_ACTOR {
+            new_owner_user_id
+        } else {
+            actor_user_id
+        };
         sqlx::query(
             "INSERT OR IGNORE INTO project_members (project_id, user_id, invited_by) VALUES (?, ?, ?)",
         )
         .bind(project_id)
         .bind(&old_owner)
-        .bind(actor_user_id)
+        .bind(invited_by)
         .execute(&mut *tx)
         .await?;
         sqlx::query(
@@ -3349,7 +3401,7 @@ impl Database {
             "#,
         )
         .bind(&old_owner)
-        .bind(actor_user_id)
+        .bind(invited_by)
         .bind(project_id)
         .execute(&mut *tx)
         .await?;
@@ -3600,6 +3652,14 @@ impl Database {
             ProjectLifecycle::parse(&lifecycle) == ProjectLifecycle::Deleting,
             "project deletion has not started"
         );
+        let unresolved: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM autonomous_jobs WHERE project_id=? AND (state NOT IN ('review_ready','cancelled','failed') OR EXISTS (SELECT 1 FROM autonomous_job_runs r WHERE r.job_id=autonomous_jobs.id AND r.unresolved=1))")
+            .bind(project_id).fetch_one(&mut *tx).await?;
+        anyhow::ensure!(unresolved == 0, "autonomous job stop evidence pending");
+        let unpurged: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM autonomous_job_runs r JOIN autonomous_jobs j ON j.id=r.job_id WHERE j.project_id=? AND json_extract(r.document,'$.started_at') IS NOT NULL AND NOT EXISTS(SELECT 1 FROM autonomous_job_purges p WHERE p.run_id=r.id AND p.confirmed=1)")
+            .bind(project_id).fetch_one(&mut *tx).await?;
+        anyhow::ensure!(unpurged == 0, "autonomous job host-content purge pending");
+        sqlx::query("DELETE FROM autonomous_job_policies WHERE scope='project' AND scope_id=?")
+            .bind(project_id).execute(&mut *tx).await?;
 
         for statement in [
             "DELETE FROM messages WHERE session_id IN (SELECT id FROM sessions WHERE COALESCE(project_id, id) = ?)",
@@ -6030,6 +6090,72 @@ mod cluster_administration_tests {
             cluster_role: role.to_string(),
             account_status: "active".to_string(),
         }
+    }
+
+    #[tokio::test]
+    async fn last_login_upgrade_preserves_unknown_history_and_recorded_logins() {
+        let db = database("last-login-migration").await;
+        sqlx::query(
+            "CREATE TABLE users (id TEXT PRIMARY KEY, email TEXT UNIQUE NOT NULL, password_hash TEXT NOT NULL, created_at DATETIME DEFAULT CURRENT_TIMESTAMP)",
+        )
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO users (id, email, password_hash, created_at) VALUES ('u1', 'first@test', 'hash', '2020-01-01 00:00:00'), ('u2', 'second@test', 'hash', '2020-01-02 00:00:00')",
+        )
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+        db.run_migrations().await.unwrap();
+        let users = db.list_cluster_users(None, 50, 0).await.unwrap();
+        assert_eq!(users.len(), 2);
+        assert!(users.iter().all(|user| user.last_login_at.is_none()));
+        assert!(db
+            .get_cluster_user("u1")
+            .await
+            .unwrap()
+            .unwrap()
+            .last_login_at
+            .is_none());
+        assert!(db.get_cluster_user("missing").await.unwrap().is_none());
+
+        let before = chrono::Utc::now().timestamp_millis();
+        db.record_user_login("u1").await.unwrap();
+        let after = chrono::Utc::now().timestamp_millis();
+        let recorded = db
+            .get_cluster_user("u1")
+            .await
+            .unwrap()
+            .unwrap()
+            .last_login_at
+            .unwrap();
+        assert!(recorded.ends_with('Z'));
+        let parsed = chrono::DateTime::parse_from_rfc3339(&recorded).unwrap();
+        assert!((before..=after).contains(&parsed.timestamp_millis()));
+        let stored: Option<String> =
+            sqlx::query_scalar("SELECT last_login_at FROM users WHERE id = 'u1'")
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert_eq!(stored.as_deref(), Some(recorded.as_str()));
+
+        db.run_migrations().await.unwrap();
+        let users = db.list_cluster_users(None, 50, 0).await.unwrap();
+        assert_eq!(users[0].id, "u1");
+        assert_eq!(users[0].last_login_at.as_deref(), Some(recorded.as_str()));
+        assert_eq!(users[0].created_at.as_deref(), Some("2020-01-01 00:00:00"));
+        assert_eq!(users[1].id, "u2");
+        assert!(users[1].last_login_at.is_none());
+        assert_eq!(
+            db.get_cluster_user("u1")
+                .await
+                .unwrap()
+                .unwrap()
+                .last_login_at,
+            Some(recorded)
+        );
     }
 
     #[tokio::test]

@@ -16,6 +16,7 @@ mod conversation;
 mod daemon_registry;
 mod file_watcher;
 mod host_storage;
+mod jobs;
 mod mode;
 mod omp_activity;
 mod omp_local;
@@ -151,6 +152,22 @@ enum Commands {
     PaneHost {
         #[arg(long)]
         runtime_dir: PathBuf,
+    },
+    /// Internal durable autonomous worker host (never a terminal pane).
+    #[command(hide = true)]
+    JobHost {
+        #[arg(long)]
+        run_dir: PathBuf,
+    },
+    /// Internal sandbox-only loopback model/dependency bridge.
+    #[command(hide = true)]
+    JobGatewayBridge {
+        #[arg(long)]
+        socket: PathBuf,
+        #[arg(long)]
+        token_file: PathBuf,
+        #[arg(long)]
+        listen: std::net::SocketAddr,
     },
     /// Internal `SessionStart` hook for Claude panes: reads the hook payload on
     /// stdin and records which transcript that pane is writing. Not intended
@@ -323,6 +340,10 @@ async fn main() -> Result<()> {
                     tracing::error!(%error, "pane-host failed");
                 }
                 return result;
+            }
+            Commands::JobHost { run_dir } => return jobs::host::run(run_dir).await,
+            Commands::JobGatewayBridge { socket, token_file, listen } => {
+                return jobs::gateway::run_bridge(socket, token_file, listen).await;
             }
             Commands::Daemon { roots } => {
                 let state_path = config::Config::daemon_state_path()?;

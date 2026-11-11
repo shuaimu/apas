@@ -85,3 +85,45 @@ The application SHALL report an unresolved agent question as Pending answer rath
 - **WHEN** a running project has a pane awaiting an answer
 - **THEN** that pane appears ahead of ordinary idle and usage-limited panes in the waiting-agent list
 - **AND** its badge reads Pending answer
+
+### Requirement: OMP questions use structured native answers
+
+OMP terminal conversations SHALL expose native `ask` questions and results using the existing question-card surface. Answers SHALL preserve native question IDs, selected-option arrays, and custom text separately. The answer bridge SHALL resolve the current native dialog without sending terminal keystrokes or changing the provider to RPC mode.
+
+#### Scenario: Multiple questions with ambiguous display text
+
+- **WHEN** an OMP ask contains repeated question text, comma-containing labels, multiple selections, or a custom response
+- **THEN** the conversation view preserves each native question ID and exact answer fields
+- **AND** OMP records those values in its native tool result before the card confirms them
+
+#### Scenario: Native terminal wins the answer race
+
+- **WHEN** a question is answered in the terminal before a submitted web answer is consumed
+- **THEN** the native terminal answer wins
+- **AND** the web displays that recorded answer rather than its submitted selection
+- **AND** no answer bytes enter the provider's ordinary input
+
+#### Scenario: A question is cancelled or leaves the active branch
+
+- **WHEN** a native question is cancelled, its session changes, or its branch is abandoned
+- **THEN** the old card becomes cancelled or unavailable, not successfully answered
+- **AND** an old web submission cannot answer a newer dialog
+
+#### Scenario: Invalid or duplicate submission
+
+- **WHEN** an OMP answer has an invalid question ID, option, pane, session, or dialog generation, or repeats a settled request
+- **THEN** the system rejects it without altering native input
+- **AND** a still-valid native question remains answerable
+
+#### Scenario: CLI restore or metadata update
+
+- **WHEN** the CLI restores a pending OMP question or discovers its current answer bridge
+- **THEN** the pending card and answerability recover without replaying ordinary historical turns
+- **AND** repeated metadata does not create duplicate cards
+
+#### Scenario: Native bridge is unavailable
+
+- **WHEN** an older OMP process has no compatible loaded question bridge
+- **THEN** its captured question remains readable with terminal fallback
+- **AND** the conversation view does not claim it can submit an answer
+- **AND** deployment does not silently restart the active provider

@@ -1,0 +1,6 @@
+{
+  "error": "Autonomous execution is unavailable on the selected host.",
+  "code": "sandbox_unavailable",
+  "request_id": "7c6d2400-7b4b-455d-b732-7f066dab7a24",
+  "retryable": false
+}

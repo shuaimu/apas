@@ -7,6 +7,7 @@ import { EmptyState, OfflineBanner, PrimaryButton, Screen, SectionTitle } from "
 import { SessionCard, sessionActivityStatus } from "@/components/SessionCard";
 import { useTheme } from "@/design/tokens";
 import { useMobileStore } from "@/state/store";
+import { JobAction } from "@/jobs/ui";
 
 type Filter = "all" | "idle";
 const FILTERS: { key: Filter; label: string }[] = [
@@ -65,6 +66,10 @@ export default function CodeHomeScreen() {
           <Pressable accessibilityRole="button" onPress={() => router.push("/(code)/settings/account")} style={styles.accountButton}><Text style={{ color: theme.accent, fontWeight: "700" }}>Account</Text></Pressable>
           <PrimaryButton onPress={() => router.push("/(code)/new")}>New task</PrimaryButton>
         </View>
+      </View>
+      <View style={{ padding: 16, gap: 8 }}>
+        <JobAction onPress={() => router.push("/(code)/jobs")}>Autonomous jobs</JobAction>
+        <JobAction onPress={() => router.push("/(code)/(tabs)/attention")}>Attention: sessions and jobs</JobAction>
       </View>
       <View style={styles.filters}>
         {FILTERS.map((item) => { const selectedFilter = filter === item.key; return <Pressable accessibilityRole="button" accessibilityState={{ selected: selectedFilter }} key={item.key} onPress={() => setFilter(item.key)} style={[styles.chip, { backgroundColor: selectedFilter ? theme.accent : theme.surfaceMuted }]}><Text style={{ color: selectedFilter ? "#fff" : theme.text, fontWeight: "600" }}>{item.label}</Text></Pressable>; })}

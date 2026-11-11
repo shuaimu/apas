@@ -36,6 +36,8 @@ fn is_read_only_message(message: &WebToServer) -> bool {
             | WebToServer::TerminalAttach { .. }
             | WebToServer::ListPaneWorkSummaries { .. }
             | WebToServer::MobileTelemetry { .. }
+            | WebToServer::SubscribeJob { .. }
+            | WebToServer::UnsubscribeJob { .. }
             | WebToServer::Heartbeat
     )
 }
@@ -472,10 +474,9 @@ pub(crate) async fn list_accessible_machines_for_user(
         }
     }
     for machine in &mut machines {
-        state.sessions.apply_project_machine_preferences(
-            &machine.machine.machine_id,
-            &mut machine.projects,
-        );
+        state
+            .sessions
+            .apply_project_machine_preferences(&machine.machine.machine_id, &mut machine.projects);
     }
 
     machines
@@ -1123,6 +1124,7 @@ async fn send_mutation_ack(
         mutation,
         accepted,
         error,
+        question_pending: None,
     };
     if let Some(user_id) = state.sessions.get_web_user(connection_id) {
         state.sessions.complete_mutation_request(
@@ -1161,6 +1163,107 @@ async fn replay_or_claim_mutation_request(
             true
         }
     }
+}
+
+async fn handle_omp_question_answer(state: &AppState, connection_id: &Uuid, command: WebToServer) {
+    let WebToServer::AnswerOmpQuestion {
+        session_id,
+        pane_id,
+        tool_use_id,
+        dialog_id,
+        request_id,
+        answers,
+        cancel,
+    } = command
+    else {
+        return;
+    };
+    let Some(user_id) = state.sessions.get_web_user(connection_id) else {
+        return;
+    };
+    if request_id.is_empty() || request_id.len() > 128 {
+        send_policy_error(state, connection_id, "Invalid question request identifier").await;
+        return;
+    }
+    if replay_or_claim_mutation_request(state, connection_id, Some(&request_id)).await {
+        return;
+    }
+    let result: Result<crate::session::OmpAnswerReceipt, &str> = async {
+        resolve_target_session(state, connection_id, Some(session_id), None)
+            .await
+            .ok_or("This project runtime is unavailable or access was denied")?;
+        if !tool_use_id.starts_with("omp:") || tool_use_id.len() > 1024 {
+            return Err("This is not an OMP question");
+        }
+        if !state.sessions.get_session_panes(&session_id).iter().any(|pane| {
+            pane.pane_id == pane_id
+                && pane.kind.is_terminal()
+                && pane.provider == shared::Provider::Omp
+        }) {
+            return Err("This OMP terminal pane is no longer available");
+        }
+        if !state.sessions.session_supports_capability(&session_id, shared::OMP_QUESTION_CAPABILITY) {
+            return Err("Update the project CLI before answering OMP questions here; use the terminal meanwhile");
+        }
+        let cli_id = state.sessions.get_session(&session_id)
+            .and_then(|session| session.cli_client_id)
+            .ok_or("The project runtime is unavailable")?;
+        let decision = state.sessions.claim_pending_decision(
+            session_id, &tool_use_id, Some(pane_id), shared::MutationKind::Question,
+        ).ok_or("This question was already answered or is no longer current")?;
+        let Some(receiver) = state.sessions.begin_omp_answer(
+            session_id, pane_id, cli_id, tool_use_id.clone(), request_id.clone(),
+        ) else {
+            state.sessions.restore_pending_decision(session_id, tool_use_id.clone(), decision);
+            return Err("An answer for this pane is already being processed");
+        };
+        let routed = state.sessions.send_to_cli(&cli_id, ServerToCli::AnswerOmpQuestion {
+            session_id,
+            pane_id,
+            tool_use_id: tool_use_id.clone(),
+            dialog_id,
+            request_id: request_id.clone(),
+            answers,
+            cancel,
+        }).await;
+        if !routed {
+            state.sessions.cancel_omp_answer_waiter(session_id, pane_id, &request_id);
+            state.sessions.restore_pending_decision(session_id, tool_use_id.clone(), decision);
+            return Err("The project runtime is unavailable; no answer was delivered");
+        }
+        let response = tokio::time::timeout(Duration::from_secs(5), receiver).await;
+        state.sessions.cancel_omp_answer_waiter(session_id, pane_id, &request_id);
+        let receipt = response.ok().and_then(Result::ok)
+            .ok_or("Answer delivery could not be confirmed; check the terminal before trying again")?;
+        if !receipt.accepted && receipt.pending
+            && state.sessions.get_pane_statuses(&session_id).iter().any(|(_, id, status)| {
+                *id == pane_id && status == shared::PANE_STATUS_PENDING_ANSWER
+            })
+        {
+            state.sessions.restore_pending_decision(session_id, tool_use_id.clone(), decision);
+        }
+        Ok(receipt)
+    }.await;
+    let (accepted, question_pending, error) = match result {
+        Ok(receipt) => (receipt.accepted, Some(receipt.pending), receipt.error),
+        Err(error) => (false, None, Some(error.to_string())),
+    };
+    let acknowledgement = ServerToWeb::MutationAck {
+        request_id: request_id.clone(),
+        session_id,
+        pane_id: Some(pane_id),
+        mutation: shared::MutationKind::Question,
+        accepted,
+        error,
+        question_pending,
+    };
+    state
+        .sessions
+        .complete_mutation_request(user_id, request_id, acknowledgement.clone());
+    state
+        .sessions
+        .send_to_web(connection_id, acknowledgement)
+        .await;
 }
 
 /// Load the latest effective policy for a launch-like mutation. Both ends of
@@ -2005,6 +2108,197 @@ mod retired_launch_authorization_tests {
         assert!(
             cli_rx.try_recv().is_err(),
             "an incompatible CLI must not receive the reboot command"
+        );
+    }
+
+    async fn omp_question_state() -> (
+        AppState,
+        Uuid,
+        Uuid,
+        mpsc::Receiver<ServerToWeb>,
+        mpsc::Receiver<ServerToCli>,
+        Uuid,
+    ) {
+        let (state, connection, session, web, cli, cli_id) = policy_state().await;
+        let user = state.sessions.get_session(&session).unwrap().user_id;
+        state.sessions.set_web_user(connection, user);
+        state
+            .sessions
+            .set_cli_capabilities(cli_id, vec![shared::OMP_QUESTION_CAPABILITY.into()]);
+        state
+            .sessions
+            .set_session_panes(&session, vec![pane(7, shared::Provider::Omp, false)]);
+        state.sessions.register_pending_decision(
+            session,
+            "omp:7:native:question".into(),
+            Some(7),
+            shared::MutationKind::Question,
+        );
+        state.sessions.set_pane_status(
+            &session,
+            shared::PaneType::Interactive,
+            7,
+            Some(shared::PANE_STATUS_PENDING_ANSWER.into()),
+        );
+        (state, connection, session, web, cli, cli_id)
+    }
+
+    fn omp_answer(session_id: Uuid, pane_id: u32, request_id: &str) -> WebToServer {
+        WebToServer::AnswerOmpQuestion {
+            session_id,
+            pane_id,
+            tool_use_id: "omp:7:native:question".into(),
+            dialog_id: Uuid::new_v4(),
+            request_id: request_id.into(),
+            answers: vec![shared::OmpQuestionAnswer {
+                id: "choice".into(),
+                selected_options: vec!["A, B".into()],
+                custom_input: None,
+            }],
+            cancel: false,
+        }
+    }
+
+    fn omp_ack(web: &mut mpsc::Receiver<ServerToWeb>) -> ServerToWeb {
+        while let Ok(message) = web.try_recv() {
+            if matches!(message, ServerToWeb::MutationAck { .. }) {
+                return message;
+            }
+        }
+        panic!("expected correlated OMP acknowledgement")
+    }
+
+    #[tokio::test]
+    async fn omp_answer_requires_live_runtime_access_and_the_exact_pane() {
+        let (state, connection, session, mut web, mut cli, _) = omp_question_state().await;
+        handle_omp_question_answer(&state, &connection, omp_answer(session, 8, "wrong-pane")).await;
+        assert!(matches!(
+            omp_ack(&mut web),
+            ServerToWeb::MutationAck {
+                accepted: false,
+                ..
+            }
+        ));
+        assert!(cli.try_recv().is_err());
+
+        state.sessions.set_web_user(connection, Uuid::new_v4());
+        handle_omp_question_answer(&state, &connection, omp_answer(session, 7, "no-access")).await;
+        assert!(matches!(
+            omp_ack(&mut web),
+            ServerToWeb::MutationAck {
+                accepted: false,
+                ..
+            }
+        ));
+        assert!(cli.try_recv().is_err());
+        assert!(
+            state
+                .sessions
+                .claim_pending_decision(
+                    session,
+                    "omp:7:native:question",
+                    Some(7),
+                    shared::MutationKind::Question,
+                )
+                .is_some(),
+            "denied requests must not consume the genuine question"
+        );
+    }
+
+    #[tokio::test]
+    async fn omp_answer_never_reaches_a_cli_without_native_answer_capability() {
+        let (state, connection, session, mut web, mut cli, cli_id) = omp_question_state().await;
+        state
+            .sessions
+            .set_cli_capabilities(cli_id, vec![shared::OMP_TERMINAL_CAPABILITY.into()]);
+        handle_omp_question_answer(&state, &connection, omp_answer(session, 7, "old-cli")).await;
+        assert!(matches!(
+            omp_ack(&mut web),
+            ServerToWeb::MutationAck {
+                accepted: false,
+                ..
+            }
+        ));
+        assert!(cli.try_recv().is_err());
+        assert!(state
+            .sessions
+            .claim_pending_decision(
+                session,
+                "omp:7:native:question",
+                Some(7),
+                shared::MutationKind::Question,
+            )
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn omp_rejection_waits_for_native_receipt_and_preserves_explicit_retry() {
+        let (state, connection, session, mut web, mut cli, cli_id) = omp_question_state().await;
+        tokio::join!(
+            handle_omp_question_answer(
+                &state,
+                &connection,
+                omp_answer(session, 7, "invalid-option")
+            ),
+            async {
+                let message = cli.recv().await.expect("native answer request");
+                assert!(matches!(message, ServerToCli::AnswerOmpQuestion { .. }));
+                while let Ok(message) = web.try_recv() {
+                    assert!(
+                        !matches!(message, ServerToWeb::MutationAck { .. }),
+                        "routing a request is not native acceptance"
+                    );
+                }
+                assert!(state.sessions.finish_omp_answer(
+                    session,
+                    7,
+                    cli_id,
+                    "omp:7:native:question",
+                    "invalid-option",
+                    crate::session::OmpAnswerReceipt {
+                        accepted: false,
+                        pending: true,
+                        error: Some("Unknown option".into()),
+                    },
+                ));
+            },
+        );
+        assert!(matches!(
+            omp_ack(&mut web),
+            ServerToWeb::MutationAck {
+                accepted: false,
+                question_pending: Some(true),
+                ..
+            }
+        ));
+        handle_omp_question_answer(
+            &state,
+            &connection,
+            omp_answer(session, 7, "invalid-option"),
+        )
+        .await;
+        assert!(matches!(
+            omp_ack(&mut web),
+            ServerToWeb::MutationAck {
+                accepted: false,
+                ..
+            }
+        ));
+        assert!(
+            cli.try_recv().is_err(),
+            "a repeated request must not be redelivered"
+        );
+        assert!(
+            state
+                .sessions
+                .claim_pending_decision(
+                    session,
+                    "omp:7:native:question",
+                    Some(7),
+                    shared::MutationKind::Question,
+                )
+                .is_some(),
+            "a corrected new request remains possible"
         );
     }
 }
@@ -3232,8 +3526,12 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
     state.sessions.register_web(connection_id, tx);
 
     // Task to forward messages from channel to WebSocket
+    let outbound_state = state.clone();
     let send_task = tokio::spawn(async move {
         while let Some(msg) = rx.recv().await {
+            if !crate::jobs::web_outbound_allowed(&outbound_state, connection_id, &msg).await {
+                continue;
+            }
             let text = serde_json::to_string(&msg).unwrap();
             if sender.send(Message::Text(text.into())).await.is_err() {
                 break;
@@ -3328,6 +3626,12 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                 continue;
             }
             match parsed {
+                Ok(WebToServer::SubscribeJob { project_id, job_id, after_seq }) => {
+                    crate::jobs::subscribe(&state, connection_id, project_id, job_id, after_seq).await;
+                }
+                Ok(WebToServer::UnsubscribeJob { job_id }) => {
+                    state.jobs.subscriptions.remove(&(connection_id, job_id));
+                }
                 Ok(WebToServer::Authenticate {
                     token,
                     capabilities,
@@ -3416,6 +3720,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                             }
                                         };
                                     mobile_device_session_id = claims.device_session_id.clone();
+                                    state.jobs.connection_auth.insert(connection_id, (uid, claims.device_session_id.clone(), claims.exp));
                                     is_mobile_client =
                                         matches!(client_kind, Some(shared::ClientKind::Mobile))
                                             && mobile_device_session_id.is_some();
@@ -3429,6 +3734,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                                 capability.as_str(),
                                                 shared::PROJECT_POLICY_CAPABILITY
                                                     | shared::PANE_WORK_SUMMARY_CAPABILITY
+                                                    | shared::AUTONOMOUS_JOBS_CAPABILITY
                                                     | "mobile_bootstrap_v1"
                                                     | "mobile_coding_mutations_v1"
                                                     | "mobile_terminal_v1"
@@ -5414,6 +5720,9 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             .await;
                     }
                 }
+                Ok(command @ WebToServer::AnswerOmpQuestion { .. }) => {
+                    handle_omp_question_answer(&state, &connection_id, command).await;
+                }
                 Ok(WebToServer::AnswerQuestion {
                     session_id: msg_sid,
                     tool_use_id,
@@ -5435,6 +5744,14 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     if let Some(sid) =
                         resolve_target_session(&state, &connection_id, msg_sid, session_id).await
                     {
+                        if tool_use_id.starts_with("omp:") {
+                            send_mutation_ack(
+                                &state, &connection_id, request_id.as_deref(), sid, pane_id,
+                                shared::MutationKind::Question,
+                                Err("OMP questions require a structured native answer; refresh this page"),
+                            ).await;
+                            continue;
+                        }
                         if replay_or_claim_mutation_request(
                             &state,
                             &connection_id,
@@ -6601,6 +6918,8 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
     // so unregistering cannot deadlock with a full channel. Bound the drain in
     // case another transient sender clone or a stalled transport remains.
     state.sessions.unregister_web(&connection_id);
+    state.jobs.connection_auth.remove(&connection_id);
+    state.jobs.subscriptions.retain(|(connection, _), _| *connection != connection_id);
     let mut send_task = send_task;
     if tokio::time::timeout(std::time::Duration::from_millis(250), &mut send_task)
         .await

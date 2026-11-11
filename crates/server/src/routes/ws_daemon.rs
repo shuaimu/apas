@@ -112,6 +112,9 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     Ok(DaemonToServer::ProjectRuntimeStopped { .. }) => {
                         tracing::warn!("Daemon sent project-runtime stop result before register");
                     }
+                    Ok(DaemonToServer::AutonomousJob { .. }) => {
+                        tracing::warn!("Daemon sent job report before register");
+                    }
                     Err(err) => {
                         tracing::warn!("Failed to parse daemon registration message: {}", err);
                     }
@@ -144,6 +147,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
     // Channel for async server->daemon commands.
     let (tx, mut rx) = mpsc::channel::<ServerToDaemon>(64);
     let connection_sender = tx.clone();
+    let job_registration_guard = state.jobs.daemon_guard(machine_id).await;
     let registered_msg = register_daemon_session(
         &state.sessions,
         machine_id,
@@ -169,6 +173,8 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
         }
         return;
     }
+    crate::jobs::daemon_connected(&state, machine_id).await;
+    drop(job_registration_guard);
 
     tracing::info!(
         "Daemon connected: machine={} user={} hostname={}",
@@ -180,6 +186,15 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
     loop {
         tokio::select! {
             Some(msg) = rx.recv() => {
+                let _job_delivery_guard = if matches!(&msg, ServerToDaemon::AutonomousJob { .. }) {
+                    Some(state.jobs.daemon_guard(machine_id).await)
+                } else { None };
+                if let ServerToDaemon::AutonomousJob { command } = &msg {
+                    if !state.sessions.is_daemon_connection(&machine_id, &connection_sender)
+                        || !crate::jobs::outbound_allowed(&state, machine_id, command).await.unwrap_or(false) {
+                        continue;
+                    }
+                }
                 let text = serde_json::to_string(&msg).unwrap();
                 if sender.send(Message::Text(text.into())).await.is_err() {
                     break;
@@ -194,7 +209,19 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                         let parsed: Result<DaemonToServer, _> = serde_json::from_str(&text);
                         match parsed {
                             Ok(message) => {
-                                apply_registered_daemon_message(&state, &machine_id, message).await
+                                if matches!(&message, DaemonToServer::AutonomousJob { .. }) {
+                                    if text.len() > shared::JOB_MAX_FRAME_BYTES {
+                                        tracing::warn!(%machine_id, "Rejected oversized job report");
+                                        continue;
+                                    }
+                                    let _guard = state.jobs.daemon_guard(machine_id).await;
+                                    if !state.sessions.is_daemon_connection(&machine_id, &connection_sender) {
+                                        break;
+                                    }
+                                    apply_registered_daemon_message(&state, &machine_id, message).await;
+                                } else {
+                                    apply_registered_daemon_message(&state, &machine_id, message).await;
+                                }
                             }
                             Err(err) => {
                                 tracing::warn!("Failed to parse daemon message: {}", err);
@@ -219,6 +246,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
         }
     }
 
+    let _job_disconnect_guard = state.jobs.daemon_guard(machine_id).await;
     if state
         .sessions
         .is_daemon_connection(&machine_id, &connection_sender)
@@ -275,7 +303,7 @@ fn register_daemon_session(
     projects: Vec<MachineProjectInfo>,
 ) -> ServerToDaemon {
     sessions.register_daemon(machine_id, user_id, sender, machine, projects);
-    ServerToDaemon::Registered { machine_id }
+    ServerToDaemon::Registered { machine_id, cluster_owner_user_id: Some(user_id) }
 }
 
 async fn apply_registered_daemon_message(
@@ -284,6 +312,11 @@ async fn apply_registered_daemon_message(
     message: DaemonToServer,
 ) {
     match message {
+        DaemonToServer::AutonomousJob { report } => {
+            if let Err(error) = crate::jobs::report(state, *machine_id, report).await {
+                tracing::warn!(%machine_id, %error, "Rejected autonomous job report");
+            }
+        }
         DaemonToServer::Heartbeat { projects } => {
             state.sessions.update_daemon_projects(machine_id, projects);
         }
@@ -611,7 +644,8 @@ mod tests {
         );
 
         match response {
-            ServerToDaemon::Registered { machine_id } => {
+            ServerToDaemon::Registered { machine_id, cluster_owner_user_id } => {
+                assert_eq!(cluster_owner_user_id, Some(registration.user_id));
                 assert_eq!(machine_id, registration.machine_id);
             }
             other => panic!("unexpected registration response: {other:?}"),

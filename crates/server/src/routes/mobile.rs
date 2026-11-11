@@ -527,6 +527,9 @@ pub async fn bootstrap(
     let sessions = accessible_sessions(&state, &user.id).await?;
     let machines = super::ws_web::list_accessible_machines_for_user(&state, &user_id).await;
     let launch_targets = launch_targets(&state, &machines).await;
+    let jobs = crate::jobs::list_jobs(&state, user_id, None, None)
+        .await
+        .map_err(|_| AppError::Internal("Unable to load autonomous jobs".to_string()))?;
     Ok(Json(MobileBootstrapResponse {
         user_id,
         user_email: user.email,
@@ -538,6 +541,12 @@ pub async fn bootstrap(
         sessions,
         machines,
         launch_targets,
+        autonomous_jobs: shared::MobileJobsBootstrap {
+            available: true,
+            jobs: jobs.jobs,
+            next_cursor: jobs.next_cursor,
+            unavailable_reasons: Vec::new(),
+        },
     }))
 }
 

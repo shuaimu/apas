@@ -1,0 +1,6 @@
+{
+  "type": "subscribe_job",
+  "project_id": "example-project",
+  "job_id": "06974c2c-cd7d-446b-aac3-e0f550e739f6",
+  "after_seq": 3
+}

@@ -390,6 +390,8 @@ pub async fn add_member(
         )
         .await
         .map_err(|error| AppError::BadRequest(error.to_string()))?;
+    // This endpoint is an upsert and can revoke an existing machine grant.
+    crate::jobs::reconcile_authority(&state).await?;
     refresh_member_runtime_access(&state, &membership).await;
     Ok(Json(membership.into()))
 }
@@ -437,6 +439,7 @@ pub async fn update_member(
         .await
         .map_err(|error| AppError::BadRequest(error.to_string()))?
         .ok_or_else(|| AppError::NotFound("Active cluster member not found".to_string()))?;
+    crate::jobs::reconcile_authority(&state).await?;
     refresh_member_runtime_access(&state, &membership).await;
     Ok(Json(membership.into()))
 }
@@ -453,6 +456,7 @@ pub async fn revoke_member(
         .revoke_cluster_membership(&owner.id, &user_id)
         .await
         .map_err(|error| AppError::BadRequest(error.to_string()))?;
+    crate::jobs::reconcile_authority(&state).await?;
     if let Ok(member_id) = uuid::Uuid::parse_str(&user_id) {
         state
             .sessions
@@ -853,6 +857,7 @@ pub async fn remove_project_member(
         .db
         .remove_project_member(&actor.id, &project_id, &user_id)
         .await?;
+    crate::jobs::reconcile_authority(&state).await?;
     Ok(Json(serde_json::json!({ "success": removed })))
 }
 
@@ -868,6 +873,7 @@ pub async fn transfer_owner(
         .transfer_project_ownership(&actor.id, &project_id, &request.user_id)
         .await
         .map_err(|error| AppError::BadRequest(error.to_string()))?;
+    crate::jobs::reconcile_authority(&state).await?;
     Ok(Json(serde_json::json!({ "success": changed })))
 }
 
@@ -888,8 +894,10 @@ pub async fn update_lifecycle(
         .set_project_lifecycle(&actor.id, &project_id, lifecycle)
         .await?;
     if lifecycle == ProjectLifecycle::Suspended {
+        crate::jobs::cancel_project_jobs(&state, &project_id, "project_suspended").await?;
         state.sessions.stop_project_runtime(&project_id).await;
     }
+    crate::jobs::reconcile_authority(&state).await?;
     Ok(Json(
         serde_json::json!({ "success": changed, "status": lifecycle.as_str() }),
     ))
@@ -901,6 +909,7 @@ pub async fn stop_runtime(
     Path(project_id): Path<String>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let actor = require_cluster_operator(&headers, &state, &project_id).await?;
+    crate::jobs::cancel_project_jobs(&state, &project_id, "project_stopped").await?;
     let stopped = state.sessions.stop_project_runtime(&project_id).await;
     state
         .db
@@ -934,6 +943,7 @@ pub async fn update_policy(
         )
         .await
         .map_err(|error| AppError::BadRequest(error.to_string()))?;
+    crate::jobs::reconcile_authority(&state).await?;
     state
         .sessions
         .broadcast_project_policy(&project_id, policy.clone())
@@ -990,6 +1000,7 @@ pub async fn update_default_policy(
         )
         .await
         .map_err(|error| AppError::BadRequest(error.to_string()))?;
+    crate::jobs::reconcile_authority(&state).await?;
     // A cluster default changes the effective policy of every project hosted
     // here, including projects other accounts own, so recalculate before
     // fanning out to live peers.

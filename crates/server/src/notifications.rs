@@ -208,10 +208,10 @@ fn message_for(delivery: &MobileNotificationDeliveryRecord) -> PushMessage {
         data: GenericPushData {
             category: delivery.category.clone(),
             routing_id: delivery.routing_id.clone(),
-            url: delivery
+            url: job_notification_url(&delivery.routing_id).or_else(|| delivery
                 .session_id
                 .as_deref()
-                .map(|session_id| format!("apas://code/session/{session_id}")),
+                .map(|session_id| format!("apas://code/session/{session_id}"))),
         },
         sound: None,
         ttl: 3600,
@@ -392,9 +392,80 @@ pub async fn enqueue_project_event(
     Ok(inserted)
 }
 
+// Routing data contains only validated opaque identities; never copy worker text.
+fn job_notification_url(routing_id: &str) -> Option<String> {
+    let parts: Vec<_> = routing_id.split(':').collect();
+    if parts.len() != 4 || parts[0] != "job" { return None; }
+    let job = uuid::Uuid::parse_str(parts[1]).ok()?;
+    let run = if parts[2] == "-" { None } else { Some(uuid::Uuid::parse_str(parts[2]).ok()?) };
+    let suffix = match parts[3] {
+        "detail" => String::new(),
+        "review" => "/review".to_string(),
+        question => format!("/questions/{}", uuid::Uuid::parse_str(question).ok()?),
+    };
+    Some(format!("apas://code/jobs/{job}{suffix}{}", run.map(|id| format!("?run={id}")).unwrap_or_default()))
+}
+
+pub async fn enqueue_job_event(
+    state: &AppState,
+    project_id: &str,
+    event: &shared::JobEvent,
+) -> Result<bool> {
+    use shared::JobEventKind;
+    if !state.config.mobile.features.notifications { return Ok(false); }
+    let (category, destination) = match event.kind {
+        JobEventKind::Question => {
+            let question = event.detail.as_ref().and_then(|value|
+                value.get("question_id").or_else(|| value.get("id"))
+                    .or_else(|| value.get("question").and_then(|q| q.get("id"))))
+                .and_then(|value| value.as_str())
+                .and_then(|value| uuid::Uuid::parse_str(value).ok());
+            ("decision", question.map(|id| id.to_string()).unwrap_or_else(|| "detail".to_string()))
+        }
+        JobEventKind::Failed | JobEventKind::RecoveryRequired => ("failure", "detail".to_string()),
+        JobEventKind::Verification | JobEventKind::Publication => ("pull_request", "review".to_string()),
+        JobEventKind::Stopped => ("completion", "detail".to_string()),
+        _ => return Ok(false),
+    };
+    let routing = format!("job:{}:{}:{destination}", event.job_id,
+        event.run_id.map(|id| id.to_string()).unwrap_or_else(|| "-".to_string()));
+    let mut inserted = false;
+    for user_id in state.db.active_project_user_ids(project_id).await? {
+        let Ok(actor) = uuid::Uuid::parse_str(&user_id) else { continue; };
+        if crate::jobs::detail(state, actor, project_id, event.job_id).await.is_err() { continue; }
+        inserted |= state.db.enqueue_mobile_notification_event(
+            &uuid::Uuid::new_v4().to_string(), &user_id, project_id, None, None,
+            category, &routing, &format!("job:{}:{user_id}", event.id),
+        ).await?;
+    }
+    Ok(inserted)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn job_notification_routes_only_validated_opaque_context_without_a_session() {
+        let job = uuid::Uuid::new_v4();
+        let run = uuid::Uuid::new_v4();
+        let question = uuid::Uuid::new_v4();
+        let delivery = MobileNotificationDeliveryRecord {
+            id: 1, event_id: uuid::Uuid::new_v4().to_string(),
+            push_token_id: "token-id".to_string(), token: "ExponentPushToken[opaque]".to_string(),
+            category: "decision".to_string(),
+            routing_id: format!("job:{job}:{run}:{question}"),
+            session_id: None, attempt_count: 0, provider_ticket_id: None,
+        };
+        let message = message_for(&delivery);
+        assert_eq!(message.body, "A coding decision needs your attention.");
+        assert_eq!(message.data.url, Some(format!("apas://code/jobs/{job}/questions/{question}?run={run}")));
+        assert_eq!(job_notification_url(&format!("job:{job}:{run}:review")),
+            Some(format!("apas://code/jobs/{job}/review?run={run}")));
+        assert!(job_notification_url(&format!("job:{job}:{run}:private-question-text")).is_none());
+        assert!(job_notification_url("job:../../secret:-:detail").is_none());
+        assert!(job_notification_url(&format!("job:{job}:invalid:detail")).is_none());
+    }
 
     #[test]
     fn generic_payload_contains_no_project_content_or_paths() {

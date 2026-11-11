@@ -20,6 +20,11 @@ export default function AuthenticatedLayout() {
     }}>
       <Stack.Screen name="(tabs)" options={{ headerShown: false }} />
       <Stack.Screen name="new" options={{ title: "New task", presentation: "modal" }} />
+      <Stack.Screen name="jobs/index" options={{ title: "Jobs & Attention" }} />
+      <Stack.Screen name="jobs/new" options={{ title: "New autonomous job" }} />
+      <Stack.Screen name="jobs/[jobId]/index" options={{ title: "Job detail" }} />
+      <Stack.Screen name="jobs/[jobId]/questions/[questionId]" options={{ title: "Job questions" }} />
+      <Stack.Screen name="jobs/[jobId]/review" options={{ title: "Job review" }} />
       <Stack.Screen name="session/[sessionId]/index" options={{ title: "Activity" }} />
       <Stack.Screen name="session/[sessionId]/review" options={{ title: "Review" }} />
       <Stack.Screen name="session/[sessionId]/terminal" options={{ title: "Terminal" }} />

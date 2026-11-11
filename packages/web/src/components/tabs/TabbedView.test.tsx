@@ -8,7 +8,6 @@ import {
   defaultBotPromptForPane,
   deriveInitialActiveTabId,
   lazyPaneMessageLoadTargets,
-  OVERVIEW_PANE_ID,
   requestConfirmedPaneReboot,
   shouldShowPaneRebootButton,
   TabbedView,
@@ -130,7 +129,6 @@ describe("deriveInitialActiveTabId", () => {
     activeTabId: null,
     clientChanged: true,
     managerTabId: null,
-    overviewAvailable: true,
     paneConfigsLength: 2,
     paneListReceived: true,
     savedActiveTab: "",
@@ -157,17 +155,17 @@ describe("deriveInitialActiveTabId", () => {
     ).toBe(10);
   });
 
-  it("falls back to Overview when there is no Manager and no valid saved tab", () => {
+  it("falls back to the first real pane when there is no Manager or saved pane", () => {
     expect(
       deriveInitialActiveTabId({
         ...base,
         managerTabId: null,
         savedActiveTab: "",
       }),
-    ).toBe(OVERVIEW_PANE_ID);
+    ).toBe(10);
   });
 
-  it("ignores stale saved tabs and still uses Manager or Overview fallback", () => {
+  it("ignores stale saved tabs and still uses Manager or the first real pane", () => {
     expect(
       deriveInitialActiveTabId({
         ...base,
@@ -182,20 +180,20 @@ describe("deriveInitialActiveTabId", () => {
         managerTabId: null,
         savedActiveTab: "999",
       }),
-    ).toBe(OVERVIEW_PANE_ID);
+    ).toBe(10);
   });
 
-  it("lands on Overview when the selected project has no real panes", () => {
+  it("leaves the pane selection empty when the project has no real panes", () => {
     expect(
       deriveInitialActiveTabId({
         ...base,
         paneConfigsLength: 0,
         tabIds: [],
       }),
-    ).toBe(OVERVIEW_PANE_ID);
+    ).toBeNull();
   });
 
-  it("replaces an outgoing project's active pane with Overview for a zero-pane project", () => {
+  it("clears an outgoing project's active pane for a zero-pane project", () => {
     expect(
       deriveInitialActiveTabId({
         ...base,
@@ -205,30 +203,16 @@ describe("deriveInitialActiveTabId", () => {
         savedActiveTab: "20",
         tabIds: [],
       }),
-    ).toBe(OVERVIEW_PANE_ID);
+    ).toBeNull();
   });
 
-  it("falls back to a real pane when cluster policy disables Overview", () => {
+  it("does not restore a legacy Overview selection as a pane", () => {
     expect(
       deriveInitialActiveTabId({
         ...base,
-        activeTabId: OVERVIEW_PANE_ID,
-        clientChanged: false,
-        overviewAvailable: false,
-        savedActiveTab: String(OVERVIEW_PANE_ID),
+        savedActiveTab: "-1",
       }),
     ).toBe(10);
-  });
-
-  it("leaves a zero-pane project unselected when cluster policy disables Overview", () => {
-    expect(
-      deriveInitialActiveTabId({
-        ...base,
-        overviewAvailable: false,
-        paneConfigsLength: 0,
-        tabIds: [],
-      }),
-    ).toBeNull();
   });
 });
 
@@ -242,13 +226,7 @@ describe("lazyPaneMessageLoadTargets", () => {
     ).toEqual([20]);
   });
 
-  it("skips Overview, stale active tabs, and null active tabs", () => {
-    expect(
-      lazyPaneMessageLoadTargets({
-        activeTabId: OVERVIEW_PANE_ID,
-        tabIds: [10, 20],
-      }),
-    ).toEqual([]);
+  it("skips stale active tabs and null active tabs", () => {
     expect(
       lazyPaneMessageLoadTargets({
         activeTabId: 99,
@@ -347,61 +325,38 @@ describe("TabbedView zero-pane projects", () => {
 
     render(<TabbedView />);
 
-    expect(await screen.findByRole("heading", { name: "Overview" })).toBeTruthy();
-    expect(screen.getByRole("button", { name: "Overview" })).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Project overview" }));
+    expect(await screen.findByRole("heading", { name: "Interactive project" })).toBeTruthy();
     expect(screen.getByTitle("New tab")).toBeTruthy();
     expect(screen.queryByText("Waiting for activity...")).toBeNull();
     expect(addPane).not.toHaveBeenCalled();
   });
 
-  it("creates the first pane through the existing policy-aware action", async () => {
-    const { addPane } = seedZeroPaneTabbedView();
+  it("migrates a saved Overview selection without treating it as a pane", async () => {
+    seedZeroPaneTabbedView(["terminal:claude:official:default"], false);
+    localStorage.setItem(`apas_layout_${ZERO_PANE_CLI_CLIENT_ID}_active_tab`, "-1");
 
     render(<TabbedView />);
-    await screen.findByRole("heading", { name: "Overview" });
 
-    fireEvent.click(screen.getByTitle("New tab"));
-    fireEvent.click(screen.getByText("Claude"));
-
-    expect(addPane).toHaveBeenCalledWith(
-      "claude",
-      "interactive",
-      "Claude 1",
-      undefined,
-      undefined,
-      undefined,
-      undefined,
-      false,
-      "terminal",
-    );
+    expect(await screen.findByRole("heading", { name: "Interactive project" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Project overview" }).getAttribute("aria-pressed")).toBe("true");
+    expect(useStore.getState().loadPaneMessagesIfNeeded).not.toHaveBeenCalled();
+    expect(screen.queryByRole("button", { name: "Reboot" })).toBeNull();
   });
 
   it("does not offer a disallowed launch profile for the first pane", async () => {
     const { addPane } = seedZeroPaneTabbedView(["terminal:codex:official:default"]);
 
     render(<TabbedView />);
-    await screen.findByRole("heading", { name: "Overview" });
     fireEvent.click(screen.getByTitle("New tab"));
+    fireEvent.click(screen.getByRole("button", { name: /^Interactive agent/ }));
 
     expect(screen.queryByText("Claude")).toBeNull();
     expect(screen.getByText("Codex")).toBeTruthy();
     expect(addPane).not.toHaveBeenCalled();
   });
 
-  it("hides Overview but keeps the first-pane control when cluster policy disables team mode", () => {
-    seedZeroPaneTabbedView(["terminal:claude:official:default"], false);
-
-    render(<TabbedView />);
-
-    expect(screen.queryByRole("button", { name: "Overview" })).toBeNull();
-    expect(screen.queryByRole("heading", { name: "Overview" })).toBeNull();
-    expect(screen.getByTitle("New tab")).toBeTruthy();
-    expect(screen.queryByText("Waiting for activity...")).toBeNull();
-  });
-
   it("explains an empty project and points at the control that fixes it", () => {
-    // Overview is gated on a policy field that no longer decides anything, so
-    // on a real deployment this is what a project with no panes actually shows.
     seedZeroPaneTabbedView(["terminal:claude:official:default"], false);
 
     render(<TabbedView />);
@@ -444,76 +399,19 @@ describe("TabbedView zero-pane projects", () => {
     expect(screen.queryByText("No pane is open")).toBeNull();
   });
 
-  it("fails closed while the selected project's policy is absent or stale", () => {
-    seedZeroPaneTabbedView();
-    act(() => useStore.setState({
-      projectPolicies: {
-        "different-session": {
-          teamAvailable: true,
-          allowedLaunchProfiles: ["terminal:claude:official:default"],
-          version: 1,
-          projectSuspended: false,
-          noncompliantPaneIds: [],
-        },
-      },
-    }));
-
-    render(<TabbedView />);
-
-    expect(screen.queryByRole("button", { name: "Overview" })).toBeNull();
-    expect(screen.queryByRole("heading", { name: "Overview" })).toBeNull();
-    expect(screen.getByTitle("New tab")).toBeTruthy();
-  });
-
-  it("requires an enabled authoritative policy even when real panes exist", () => {
-    seedToolbarTabbedView();
-    act(() => useStore.setState({ projectPolicies: {} }));
-    const { rerender } = render(<TabbedView />);
-    expect(screen.queryByRole("button", { name: "Overview" })).toBeNull();
-
-    act(() => useStore.setState({
-      projectPolicies: {
-        [TOOLBAR_SESSION_ID]: {
-          teamAvailable: false,
-          allowedLaunchProfiles: ["terminal:claude:official:default"],
-          version: 1,
-          projectSuspended: false,
-          noncompliantPaneIds: [],
-        },
-      },
-    }));
-    rerender(<TabbedView />);
-    expect(screen.queryByRole("button", { name: "Overview" })).toBeNull();
-
-    act(() => useStore.setState({
-      projectPolicies: {
-        [TOOLBAR_SESSION_ID]: {
-          teamAvailable: true,
-          allowedLaunchProfiles: ["terminal:claude:official:default"],
-          version: 1,
-          projectSuspended: false,
-          noncompliantPaneIds: [],
-        },
-      },
-    }));
-    rerender(<TabbedView />);
-    expect(screen.getByRole("button", { name: "Overview" })).toBeTruthy();
-  });
-
   it("keeps the fallback and hides project controls when no session is selected", () => {
     render(<TabbedView />);
 
     expect(screen.getByText("No messages yet")).toBeTruthy();
     expect(screen.getByText("Waiting for activity...")).toBeTruthy();
-    expect(screen.queryByRole("button", { name: "Overview" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Project overview" })).toBeNull();
     expect(screen.queryByTitle("New tab")).toBeNull();
-    expect(screen.queryByRole("heading", { name: "Overview" })).toBeNull();
+    expect(screen.queryByRole("heading", { name: "Project overview" })).toBeNull();
   });
 });
 
 describe("pane reboot controls", () => {
-  it("hides the per-pane reboot button on Overview and null tabs", () => {
-    expect(shouldShowPaneRebootButton(OVERVIEW_PANE_ID)).toBe(false);
+  it("hides the per-pane reboot button without a selected pane", () => {
     expect(shouldShowPaneRebootButton(null)).toBe(false);
     expect(shouldShowPaneRebootButton(42)).toBe(true);
   });
@@ -524,7 +422,6 @@ describe("pane reboot controls", () => {
     expect(confirmedPaneRebootTarget(42, confirm)).toBe(42);
     expect(confirm).toHaveBeenCalledOnce();
 
-    expect(confirmedPaneRebootTarget(OVERVIEW_PANE_ID, confirm)).toBeNull();
     expect(confirmedPaneRebootTarget(null, confirm)).toBeNull();
     expect(confirm).toHaveBeenCalledOnce();
 
@@ -540,7 +437,6 @@ describe("pane reboot controls", () => {
     expect(confirm).toHaveBeenCalledOnce();
     expect(rebootPane).toHaveBeenCalledWith(42);
 
-    requestConfirmedPaneReboot(OVERVIEW_PANE_ID, confirm, rebootPane);
     requestConfirmedPaneReboot(null, confirm, rebootPane);
     expect(confirm).toHaveBeenCalledOnce();
     expect(rebootPane).toHaveBeenCalledOnce();

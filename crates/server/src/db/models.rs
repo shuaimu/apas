@@ -353,6 +353,7 @@ pub struct ClusterUserSummary {
     pub cluster_role: String,
     pub account_status: String,
     pub created_at: Option<String>,
+    pub last_login_at: Option<String>,
 }
 
 #[derive(Debug, Clone, FromRow, Serialize)]

@@ -1,5 +1,18 @@
 /* Generated from Rust JSON Schema. Do not edit by hand. */
 
+export type JobState =
+  | "queued"
+  | "preparing"
+  | "running"
+  | "needs_input"
+  | "verifying"
+  | "publishing"
+  | "review_ready"
+  | "blocked"
+  | "recovery_required"
+  | "cancelling"
+  | "cancelled"
+  | "failed";
 /**
  * How a pane hosts its agent process. Orthogonal to [`Provider`] (which
  * binary) and [`PaneMode`] (how autonomous).
@@ -48,7 +61,56 @@ export type CodeEventKind =
   | "interrupted"
   | "error";
 export type MobilePlatform = "ios" | "android";
+export type JobArtifactKind = "candidate" | "diff" | "check_log" | "worker_log" | "verification" | "publication";
+export type JobQuestionState =
+  "pending" | "answer_accepted" | "answer_delivered" | "confirmed" | "uncertain" | "cancelled";
+export type JobEventKind =
+  | "admitted"
+  | "phase_changed"
+  | "progress"
+  | "subagent"
+  | "question"
+  | "answer_confirmed"
+  | "usage"
+  | "verification"
+  | "publication"
+  | "cancellation_requested"
+  | "stopped"
+  | "failed"
+  | "recovery_required";
+export type JobPolicyDocument = JobPolicy | JobPolicyOverride;
+export type JobMutationKind = "admit" | "answer" | "cancel" | "retry" | "retry_publication";
+export type JobReceiptStatus = "pending" | "accepted" | "completed" | "rejected";
+export type JobCheckStatus = "passed" | "failed" | "timed_out" | "missing" | "cancelled";
+export type JobModelApi = "openai_responses" | "anthropic_messages";
 export type ServerToWeb =
+  | {
+      detail: JobDetail;
+      type: "job_snapshot";
+      [k: string]: unknown;
+    }
+  | {
+      event: JobEvent;
+      type: "job_event";
+      [k: string]: unknown;
+    }
+  | {
+      job_id: string;
+      last_event_seq: number;
+      project_id: string;
+      state_version: number;
+      type: "job_changed";
+      [k: string]: unknown;
+    }
+  | {
+      code: string;
+      job_id: string;
+      message: string;
+      project_id: string;
+      resync_required: boolean;
+      type: "job_subscription_rejected";
+      [k: string]: unknown;
+    }
   | {
       account_status?: string;
       cluster_role?: string;
@@ -79,6 +141,11 @@ export type ServerToWeb =
       error?: string | null;
       mutation: MutationKind;
       pane_id?: number | null;
+      /**
+       * A fresh native bridge check permits an explicit corrected submission
+       * after rejection. Missing means the question's state is uncertain.
+       */
+      question_pending?: boolean | null;
       request_id: string;
       session_id: string;
       type: "mutation_ack";
@@ -548,6 +615,18 @@ export type LocalProjectRegistrationResult =
  */
 export type WebToServer =
   | {
+      after_seq: number;
+      job_id: string;
+      project_id: string;
+      type: "subscribe_job";
+      [k: string]: unknown;
+    }
+  | {
+      job_id: string;
+      type: "unsubscribe_job";
+      [k: string]: unknown;
+    }
+  | {
       app_version?: string | null;
       capabilities?: string[];
       client_kind?: ClientKind | null;
@@ -886,6 +965,17 @@ export type WebToServer =
       [k: string]: unknown;
     }
   | {
+      answers?: OmpQuestionAnswer[];
+      cancel?: boolean;
+      dialog_id: string;
+      pane_id: number;
+      request_id: string;
+      session_id: string;
+      tool_use_id: string;
+      type: "answer_omp_question";
+      [k: string]: unknown;
+    }
+  | {
       pane_id: number;
       session_id?: string | null;
       type: "request_pane_diff";
@@ -1027,6 +1117,7 @@ export interface MobileProtocolContract {
   bootstrap_response: MobileBootstrapResponse;
   code_event: CodeEvent;
   device_session: MobileDeviceSession;
+  jobs: JobProtocolContract;
   login_request: MobileLoginRequest;
   logout_request: MobileLogoutRequest;
   notification_preferences: MobileNotificationPreferences;
@@ -1051,6 +1142,7 @@ export interface MobileAuthResponse {
 }
 export interface MobileBootstrapResponse {
   account_status: string;
+  autonomous_jobs?: MobileJobsBootstrap;
   cluster_role: string;
   features: MobileFeatureFlags;
   launch_targets: MobileLaunchTarget[];
@@ -1060,6 +1152,68 @@ export interface MobileBootstrapResponse {
   sessions: MobileSessionSummary[];
   user_email: string;
   user_id: string;
+  [k: string]: unknown;
+}
+export interface MobileJobsBootstrap {
+  available: boolean;
+  jobs: JobSummary[];
+  next_cursor?: string | null;
+  unavailable_reasons: string[];
+  [k: string]: unknown;
+}
+export interface JobSummary {
+  allowed_actions: JobAllowedActions;
+  attention_count: number;
+  cluster_owner_user_id: string;
+  created_at: string;
+  current_run_id: string;
+  hostname: string;
+  id: string;
+  limits: JobLimits;
+  machine_id: string;
+  project_id: string;
+  project_name: string;
+  reason?: string | null;
+  state: JobState;
+  state_version: number;
+  title: string;
+  updated_at: string;
+  usage: JobUsage;
+  [k: string]: unknown;
+}
+export interface JobAllowedActions {
+  admit: boolean;
+  answer: boolean;
+  cancel: boolean;
+  manage_policy: boolean;
+  retry: boolean;
+  retry_publication: boolean;
+  [k: string]: unknown;
+}
+export interface JobLimits {
+  attempts: number;
+  cpu_millis: number;
+  elapsed_seconds: number;
+  memory_bytes: number;
+  model_concurrency: number;
+  model_output_tokens: number;
+  output_bytes: number;
+  pids: number;
+  /**
+   * Reported-spend threshold, not a promise about the provider's final invoice.
+   */
+  spend_micro_usd: number;
+  workspace_bytes: number;
+}
+export interface JobUsage {
+  elapsed_seconds: number;
+  estimated: boolean;
+  input_tokens: number;
+  output_tokens: number;
+  /**
+   * None is unknown, not zero.
+   */
+  spend_micro_usd?: number | null;
   [k: string]: unknown;
 }
 export interface MobileFeatureFlags {
@@ -1298,6 +1452,383 @@ export interface MobileDeviceSession {
   last_used_at: string;
   platform: MobilePlatform;
   revoked_at?: string | null;
+  [k: string]: unknown;
+}
+export interface JobProtocolContract {
+  admission_request: JobAdmissionRequest;
+  answer_request: JobAnswerRequest;
+  artifact: JobArtifactContent;
+  bootstrap: MobileJobsBootstrap1;
+  deployment_policy: JobPolicy;
+  detail: JobDetail;
+  error: JobApiError;
+  events: JobEventsResponse;
+  list: JobListResponse;
+  mutation_request: JobMutationRequest;
+  policy: EffectiveJobPolicy;
+  policy_management: JobPolicyManagement;
+  policy_override: JobPolicyOverride;
+  preview: JobPreview;
+  preview_request: JobPreviewRequest;
+  project_list: ProjectJobListResponse;
+  receipt: JobMutationReceipt;
+  review: JobReview;
+  targets: JobTargetsResponse;
+  [k: string]: unknown;
+}
+export interface JobAdmissionRequest {
+  fingerprint: string;
+  preview_id: string;
+  request_id: string;
+}
+export interface JobAnswerRequest {
+  answers: JobQuestionAnswer[];
+  epoch: number;
+  expected_version: number;
+  request_id: string;
+  run_id: string;
+}
+export interface JobQuestionAnswer {
+  custom_input?: string | null;
+  id: string;
+  selected_option_ids: string[];
+}
+export interface JobArtifactContent {
+  artifact: JobArtifact;
+  expired: boolean;
+  next_cursor?: string | null;
+  text: string;
+  [k: string]: unknown;
+}
+export interface JobArtifact {
+  content_type: string;
+  expires_at?: string | null;
+  id: string;
+  kind: JobArtifactKind;
+  run_id: string;
+  sha256: string;
+  size_bytes: number;
+  truncated: boolean;
+  [k: string]: unknown;
+}
+export interface MobileJobsBootstrap1 {
+  available: boolean;
+  jobs: JobSummary[];
+  next_cursor?: string | null;
+  unavailable_reasons: string[];
+  [k: string]: unknown;
+}
+export interface JobPolicy {
+  enabled: boolean;
+  limits: JobLimits;
+  max_active_cluster: number;
+  max_active_machine: number;
+  max_active_project: number;
+  max_queued_project: number;
+  model_profiles: string[];
+  publish_enabled: boolean;
+  verification_profiles: string[];
+  worker_profiles: string[];
+}
+export interface JobDetail {
+  high_watermark: number;
+  job: JobSummary;
+  policy_digest: string;
+  publication?: JobPublication | null;
+  questions: JobQuestion[];
+  runs: JobRun[];
+  task: JobTaskSpec;
+  [k: string]: unknown;
+}
+export interface JobPublication {
+  base_sha: string;
+  branch: string;
+  draft: boolean;
+  head_sha: string;
+  number: number;
+  observed_at: string;
+  repository: string;
+  state: string;
+  url: string;
+  [k: string]: unknown;
+}
+export interface JobQuestion {
+  answers?: JobQuestionAnswer[] | null;
+  confirmed_at?: string | null;
+  created_at: string;
+  dialog_id: string;
+  epoch: number;
+  id: string;
+  questions: JobQuestionItem[];
+  run_id: string;
+  state: JobQuestionState;
+  tool_call_id: string;
+  version: number;
+  [k: string]: unknown;
+}
+export interface JobQuestionItem {
+  header?: string | null;
+  id: string;
+  multi: boolean;
+  options: JobQuestionOption[];
+  question: string;
+  recommended?: number | null;
+  [k: string]: unknown;
+}
+export interface JobQuestionOption {
+  description?: string | null;
+  id: string;
+  label: string;
+  preview?: string | null;
+  [k: string]: unknown;
+}
+export interface JobRun {
+  attempt: number;
+  candidate_sha?: string | null;
+  ended_at?: string | null;
+  epoch: number;
+  id: string;
+  job_id: string;
+  reason?: string | null;
+  started_at?: string | null;
+  state: JobState;
+  stop_evidence?: JobStopEvidence | null;
+  usage: JobUsage;
+  worker_version?: string | null;
+  [k: string]: unknown;
+}
+export interface JobStopEvidence {
+  boot_id: string;
+  container_id: string;
+  descendants_stopped: boolean;
+  reason: string;
+  stopped_at: string;
+  [k: string]: unknown;
+}
+export interface JobTaskSpec {
+  acceptance_criteria: string[];
+  base_ref: string;
+  base_sha: string;
+  instruction: string;
+  model_profile: string;
+  repository: string;
+  source_url?: string | null;
+  verification_profile: string;
+  verification_profile_digest: string;
+  worker_profile: string;
+  worker_profile_digest: string;
+  [k: string]: unknown;
+}
+export interface JobApiError {
+  code: string;
+  error: string;
+  request_id?: string | null;
+  retryable: boolean;
+  [k: string]: unknown;
+}
+export interface JobEventsResponse {
+  events: JobEvent[];
+  has_more: boolean;
+  high_watermark: number;
+  next_seq: number;
+  resync_required: boolean;
+  [k: string]: unknown;
+}
+export interface JobEvent {
+  created_at: string;
+  detail?: unknown;
+  id: string;
+  job_id: string;
+  kind: JobEventKind;
+  run_id?: string | null;
+  seq: number;
+  summary: string;
+  [k: string]: unknown;
+}
+export interface JobListResponse {
+  jobs: JobSummary[];
+  next_cursor?: string | null;
+  [k: string]: unknown;
+}
+export interface JobMutationRequest {
+  expected_version: number;
+  request_id: string;
+}
+export interface EffectiveJobPolicy {
+  digest: string;
+  policy: JobPolicy;
+  requested?: JobPolicyOverride | null;
+  sources: JobPolicySource[];
+  [k: string]: unknown;
+}
+export interface JobPolicyOverride {
+  enabled?: boolean | null;
+  limits?: JobLimits | null;
+  max_active_cluster?: number | null;
+  max_active_machine?: number | null;
+  max_active_project?: number | null;
+  max_queued_project?: number | null;
+  model_profiles?: string[] | null;
+  publish_enabled?: boolean | null;
+  verification_profiles?: string[] | null;
+  worker_profiles?: string[] | null;
+}
+export interface JobPolicySource {
+  id: string;
+  revision: number;
+  scope: string;
+  [k: string]: unknown;
+}
+export interface JobPolicyManagement {
+  can_manage: boolean;
+  effective?: EffectiveJobPolicy | null;
+  inherited?: EffectiveJobPolicy | null;
+  requested?: JobPolicyDocument | null;
+  unavailable_reasons: string[];
+  [k: string]: unknown;
+}
+export interface JobPreview {
+  cluster_owner_user_id: string;
+  expires_at: string;
+  fingerprint: string;
+  hostname: string;
+  id: string;
+  limits: JobLimits;
+  machine_id: string;
+  policy_digest: string;
+  project_id: string;
+  task: JobTaskSpec;
+  [k: string]: unknown;
+}
+export interface JobPreviewRequest {
+  acceptance_criteria: string[];
+  base_ref: string;
+  instruction: string;
+  limits: JobLimits;
+  machine_id: string;
+  model_profile: string;
+  source_url?: string | null;
+  verification_profile: string;
+  worker_profile: string;
+}
+export interface ProjectJobListResponse {
+  jobs: ProjectJobSummary[];
+  next_cursor?: string | null;
+  [k: string]: unknown;
+}
+export interface ProjectJobSummary {
+  allowed_actions: JobAllowedActions;
+  attention_count: number;
+  cluster_owner_user_id: string;
+  created_at: string;
+  current_run_id: string;
+  description: string;
+  hostname: string;
+  id: string;
+  limits: JobLimits;
+  machine_id: string;
+  project_id: string;
+  project_name: string;
+  reason?: string | null;
+  state: JobState;
+  state_version: number;
+  title: string;
+  updated_at: string;
+  usage: JobUsage;
+  [k: string]: unknown;
+}
+export interface JobMutationReceipt {
+  error_code?: string | null;
+  job_id?: string | null;
+  message?: string | null;
+  operation: JobMutationKind;
+  request_id: string;
+  run_id?: string | null;
+  status: JobReceiptStatus;
+  [k: string]: unknown;
+}
+export interface JobReview {
+  base_sha: string;
+  candidate_sha?: string | null;
+  files: JobDiffFile[];
+  job_id: string;
+  next_cursor?: string | null;
+  publication?: JobPublication | null;
+  reason?: string | null;
+  run_id: string;
+  verification?: JobVerification | null;
+  [k: string]: unknown;
+}
+export interface JobDiffFile {
+  additions: number;
+  artifact_id?: string | null;
+  binary: boolean;
+  deletions: number;
+  path: string;
+  unavailable_reason?: string | null;
+  [k: string]: unknown;
+}
+export interface JobVerification {
+  base_sha: string;
+  candidate_sha: string;
+  checks: JobCheckResult[];
+  completed_at: string;
+  image_digest: string;
+  profile_digest: string;
+  [k: string]: unknown;
+}
+export interface JobCheckResult {
+  argv: string[];
+  elapsed_seconds: number;
+  exit_code?: number | null;
+  log_artifact_id?: string | null;
+  name: string;
+  status: JobCheckStatus;
+  [k: string]: unknown;
+}
+export interface JobTargetsResponse {
+  project_id: string;
+  targets: JobTarget[];
+  unavailable_reasons: string[];
+  [k: string]: unknown;
+}
+export interface JobTarget {
+  allowed_actions: JobAllowedActions;
+  available: boolean;
+  cluster_owner_user_id: string;
+  hostname: string;
+  machine_id: string;
+  policy: EffectiveJobPolicy;
+  profiles: JobWorkerProfile[];
+  project_id: string;
+  unavailable_reasons: string[];
+  [k: string]: unknown;
+}
+export interface JobWorkerProfile {
+  digest: string;
+  image: string;
+  key: string;
+  label: string;
+  limits: JobLimits;
+  model_profiles: JobModelProfile[];
+  omp_version: string;
+  ready: boolean;
+  unavailable_reasons: string[];
+  verification_profiles: JobVerificationProfile[];
+  [k: string]: unknown;
+}
+export interface JobModelProfile {
+  api: JobModelApi;
+  key: string;
+  label: string;
+  model: string;
+  [k: string]: unknown;
+}
+export interface JobVerificationProfile {
+  digest: string;
+  image: string;
+  key: string;
+  label: string;
   [k: string]: unknown;
 }
 export interface MobileLoginRequest {
@@ -1828,5 +2359,15 @@ export interface MobileTaskLaunchResponse {
   request_id: string;
   session_id: string;
   status: string;
+  [k: string]: unknown;
+}
+/**
+ * A native OMP answer. Question identity and selections must not be flattened
+ * into question text or comma-separated labels.
+ */
+export interface OmpQuestionAnswer {
+  customInput?: string | null;
+  id: string;
+  selectedOptions: string[];
   [k: string]: unknown;
 }

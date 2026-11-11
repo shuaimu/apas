@@ -683,6 +683,8 @@ pub enum TranscriptActivity {
 pub struct PiSnapshot {
     pub turns: Vec<TurnRecord>,
     pub activity: Option<TranscriptActivity>,
+    /// Native header identity, never the APAS pane's generated conversation id.
+    pub session_id: Option<String>,
 }
 
 #[derive(PartialEq, Eq)]
@@ -721,11 +723,20 @@ pub struct PiTranscriptReader {
     path: PathBuf,
     stamp: Option<PiFileStamp>,
     pane_id: u32,
+    omp: bool,
     snapshot: PiSnapshot,
 }
 
 impl PiTranscriptReader {
     pub fn read(&mut self, path: &Path, pane_id: u32) -> Result<&PiSnapshot> {
+        self.read_provider(path, pane_id, false)
+    }
+
+    pub fn read_omp(&mut self, path: &Path, pane_id: u32) -> Result<&PiSnapshot> {
+        self.read_provider(path, pane_id, true)
+    }
+
+    fn read_provider(&mut self, path: &Path, pane_id: u32, omp: bool) -> Result<&PiSnapshot> {
         use std::io::Read;
 
         let metadata = match std::fs::metadata(path) {
@@ -738,7 +749,11 @@ impl PiTranscriptReader {
             Err(err) => return Err(err).with_context(|| format!("stat {}", path.display())),
         };
         let stamp = PiFileStamp::new(&metadata)?;
-        if self.path != path || self.stamp.as_ref() != Some(&stamp) {
+        if self.path != path
+            || self.stamp.as_ref() != Some(&stamp)
+            || self.omp != omp
+            || self.pane_id != pane_id
+        {
             let mut file =
                 std::fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
             // Stamp the opened inode before reading. An append/replacement
@@ -747,22 +762,15 @@ impl PiTranscriptReader {
             let mut raw = Vec::new();
             file.read_to_end(&mut raw)
                 .with_context(|| format!("read {}", path.display()))?;
-            self.snapshot = parse_pi_snapshot(&raw, pane_id);
+            self.snapshot = parse_pi_provider_snapshot(&raw, pane_id, omp);
+            self.omp = omp;
             self.path = path.to_path_buf();
             self.stamp = Some(stamp);
-            self.pane_id = pane_id;
-        } else if self.pane_id != pane_id {
-            for turn in &mut self.snapshot.turns {
-                turn.pane_id = pane_id;
-            }
             self.pane_id = pane_id;
         }
         Ok(&self.snapshot)
     }
 }
-
-// Ask is lifecycle metadata only. Pi/OMP tool traffic never becomes a chat
-// turn or a question card, and this reader never drives the provider's UI.
 
 /// Pull the text out of a Pi content field: a bare string or an array of typed
 /// blocks. Thinking, tool-call, image, and tool-result blocks are not
@@ -797,10 +805,15 @@ struct PiEntryLink<'a> {
     parent: Option<std::borrow::Cow<'a, str>>,
 }
 
+#[cfg(test)]
+fn parse_pi_snapshot(raw: &[u8], pane_id: u32) -> PiSnapshot {
+    parse_pi_provider_snapshot(raw, pane_id, false)
+}
+
 /// Follow the last valid entry's parent chain in linear time. Index only
 /// links and raw slices, not the potentially huge tool arguments/results.
 /// Full records are decoded one at a time on the selected branch.
-fn parse_pi_snapshot(raw: &[u8], pane_id: u32) -> PiSnapshot {
+fn parse_pi_provider_snapshot(raw: &[u8], pane_id: u32, omp: bool) -> PiSnapshot {
     let entries: Vec<_> = raw
         .split(|byte| *byte == b'\n')
         .filter_map(|line| {
@@ -830,6 +843,12 @@ fn parse_pi_snapshot(raw: &[u8], pane_id: u32) -> PiSnapshot {
     }
 
     let mut snapshot = PiSnapshot::default();
+    snapshot.session_id = raw
+        .split(|byte| *byte == b'\n')
+        .filter_map(|line| serde_json::from_slice::<Value>(line).ok())
+        .find(|header| header["type"] == "session")
+        .and_then(|header| header["id"].as_str().map(str::to_owned));
+    let mut omp_asks = HashMap::new();
     let mut pending_asks = HashSet::new();
     let mut halted = false;
     // Do not search backward through all visible turns for every tool-only
@@ -908,6 +927,33 @@ fn parse_pi_snapshot(raw: &[u8], pane_id: u32) -> PiSnapshot {
                 });
             }
             "assistant" => {
+                // Native ask calls are conversation, but only for OMP. Keep
+                // them separate from prose/usage: the stream converter treats
+                // question records as tools rather than assistant text.
+                if omp {
+                    if let (Some(session_id), Some(blocks)) =
+                        (snapshot.session_id.as_deref(), content.as_array())
+                    {
+                        for block in blocks {
+                            if block["type"] != "toolCall" || block["name"] != "ask" {
+                                continue;
+                            }
+                            let (Some(id), Some(questions)) = (
+                                block["id"].as_str(),
+                                block["arguments"]["questions"].as_array(),
+                            ) else {
+                                continue;
+                            };
+                            let question =
+                                normalize_omp_question(pane_id, session_id, id, questions);
+                            omp_asks.insert(id.to_owned(), question.clone());
+                            pending_asks.insert(id.to_owned());
+                            let mut turn = omp_tool_turn(pane_id, pi_timestamp(&entry, message));
+                            turn.question = Some(question);
+                            out.push(turn);
+                        }
+                    }
+                }
                 let text = pi_text(content);
                 let reason = message.get("stopReason").and_then(Value::as_str);
                 let has_tools = content.as_array().is_some_and(|blocks| {
@@ -950,7 +996,11 @@ fn parse_pi_snapshot(raw: &[u8], pane_id: u32) -> PiSnapshot {
                             out[index].completes_work = true;
                         }
                     }
-                    continue;
+                    // OMP tool-only rounds still carry real billable usage.
+                    // Pi keeps its existing text-only conversation behavior.
+                    if !omp || message.get("usage").is_none() {
+                        continue;
+                    }
                 }
                 let usage = message.get("usage");
                 let token = |key: &str| {
@@ -983,6 +1033,12 @@ fn parse_pi_snapshot(raw: &[u8], pane_id: u32) -> PiSnapshot {
             "toolResult" => {
                 if let Some(id) = message.get("toolCallId").and_then(Value::as_str) {
                     pending_asks.remove(id);
+                    if let Some(question) = omp_asks.remove(id) {
+                        let mut turn = omp_tool_turn(pane_id, pi_timestamp(&entry, message));
+                        turn.role = "user".into();
+                        turn.answer = Some(normalize_omp_answer(&question, message));
+                        out.push(turn);
+                    }
                 }
                 // Aborted/error assistant records can be followed by synthetic
                 // result pairs; those do not restart the stopped run.
@@ -998,6 +1054,92 @@ fn parse_pi_snapshot(raw: &[u8], pane_id: u32) -> PiSnapshot {
         }
     }
     snapshot
+}
+
+pub(crate) fn omp_tool_turn(pane_id: u32, ts: String) -> TurnRecord {
+    TurnRecord {
+        pane_id,
+        ts,
+        role: "assistant".into(),
+        text: String::new(),
+        model: None,
+        input_tokens: None,
+        output_tokens: None,
+        cost_usd: None,
+        completes_work: false,
+        question: None,
+        answer: None,
+    }
+}
+
+fn normalize_omp_question(
+    pane_id: u32,
+    session_id: &str,
+    id: &str,
+    native_questions: &[Value],
+) -> crate::conversation::TurnQuestion {
+    let mut questions = native_questions.to_vec();
+    for question in &mut questions {
+        if let Some(object) = question.as_object_mut() {
+            if let Some(multi) = object.remove("multi") {
+                object.insert("multiSelect".into(), multi);
+            }
+        }
+    }
+    crate::conversation::TurnQuestion {
+        tool_use_id: crate::omp_activity::question_tool_use_id(pane_id, session_id, id),
+        tool_name: "AskUserQuestion".into(),
+        input: serde_json::json!({
+            "provider": "omp", "questions": questions, "omp": { "dialog_id": null },
+        }),
+    }
+}
+
+pub(crate) fn omp_unavailable_answer(
+    tool_use_id: String,
+    message: &str,
+) -> crate::conversation::TurnAnswer {
+    crate::conversation::TurnAnswer {
+        tool_use_id,
+        recorded: serde_json::json!({
+            "type": "omp_question_result", "status": "unavailable",
+            "results": [], "message": message,
+        })
+        .to_string(),
+    }
+}
+
+fn normalize_omp_answer(
+    question: &crate::conversation::TurnQuestion,
+    message: &Value,
+) -> crate::conversation::TurnAnswer {
+    let details = &message["details"];
+    let text = pi_text(&message["content"]);
+    let mut results = details["results"].as_array().cloned().unwrap_or_default();
+    if details["selectedOptions"].is_array() {
+        let mut result = details.clone();
+        result["id"] = question.input["questions"][0]["id"].clone();
+        results.push(result);
+    }
+    let successful = message["isError"] != true && !results.is_empty();
+    // These messages are the native AskTool's explicit cancellation errors.
+    let status = if successful {
+        "answered"
+    } else if text.contains("Ask tool was cancelled by the user")
+        || text.contains("Ask input was cancelled")
+    {
+        "cancelled"
+    } else {
+        "unavailable"
+    };
+    crate::conversation::TurnAnswer {
+        tool_use_id: question.tool_use_id.clone(),
+        recorded: serde_json::json!({
+            "type": "omp_question_result", "status": status,
+            "results": results, "message": text,
+        })
+        .to_string(),
+    }
 }
 
 /// Newest codex rollout whose `session_meta.cwd` matches `cwd`.
@@ -1339,6 +1481,203 @@ fn codex_working_state(raw: &str) -> Option<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn omp_ask_fixture(text: &str) -> Vec<Value> {
+        vec![
+            serde_json::json!({"type":"title","v":1,"title":"","pad":"   "}),
+            serde_json::json!({"type":"session","id":"native-session","version":3}),
+            serde_json::json!({"type":"message","id":"ask-entry","parentId":null,
+            "timestamp":"2026-10-10T00:00:00Z","message":{
+                "role":"assistant","stopReason":"toolUse","model":"native-model",
+                "content":[{"type":"text","text":text},{"type":"toolCall","id":"call_ask","name":"ask",
+                    "arguments":{"questions":[{"id":"choice","question":"Choose","multi":true,
+                        "options":[{"label":"A, B","description":"One label"},{"label":"C"}]}]}}],
+                "usage":{"input":17,"output":9,"cost":{"total":0.25}}
+            }}),
+            serde_json::json!({"type":"custom","id":"start","parentId":"ask-entry",
+                "customType":"tool_execution_start","data":{"toolName":"ask","toolCallId":"call_ask"}}),
+        ]
+    }
+
+    fn omp_fixture_bytes(entries: &[Value]) -> Vec<u8> {
+        entries
+            .iter()
+            .map(Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n")
+            .into_bytes()
+    }
+
+    #[test]
+    fn omp_native_ask_preserves_prose_usage_and_identity_without_enabling_pi() {
+        let raw = omp_fixture_bytes(&omp_ask_fixture("Please choose first."));
+        let snapshot = parse_pi_provider_snapshot(&raw, 7, true);
+        assert_eq!(snapshot.session_id.as_deref(), Some("native-session"));
+        assert_eq!(snapshot.activity, Some(TranscriptActivity::PendingAnswer));
+        let question = snapshot
+            .turns
+            .iter()
+            .find_map(|turn| turn.question.as_ref())
+            .unwrap();
+        assert_eq!(question.tool_use_id, "omp:7:native-session:call_ask");
+        assert_eq!(question.input["questions"][0]["multiSelect"], true);
+        assert_eq!(
+            question.input["questions"][0]["options"][0]["label"],
+            "A, B"
+        );
+        assert!(question.input["omp"]["dialog_id"].is_null());
+        let prose = snapshot
+            .turns
+            .iter()
+            .find(|turn| !turn.text.is_empty())
+            .unwrap();
+        assert_eq!(prose.text, "Please choose first.");
+        assert_eq!(prose.input_tokens, Some(17));
+        assert_eq!(prose.cost_usd, Some(0.25));
+        assert!(prose.question.is_none());
+        assert_eq!(
+            snapshot
+                .turns
+                .iter()
+                .filter(|turn| turn.has_usage())
+                .count(),
+            1
+        );
+        let pi = parse_pi_snapshot(&raw, 7);
+        assert!(pi
+            .turns
+            .iter()
+            .all(|turn| turn.question.is_none() && turn.answer.is_none()));
+        assert_eq!(pi.turns.len(), 1);
+    }
+
+    #[test]
+    fn omp_native_single_result_recovers_id_and_preserves_empty_multi_and_custom_text() {
+        let mut entries = omp_ask_fixture("");
+        entries.push(
+            serde_json::json!({"type":"message","id":"result","parentId":"start",
+            "message":{"role":"toolResult","toolCallId":"call_ask","toolName":"ask","isError":false,
+                "content":[{"type":"text","text":"User chose none"}],
+                "details":{"question":"Choose","options":["A, B","C"],"multi":true,
+                    "selectedOptions":[],"customInput":"separate, exact text","timedOut":false}}}),
+        );
+        let snapshot = parse_pi_provider_snapshot(&omp_fixture_bytes(&entries), 7, true);
+        let answer = snapshot
+            .turns
+            .iter()
+            .find_map(|turn| turn.answer.as_ref())
+            .unwrap();
+        let result: Value = serde_json::from_str(&answer.recorded).unwrap();
+        assert_eq!(result["status"], "answered");
+        assert_eq!(result["results"][0]["id"], "choice");
+        assert_eq!(
+            result["results"][0]["selectedOptions"],
+            serde_json::json!([])
+        );
+        assert_eq!(result["results"][0]["customInput"], "separate, exact text");
+        assert!(!answer.is_error());
+        assert_eq!(
+            snapshot
+                .turns
+                .iter()
+                .filter(|turn| turn.has_usage())
+                .count(),
+            1
+        );
+        assert_eq!(
+            snapshot
+                .turns
+                .iter()
+                .filter_map(|turn| turn.input_tokens)
+                .sum::<u64>(),
+            17
+        );
+    }
+
+    #[test]
+    fn omp_native_multiple_results_and_errors_are_not_inferred_from_submission() {
+        let question = normalize_omp_question(
+            2,
+            "native",
+            "ask",
+            &[
+                serde_json::json!({"id":"a","question":"Same","options":[]}),
+                serde_json::json!({"id":"b","question":"Same","options":[]}),
+            ],
+        );
+        let details = serde_json::json!({"results":[
+            {"id":"a","question":"Same","options":["A, B"],"multi":false,"selectedOptions":["A, B"]},
+            {"id":"b","question":"Same","options":[],"multi":true,"selectedOptions":[],"note":"none"}
+        ]});
+        let answer = normalize_omp_answer(
+            &question,
+            &serde_json::json!({
+                "isError":false,"details":details,"content":[{"type":"text","text":"Native answer"}],
+            }),
+        );
+        let result: Value = serde_json::from_str(&answer.recorded).unwrap();
+        assert_eq!(result["results"], details["results"]);
+        for (text, status) in [
+            ("Ask tool was cancelled by the user", "cancelled"),
+            ("Ask input was cancelled", "cancelled"),
+            ("Provider failed", "unavailable"),
+        ] {
+            let answer = normalize_omp_answer(
+                &question,
+                &serde_json::json!({
+                    "isError":true,"content":[{"type":"text","text":text}],
+                }),
+            );
+            assert!(answer.is_error());
+            let result: Value = serde_json::from_str(&answer.recorded).unwrap();
+            assert_eq!(result["status"], status);
+        }
+    }
+
+    #[test]
+    fn omp_equal_length_branch_replacement_and_reader_provider_changes_are_observed() {
+        let mut entries = omp_ask_fixture("Before");
+        entries.push(serde_json::json!({"type":"message","id":"other","parentId":null,
+            "message":{"role":"assistant","stopReason":"stop","content":[{"type":"text","text":"Other"}]}}));
+        let snapshot = parse_pi_provider_snapshot(&omp_fixture_bytes(&entries), 1, true);
+        assert!(snapshot.turns.iter().all(|turn| turn.question.is_none()));
+        assert_eq!(snapshot.turns[0].text, "Other");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.jsonl");
+        std::fs::write(&path, omp_fixture_bytes(&omp_ask_fixture("Before"))).unwrap();
+        let mut reader = PiTranscriptReader::default();
+        assert!(reader
+            .read(&path, 1)
+            .unwrap()
+            .turns
+            .iter()
+            .all(|turn| turn.question.is_none()));
+        assert!(reader
+            .read_omp(&path, 1)
+            .unwrap()
+            .turns
+            .iter()
+            .any(|turn| turn.question.is_some()));
+        let rescaled = reader.read_omp(&path, 3).unwrap();
+        assert_eq!(
+            rescaled.turns[0].question.as_ref().unwrap().tool_use_id,
+            "omp:3:native-session:call_ask"
+        );
+        let replacement = omp_fixture_bytes(&omp_ask_fixture("Afters"));
+        assert_eq!(
+            replacement.len(),
+            std::fs::metadata(&path).unwrap().len() as usize
+        );
+        std::fs::write(&path, replacement).unwrap();
+        assert_eq!(reader.read_omp(&path, 3).unwrap().turns[1].text, "Afters");
+        std::fs::write(&path, omp_fixture_bytes(&entries)).unwrap();
+        assert!(reader
+            .read_omp(&path, 3)
+            .unwrap()
+            .turns
+            .iter()
+            .all(|turn| turn.question.is_none()));
+    }
 
     /// Claude Code can move a session into one of its own worktrees, after
     /// which it writes under that directory's slug rather than the pane's cwd.
@@ -2570,7 +2909,7 @@ mod tests {
     }
 
     #[test]
-    fn pi_reader_reuses_unchanged_turns_and_recovers_an_incomplete_append() {
+    fn pi_reader_recovers_incomplete_appends_after_pane_changes() {
         use std::io::Write;
 
         let dir = tempfile::tempdir().unwrap();
@@ -2579,13 +2918,7 @@ mod tests {
         let mut reader = PiTranscriptReader::default();
         let first = reader.read(&path, 131).unwrap();
         assert_eq!(first.activity, Some(TranscriptActivity::Working));
-        let turns_ptr = first.turns.as_ptr();
-        let text_ptr = first.turns[0].text.as_ptr();
-        let same = reader.read(&path, 131).unwrap();
-        assert_eq!(same.turns.as_ptr(), turns_ptr);
-        assert_eq!(same.turns[0].text.as_ptr(), text_ptr);
         let restamped = reader.read(&path, 132).unwrap();
-        assert_eq!(restamped.turns.as_ptr(), turns_ptr);
         assert_eq!(restamped.turns[0].pane_id, 132);
 
         let completed = pi_assistant("a1", Some("u1"), "Finished", "stop", None);

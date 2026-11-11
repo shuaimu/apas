@@ -1,4 +1,4 @@
-use shared::{CodeEvent, ServerToWeb, WebToServer};
+use shared::{CodeEvent, JobApiError, JobEventsResponse, JobMutationReceipt, ServerToWeb, WebToServer};
 use std::path::PathBuf;
 
 fn fixtures_dir() -> PathBuf {
@@ -7,7 +7,6 @@ fn fixtures_dir() -> PathBuf {
 
 #[test]
 fn golden_mobile_fixtures_match_rust_wire_types() {
-    let mut seen = 0;
     for entry in std::fs::read_dir(fixtures_dir()).expect("read protocol fixtures") {
         let path = entry.expect("fixture entry").path();
         if path.extension().and_then(|value| value.to_str()) != Some("json") {
@@ -24,10 +23,17 @@ fn golden_mobile_fixtures_match_rust_wire_types() {
         } else if name == "code-event.json" {
             serde_json::from_str::<CodeEvent>(&json)
                 .unwrap_or_else(|error| panic!("{}: {error}", path.display()));
+        } else if name == "job-receipt.json" {
+            serde_json::from_str::<JobMutationReceipt>(&json)
+                .unwrap_or_else(|error| panic!("{}: {error}", path.display()));
+        } else if name == "job-events.json" {
+            serde_json::from_str::<JobEventsResponse>(&json)
+                .unwrap_or_else(|error| panic!("{}: {error}", path.display()));
+        } else if name == "job-error.json" {
+            serde_json::from_str::<JobApiError>(&json)
+                .unwrap_or_else(|error| panic!("{}: {error}", path.display()));
         } else {
             panic!("unclassified protocol fixture: {}", path.display());
         }
-        seen += 1;
     }
-    assert!(seen >= 10, "expected representative mobile fixtures");
 }

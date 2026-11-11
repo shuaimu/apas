@@ -72,7 +72,9 @@ export async function login(email: string, password: string): Promise<MobileAuth
   return response;
 }
 
-export async function refresh(): Promise<MobileAuthResponse> {
+let refreshing: Promise<MobileAuthResponse> | null = null;
+
+async function refreshOnce(): Promise<MobileAuthResponse> {
   const current = await loadCredentials();
   if (!current) throw new ApiError("This device is signed out", 401);
   const response = await request<MobileAuthResponse>("/auth/mobile/refresh", {
@@ -84,6 +86,11 @@ export async function refresh(): Promise<MobileAuthResponse> {
   });
   await saveCredentials(stored(response));
   return response;
+}
+
+export function refresh(): Promise<MobileAuthResponse> {
+  refreshing ??= refreshOnce().finally(() => { refreshing = null; });
+  return refreshing;
 }
 
 export async function validAccessToken(forceRefresh = false): Promise<string> {

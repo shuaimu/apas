@@ -40,8 +40,9 @@ cargo test --workspace
 
 ## Protocol and terminal generation
 
-Rust `shared` DTOs are canonical. After changing a public mobile/auth/session or
-WebSocket DTO, regenerate and commit the schema and TypeScript output:
+Rust `shared` DTOs are canonical. After changing a public mobile/auth/session,
+autonomous-job REST contract or WebSocket DTO, regenerate and commit the schema
+and TypeScript output:
 
 ```bash
 npm run protocol:generate
@@ -119,6 +120,79 @@ Enable in this order after each acceptance gate: `bootstrap` (read-only),
 `coding_mutations`, `terminal`, `notifications`, then `deep_links`. Disabling a
 flag is the first rollback action. Protocol negotiation also advertises bounds
 and capabilities; incompatible apps remain read-only.
+
+## Autonomous jobs and native qualification
+
+Jobs/Attention is separate from the interactive session home. Protected native
+composer, detail, all-question, cancellation and retained-review screens resolve
+`/code/jobs/...` links to the exact authorized job; they never attach an unrelated
+session or embed the web job UI. An in-app Attention inbox does not require push
+permission.
+
+The responsive **web** project screen has its own `+` → Interactive agent /
+Autonomous agent chooser and embedded job tabs. Its project-fixed composer,
+question and review views reuse the web job components. A visible **Overview**
+lists autonomous jobs with full expandable descriptions, confirmed status, host
+and update time; hidden/completed jobs remain reachable through bounded paging.
+Selecting or hiding a view never closes an interactive terminal or cancels
+execution, and stale cached status is labeled. Global web Jobs/Attention remain
+cross-project views. This integration is not
+a change to the native stack or evidence that native device gates have passed.
+
+Host provisioning, pinned images, scoped credentials, finite allowances,
+retention and stop/recovery rules are canonical in `AGENTS.md`, under
+**Autonomous jobs: deployment remains qualification-gated**. There is no
+qualified image/profile to enable yet. Do not infer qualification from the OMP
+18.18.0 source pin, container metadata, unit tests or Android export.
+
+The additive bootstrap `autonomous_jobs` field advertises server support;
+effective policy and fresh machine readiness decide whether a target is usable.
+Admission defaults disabled and project content visibility alone is not compute
+authority. Existing `bootstrap` and `coding_mutations` gates remain in force;
+notifications and deep links require their own existing flags. No mobile flag
+can widen the deployment/cluster/project job policy. Show unavailability rather
+than falling back to an interactive pane or replaying a mutation.
+
+Composer/answer drafts and request identities are persisted in SQLCipher before
+submission. Event bytes and the applied cursor commit together. Foreground,
+network recovery and receipt resolution recheck authority; reconnect does not
+automatically resend prompts, answers or cancellation. Unknown outcomes stay
+visible until the actor-scoped receipt resolves them. Recommendations in a
+multi-question dialog are not preselected consent.
+
+Account changes, logout and discovered project revocation purge protected job
+records and in-memory/download caches. Offline devices cannot discover a new
+revocation until they reconnect. Revoking one device session invalidates that
+device's credentials, not an otherwise authorized account's running jobs;
+account/runtime-grant revocation is the separate execution-stop path.
+
+Notifications carry privacy-safe job/question identities, not task text, answers
+or diffs. Cold-start and foreground routing first reauthenticate and authorize
+the exact target. Stale, answered or inaccessible questions must stay
+read-only or return to the nearest authorized Code screen, never trigger an
+answer or select another session.
+
+Before enabling jobs for mobile users, run **both iOS and Android development
+builds** through creation, every question in a multi-question form, cancellation,
+retained diff/check/log review and draft-PR handoff. Include interrupted replies,
+offline/background/reconnect, stale/cold notification links, account switching,
+revoked access, 320dp layouts, 48dp targets, keyboard/safe areas, enlarged text and
+VoiceOver/TalkBack. Verify visible focus and exact answer confirmation, and that
+unknown/expired verification cannot appear as a passing check.
+
+On 2026-11-08, native lint, TypeScript and 81 tests passed, as did Android
+Hermes export. No native device or emulator was available, so **none of the
+device interaction gates above is claimed complete**. Chromium viewport and
+zoom emulation do not substitute for a real mobile keyboard, safe area or screen
+reader. The local web/API smoke used explicitly synthetic retained job data;
+no model-driven job or real PR was executed.
+
+Roll out the job-aware server first, web/native clients second and daemon/CLI
+last, with admission disabled until qualification succeeds. To roll back,
+disable admission and affected mobile flags, keep capable controllers until
+whole-unit termination and required host purges are confirmed, and preserve
+durable receipts/journals/evidence before installing older binaries. An
+unreachable host must remain pending cleanup, not become a successful deletion.
 
 ## Device-session administration
 

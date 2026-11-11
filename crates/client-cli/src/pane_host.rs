@@ -609,10 +609,17 @@ pub fn persistent_hosting_available() -> bool {
         && Command::new(executable)
             .args(["pane-host", "--help"])
             .stdin(Stdio::null())
-            .stdout(Stdio::null())
             .stderr(Stdio::null())
-            .status()
-            .is_ok_and(|status| status.success())
+            .output()
+            .is_ok_and(|output| {
+                // A generic --help handler (including a Rust test harness)
+                // can exit successfully without supporting pane-host at all.
+                output.status.success()
+                    && output
+                        .stdout
+                        .windows(b"--runtime-dir".len())
+                        .any(|window| window == b"--runtime-dir")
+            })
         && runtime_root().is_ok()
 }
 

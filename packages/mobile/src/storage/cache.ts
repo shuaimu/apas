@@ -111,6 +111,14 @@ export async function openCache(): Promise<SQLite.SQLiteDatabase> {
         updated_at TEXT NOT NULL,
         PRIMARY KEY(session_id, pane_id)
       );
+      CREATE TABLE IF NOT EXISTS job_records (
+        account_id TEXT NOT NULL,
+        project_id TEXT NOT NULL,
+        job_id TEXT NOT NULL,
+        record_key TEXT NOT NULL,
+        payload TEXT NOT NULL,
+        PRIMARY KEY(account_id, project_id, job_id, record_key)
+      );
       PRAGMA user_version = 4;
     `);
     return db;

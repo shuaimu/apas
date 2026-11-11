@@ -500,6 +500,25 @@ async fn run_connection(
                     | Ok(ServerToCli::VersionUnsupported { .. }) => {
                         // Already handled during registration
                     }
+                    Ok(ServerToCli::AnswerOmpQuestion {
+                        session_id,
+                        pane_id,
+                        tool_use_id,
+                        request_id,
+                        ..
+                    }) => {
+                        let _ = ws_tx_clone
+                            .send(CliToServer::OmpQuestionAnswerResult {
+                                session_id,
+                                pane_id,
+                                tool_use_id,
+                                request_id,
+                                accepted: false,
+                                pending: false,
+                                error: Some("Remote-only mode has no OMP terminal dialogs".into()),
+                            })
+                            .await;
+                    }
                     Ok(ServerToCli::PauseDeadloop { .. })
                     | Ok(ServerToCli::ResumeDeadloop { .. })
                     | Ok(ServerToCli::PausePane { .. })

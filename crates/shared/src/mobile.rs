@@ -102,6 +102,8 @@ pub struct MobileBootstrapResponse {
     pub sessions: Vec<MobileSessionSummary>,
     pub machines: Vec<MachineWithProjects>,
     pub launch_targets: Vec<MobileLaunchTarget>,
+    #[serde(default)]
+    pub autonomous_jobs: crate::jobs::MobileJobsBootstrap,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]

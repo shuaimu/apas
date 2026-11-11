@@ -14,6 +14,8 @@ pub struct Config {
     pub daemon: DaemonConfig,
     #[serde(default)]
     pub summaries: SummaryConfig,
+    #[serde(default)]
+    pub autonomous_jobs: crate::jobs::config::AutonomousJobConfig,
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]

@@ -18,6 +18,7 @@ import { useStore } from "@/lib/store";
 import { CreateInstanceModal } from "@/components/CreateInstanceModal";
 import { AllProvidersUsage } from "@/components/UsageLimits";
 import { EffectivePolicy, LaunchProfile, PolicyEditor } from "@/components/PolicyEditor";
+import { AutonomousJobPolicyEditor } from "@/components/AutonomousJobPolicyEditor";
 import { isRetiredLaunchProfileKey } from "@/lib/providerOptions";
 import {
   daemonVersionLabel,
@@ -937,6 +938,12 @@ export default function MachinesPage() {
                     onInherit={() => mutate(`/cluster/projects/${selected.project.id}/policy`, { method: "PATCH", body: JSON.stringify({ team_available: null, allowed_launch_profiles: null }) }, () => loadProject(selected.project.id))}
                   />
                   )}
+                  {!sharedView && <AutonomousJobPolicyEditor
+                    key={selected.project.id}
+                    title="Project autonomous job policy"
+                    endpoint={`/cluster/projects/${encodeURIComponent(selected.project.id)}/job-policy`}
+                    request={api}
+                  />}
                 </div>
               ) : (
                 <div className="rounded-lg border border-dashed border-gray-300 p-8 text-center text-sm text-gray-500 dark:border-gray-700">
@@ -964,6 +971,7 @@ export default function MachinesPage() {
             onInherit={() => mutate("/cluster/policy/default", { method: "PATCH", body: JSON.stringify({ team_available: null, allowed_launch_profiles: null }) })}
           />
         )}
+        {!sharedView && <AutonomousJobPolicyEditor title="Cluster autonomous job policy" endpoint="/cluster/job-policy" request={api} />}
 
         {!sharedView && <section className="rounded-lg border border-gray-200 bg-white shadow-sm dark:border-gray-800 dark:bg-gray-900">
           <div className="border-b border-gray-200 px-4 py-3 dark:border-gray-800">

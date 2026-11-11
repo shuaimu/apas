@@ -6,13 +6,8 @@ import { UsageStatsRollup } from "./UsageStatsRollup";
 import { AllowedTabTypesCard } from "./AllowedTabTypesCard";
 
 /**
- * The project overview: what this project may launch, the panes it is running,
- * and what they are costing.
- *
- * It used to be the team overview — a goal bar, a TODO queue, a delegation
- * board, a scratchpad ticker and a managed pane grid, all gated on team mode.
- * That feature is gone, and with it the distinction between managed and
- * unmanaged panes, so there is one grid rather than two.
+ * Interactive project panels embedded below the autonomous agent overview:
+ * launch policy, panes, usage and resource costs.
  */
 interface OverviewViewProps {
   onOpenPane: (paneId: number) => void;
@@ -32,11 +27,11 @@ export function OverviewView({
   onRemovePane,
 }: OverviewViewProps) {
   return (
-    <div className="h-full overflow-y-auto bg-gray-50 p-6 dark:bg-gray-950">
+    <section aria-label="Interactive project" className="mt-6 rounded-lg bg-gray-50 p-6 dark:bg-gray-950">
       <div className="mx-auto max-w-7xl">
         <div className="mb-1 flex flex-wrap items-center justify-between gap-2">
           <h2 className="text-xl font-semibold text-gray-900 dark:text-gray-100">
-            Overview
+            Interactive project
           </h2>
         </div>
         <p className="mb-6 text-sm text-gray-500 dark:text-gray-400">
@@ -65,7 +60,7 @@ export function OverviewView({
           <ResourceUseRollup />
         </OverviewSection>
       </div>
-    </div>
+    </section>
   );
 }
 

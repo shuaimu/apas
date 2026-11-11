@@ -15,11 +15,12 @@ use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 use uuid::Uuid;
 
 const UPDATE_INTERVAL: Duration = Duration::from_secs(4 * 60 * 60);
 const UPDATE_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+const LOCK_WAIT_TIMEOUT: Duration = Duration::from_secs(16 * 60);
 const VERSION_TIMEOUT: Duration = Duration::from_secs(10);
 const RETAIN_OLD_COPIES: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
@@ -38,9 +39,33 @@ pub fn omp_binary_for_launch(source: &Path) -> Result<PathBuf> {
     )
 }
 
-fn omp_binary_for_launch_in(source: &Path, dir: &Path, legacy: &Path) -> Result<PathBuf> {
+/// Prepare a fresh native OMP update before an explicit pane reboot.
+/// Unlike ordinary launches, this waits for an in-flight updater, ignores the
+/// successful-check interval, and propagates failures instead of selecting an
+/// older binary. Call it off the UI thread while the existing pane stays alive.
+/// Uses the same native-cache precedence as ordinary launches; uncached
+/// script/package launchers retain their configured path and are not updated.
+pub fn omp_binary_for_reboot(source: &Path) -> Result<PathBuf> {
+    let dir = storage_dir()?;
+    omp_binary_for_reboot_in(
+        source,
+        &dir,
+        &host_storage::legacy_provider_root().join("omp"),
+    )
+}
+
+fn omp_binary_for_reboot_in(source: &Path, dir: &Path, legacy: &Path) -> Result<PathBuf> {
+    if prepare_native_cache(source, dir, legacy)?.is_none() {
+        return Ok(source.to_path_buf());
+    }
+    check_for_update(dir, source, UpdateCheck::Required)?;
+    let active = read_active(dir)?.context("no verified OMP version after reboot update")?;
+    Ok(dir.join(active.name))
+}
+
+fn prepare_native_cache(source: &Path, dir: &Path, legacy: &Path) -> Result<Option<Active>> {
     let lock = locked_file(&dir.join(".launch.lock"))?;
-    FileExt::lock_exclusive(&lock)?;
+    lock_exclusive_with_timeout(&lock, LOCK_WAIT_TIMEOUT)?;
     let result = (|| {
         let active = match read_active(dir)? {
             Some(active) => Some(active),
@@ -66,7 +91,11 @@ fn omp_binary_for_launch_in(source: &Path, dir: &Path, legacy: &Path) -> Result<
         Ok(active)
     })();
     FileExt::unlock(&lock)?;
-    let Some(active) = result? else {
+    result
+}
+
+fn omp_binary_for_launch_in(source: &Path, dir: &Path, legacy: &Path) -> Result<PathBuf> {
+    let Some(active) = prepare_native_cache(source, dir, legacy)? else {
         return Ok(source.to_path_buf());
     };
 
@@ -78,7 +107,9 @@ fn omp_binary_for_launch_in(source: &Path, dir: &Path, legacy: &Path) -> Result<
         if let Err(error) = thread::Builder::new()
             .name("omp-local-update".into())
             .spawn(move || {
-                if let Err(error) = check_for_update(&background_dir, &source) {
+                if let Err(error) =
+                    check_for_update(&background_dir, &source, UpdateCheck::Opportunistic)
+                {
                     tracing::warn!(%error, "host-local OMP update failed; keeping last verified binary");
                 }
             })
@@ -127,7 +158,7 @@ fn migrate_legacy_active(dir: &Path, legacy: &Path) -> Option<Active> {
             }
         }
         let lock = locked_file(&legacy.join(".launch.lock"))?;
-        FileExt::lock_exclusive(&lock)?;
+        lock_exclusive_with_timeout(&lock, LOCK_WAIT_TIMEOUT)?;
         let result = (|| {
             let old = match read_active(legacy)? {
                 Some(old) => old,
@@ -197,6 +228,23 @@ fn locked_file(path: &Path) -> Result<File> {
         bail!("unsafe OMP lock {}", path.display());
     }
     Ok(file)
+}
+
+fn lock_exclusive_with_timeout(lock: &File, timeout: Duration) -> Result<()> {
+    let start = Instant::now();
+    loop {
+        match FileExt::try_lock_exclusive(lock) {
+            Ok(()) => return Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                let elapsed = start.elapsed();
+                if elapsed >= timeout {
+                    bail!("timed out after {timeout:?} waiting for an OMP cache lock");
+                }
+                thread::sleep(Duration::from_millis(100).min(timeout - elapsed));
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
 }
 
 fn is_native_elf(source: &Path) -> Result<bool> {
@@ -423,19 +471,37 @@ fn run_command(
         command.env("PATH", path);
     }
     // Upstream's update can spawn a downloader. Terminate the entire process
-    // group on timeout, not just the immediate CLI process.
-    unsafe {
-        command.pre_exec(|| {
-            if libc::setpgid(0, 0) == -1 {
-                return Err(std::io::Error::last_os_error());
+    // group on timeout, not just the immediate CLI process. Use the native
+    // spawn attribute rather than pre_exec: a concurrent fork can inherit a
+    // staging writer until exec and make another thread's verification fail
+    // with ETXTBSY even after that thread closes its own writer.
+    command.process_group(0);
+    let start = Instant::now();
+    let mut child = loop {
+        match command.spawn() {
+            Ok(child) => break child,
+            Err(error) if error.raw_os_error() == Some(libc::ETXTBSY) => {
+                // Other fork paths can still briefly retain a staging writer.
+                // Retry only this kernel contention, before any command ran,
+                // and charge the wait to the same subprocess deadline.
+                let remaining = timeout.saturating_sub(start.elapsed());
+                if !remaining.is_zero() {
+                    thread::sleep(Duration::from_millis(100).min(remaining));
+                }
+                if start.elapsed() >= timeout {
+                    return Err(error).with_context(|| {
+                        format!(
+                            "start {} exceeded {timeout:?} waiting for executable writers",
+                            binary.display()
+                        )
+                    });
+                }
             }
-            Ok(())
-        });
-    }
-    let mut child = command
-        .spawn()
-        .with_context(|| format!("start {}", binary.display()))?;
-    let start = std::time::Instant::now();
+            Err(error) => {
+                return Err(error).with_context(|| format!("start {}", binary.display()));
+            }
+        }
+    };
     loop {
         let status = match child.try_wait() {
             Ok(status) => status,
@@ -569,24 +635,33 @@ fn prune_stale_work(dir: &Path) {
     }
 }
 
-fn check_for_update(dir: &Path, source: &Path) -> Result<()> {
+enum UpdateCheck {
+    Opportunistic,
+    Required,
+}
+
+fn check_for_update(dir: &Path, source: &Path, check: UpdateCheck) -> Result<()> {
     private_dir(dir)?;
     let lock = locked_file(&dir.join(".update.lock"))?;
-    match FileExt::try_lock_exclusive(&lock) {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-            return Ok(()); // Another process already performs this update.
-        }
-        Err(error) => return Err(error.into()),
+    match check {
+        UpdateCheck::Opportunistic => match FileExt::try_lock_exclusive(&lock) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                return Ok(()); // Another process already performs this update.
+            }
+            Err(error) => return Err(error.into()),
+        },
+        UpdateCheck::Required => lock_exclusive_with_timeout(&lock, LOCK_WAIT_TIMEOUT)
+            .context("wait for the in-flight OMP updater")?,
     }
     let result = (|| {
         prune_stale_work(dir);
         let last = dir.join("last-successful-check");
-        if checked_recently(&last) {
+        if matches!(check, UpdateCheck::Opportunistic) && checked_recently(&last) {
             return Ok(());
         }
         let launch_lock = locked_file(&dir.join(".launch.lock"))?;
-        FileExt::lock_exclusive(&launch_lock)?;
+        lock_exclusive_with_timeout(&launch_lock, LOCK_WAIT_TIMEOUT)?;
         let current = read_active(dir)?.context("no verified OMP version to update")?;
         FileExt::unlock(&launch_lock)?;
         let work = WorkDir::new(dir)?;
@@ -608,7 +683,7 @@ fn check_for_update(dir: &Path, source: &Path) -> Result<()> {
         }
         let updated = verify_version(&candidate, &work.path)?;
         if updated > original {
-            FileExt::lock_exclusive(&launch_lock)?;
+            lock_exclusive_with_timeout(&launch_lock, LOCK_WAIT_TIMEOUT)?;
             let result = (|| {
                 let current =
                     read_active(dir)?.context("OMP active pointer removed during update")?;
@@ -750,12 +825,21 @@ mod tests {
     use super::*;
 
     fn executable_fixture(root: &Path, name: &str, version: &str) -> PathBuf {
+        executable_fixture_with_update(root, name, version, "")
+    }
+
+    fn executable_fixture_with_update(
+        root: &Path,
+        name: &str,
+        version: &str,
+        update: &str,
+    ) -> PathBuf {
         let code = root.join(format!("{name}.rs"));
         let binary = root.join(name);
         fs::write(
             &code,
             format!(
-                "fn main() {{ match std::env::args().nth(1).as_deref() {{ Some(\"--version\") => println!(\"omp/{version}\"), Some(\"update\") => (), _ => std::process::exit(2) }} }}"
+                "fn main() {{ match std::env::args().nth(1).as_deref() {{ Some(\"--version\") => println!(\"omp/{version}\"), Some(\"update\") => {{ {update} }}, _ => std::process::exit(2) }} }}"
             ),
         )
         .unwrap();
@@ -780,6 +864,280 @@ mod tests {
         let verified = verify_version(&candidate, &work.path).unwrap();
         assert_eq!(verified, Version::parse(version).unwrap());
         publish(dir, &candidate, &verified).unwrap()
+    }
+
+    fn replace_self_update(replacement: &Path) -> String {
+        format!(
+            r#"
+                let binary = std::env::current_exe().unwrap();
+                let staged = binary.with_extension("next");
+                std::fs::copy({replacement:?}, &staged).unwrap();
+                std::fs::rename(staged, binary).unwrap();
+            "#
+        )
+    }
+
+    #[test]
+    fn reboot_bypasses_recent_check_and_selects_fresh_update() {
+        let temp = tempfile::tempdir().unwrap();
+        let legacy = temp.path().join("absent-legacy");
+        let newer = executable_fixture(temp.path(), "newer-omp", "18.12.6");
+        let invocation = temp.path().join("update-path");
+        let source = executable_fixture_with_update(
+            temp.path(),
+            "shared-omp",
+            "18.10.3",
+            &format!(
+                "std::fs::write({invocation:?}, std::env::current_exe().unwrap().to_str().unwrap()).unwrap(); {}",
+                replace_self_update(&newer)
+            ),
+        );
+        let source_bytes = fs::read(&source).unwrap();
+
+        for cached in [false, true] {
+            let dir = temp.path().join(if cached { "cached" } else { "cold" });
+            private_dir(&dir).unwrap();
+            let old = cached.then(|| publish_fixture(&dir, &source, "18.10.3"));
+            fs::write(dir.join("last-successful-check"), b"").unwrap();
+            if let Some(old) = &old {
+                fs::remove_file(&invocation).unwrap();
+                check_for_update(&dir, &source, UpdateCheck::Opportunistic).unwrap();
+                assert_eq!(
+                    omp_binary_for_launch_in(&source, &dir, &legacy).unwrap(),
+                    dir.join(&old.name)
+                );
+                assert!(!invocation.exists());
+            }
+
+            let selected = omp_binary_for_reboot_in(&source, &dir, &legacy).unwrap();
+            assert_eq!(
+                verify_version(&selected, temp.path()).unwrap(),
+                Version::parse("18.12.6").unwrap()
+            );
+            assert_eq!(selected, dir.join(read_active(&dir).unwrap().unwrap().name));
+            assert_eq!(fs::read(&source).unwrap(), source_bytes);
+            assert_eq!(fs::metadata(&selected).unwrap().mode() & 0o222, 0);
+            if let Some(old) = old {
+                assert_ne!(selected, dir.join(&old.name));
+                assert_eq!(fs::read(dir.join(old.name)).unwrap(), source_bytes);
+            }
+            let updated_copy = PathBuf::from(fs::read_to_string(&invocation).unwrap());
+            assert_eq!(updated_copy.parent().unwrap().parent(), Some(dir.as_path()));
+            assert!(updated_copy
+                .parent()
+                .unwrap()
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .starts_with(".work-"));
+        }
+    }
+
+    #[test]
+    fn reboot_waits_for_in_flight_update_and_uses_new_active() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("omp");
+        let legacy = temp.path().join("absent-legacy");
+        private_dir(&dir).unwrap();
+        let source = executable_fixture(temp.path(), "shared-omp", "18.10.3");
+        let fresh_check = temp.path().join("fresh-check");
+        let newer = executable_fixture_with_update(
+            temp.path(),
+            "newer-omp",
+            "18.12.6",
+            &format!("std::fs::write({fresh_check:?}, b\"checked\").unwrap();"),
+        );
+        let old = publish_fixture(&dir, &source, "18.10.3");
+        let update_lock = locked_file(&dir.join(".update.lock")).unwrap();
+        FileExt::lock_exclusive(&update_lock).unwrap();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let worker_dir = dir.clone();
+        let worker_source = source.clone();
+        let worker = thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            result_tx
+                .send(omp_binary_for_reboot_in(
+                    &worker_source,
+                    &worker_dir,
+                    &legacy,
+                ))
+                .unwrap();
+        });
+        started_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        let early = result_rx.recv_timeout(Duration::from_millis(200));
+
+        // Finish the already-running updater while retaining its lock, then
+        // require the waiting reboot to check again from this newer active.
+        let new = publish_fixture(&dir, &newer, "18.12.6");
+        fs::write(dir.join("last-successful-check"), b"").unwrap();
+        FileExt::unlock(&update_lock).unwrap();
+        worker.join().unwrap();
+        assert!(
+            matches!(early, Err(std::sync::mpsc::RecvTimeoutError::Timeout)),
+            "reboot returned before the existing updater finished: {early:?}"
+        );
+        let selected = result_rx
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap()
+            .unwrap();
+        assert_eq!(selected, dir.join(&new.name));
+        assert_eq!(read_active(&dir).unwrap().unwrap().name, new.name);
+        assert!(fresh_check.exists());
+        assert_eq!(
+            verify_version(&dir.join(old.name), temp.path()).unwrap(),
+            Version::parse("18.10.3").unwrap()
+        );
+        assert_eq!(
+            verify_version(&source, temp.path()).unwrap(),
+            Version::parse("18.10.3").unwrap()
+        );
+    }
+
+    #[test]
+    fn reboot_update_failure_or_downgrade_preserves_active_and_source() {
+        let temp = tempfile::tempdir().unwrap();
+        let legacy = temp.path().join("absent-legacy");
+        let older = executable_fixture(temp.path(), "older-omp", "18.3.2");
+        for (name, update, error_text) in [
+            ("failure", "std::process::exit(3);".into(), "exited with"),
+            ("downgrade", replace_self_update(&older), "downgrade"),
+        ] {
+            let dir = temp.path().join(name);
+            private_dir(&dir).unwrap();
+            let source = executable_fixture_with_update(
+                temp.path(),
+                &format!("{name}-omp"),
+                "18.10.3",
+                &update,
+            );
+            let source_bytes = fs::read(&source).unwrap();
+            let old = publish_fixture(&dir, &source, "18.10.3");
+            fs::write(dir.join("last-successful-check"), b"previous").unwrap();
+
+            let error = omp_binary_for_reboot_in(&source, &dir, &legacy).unwrap_err();
+            assert!(error.to_string().contains(error_text), "{error:#}");
+            assert_eq!(read_active(&dir).unwrap().unwrap().name, old.name);
+            assert_eq!(fs::read(dir.join(old.name)).unwrap(), source_bytes);
+            assert_eq!(fs::read(&source).unwrap(), source_bytes);
+            assert_eq!(
+                fs::read(dir.join("last-successful-check")).unwrap(),
+                b"previous"
+            );
+        }
+    }
+
+    #[test]
+    fn reboot_preserves_launch_cache_and_package_launcher_precedence() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("omp");
+        let legacy = temp.path().join("absent-legacy");
+        private_dir(&dir).unwrap();
+        let source = temp.path().join("package-omp");
+        let script = b"#!/bin/sh\nexit 99\n";
+        fs::write(&source, script).unwrap();
+        fs::set_permissions(&source, fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(
+            omp_binary_for_reboot_in(&source, &dir, &legacy).unwrap(),
+            source
+        );
+        assert_eq!(
+            omp_binary_for_launch_in(&source, &dir, &legacy).unwrap(),
+            source
+        );
+        assert!(read_active(&dir).unwrap().is_none());
+        assert!(!dir.join("last-successful-check").exists());
+
+        let native = executable_fixture(temp.path(), "native-omp", "18.12.6");
+        let active = publish_fixture(&dir, &native, "18.12.6");
+        fs::write(dir.join("last-successful-check"), b"").unwrap();
+        assert_eq!(
+            omp_binary_for_reboot_in(&source, &dir, &legacy).unwrap(),
+            dir.join(&active.name)
+        );
+        assert_eq!(
+            omp_binary_for_launch_in(&source, &dir, &legacy).unwrap(),
+            dir.join(&active.name)
+        );
+        assert_eq!(fs::read(&source).unwrap(), script);
+        fs::remove_file(&source).unwrap();
+        assert_eq!(
+            omp_binary_for_reboot_in(&source, &dir, &legacy).unwrap(),
+            dir.join(active.name)
+        );
+    }
+
+    #[test]
+    fn waiting_for_cache_lock_times_out_without_taking_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join(".update.lock");
+        let owner = locked_file(&path).unwrap();
+        FileExt::lock_exclusive(&owner).unwrap();
+        let waiter = locked_file(&path).unwrap();
+        let error = lock_exclusive_with_timeout(&waiter, Duration::from_millis(20)).unwrap_err();
+        assert!(error.to_string().contains("timed out"), "{error:#}");
+        FileExt::unlock(&owner).unwrap();
+        lock_exclusive_with_timeout(&waiter, Duration::ZERO).unwrap();
+        FileExt::unlock(&waiter).unwrap();
+    }
+
+    #[test]
+    fn command_waits_for_executable_writer_then_succeeds() {
+        let temp = tempfile::tempdir().unwrap();
+        let binary = executable_fixture(temp.path(), "busy-omp", "18.12.6");
+        let writer = OpenOptions::new().write(true).open(&binary).unwrap();
+        let error = Command::new(&binary).arg("--version").spawn().unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::ETXTBSY));
+
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let worker = thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            result_tx
+                .send(run_command(
+                    &binary,
+                    &["--version"],
+                    Duration::from_secs(10),
+                    None,
+                    None,
+                ))
+                .unwrap();
+        });
+        started_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        let early = result_rx.recv_timeout(Duration::from_millis(200));
+        drop(writer);
+        worker.join().unwrap();
+        assert!(
+            matches!(early, Err(std::sync::mpsc::RecvTimeoutError::Timeout)),
+            "command returned while its executable had a writer: {early:?}"
+        );
+        result_rx
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap()
+            .unwrap();
+    }
+
+    #[test]
+    fn executable_writer_contention_obeys_command_deadline() {
+        let temp = tempfile::tempdir().unwrap();
+        let binary = executable_fixture(temp.path(), "busy-omp", "18.12.6");
+        let writer = OpenOptions::new().write(true).open(&binary).unwrap();
+        let timeout = Duration::from_millis(20);
+        let started = Instant::now();
+        let error = run_command(&binary, &["--version"], timeout, None, None).unwrap_err();
+        let elapsed = started.elapsed();
+        drop(writer);
+        assert!(error.to_string().contains("exceeded"), "{error:#}");
+        assert_eq!(
+            error
+                .downcast_ref::<std::io::Error>()
+                .unwrap()
+                .raw_os_error(),
+            Some(libc::ETXTBSY)
+        );
+        assert!(elapsed >= timeout);
+        assert!(elapsed < Duration::from_secs(5), "wait took {elapsed:?}");
     }
 
     #[test]
@@ -809,7 +1167,7 @@ mod tests {
         assert_eq!(read_active(&legacy).unwrap().unwrap().name, old.name);
 
         fs::remove_file(durable.join("last-successful-check")).unwrap();
-        check_for_update(&durable, &shared).unwrap();
+        check_for_update(&durable, &shared, UpdateCheck::Opportunistic).unwrap();
         assert!(durable.join("last-successful-check").exists());
         assert_eq!(
             verify_version(&launched, temp.path()).unwrap(),

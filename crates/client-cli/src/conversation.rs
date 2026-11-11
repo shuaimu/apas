@@ -71,15 +71,26 @@ pub struct TurnRecord {
 pub struct TurnQuestion {
     pub tool_use_id: String,
     pub tool_name: String,
-    /// The tool call's `input`, unaltered.
+    /// Native tool input, or the provider-tagged normalized OMP question.
     pub input: serde_json::Value,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TurnAnswer {
     pub tool_use_id: String,
-    /// What the provider recorded, verbatim.
+    /// Native answer text, or the structured OMP result encoded as JSON.
     pub recorded: String,
+}
+
+impl TurnAnswer {
+    pub fn is_error(&self) -> bool {
+        self.tool_use_id.starts_with("omp:")
+            && serde_json::from_str::<serde_json::Value>(&self.recorded)
+                .ok()
+                .is_some_and(|result| {
+                    result["type"] == "omp_question_result" && result["status"] != "answered"
+                })
+    }
 }
 
 impl TurnRecord {

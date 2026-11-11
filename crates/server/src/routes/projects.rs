@@ -112,6 +112,7 @@ pub async fn transfer_owner(
             "Project ownership changed concurrently".to_string(),
         ));
     }
+    crate::jobs::reconcile_authority(&state).await?;
 
     if let Ok(old_owner_id) = Uuid::parse_str(&actor.id) {
         state.sessions.notify_project_access_changed(
@@ -171,6 +172,7 @@ pub async fn leave_project(
             "Project membership changed concurrently".to_string(),
         ));
     }
+    crate::jobs::reconcile_authority(&state).await?;
     if let Ok(user_id) = Uuid::parse_str(&actor.id) {
         state
             .sessions
@@ -203,6 +205,8 @@ pub async fn delete_project(
         .begin_project_deletion(&actor.id, &project_id, &request.confirmation)
         .await
         .map_err(|error| AppError::Conflict(error.to_string()))?;
+    crate::jobs::cancel_project_jobs(&state, &project_id, "project_deleting").await?;
+    crate::jobs::reconcile_authority(&state).await?;
     schedule_project_cleanup(state, project_id);
 
     Ok((

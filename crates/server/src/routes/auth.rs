@@ -218,6 +218,7 @@ pub async fn register(
 
     // Generate token
     let token = generate_token(&user_id, &state.config.auth)?;
+    state.db.record_user_login(&user_id).await?;
 
     Ok(Json(AuthResponse {
         token,
@@ -253,6 +254,7 @@ pub async fn login(
 
     // Generate token
     let token = generate_token(&user.id, &state.config.auth)?;
+    state.db.record_user_login(&user.id).await?;
 
     Ok(Json(AuthResponse {
         token,
@@ -492,6 +494,7 @@ pub async fn device_poll(
                     ));
                 }
                 let token = generate_token(&user_id.to_string(), &state.config.auth)?;
+                state.db.record_user_login(&user.id).await?;
                 tracing::info!("Device code {} completed for user {}", code, user_id);
                 Ok(Json(DevicePollResponse::Success {
                     token,
@@ -684,6 +687,8 @@ pub async fn reset_password(
     if !updated {
         return Err(AppError::Internal("Failed to update password".to_string()));
     }
+    // Password reset revokes device credentials, not account-owned execution.
+    crate::jobs::reconcile_subscriptions(&state).await?;
 
     // Remove the used token
     state.password_reset_tokens.remove(&req.token);

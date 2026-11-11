@@ -1,6 +1,7 @@
 import type { Metadata, Viewport } from "next";
 import "./globals.css";
 import { Toaster } from "@/components/Toaster";
+import { JobConnection } from "@/components/jobs/JobConnection";
 
 export const metadata: Metadata = {
   title: "APAS - Claude Code Remote",
@@ -27,8 +28,6 @@ export const metadata: Metadata = {
 export const viewport: Viewport = {
   width: "device-width",
   initialScale: 1,
-  maximumScale: 1,
-  userScalable: false,
   themeColor: "#7c3aed",
   viewportFit: "cover", // Required for iOS safe area handling
 };
@@ -58,6 +57,7 @@ if(t==='system'){r.removeAttribute('data-theme')}else{r.setAttribute('data-theme
 }catch(e){}})()`,
           }}
         />
+        <JobConnection />
         {children}
         <Toaster />
       </body>

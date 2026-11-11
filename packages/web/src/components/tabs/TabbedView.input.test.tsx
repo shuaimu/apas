@@ -1,7 +1,7 @@
 import { act, createEvent, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { paneKey, useStore, type PaneConfig } from "@/lib/store";
-import { OVERVIEW_PANE_ID, TabbedView } from "./TabbedView";
+import { TabbedView } from "./TabbedView";
 
 type StoreState = ReturnType<typeof useStore.getState>;
 
@@ -186,9 +186,9 @@ describe("TabbedView pane input drafts", () => {
 
     await activeInput();
 
-    fireEvent.click(screen.getByText("Overview"));
+    fireEvent.click(screen.getByRole("button", { name: "Project overview" }));
     await waitFor(() => {
-      expect(screen.queryByPlaceholderText("Type a message...")).toBeNull();
+      expect(screen.queryByRole("textbox")).toBeNull();
     });
 
     fireEvent.click(screen.getByText("Reviewer (Bot)"));

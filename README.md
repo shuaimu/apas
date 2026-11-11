@@ -214,6 +214,14 @@ upgrades a local candidate with `omp update`; later launches use the verified
 version. Script/package-manager launchers stay at their configured paths.
 Network/update failures do not stop a pane from launching.
 
+An explicit OMP agent **Reboot** instead performs a fresh update check and
+waits for a verified executable before stopping the current provider. It
+bypasses the background-check throttle and resumes the same pane conversation
+on that exact executable. A preparation failure cancels the reboot and leaves
+the running agent intact. Script/package installations still need their
+package manager. **Reboot CLI** continues to preserve hosted provider processes;
+use the agent's reboot control to replace OMP itself.
+
 ### Projects run inside one instance
 
 A host runs one `apas` process per user, with the projects running inside it as

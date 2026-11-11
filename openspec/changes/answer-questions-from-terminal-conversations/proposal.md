@@ -11,7 +11,8 @@ The pane is then stuck: it is waiting for an answer the human cannot see, and on
 - An answer is **confirmed by reading, not by assuming**. The transcript's `tool_result` for that `tool_use_id` is published as the acknowledgement the web's pending-answer queue already waits for, so the card settles on what the agent actually recorded rather than on what APAS believes it sent.
 - A question that is **already answered cannot be answered again**: once its `tool_result` exists, the pane refuses further keystrokes for that `tool_use_id`. Terminal writes are blind, and a stale browser tab replaying a selection into a live prompt is the failure this must not allow.
 - An unanswered question is reported as **Pending answer**, distinct from Working, Idle, Usage limited, and Offline. Project lists, waiting-agent lists, pane tabs, and conversation status surfaces preserve that distinction until the provider records the answer.
-- Scope is **Claude terminal panes**. `AskUserQuestion` is Claude's; Codex and OpenCode have their own approval interfaces and are untouched.
+- Scope now includes **Claude and OMP terminal panes**. OMP's native `ask` is normalized into the existing question card, with provider-specific structured delivery through APAS's pane-local extension. Codex, OpenCode, and Pi question interfaces remain untouched.
+- OMP answers retain native question IDs, selected-option arrays, and custom text. Cancellation and terminal answers settle from native outcomes; bridge acceptance is not confirmation. Older or already-running panes without the bridge expose readable questions with terminal fallback.
 
 ## Capabilities
 
@@ -29,5 +30,5 @@ The pane is then stuck: it is waiting for an answer the human cannot see, and on
 - `crates/client-cli/src/mode/dual_pane.rs`: `conversation_turn_to_stream_messages` dresses a question turn as a `ToolUse` content block and an answer turn as a `ToolResult`, and `ServerToCli::AnswerQuestion` gains a terminal-pane branch that writes keystrokes to the pty.
 - `crates/client-cli/src/terminal_pane.rs`: keystroke delivery for a selection, alongside the existing `TerminalInput` write path.
 - `crates/server` and `crates/shared`: the existing pane-status cache classifies a question as awaiting an answer, reports it separately from active work in session summaries, and returns it to working only when the recorded tool result arrives.
-- `packages/web`: the question card is reused as-is; project and waiting-agent lists plus pane/conversation indicators render Pending answer without treating it as working or ordinary idle.
-- Docs: the terminal-pane section of `CLAUDE.md`, which currently states the conversation view shows only user/assistant turns.
+- `packages/web`: the shared question card becomes provider-aware and supports lossless OMP answers, cancellation, live/history confirmation, and metadata updates without duplicate cards.
+- Docs: the terminal-pane section of the canonical `AGENTS.md` runbook.

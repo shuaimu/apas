@@ -83,6 +83,41 @@ afterEach(() => {
 });
 
 describe("TabbedView terminal panes", () => {
+  it("opens project Overview without pane commands or remounting the terminal", async () => {
+    seed([pane({ pane_id: 7, label: "Codex TTY", kind: "terminal" })], 7);
+    const removePane = vi.fn();
+    const rebootPane = vi.fn();
+    const sendMessageToPane = vi.fn(() => ({ success: true }));
+    act(() => useStore.setState({
+      projectPolicies: {},
+      removePane,
+      rebootPane,
+      sendMessageToPane,
+    }));
+    render(<TabbedView />);
+    const terminal = await screen.findByTestId("terminal-pane-7");
+    const loadMessages = vi.mocked(useStore.getState().loadPaneMessagesIfNeeded);
+    loadMessages.mockClear();
+
+    fireEvent.click(screen.getByRole("button", { name: "Project overview" }));
+
+    const panels = await screen.findByRole("region", { name: "Interactive project" });
+    expect(screen.getAllByRole("button", { name: "Project overview" })).toHaveLength(1);
+    expect(screen.getByTestId("terminal-pane-7")).toBe(terminal);
+    expect(terminal.closest(".hidden")).not.toBeNull();
+    expect(loadMessages).not.toHaveBeenCalled();
+    expect(removePane).not.toHaveBeenCalled();
+    expect(rebootPane).not.toHaveBeenCalled();
+    expect(sendMessageToPane).not.toHaveBeenCalled();
+
+    fireEvent.click(within(panels).getByText("Codex TTY"));
+
+    await waitFor(() => expect(screen.getByRole("button", { name: "Project overview" }).getAttribute("aria-pressed")).toBe("false"));
+    expect(screen.getByTestId("terminal-pane-7")).toBe(terminal);
+    expect(terminal.closest(".hidden")).toBeNull();
+    expect(localStorage.getItem(`apas_layout_${CLI_CLIENT_ID}_active_tab`)).toBe("7");
+  });
+
   it("loads older terminal conversation turns when scrolling to the top", async () => {
     vi.stubGlobal("requestAnimationFrame", (callback: FrameRequestCallback) => {
       callback(0);

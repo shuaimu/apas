@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 use crate::transcript::TranscriptActivity;
@@ -16,6 +17,344 @@ const REPORT_FILE: &str = "omp-activity.json";
 const EXTENSION_FILE: &str = "omp-activity.mjs";
 const EXTENSION: &str = include_str!("omp_activity.mjs");
 const MAX_REPORT_BYTES: u64 = 8192;
+const QUESTION_FILE: &str = "omp-question.json";
+const SUBMISSION_FILE: &str = "omp-question-submit.json";
+const ACK_FILE: &str = "omp-question-ack.json";
+const ANSWER_LOCK_FILE: &str = "omp-question.lock";
+const MAX_QUESTION_BYTES: u64 = 128 * 1024;
+const ANSWER_TIMEOUT: Duration = Duration::from_secs(2);
+
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct QuestionScope {
+    launch_id: Uuid,
+    pid: i32,
+    process_start: String,
+    session_id: String,
+    transcript_path: PathBuf,
+    tool_call_id: String,
+    dialog_id: Uuid,
+}
+
+#[derive(Serialize, Deserialize)]
+struct QuestionReport {
+    #[serde(flatten)]
+    scope: QuestionScope,
+    questions: serde_json::Value,
+}
+
+#[derive(Serialize)]
+struct AnswerRequest<'a> {
+    #[serde(flatten)]
+    scope: &'a QuestionScope,
+    nonce: Uuid,
+    request_id: &'a str,
+    answers: &'a [shared::OmpQuestionAnswer],
+    cancel: bool,
+}
+
+#[derive(Serialize, Deserialize)]
+struct AnswerAck {
+    #[serde(flatten)]
+    scope: QuestionScope,
+    nonce: Uuid,
+    request_id: String,
+    accepted: bool,
+    error: Option<String>,
+}
+
+pub struct OmpQuestionReport {
+    pub tool_use_id: String,
+    pub dialog_id: Uuid,
+    pub session_id: String,
+    pub transcript_path: PathBuf,
+}
+
+/// The native identity is opaque to routing; callers must never split this ID.
+pub fn question_tool_use_id(pane_id: u32, session_id: &str, tool_call_id: &str) -> String {
+    format!("omp:{pane_id}:{session_id}:{tool_call_id}")
+}
+
+pub fn reported_question(
+    project_id: Uuid,
+    pane_id: u32,
+    process_group_id: Option<i32>,
+) -> Option<OmpQuestionReport> {
+    let report = read_question(&pane_runtime_dir(project_id, pane_id)?, process_group_id?)?;
+    Some(OmpQuestionReport {
+        tool_use_id: question_tool_use_id(
+            pane_id,
+            &report.scope.session_id,
+            &report.scope.tool_call_id,
+        ),
+        dialog_id: report.scope.dialog_id,
+        session_id: report.scope.session_id,
+        transcript_path: report.scope.transcript_path,
+    })
+}
+
+/// A bounded, private native-dialog exchange, not a PTY write. Success means
+/// the live extension accepted the answer; only its transcript confirms it.
+pub fn submit_answer(
+    project_id: Uuid,
+    pane_id: u32,
+    process_group_id: Option<i32>,
+    tool_use_id: &str,
+    dialog_id: Uuid,
+    request_id: &str,
+    answers: &[shared::OmpQuestionAnswer],
+    cancel: bool,
+) -> Result<()> {
+    let runtime = pane_runtime_dir(project_id, pane_id).context("OMP runtime is unavailable")?;
+    submit_answer_at(
+        &runtime,
+        process_group_id.context("OMP process is unavailable")?,
+        pane_id,
+        tool_use_id,
+        dialog_id,
+        request_id,
+        answers,
+        cancel,
+        ANSWER_TIMEOUT,
+    )
+}
+
+fn pane_runtime_dir(project_id: Uuid, pane_id: u32) -> Option<PathBuf> {
+    Some(
+        crate::config::Config::runtime_dir()
+            .ok()?
+            .join("panes")
+            .join(crate::pane_host::short_uuid(project_id))
+            .join(pane_id.to_string()),
+    )
+}
+
+fn read_question(runtime: &Path, pid: i32) -> Option<QuestionReport> {
+    if pid <= 0 || !private_metadata(runtime, true) {
+        return None;
+    }
+    let launch: Launch = read_private_json(&runtime.join(LAUNCH_FILE))?;
+    let mut report: QuestionReport =
+        read_private_json_bounded(&runtime.join(QUESTION_FILE), MAX_QUESTION_BYTES)?;
+    let scope = &mut report.scope;
+    if scope.launch_id != launch.launch_id
+        || scope.pid != pid
+        || scope.session_id.is_empty()
+        || scope.tool_call_id.is_empty()
+        || process_start(pid).as_deref() != Some(scope.process_start.as_str())
+        || !valid_questions(&report.questions)
+    {
+        return None;
+    }
+    scope.transcript_path = scoped_transcript(&launch.session_dir, &scope.transcript_path)?;
+    Some(report)
+}
+
+fn valid_questions(value: &serde_json::Value) -> bool {
+    let Some(questions) = value.as_array().filter(|questions| !questions.is_empty()) else {
+        return false;
+    };
+    let mut ids = std::collections::HashSet::with_capacity(questions.len());
+    for question in questions {
+        let Some(id) = question.get("id").and_then(serde_json::Value::as_str) else {
+            return false;
+        };
+        let Some(options) = question
+            .get("options")
+            .and_then(serde_json::Value::as_array)
+        else {
+            return false;
+        };
+        if !ids.insert(id)
+            || question
+                .get("question")
+                .and_then(serde_json::Value::as_str)
+                .is_none()
+            || question
+                .get("multi")
+                .is_some_and(|multi| !multi.is_boolean())
+        {
+            return false;
+        }
+        let mut labels = std::collections::HashSet::with_capacity(options.len());
+        for option in options {
+            let Some(label) = option.get("label").and_then(serde_json::Value::as_str) else {
+                return false;
+            };
+            if !labels.insert(label) {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+fn validate_answers(
+    questions: &serde_json::Value,
+    answers: &[shared::OmpQuestionAnswer],
+    cancel: bool,
+) -> Result<()> {
+    if cancel {
+        if !answers.is_empty() {
+            bail!("cancellation cannot include answers");
+        }
+        return Ok(());
+    }
+    let questions = questions
+        .as_array()
+        .context("invalid native OMP questions")?;
+    if questions.len() != answers.len() {
+        bail!("answer every OMP question exactly once");
+    }
+    for (question, answer) in questions.iter().zip(answers) {
+        if question["id"].as_str() != Some(answer.id.as_str()) {
+            bail!("OMP answers must match the native question IDs and order");
+        }
+        let options = question["options"]
+            .as_array()
+            .context("invalid native OMP options")?;
+        for (index, selected) in answer.selected_options.iter().enumerate() {
+            if !options
+                .iter()
+                .any(|option| option["label"].as_str() == Some(selected.as_str()))
+                || answer.selected_options[..index].contains(selected)
+            {
+                bail!("invalid or repeated OMP option");
+            }
+        }
+        if answer
+            .custom_input
+            .as_ref()
+            .is_some_and(|text| text.trim().is_empty())
+        {
+            bail!("OMP custom input must not be blank");
+        }
+        if question["multi"].as_bool() != Some(true)
+            && (answer.selected_options.len() > 1
+                || (answer.selected_options.is_empty() && answer.custom_input.is_none()))
+        {
+            bail!("a single-select OMP question requires one option or custom input");
+        }
+    }
+    Ok(())
+}
+
+struct AnswerLock(fs::File);
+
+impl Drop for AnswerLock {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+            // APAS has other threads spawning providers. A concurrent fork
+            // can briefly inherit this open file description, so closing our
+            // descriptor alone does not necessarily release its flock.
+            unsafe { libc::flock(self.0.as_raw_fd(), libc::LOCK_UN) };
+        }
+    }
+}
+
+fn lock_answers(runtime: &Path) -> Result<AnswerLock> {
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create(true);
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::OpenOptionsExt;
+        options
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        let file = options.open(runtime.join(ANSWER_LOCK_FILE))?;
+        let metadata = file.metadata()?;
+        if !metadata.is_file() || !private_owner(&metadata) {
+            bail!("insecure OMP answer lock");
+        }
+        // The inode remains in place. Removing a lock file would allow a
+        // second submitter to lock a new inode while this exchange still runs.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+            bail!("another OMP answer is already being submitted");
+        }
+        Ok(AnswerLock(file))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (options, runtime);
+        bail!("the OMP native bridge requires a Unix runtime");
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn submit_answer_at(
+    runtime: &Path,
+    pid: i32,
+    pane_id: u32,
+    tool_use_id: &str,
+    dialog_id: Uuid,
+    request_id: &str,
+    answers: &[shared::OmpQuestionAnswer],
+    cancel: bool,
+    timeout: Duration,
+) -> Result<()> {
+    if request_id.is_empty() || request_id.len() > 1024 || !private_metadata(runtime, true) {
+        bail!("invalid OMP request or private runtime");
+    }
+    let _lock = lock_answers(runtime)?;
+    let report =
+        read_question(runtime, pid).context("the native OMP question is no longer available")?;
+    if report.scope.dialog_id != dialog_id
+        || question_tool_use_id(
+            pane_id,
+            &report.scope.session_id,
+            &report.scope.tool_call_id,
+        ) != tool_use_id
+    {
+        bail!("this OMP question is no longer current");
+    }
+    validate_answers(&report.questions, answers, cancel)?;
+    let nonce = Uuid::new_v4();
+    let request = AnswerRequest {
+        scope: &report.scope,
+        nonce,
+        request_id,
+        answers,
+        cancel,
+    };
+    let body = serde_json::to_vec(&request)?;
+    if body.len() as u64 > MAX_QUESTION_BYTES {
+        bail!("OMP answer exceeds the private bridge size limit");
+    }
+    let submission = runtime.join(SUBMISSION_FILE);
+    let ack_path = runtime.join(ACK_FILE);
+    // An old acknowledgement can never satisfy a fresh random nonce.
+    let _ = fs::remove_file(&ack_path);
+    write_private_atomic(&submission, &body)?;
+    let deadline = Instant::now() + timeout;
+    let result = loop {
+        if let Some(ack) = read_private_json::<AnswerAck>(&ack_path) {
+            if ack.scope == report.scope && ack.nonce == nonce && ack.request_id == request_id {
+                let _ = fs::remove_file(&ack_path);
+                break if ack.accepted {
+                    Ok(())
+                } else {
+                    Err(anyhow::anyhow!(ack
+                        .error
+                        .unwrap_or_else(|| "native OMP rejected the answer".into())))
+                };
+            }
+        }
+        if Instant::now() >= deadline {
+            break Err(anyhow::anyhow!(
+                "OMP did not acknowledge the answer; delivery is uncertain, use the terminal and do not automatically resend"
+            ));
+        }
+        // Do not fail early when the question report disappears: the native
+        // picker may just have settled and its acknowledgement is in flight.
+        std::thread::sleep(
+            Duration::from_millis(10).min(deadline.saturating_duration_since(Instant::now())),
+        );
+    };
+    let _ = fs::remove_file(&submission);
+    result
+}
 
 #[derive(Serialize, Deserialize)]
 struct Launch {
@@ -87,10 +426,12 @@ fn install(runtime_dir: &Path, session_dir: &Path) -> Result<(PathBuf, Launch)> 
         &runtime_dir.join(LAUNCH_FILE),
         &serde_json::to_vec(&launch)?,
     )?;
-    match fs::remove_file(runtime_dir.join(REPORT_FILE)) {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error.into()),
+    for name in [REPORT_FILE, QUESTION_FILE, SUBMISSION_FILE, ACK_FILE] {
+        match fs::remove_file(runtime_dir.join(name)) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
     }
     let extension = runtime_dir.join(EXTENSION_FILE);
     write_private_atomic(&extension, EXTENSION.as_bytes())?;
@@ -103,12 +444,7 @@ pub fn reported_activity(
     pane_id: u32,
     process_group_id: Option<i32>,
 ) -> Option<OmpActivityReport> {
-    let runtime_dir = crate::config::Config::runtime_dir()
-        .ok()?
-        .join("panes")
-        .join(crate::pane_host::short_uuid(project_id))
-        .join(pane_id.to_string());
-    read_activity(&runtime_dir, process_group_id?)
+    read_activity(&pane_runtime_dir(project_id, pane_id)?, process_group_id?)
 }
 
 fn read_activity(runtime_dir: &Path, pid: i32) -> Option<OmpActivityReport> {
@@ -149,6 +485,10 @@ fn scoped_transcript(session_dir: &Path, transcript_path: &Path) -> Option<PathB
 }
 
 fn read_private_json<T: serde::de::DeserializeOwned>(path: &Path) -> Option<T> {
+    read_private_json_bounded(path, MAX_REPORT_BYTES)
+}
+
+fn read_private_json_bounded<T: serde::de::DeserializeOwned>(path: &Path, limit: u64) -> Option<T> {
     if !private_metadata(path, false) {
         return None;
     }
@@ -161,14 +501,12 @@ fn read_private_json<T: serde::de::DeserializeOwned>(path: &Path) -> Option<T> {
     }
     let file = options.open(path).ok()?;
     let metadata = file.metadata().ok()?;
-    if !metadata.is_file() || metadata.len() > MAX_REPORT_BYTES || !private_owner(&metadata) {
+    if !metadata.is_file() || metadata.len() > limit || !private_owner(&metadata) {
         return None;
     }
     let mut bytes = Vec::with_capacity(metadata.len() as usize);
-    file.take(MAX_REPORT_BYTES + 1)
-        .read_to_end(&mut bytes)
-        .ok()?;
-    if bytes.len() as u64 > MAX_REPORT_BYTES {
+    file.take(limit + 1).read_to_end(&mut bytes).ok()?;
+    if bytes.len() as u64 > limit {
         return None;
     }
     serde_json::from_slice(&bytes).ok()
@@ -224,7 +562,7 @@ fn write_private_atomic(path: &Path, body: &[u8]) -> Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
     }
     let result = (|| -> Result<()> {
         let mut file = options.open(&temporary)?;
@@ -299,6 +637,36 @@ mod tests {
         fn activity(&self) -> Option<TranscriptActivity> {
             read_activity(&self.runtime, self.provider.id() as i32).map(|report| report.activity)
         }
+
+        fn publish_question(&self) -> QuestionReport {
+            let report = QuestionReport {
+                scope: QuestionScope {
+                    launch_id: self.report.launch_id,
+                    pid: self.report.pid,
+                    process_start: self.report.process_start.clone(),
+                    session_id: self.report.session_id.clone(),
+                    transcript_path: self.transcript.clone(),
+                    tool_call_id: "native:call".into(),
+                    dialog_id: Uuid::new_v4(),
+                },
+                questions: serde_json::json!([
+                    {"id":"db", "question":"Database?", "recommended":1,
+                     "options":[{"label":"SQLite"},{"label":"Postgres","description":"server"}]},
+                    {"id":"features", "question":"Features?", "multi":true, "options":[{"label":"Auth"}]},
+                    {"id":"note", "question":"Note?", "options":[]}
+                ]),
+            };
+            self.write_question(&report);
+            report
+        }
+
+        fn write_question(&self, report: &QuestionReport) {
+            write_private_atomic(
+                &self.runtime.join(QUESTION_FILE),
+                &serde_json::to_vec(report).unwrap(),
+            )
+            .unwrap();
+        }
     }
 
     impl Drop for Fixture {
@@ -306,6 +674,254 @@ mod tests {
             let _ = self.provider.kill();
             let _ = self.provider.wait();
         }
+    }
+
+    fn answers() -> Vec<shared::OmpQuestionAnswer> {
+        vec![
+            shared::OmpQuestionAnswer {
+                id: "db".into(),
+                selected_options: vec!["Postgres".into()],
+                custom_input: None,
+            },
+            shared::OmpQuestionAnswer {
+                id: "features".into(),
+                selected_options: vec![],
+                custom_input: None,
+            },
+            shared::OmpQuestionAnswer {
+                id: "note".into(),
+                selected_options: vec![],
+                custom_input: Some("  exact text\nand spaces  ".into()),
+            },
+        ]
+    }
+
+    #[test]
+    fn question_reports_preserve_native_identity_and_reject_stale_or_nested_scopes() {
+        let fixture = Fixture::new();
+        let mut question = fixture.publish_question();
+        let current = read_question(&fixture.runtime, fixture.report.pid).unwrap();
+        assert_eq!(current.scope.dialog_id, question.scope.dialog_id);
+        assert_eq!(current.questions, question.questions);
+        assert_eq!(
+            question_tool_use_id(7, "native-session", "call:opaque"),
+            "omp:7:native-session:call:opaque"
+        );
+        question.scope.pid += 1;
+        fixture.write_question(&question);
+        assert!(read_question(&fixture.runtime, fixture.report.pid).is_none());
+        question.scope.pid -= 1;
+        question.scope.process_start.push('0');
+        fixture.write_question(&question);
+        assert!(read_question(&fixture.runtime, fixture.report.pid).is_none());
+        question.scope.process_start = fixture.report.process_start.clone();
+        let nested = fixture.session_dir.join("subagents");
+        fs::create_dir(&nested).unwrap();
+        question.scope.transcript_path = nested.join("child.jsonl");
+        fixture.write_question(&question);
+        assert!(read_question(&fixture.runtime, fixture.report.pid).is_none());
+        question.scope.transcript_path = fixture.transcript.clone();
+        fixture.write_question(&question);
+        install(&fixture.runtime, &fixture.session_dir).unwrap();
+        fixture.write_question(&question);
+        assert!(read_question(&fixture.runtime, fixture.report.pid).is_none());
+    }
+
+    #[test]
+    fn question_files_are_private_bounded_and_never_follow_symlinks() {
+        let fixture = Fixture::new();
+        let question = fixture.publish_question();
+        let file = fixture.runtime.join(QUESTION_FILE);
+        assert_eq!(
+            fs::metadata(&file).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(read_question(&fixture.runtime, fixture.report.pid).is_none());
+        fs::remove_file(&file).unwrap();
+        let target = fixture.root.path().join("foreign-question.json");
+        write_private_atomic(&target, &serde_json::to_vec(&question).unwrap()).unwrap();
+        symlink(&target, &file).unwrap();
+        assert!(read_question(&fixture.runtime, fixture.report.pid).is_none());
+        fs::remove_file(&file).unwrap();
+        write_private_atomic(&file, &vec![b' '; MAX_QUESTION_BYTES as usize + 1]).unwrap();
+        assert!(read_question(&fixture.runtime, fixture.report.pid).is_none());
+    }
+
+    #[test]
+    fn answers_validate_native_ids_labels_order_empty_multi_and_lossless_text() {
+        let fixture = Fixture::new();
+        let question = fixture.publish_question();
+        assert!(validate_answers(&question.questions, &answers(), false).is_ok());
+        assert!(validate_answers(&question.questions, &[], true).is_ok());
+        assert!(validate_answers(&question.questions, &answers(), true).is_err());
+        assert!(validate_answers(&question.questions, &[], false).is_err());
+        let mut invalid = answers();
+        invalid.swap(0, 1);
+        assert!(validate_answers(&question.questions, &invalid, false).is_err());
+        let mut invalid = answers();
+        invalid[0].selected_options = vec!["fabricated".into()];
+        assert!(validate_answers(&question.questions, &invalid, false).is_err());
+        invalid[0].selected_options = vec!["SQLite".into(), "Postgres".into()];
+        assert!(validate_answers(&question.questions, &invalid, false).is_err());
+        invalid[0].selected_options.clear();
+        assert!(validate_answers(&question.questions, &invalid, false).is_err());
+        let mut invalid = answers();
+        invalid[1].selected_options = vec!["Auth".into(), "Auth".into()];
+        assert!(validate_answers(&question.questions, &invalid, false).is_err());
+        let mut invalid = answers();
+        invalid[2].custom_input = Some(" \n ".into());
+        assert!(validate_answers(&question.questions, &invalid, false).is_err());
+        let mut duplicate_questions = question.questions.clone();
+        duplicate_questions[1]["id"] = serde_json::json!("db");
+        assert!(!valid_questions(&duplicate_questions));
+        let mut duplicate_labels = question.questions.clone();
+        duplicate_labels[0]["options"][1]["label"] = serde_json::json!("SQLite");
+        assert!(!valid_questions(&duplicate_labels));
+    }
+
+    #[test]
+    fn writing_a_request_is_not_acceptance_and_delivery_wait_is_bounded() {
+        let fixture = Fixture::new();
+        let question = fixture.publish_question();
+        let result = submit_answer_at(
+            &fixture.runtime,
+            fixture.report.pid,
+            7,
+            &question_tool_use_id(7, &question.scope.session_id, &question.scope.tool_call_id),
+            question.scope.dialog_id,
+            "../../not-a-filename",
+            &answers(),
+            false,
+            Duration::ZERO,
+        );
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("delivery is uncertain"));
+        assert!(!fixture.runtime.join(SUBMISSION_FILE).exists());
+        assert!(read_question(&fixture.runtime, fixture.report.pid).is_some());
+    }
+
+    #[test]
+    fn native_ack_is_required_for_acceptance_rejection_and_cancel() {
+        for (accepted, cancel, matching) in [
+            (true, false, true),
+            (false, false, true),
+            (true, true, true),
+            (true, false, false),
+        ] {
+            let fixture = Fixture::new();
+            let question = fixture.publish_question();
+            let runtime = fixture.runtime.clone();
+            let expected_scope = question.scope.clone();
+            let responder = std::thread::spawn(move || {
+                let deadline = Instant::now() + Duration::from_secs(3);
+                let request = loop {
+                    if let Some(request) = read_private_json_bounded::<serde_json::Value>(
+                        &runtime.join(SUBMISSION_FILE),
+                        MAX_QUESTION_BYTES,
+                    ) {
+                        break request;
+                    }
+                    assert!(
+                        Instant::now() < deadline,
+                        "no answer request reached the native transport"
+                    );
+                    std::thread::sleep(Duration::from_millis(1));
+                };
+                assert_eq!(request["cancel"], cancel);
+                if cancel {
+                    assert_eq!(request["answers"], serde_json::json!([]));
+                } else {
+                    assert_eq!(
+                        request["answers"][2]["customInput"],
+                        "  exact text\nand spaces  "
+                    );
+                }
+                if accepted && matching {
+                    // Native settle removes the report before Rust reads the ack.
+                    fs::remove_file(runtime.join(QUESTION_FILE)).unwrap();
+                }
+                let ack = AnswerAck {
+                    scope: expected_scope,
+                    nonce: if matching {
+                        serde_json::from_value(request["nonce"].clone()).unwrap()
+                    } else {
+                        Uuid::new_v4()
+                    },
+                    request_id: "answer-request".into(),
+                    accepted,
+                    error: (!accepted).then(|| "native rejection".into()),
+                };
+                write_private_atomic(&runtime.join(ACK_FILE), &serde_json::to_vec(&ack).unwrap())
+                    .unwrap();
+            });
+            let sent_answers = if cancel { vec![] } else { answers() };
+            let result = submit_answer_at(
+                &fixture.runtime,
+                fixture.report.pid,
+                7,
+                &question_tool_use_id(7, &question.scope.session_id, &question.scope.tool_call_id),
+                question.scope.dialog_id,
+                "answer-request",
+                &sent_answers,
+                cancel,
+                Duration::from_secs(3),
+            );
+            responder.join().unwrap();
+            assert_eq!(result.is_ok(), accepted && matching);
+            if !accepted {
+                assert!(result.unwrap_err().to_string().contains("native rejection"));
+                assert!(read_question(&fixture.runtime, fixture.report.pid).is_some());
+            }
+            assert!(!fixture.runtime.join(SUBMISSION_FILE).exists());
+        }
+    }
+
+    #[test]
+    fn stale_and_concurrent_submissions_cannot_overwrite_the_native_mailbox() {
+        let fixture = Fixture::new();
+        let question = fixture.publish_question();
+        let id = question_tool_use_id(7, &question.scope.session_id, &question.scope.tool_call_id);
+        for (tool_id, dialog_id) in [
+            ("other", question.scope.dialog_id),
+            (id.as_str(), Uuid::new_v4()),
+        ] {
+            assert!(submit_answer_at(
+                &fixture.runtime,
+                fixture.report.pid,
+                7,
+                tool_id,
+                dialog_id,
+                "answer-request",
+                &answers(),
+                false,
+                Duration::ZERO,
+            )
+            .is_err());
+            assert!(!fixture.runtime.join(SUBMISSION_FILE).exists());
+        }
+        let lock = lock_answers(&fixture.runtime).unwrap();
+        assert!(submit_answer_at(
+            &fixture.runtime,
+            fixture.report.pid,
+            7,
+            &id,
+            question.scope.dialog_id,
+            "answer-request",
+            &answers(),
+            false,
+            Duration::ZERO,
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("already being submitted"));
+        drop(lock);
+        let path = fixture.runtime.join(ANSWER_LOCK_FILE);
+        fs::remove_file(&path).unwrap();
+        symlink(&fixture.transcript, &path).unwrap();
+        assert!(lock_answers(&fixture.runtime).is_err());
     }
 
     #[test]

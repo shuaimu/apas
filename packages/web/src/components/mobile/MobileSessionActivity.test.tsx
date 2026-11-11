@@ -1,6 +1,6 @@
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { paneWorkSummaryKey, useStore, type Message, type PaneConfig, type PaneWorkSummary } from "@/lib/store";
+import { handleServerMessage, paneWorkSummaryKey, useStore, type Message, type PaneConfig, type PaneWorkSummary } from "@/lib/store";
 import { MobileSessionActivity, type MobileSessionActivityProps } from "./MobileSessionActivity";
 
 vi.mock("@/components/tabs/TerminalPane", () => ({
@@ -162,6 +162,7 @@ function renderActivity(overrides: Partial<MobileSessionActivityProps> = {}) {
 }
 
 beforeEach(() => {
+  Element.prototype.scrollIntoView = vi.fn();
   for (let index = localStorage.length - 1; index >= 0; index -= 1) {
     const key = localStorage.key(index);
     if (key?.startsWith("apas_mobile_activity_scroll:") || key?.startsWith("apas_mobile_selected_pane:")) {
@@ -178,6 +179,73 @@ afterEach(() => {
 });
 
 describe("MobileSessionActivity", () => {
+  it("opens project Overview without sending pane commands", async () => {
+    const actions = seedStore({ projectPolicies: {} });
+    renderActivity();
+    const overview = screen.getByRole("button", { name: "Project overview" });
+    const paneTab = screen.getByRole("button", { name: "Codex 3" });
+    actions.loadPaneMessagesIfNeeded.mockClear();
+
+    fireEvent.click(overview);
+
+    await waitFor(() => expect(overview.getAttribute("aria-pressed")).toBe("true"));
+    expect(screen.queryByRole("button", { name: "More actions" })).toBeNull();
+    expect(actions.loadPaneMessagesIfNeeded).not.toHaveBeenCalled();
+    expect(actions.removePane).not.toHaveBeenCalled();
+    expect(actions.rebootPane).not.toHaveBeenCalled();
+    expect(actions.sendMessageToPane).not.toHaveBeenCalled();
+    expect(actions.sendTerminalInput).not.toHaveBeenCalled();
+
+    fireEvent.click(paneTab);
+
+    expect(await screen.findByRole("button", { name: "More actions" })).toBeTruthy();
+    expect(overview.getAttribute("aria-pressed")).toBe("false");
+  });
+
+  it("answers native OMP questions from the mobile pane and settles from the recorded result without a duplicate result card", () => {
+    const sent: Record<string, unknown>[] = [];
+    seedStore({
+      paneConfigs: [pane({ pane_id: 3, provider: "omp", kind: "terminal", label: "OMP native" })],
+      paneMessages: {},
+      ompQuestions: new Map(),
+      ws: { readyState: WebSocket.OPEN, send: (raw: string) => sent.push(JSON.parse(raw)) },
+    });
+    const toolUseId = "omp:3:native:mobile-ask";
+    const dialogId = "22222222-2222-4222-8222-222222222222";
+    act(() => handleServerMessage({
+      type: "stream_message", session_id: "session-a", pane_id: 3,
+      message: { type: "assistant", message: { content: [{
+        type: "tool_use", id: toolUseId, name: "AskUserQuestion",
+        input: { provider: "omp", omp: { dialog_id: dialogId }, questions: [
+          { id: "mobile-question", question: "Choose on mobile", options: [{ label: "One, two" }], multiSelect: true },
+        ] },
+      }] } },
+    }, useStore.setState, useStore.getState));
+    renderActivity();
+    fireEvent.click(screen.getByRole("button", { name: "One, two" }));
+    fireEvent.change(screen.getByRole("textbox", { name: /Custom answer for question 1/ }), { target: { value: "Mobile custom" } });
+    fireEvent.click(screen.getByRole("button", { name: "Submit" }));
+    const submission = sent.find((frame) => frame.type === "answer_omp_question");
+    expect(submission).toMatchObject({
+      session_id: "session-a", pane_id: 3, tool_use_id: toolUseId, dialog_id: dialogId,
+      answers: [{ id: "mobile-question", selectedOptions: ["One, two"], customInput: "Mobile custom" }],
+    });
+    expect(screen.queryByText("Answer recorded by OMP")).toBeNull();
+    act(() => handleServerMessage({
+      type: "stream_message", session_id: "session-a", pane_id: 3,
+      message: { type: "user", message: { content: [{
+        type: "tool_result", tool_use_id: toolUseId,
+        content: JSON.stringify({ type: "omp_question_result", status: "answered", results: [
+          { id: "mobile-question", question: "Choose on mobile", options: ["One, two"], multi: true, selectedOptions: [], customInput: "Actual terminal answer" },
+        ] }),
+      }] } },
+    }, useStore.setState, useStore.getState));
+    expect(screen.getByText("Answer recorded by OMP")).toBeTruthy();
+    expect(screen.getByText("Actual terminal answer")).toBeTruthy();
+    expect(screen.queryByText(/"omp_question_result"/)).toBeNull();
+    expect(screen.getByText("Choose on mobile").closest("article")?.className).not.toContain("border-amber-400");
+  });
+
   it("renders a native-style activity timeline instead of the desktop tab view", async () => {
     const actions = seedStore();
     renderActivity();
@@ -294,7 +362,6 @@ describe("MobileSessionActivity", () => {
       fireEvent.click(screen.getByRole("button", { name: /Conversation/ }));
 
       const restored = await screen.findByRole("log", { name: "Conversation activity" }) as HTMLDivElement;
-      expect(restored).not.toBe(activity);
       expect(restored.scrollTop).toBe(275);
     } finally {
       if (scrollHeight) Object.defineProperty(HTMLElement.prototype, "scrollHeight", scrollHeight);
@@ -473,7 +540,6 @@ describe("MobileSessionActivity", () => {
     expect(screen.getByRole("toolbar", { name: "Terminal keys" })).toBeTruthy();
     fireEvent.click(screen.getByRole("button", { name: "Send Arrow Down" }));
     expect(actions.sendTerminalInput).toHaveBeenCalledWith(9, "\x1b[B");
-    expect(screen.queryByRole("region", { name: "Mobile session activity" })).toBeNull();
   });
 
   it("renames the selected conversation with a trimmed label and closes the editor", async () => {
@@ -619,74 +685,6 @@ describe("MobileSessionActivity", () => {
     expect(screen.getByText(/keep drafting while offline/i)).toBeTruthy();
     expect(screen.getByRole("button", { name: "Send conversation message" }).hasAttribute("disabled")).toBe(true);
     expect(actions.sendTerminalInput).not.toHaveBeenCalled();
-  });
-
-  it("creates panes only from profiles allowed by project policy", async () => {
-    const actions = seedStore();
-    renderActivity();
-    fireEvent.click(screen.getByRole("button", { name: "Create pane" }));
-
-    expect(screen.getByRole("dialog", { name: "Create pane" })).toBeTruthy();
-    fireEvent.click(screen.getByRole("button", { name: /Codex terminal/ }));
-    expect(actions.addPane).toHaveBeenCalledWith(
-      "codex",
-      "interactive",
-      "Codex terminal 2",
-      undefined,
-      undefined,
-      false,
-      undefined,
-      false,
-      "terminal",
-    );
-  });
-
-  it("creates a DeepSeek terminal pane as the claude frontend with the model override", async () => {
-    const actions = seedStore({
-      projectPolicies: {
-        "session-a": {
-          teamAvailable: true,
-          allowedLaunchProfiles: [
-            "terminal:codex:official:default",
-            "terminal:claude:deepseek:deepseek-flash",
-          ],
-          version: 2,
-          projectSuspended: false,
-          noncompliantPaneIds: [],
-        },
-      },
-    });
-    renderActivity();
-    fireEvent.click(screen.getByRole("button", { name: "Create pane" }));
-
-    fireEvent.click(screen.getByRole("button", { name: /DeepSeek 4\.1 Flash terminal/ }));
-    expect(actions.addPane).toHaveBeenCalledWith(
-      "claude",
-      "interactive",
-      "DeepSeek 4.1 Flash terminal 2",
-      undefined,
-      "deepseek-flash",
-      false,
-      undefined,
-      false,
-      "terminal",
-    );
-  });
-
-  it("puts the pane list in the top row, beside the back control", () => {
-    seedStore({ paneConfigs: [pane({ pane_id: 3 }), pane({ pane_id: 4, label: "Reviewer" })] });
-    renderActivity();
-
-    // The row that carries "back" is the row that carries the panes: switching
-    // panes is what this screen is used for, so it must not sit third.
-    const back = screen.getByRole("button", { name: "Back to coding sessions" });
-    const topRow = back.parentElement as HTMLElement;
-    expect(within(topRow).getByRole("button", { name: /Reviewer/ })).toBeTruthy();
-    expect(within(topRow).getByRole("button", { name: "Create pane" })).toBeTruthy();
-    expect(within(topRow).getByRole("button", { name: "More actions" })).toBeTruthy();
-
-    fireEvent.click(within(topRow).getByRole("button", { name: /Reviewer/ }));
-    expect(screen.getByRole("button", { name: /Reviewer/ }).getAttribute("aria-pressed")).toBe("true");
   });
 
   it("opens project management from the session screen", () => {

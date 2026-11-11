@@ -369,6 +369,141 @@ struct TerminalQuestion {
 
 type TerminalQuestions = Arc<Mutex<HashMap<String, TerminalQuestion>>>;
 
+/// Native question identity, not the prose cursor, controls recovery/upserts.
+#[derive(Default)]
+struct OmpQuestionReplay {
+    generation: Option<u64>,
+    rounds: HashMap<
+        String,
+        (
+            crate::conversation::TurnRecord,
+            Option<crate::conversation::TurnRecord>,
+        ),
+    >,
+}
+
+impl OmpQuestionReplay {
+    fn reconcile(
+        &mut self,
+        turns: &[crate::conversation::TurnRecord],
+        report: Option<&crate::omp_activity::OmpQuestionReport>,
+        exited: bool,
+        generation: u64,
+    ) -> Vec<crate::conversation::TurnRecord> {
+        let reconnect = self.generation != Some(generation);
+        self.generation = Some(generation);
+        let mut current = HashMap::new();
+        let mut order = Vec::new();
+        for turn in turns {
+            if let Some(question) = turn
+                .question
+                .as_ref()
+                .filter(|q| q.input["provider"] == "omp")
+            {
+                let id = question.tool_use_id.clone();
+                let mut turn = turn.clone();
+                if !exited {
+                    if let Some(report) = report.filter(|report| report.tool_use_id == id) {
+                        turn.question.as_mut().unwrap().input["omp"]["dialog_id"] =
+                            serde_json::json!(report.dialog_id);
+                    }
+                }
+                order.push(id.clone());
+                current.insert(id, (turn, None));
+            }
+            if let Some(answer) = &turn.answer {
+                if let Some((_, recorded)) = current.get_mut(&answer.tool_use_id) {
+                    *recorded = Some(turn.clone());
+                }
+            }
+        }
+        let mut output = Vec::new();
+        for id in order {
+            let Some((question, mut answer)) = current.remove(&id) else {
+                continue;
+            };
+            let previous = self.rounds.get(&id);
+            if answer.is_none() {
+                if let Some((_, Some(old))) =
+                    previous.filter(|_| !report.is_some_and(|report| report.tool_use_id == id))
+                {
+                    // A later unrelated turn must not resurrect an ended ask.
+                    // Only a fresh verified dialog can make it pending again.
+                    answer = Some(
+                        if old.answer.as_ref().is_some_and(|answer| answer.is_error()) {
+                            old.clone()
+                        } else {
+                            unavailable_omp_turn(
+                                &question,
+                                "The native result is no longer on this branch.",
+                            )
+                        },
+                    );
+                } else if exited {
+                    answer = Some(unavailable_omp_turn(
+                        &question,
+                        "The native turn is no longer active.",
+                    ));
+                }
+            }
+            let question_changed = reconnect
+                || previous.is_none_or(|(old, _)| old != &question)
+                || previous.is_some_and(|(_, old)| old.is_some() && answer.is_none());
+            if question_changed {
+                output.push(question.clone());
+            }
+            if let Some(answer) = &answer {
+                if question_changed || previous.is_none_or(|(_, old)| old.as_ref() != Some(answer))
+                {
+                    output.push(answer.clone());
+                }
+            }
+            self.rounds.insert(id, (question, answer));
+        }
+        // Disappearing from the active branch never implies an answer.
+        let active: HashSet<&str> = turns
+            .iter()
+            .filter_map(|turn| {
+                turn.question
+                    .as_ref()
+                    .map(|question| question.tool_use_id.as_str())
+            })
+            .collect();
+        for (id, (question, answer)) in &mut self.rounds {
+            if answer.is_none() && !active.contains(id.as_str()) {
+                let unavailable = unavailable_omp_turn(
+                    question,
+                    "The question is no longer on the active native branch.",
+                );
+                output.push(unavailable.clone());
+                *answer = Some(unavailable);
+            } else if reconnect && !active.contains(id.as_str()) {
+                if let Some(answer) = answer
+                    .as_ref()
+                    .filter(|turn| turn.answer.as_ref().is_some_and(|answer| answer.is_error()))
+                {
+                    // The invalidation itself may have raced a disconnect.
+                    output.push(answer.clone());
+                }
+            }
+        }
+        output
+    }
+}
+
+fn unavailable_omp_turn(
+    question: &crate::conversation::TurnRecord,
+    message: &str,
+) -> crate::conversation::TurnRecord {
+    let mut turn = crate::transcript::omp_tool_turn(question.pane_id, question.ts.clone());
+    turn.role = "user".into();
+    turn.answer = Some(crate::transcript::omp_unavailable_answer(
+        question.question.as_ref().unwrap().tool_use_id.clone(),
+        message,
+    ));
+    turn
+}
+
 /// Rebuild one pane's unanswered-question set from the provider transcript.
 /// This runs over the full transcript so a restored pane can repopulate both
 /// answer routing and its Pending answer status without replaying old chat
@@ -380,7 +515,9 @@ fn reconcile_terminal_questions_for_pane(
 ) -> bool {
     let mut unresolved = HashMap::new();
     for turn in turns.iter().filter(|turn| turn.pane_id == pane_id) {
-        if let Some(question) = &turn.question {
+        if let Some(question) = turn.question.as_ref().filter(|question| {
+            !question.tool_use_id.starts_with("omp:") && question.input["provider"] != "omp"
+        }) {
             unresolved.insert(
                 question.tool_use_id.clone(),
                 question_options(&question.input),
@@ -510,6 +647,9 @@ fn plan_terminal_answer(
     tool_use_id: &str,
     answers: &HashMap<String, String>,
 ) -> TerminalAnswerPlan {
+    if tool_use_id.starts_with("omp:") {
+        return TerminalAnswerPlan::NotPending;
+    }
     let Some(question) = questions.get(tool_use_id) else {
         return TerminalAnswerPlan::NotPending;
     };
@@ -557,7 +697,7 @@ fn conversation_turn_to_stream_messages(
                     content: vec![shared::ClaudeContentBlock::ToolResult {
                         tool_use_id: answer.tool_use_id.clone(),
                         content: answer.recorded.clone(),
-                        is_error: false,
+                        is_error: answer.is_error(),
                     }],
                     role: "user".to_string(),
                 },
@@ -591,7 +731,9 @@ fn conversation_turn_to_stream_messages(
             pane_id: Some(turn.pane_id),
         }];
     }
-    let mut out = if turn.is_assistant() {
+    let mut out = if turn.text.is_empty() {
+        Vec::new()
+    } else if turn.is_assistant() {
         vec![CliToServer::StreamMessage {
             session_id,
             message: shared::ClaudeStreamMessage::Assistant {
@@ -1518,27 +1660,21 @@ fn spawn_terminal_pane(
             resolve_terminal_binary(provider, binary_path)?
         }
     };
-    let cwd = worktree_path.unwrap_or(working_dir);
-    let env = build_pane_env_overrides(provider, model)?;
-
-    let handle = TerminalRuntimeHandle::spawn(
+    let handle = spawn_terminal_pane_resolved(
         pane_id,
         session_id,
         claude_session_id,
         provider,
+        model,
         &binary_path,
-        cwd,
-        &env,
+        working_dir,
+        worktree_path,
+        server_tx,
         resume,
         initial_input,
-        server_tx.clone(),
-    )
-    .map_err(|e| format!("[Error starting terminal pane: {e:#}]"))?;
-
-    // Replace rather than shadow: reboot and the missing-input-channel
-    // recovery path can both re-enter here for a live pane, and inserting
-    // over the old handle without killing it would orphan a pty (and its
-    // reader thread) for the lifetime of the CLI.
+        false,
+    )?;
+    // Keep registry ownership short: host creation can wait for its handshake.
     let previous = terminal_panes
         .lock()
         .map_err(|_| "[terminal registry mutex poisoned]".to_string())?
@@ -1548,6 +1684,41 @@ fn spawn_terminal_pane(
         previous.shutdown();
     }
     Ok(())
+}
+
+/// Launch an already selected executable, without cache selection or fallback.
+#[allow(clippy::too_many_arguments)]
+fn spawn_terminal_pane_resolved(
+    pane_id: u32,
+    session_id: Uuid,
+    conversation_id: Uuid,
+    provider: &Provider,
+    model: Option<&str>,
+    binary_path: &str,
+    working_dir: &str,
+    worktree_path: Option<&str>,
+    server_tx: &tokio_mpsc::Sender<CliToServer>,
+    resume: bool,
+    initial_input: Option<&str>,
+    replace_existing_host: bool,
+) -> Result<TerminalRuntimeHandle, String> {
+    let cwd = worktree_path.unwrap_or(working_dir);
+    let env = build_pane_env_overrides(provider, model)?;
+
+    TerminalRuntimeHandle::spawn(
+        pane_id,
+        session_id,
+        conversation_id,
+        provider,
+        binary_path,
+        cwd,
+        &env,
+        resume,
+        initial_input,
+        server_tx.clone(),
+        replace_existing_host,
+    )
+    .map_err(|e| format!("[Error starting terminal pane: {e:#}]"))
 }
 
 /// Snapshot every configured terminal pane for reconnect reconciliation.
@@ -1598,10 +1769,11 @@ fn build_lifecycle_inventory(
     pane_metas: &PaneMetas,
     terminal_panes: &TerminalPanes,
 ) -> shared::CliLifecycleInventory {
-    let handles = terminal_panes.lock().ok();
     let mut panes = pane_metas
         .lock()
         .map(|metas| {
+            // Match the transcript watcher and explicit reboot lock order.
+            let handles = terminal_panes.lock().ok();
             metas
                 .iter()
                 .map(|(pane_id, meta)| shared::PanePreservationInfo {
@@ -1956,6 +2128,296 @@ fn build_pane_reboot_events(
             kind: meta.kind,
         },
     )
+}
+
+struct PendingOmpReboot {
+    request_id: Uuid,
+    child_process: Arc<Mutex<Option<std::process::Child>>>,
+    runtime_instance_id: Option<Uuid>,
+    source: PathBuf,
+}
+
+impl PendingOmpReboot {
+    fn matches(&self, meta: &PaneMeta) -> bool {
+        meta.provider == Provider::Omp
+            && meta.kind.is_terminal()
+            && Arc::ptr_eq(&meta.child_process, &self.child_process)
+    }
+}
+
+fn invalidate_omp_reboot_generation(pane_metas: &PaneMetas, pane_id: u32) {
+    if let Ok(mut metas) = pane_metas.lock() {
+        if let Some(meta) = metas.get_mut(&pane_id) {
+            if meta.kind.is_terminal() && meta.provider == Provider::Omp {
+                // Terminal panes never store a child here. Rotate their
+                // generation so a removed pane cannot register a late host.
+                meta.child_process = Arc::new(Mutex::new(None));
+            }
+        }
+    }
+}
+
+fn begin_omp_reboot(
+    pending: &mut HashMap<u32, PendingOmpReboot>,
+    pane_id: u32,
+    meta: &PaneMeta,
+    source: PathBuf,
+    runtime_instance_id: Option<Uuid>,
+) -> Option<Uuid> {
+    if meta.provider != Provider::Omp || !meta.kind.is_terminal() {
+        return None;
+    }
+    let std::collections::hash_map::Entry::Vacant(entry) = pending.entry(pane_id) else {
+        return None;
+    };
+    let request_id = Uuid::new_v4();
+    entry.insert(PendingOmpReboot {
+        request_id,
+        child_process: meta.child_process.clone(),
+        source,
+        runtime_instance_id,
+    });
+    Some(request_id)
+}
+
+/// Register a replacement only while this request still owns the pane.
+/// Removal invalidates the metadata generation before stopping its runtime,
+/// including when the registry is temporarily empty during host creation.
+#[allow(clippy::too_many_arguments)]
+fn register_omp_reboot_runtime(
+    request: &PendingOmpReboot,
+    pane_id: u32,
+    conversation_id: Uuid,
+    shutdown: &AtomicBool,
+    pane_metas: &PaneMetas,
+    pane_sessions: &Arc<Mutex<HashMap<u32, Uuid>>>,
+    terminal_panes: &TerminalPanes,
+    handle: TerminalRuntimeHandle,
+) -> Result<(), TerminalRuntimeHandle> {
+    let Ok(metas) = pane_metas.lock() else {
+        return Err(handle);
+    };
+    if shutdown.load(Ordering::SeqCst)
+        || !metas
+            .get(&pane_id)
+            .is_some_and(|meta| request.matches(meta))
+    {
+        return Err(handle);
+    }
+    let Ok(sessions) = pane_sessions.lock() else {
+        return Err(handle);
+    };
+    if sessions.get(&pane_id) != Some(&conversation_id) {
+        return Err(handle);
+    }
+    let Ok(mut terminals) = terminal_panes.lock() else {
+        return Err(handle);
+    };
+    let std::collections::hash_map::Entry::Vacant(entry) = terminals.entry(pane_id) else {
+        return Err(handle);
+    };
+    entry.insert(handle);
+    Ok(())
+}
+
+/// Consume only this request's completion. Global locks cover the short
+/// ownership checks, never provider teardown or the new host's handshake.
+#[allow(clippy::too_many_arguments)]
+fn finish_omp_reboot(
+    pending: &mut HashMap<u32, PendingOmpReboot>,
+    pane_id: u32,
+    request_id: Uuid,
+    result: Result<PathBuf, String>,
+    shutdown: &AtomicBool,
+    pane_metas: &PaneMetas,
+    pane_sessions: &Arc<Mutex<HashMap<u32, Uuid>>>,
+    terminal_panes: &TerminalPanes,
+    session_id: Uuid,
+    working_dir: &str,
+    server_tx: &tokio_mpsc::Sender<CliToServer>,
+) -> Option<String> {
+    if pending.get(&pane_id)?.request_id != request_id {
+        return None;
+    }
+    let request = pending.remove(&pane_id)?;
+    let prepared = result.and_then(|binary| {
+        let path = binary
+            .to_str()
+            .ok_or_else(|| "executable path is not UTF-8".to_string())?;
+        resolve_terminal_binary(&Provider::Omp, path)?;
+        Ok(binary)
+    });
+    let (binary, conversation_id, model, worktree_path, previous) = {
+        let metas = pane_metas.lock().ok()?;
+        let meta = metas.get(&pane_id)?;
+        if shutdown.load(Ordering::SeqCst) || !request.matches(meta) {
+            return None;
+        }
+        let sessions = pane_sessions.lock().ok()?;
+        let Ok(mut terminals) = terminal_panes.lock() else {
+            return Some(
+                "[Error rebooting OMP: terminal registry mutex poisoned. Running provider was not stopped.]"
+                    .to_string(),
+            );
+        };
+        if terminals
+            .get(&pane_id)
+            .map(TerminalRuntimeHandle::instance_id)
+            != request.runtime_instance_id
+        {
+            return None;
+        }
+        let binary = match prepared {
+            Ok(binary) => binary,
+            Err(error) => {
+                return Some(format!(
+                    "[Error preparing OMP reboot: {error}. Running provider was not stopped.]"
+                ));
+            }
+        };
+        let Some(conversation_id) = sessions.get(&pane_id).copied() else {
+            return Some(
+                "[Error preparing OMP reboot: conversation id unavailable. Running provider was not stopped.]"
+                    .to_string(),
+            );
+        };
+        (
+            binary,
+            conversation_id,
+            meta.model.clone(),
+            meta.worktree_path.clone(),
+            terminals.remove(&pane_id),
+        )
+    };
+    if let Some(previous) = previous {
+        if let Err(error) = previous.shutdown_for_reboot() {
+            if let Err(previous) = register_omp_reboot_runtime(
+                &request,
+                pane_id,
+                conversation_id,
+                shutdown,
+                pane_metas,
+                pane_sessions,
+                terminal_panes,
+                previous,
+            ) {
+                if let Err(cleanup) = previous.shutdown_for_reboot() {
+                    tracing::warn!(pane_id, %cleanup, "failed to clean cancelled OMP reboot runtime");
+                }
+                return None;
+            }
+            return Some(format!(
+                "[Error rebooting OMP: {error:#}. Replacement was not started.]"
+            ));
+        }
+    }
+    if shutdown.load(Ordering::SeqCst)
+        || !pane_metas
+            .lock()
+            .ok()?
+            .get(&pane_id)
+            .is_some_and(|meta| request.matches(meta))
+    {
+        return None;
+    }
+    let handle = match spawn_terminal_pane_resolved(
+        pane_id,
+        session_id,
+        conversation_id,
+        &Provider::Omp,
+        model.as_deref(),
+        binary.to_str()?,
+        working_dir,
+        worktree_path.as_deref(),
+        server_tx,
+        true,
+        None,
+        true,
+    ) {
+        Ok(handle) => handle,
+        Err(error) => {
+            {
+                let metas = pane_metas.lock().ok()?;
+                let sessions = pane_sessions.lock().ok()?;
+                let terminals = terminal_panes.lock().ok()?;
+                if shutdown.load(Ordering::SeqCst)
+                    || !metas
+                        .get(&pane_id)
+                        .is_some_and(|meta| request.matches(meta))
+                    || sessions.get(&pane_id) != Some(&conversation_id)
+                    || terminals.contains_key(&pane_id)
+                {
+                    return None;
+                }
+            }
+            // Intentional teardown suppressed the old runtime's normal exit
+            // report. Without a replacement, explicitly retire that instance
+            // so the web does not keep displaying a dead provider as running.
+            let text = format!(
+                "[Error restarting OMP with {}: {error}. Pane and conversation were retained.]",
+                binary.display()
+            );
+            let _ = server_tx.blocking_send(CliToServer::TerminalState {
+                session_id,
+                pane_id,
+                instance_id: request.runtime_instance_id,
+                lifecycle: shared::TerminalLifecycle::Exited,
+                status: Some(error.clone()),
+                runtime: None,
+            });
+            let _ = server_tx.blocking_send(CliToServer::TerminalExited {
+                session_id,
+                pane_id,
+                instance_id: request.runtime_instance_id,
+                status: Some(error),
+            });
+            return Some(text);
+        }
+    };
+    if let Err(handle) = register_omp_reboot_runtime(
+        &request,
+        pane_id,
+        conversation_id,
+        shutdown,
+        pane_metas,
+        pane_sessions,
+        terminal_panes,
+        handle,
+    ) {
+        if let Err(error) = handle.shutdown_for_reboot() {
+            tracing::warn!(pane_id, %error, "failed to stop stale OMP reboot runtime");
+        }
+        return None;
+    }
+    let launcher_note = if binary == request.source {
+        " Configured launcher retained; APAS cannot auto-update packages."
+    } else {
+        ""
+    };
+    Some(format!(
+        "[OMP rebooted on {} — resumed the same conversation.{launcher_note}]",
+        binary.display()
+    ))
+}
+
+fn report_omp_reboot(
+    output_tx: &mpsc::Sender<PaneOutput>,
+    server_tx: &tokio_mpsc::Sender<CliToServer>,
+    session_id: Uuid,
+    pane_id: u32,
+    text: String,
+) {
+    let _ = output_tx.send(PaneOutput {
+        text: text.clone(),
+        pane_id,
+    });
+    let _ = server_tx.blocking_send(CliToServer::Output {
+        session_id,
+        data: text,
+        output_type: shared::OutputType::System,
+        pane_type: None,
+        pane_id: Some(pane_id),
+    });
 }
 
 /// One held tool_use waiting on user approval (Phase 3.2b2).
@@ -2991,6 +3453,7 @@ async fn run_inner(
             // reconnect. Pi/OMP snapshots also retain unchanged parsed history.
             let mut provider_activities: HashMap<u32, (TranscriptActivity, u64)> = HashMap::new();
             let mut pi_readers: HashMap<u32, PiTranscriptReader> = HashMap::new();
+            let mut omp_questions: HashMap<u32, OmpQuestionReplay> = HashMap::new();
             // Per-pane claude transcript watch state (growth + idle tracking
             // for in-TUI session-switch detection).
             let mut claude_watch: HashMap<u32, ClaudeWatchState> = HashMap::new();
@@ -3038,6 +3501,7 @@ async fn run_inner(
                         .collect()
                 };
                 pi_readers.retain(|id, _| panes.iter().any(|(pane_id, ..)| pane_id == id));
+                omp_questions.retain(|id, _| panes.iter().any(|(pane_id, ..)| pane_id == id));
                 provider_activities.retain(|id, _| panes.iter().any(|(pane_id, ..)| pane_id == id));
                 #[cfg(target_os = "linux")]
                 let mut codex_process_paths = HashMap::new();
@@ -3097,6 +3561,15 @@ async fn run_inner(
                     } else {
                         None
                     };
+                    let omp_question = if provider == Provider::Omp {
+                        crate::omp_activity::reported_question(
+                            session_id,
+                            pane_id,
+                            process_group_id,
+                        )
+                    } else {
+                        None
+                    };
                     if matches!(
                         lifecycle,
                         Some(
@@ -3120,6 +3593,7 @@ async fn run_inner(
                     let transcript_cwd =
                         terminal_transcript_cwd(&project_for_turns, worktree_path.as_deref());
                     let mut provider_activity = None;
+                    let mut question_changed_status = false;
                     let (source, turns, verified_codex_session_id): (
                         String,
                         Cow<'_, [crate::conversation::TurnRecord]>,
@@ -3366,7 +3840,9 @@ async fn run_inner(
                             let Some(home) = home.as_deref() else {
                                 continue;
                             };
-                            let path = if let Some(report) = omp_report.as_ref() {
+                            let path = if let Some(report) = omp_question.as_ref() {
+                                Cow::Borrowed(report.transcript_path.as_path())
+                            } else if let Some(report) = omp_report.as_ref() {
                                 Cow::Borrowed(report.transcript_path.as_path())
                             } else {
                                 // Existing hosted processes have no extension;
@@ -3378,8 +3854,10 @@ async fn run_inner(
                                 };
                                 Cow::Owned(path)
                             };
-                            let Ok(snapshot) =
-                                pi_readers.entry(pane_id).or_default().read(&path, pane_id)
+                            let Ok(snapshot) = pi_readers
+                                .entry(pane_id)
+                                .or_default()
+                                .read_omp(&path, pane_id)
                             else {
                                 continue;
                             };
@@ -3387,6 +3865,25 @@ async fn run_inner(
                                 .as_ref()
                                 .map(|report| report.activity)
                                 .or(snapshot.activity);
+                            let verified_question = omp_question.as_ref().filter(|report| {
+                                snapshot.session_id.as_deref() == Some(report.session_id.as_str())
+                                    && report.transcript_path == path.as_ref()
+                            });
+                            for turn in omp_questions.entry(pane_id).or_default().reconcile(
+                                &snapshot.turns,
+                                verified_question,
+                                lifecycle == Some(shared::TerminalLifecycle::Exited)
+                                    || (verified_question.is_none()
+                                        && provider_activity == Some(TranscriptActivity::Idle)),
+                                connection_generation,
+                            ) {
+                                question_changed_status = true;
+                                for message in
+                                    conversation_turn_to_stream_messages(&turn, session_id, conv_id)
+                                {
+                                    let _ = server_tx_for_turns.blocking_send(message);
+                                }
+                            }
                             (
                                 format!("omp:{}", path.display()),
                                 Cow::Borrowed(&snapshot.turns),
@@ -3477,6 +3974,14 @@ async fn run_inner(
                         .unwrap_or(false);
                     if turns.len() > previous_cursor {
                         for turn in &turns[previous_cursor..] {
+                            // OMP question records have an independent replay
+                            // cursor; restoring a pane must not suppress them,
+                            // nor should their upserts replay/bill prose.
+                            if provider == Provider::Omp
+                                && (turn.question.is_some() || turn.answer.is_some())
+                            {
+                                continue;
+                            }
                             for msg in
                                 conversation_turn_to_stream_messages(turn, session_id, conv_id)
                             {
@@ -3515,7 +4020,8 @@ async fn run_inner(
                     }
                     *completed = completion_count;
 
-                    let conversation_changed_status = completion_without_new_turn
+                    let conversation_changed_status = question_changed_status
+                        || completion_without_new_turn
                         || turns[previous_cursor..]
                             .iter()
                             .any(|turn| !turn.is_assistant() || turn.completes_work);
@@ -3847,8 +4353,96 @@ fn handle_tui_events(
     file_watcher: Arc<crate::file_watcher::ProjectFileWatcher>,
     project_policy: ProjectPolicyState,
 ) {
+    let mut pending_omp_reboots = HashMap::new();
     while !shutdown.load(Ordering::SeqCst) {
         match event_rx.recv_timeout(Duration::from_millis(100)) {
+            Ok(TuiEvent::RebootOmpPane {
+                pane_id,
+                generation,
+            }) => {
+                if pending_omp_reboots.contains_key(&pane_id) {
+                    continue;
+                }
+                let source = PathBuf::from(resolve_binary_path(omp_path));
+                let request_id = {
+                    let Ok(metas) = pane_metas.lock() else {
+                        continue;
+                    };
+                    let runtime_instance_id = terminal_panes.lock().ok().and_then(|terminals| {
+                        terminals
+                            .get(&pane_id)
+                            .map(TerminalRuntimeHandle::instance_id)
+                    });
+                    metas.get(&pane_id).and_then(|meta| {
+                        if !Arc::ptr_eq(&meta.child_process, &generation) {
+                            return None;
+                        }
+                        begin_omp_reboot(
+                            &mut pending_omp_reboots,
+                            pane_id,
+                            meta,
+                            source.clone(),
+                            runtime_instance_id,
+                        )
+                    })
+                };
+                let Some(request_id) = request_id else {
+                    continue;
+                };
+                report_omp_reboot(
+                    &output_tx,
+                    &server_tx,
+                    session_id,
+                    pane_id,
+                    "[Preparing OMP reboot — checking for a verified update; the running provider stays active.]"
+                        .to_string(),
+                );
+                let completion_tx = event_tx.clone();
+                if let Err(error) = thread::Builder::new()
+                    .name(format!("omp-reboot-{pane_id}"))
+                    .spawn(move || {
+                        let result = crate::omp_local::omp_binary_for_reboot(&source)
+                            .map_err(|error| format!("{error:#}"));
+                        let _ = completion_tx.send(TuiEvent::OmpRebootPrepared {
+                            pane_id,
+                            request_id,
+                            result,
+                        });
+                    })
+                {
+                    pending_omp_reboots.remove(&pane_id);
+                    report_omp_reboot(
+                        &output_tx,
+                        &server_tx,
+                        session_id,
+                        pane_id,
+                        format!(
+                            "[Error preparing OMP reboot: {error}. Running provider was not stopped.]"
+                        ),
+                    );
+                }
+            }
+            Ok(TuiEvent::OmpRebootPrepared {
+                pane_id,
+                request_id,
+                result,
+            }) => {
+                if let Some(text) = finish_omp_reboot(
+                    &mut pending_omp_reboots,
+                    pane_id,
+                    request_id,
+                    result,
+                    &shutdown,
+                    &pane_metas,
+                    &pane_sessions,
+                    &terminal_panes,
+                    session_id,
+                    working_dir,
+                    &server_tx,
+                ) {
+                    report_omp_reboot(&output_tx, &server_tx, session_id, pane_id, text);
+                }
+            }
             Ok(TuiEvent::AddTab) => {
                 // The local "+" path follows the same retirement rule as the
                 // web: ordinary new work opens Claude's real terminal TUI.
@@ -3945,6 +4539,7 @@ fn handle_tui_events(
                     });
                     continue;
                 }
+                pending_omp_reboots.remove(&pane_id);
                 let label =
                     pane_label_or_default(Some(&requested_label), pane_id, model.as_deref());
                 // Effort is whatever the caller asked for. Managed Claude
@@ -4267,6 +4862,7 @@ fn handle_tui_events(
                 pane_id,
                 cleanup_action,
             }) => {
+                pending_omp_reboots.remove(&pane_id);
                 // Remove input channel (causes interactive session thread to exit)
                 {
                     let mut channels = input_channels.lock().unwrap();
@@ -5888,6 +6484,196 @@ mod tests {
     use tokio::sync::mpsc as tokio_mpsc;
     use uuid::Uuid;
 
+    fn omp_question_turn(id: &str) -> TurnRecord {
+        let mut turn = crate::transcript::omp_tool_turn(7, "native-time".into());
+        turn.question = Some(TurnQuestion {
+            tool_use_id: format!("omp:7:native:{id}"),
+            tool_name: "AskUserQuestion".into(),
+            input: serde_json::json!({"provider":"omp","questions":[
+                {"id":"a","question":"Pick","multiSelect":true,"options":[{"label":"A, B"}]}
+            ],"omp":{"dialog_id":null}}),
+        });
+        turn
+    }
+
+    #[test]
+    fn omp_question_restore_reconnect_and_metadata_upserts_are_independent_of_chat_cursor() {
+        let question = omp_question_turn("call");
+        let turns = vec![question.clone()];
+        let mut replay = super::OmpQuestionReplay::default();
+        assert_eq!(replay.reconcile(&turns, None, false, 1), turns);
+        assert!(replay.reconcile(&turns, None, false, 1).is_empty());
+        let mut report = crate::omp_activity::OmpQuestionReport {
+            tool_use_id: question.question.as_ref().unwrap().tool_use_id.clone(),
+            dialog_id: Uuid::new_v4(),
+            session_id: "native".into(),
+            transcript_path: "native.jsonl".into(),
+        };
+        let enriched = replay.reconcile(&turns, Some(&report), false, 1);
+        assert_eq!(enriched.len(), 1);
+        assert_eq!(
+            enriched[0].question.as_ref().unwrap().input["omp"]["dialog_id"],
+            report.dialog_id.to_string()
+        );
+        assert!(replay.reconcile(&turns, Some(&report), false, 1).is_empty());
+        assert_eq!(replay.reconcile(&turns, Some(&report), false, 2), enriched);
+        // A new dialog identity on the same tool call is a metadata upsert.
+        report.dialog_id = Uuid::new_v4();
+        assert_eq!(replay.reconcile(&turns, Some(&report), false, 2).len(), 1);
+        // A report for another call can never make this question actionable.
+        report.tool_use_id = "omp:7:native:other".into();
+        let unavailable_bridge = replay.reconcile(&turns, Some(&report), false, 2);
+        assert!(
+            unavailable_bridge[0].question.as_ref().unwrap().input["omp"]["dialog_id"].is_null()
+        );
+        assert!(replay.reconcile(&turns, None, false, 2).is_empty());
+    }
+
+    #[test]
+    fn omp_settled_question_metadata_updates_cannot_reopen_pending_state() {
+        let question = omp_question_turn("settled");
+        let tool_use_id = question.question.as_ref().unwrap().tool_use_id.clone();
+        let mut answer = crate::transcript::omp_tool_turn(7, "result-time".into());
+        answer.role = "user".into();
+        answer.answer = Some(TurnAnswer {
+            tool_use_id: tool_use_id.clone(),
+            recorded: serde_json::json!({"type":"omp_question_result","status":"answered",
+                "results":[{"id":"a","selectedOptions":["A, B"]}]})
+            .to_string(),
+        });
+        let report = crate::omp_activity::OmpQuestionReport {
+            tool_use_id,
+            dialog_id: Uuid::new_v4(),
+            session_id: "native".into(),
+            transcript_path: "native.jsonl".into(),
+        };
+        let turns = vec![question, answer];
+        let mut replay = super::OmpQuestionReplay::default();
+        let mut pending = HashSet::new();
+        // A report read immediately before native settlement can outlive it
+        // for one poll. Dropping its metadata must replay the recorded result
+        // after the question update, not reopen the already-settled decision.
+        for report in [Some(&report), None] {
+            for turn in replay.reconcile(&turns, report, false, 1) {
+                if let Some(question) = turn.question {
+                    pending.insert(question.tool_use_id);
+                }
+                if let Some(answer) = turn.answer {
+                    pending.remove(&answer.tool_use_id);
+                }
+            }
+            assert!(pending.is_empty(), "a recorded answer must remain settled");
+        }
+        assert!(replay.reconcile(&turns, None, false, 1).is_empty());
+    }
+
+    #[test]
+    fn omp_branch_replacement_exit_and_native_results_reconcile_without_repetition() {
+        let question = omp_question_turn("first");
+        let other = omp_question_turn("other");
+        let mut replay = super::OmpQuestionReplay::default();
+        replay.reconcile(&[question.clone()], None, false, 1);
+        let replaced = replay.reconcile(&[other.clone()], None, false, 1);
+        assert_eq!(
+            replaced.len(),
+            2,
+            "equal-length branch change publishes new call and invalidation"
+        );
+        let invalidation = replaced
+            .iter()
+            .find_map(|turn| turn.answer.as_ref())
+            .unwrap();
+        assert_eq!(
+            invalidation.tool_use_id,
+            question.question.as_ref().unwrap().tool_use_id
+        );
+        assert!(invalidation.is_error());
+        assert!(replay
+            .reconcile(&[other.clone()], None, false, 1)
+            .is_empty());
+        let exited = replay.reconcile(&[other.clone()], None, true, 1);
+        assert_eq!(exited.len(), 1);
+        assert!(exited[0].answer.as_ref().unwrap().is_error());
+        assert!(replay.reconcile(&[other.clone()], None, true, 1).is_empty());
+        assert!(
+            replay
+                .reconcile(&[other.clone()], None, false, 1)
+                .is_empty(),
+            "a later running turn must not resurrect the ended question"
+        );
+        // A recorded terminal answer always overrides earlier invalidation.
+        let mut result = crate::transcript::omp_tool_turn(7, "result-time".into());
+        result.role = "user".into();
+        result.answer = Some(TurnAnswer {
+            tool_use_id: other.question.as_ref().unwrap().tool_use_id.clone(),
+            recorded: serde_json::json!({"type":"omp_question_result","status":"answered",
+                "results":[{"id":"a","selectedOptions":["A, B"]}]})
+            .to_string(),
+        });
+        let turns = vec![other, result.clone()];
+        assert_eq!(replay.reconcile(&turns, None, true, 1), vec![result]);
+        assert!(replay.reconcile(&turns, None, true, 1).is_empty());
+        assert_eq!(
+            replay.reconcile(&turns, None, true, 2).len(),
+            3,
+            "reconnect also recovers the retired branch's invalidation"
+        );
+    }
+
+    #[test]
+    fn omp_questions_never_enter_legacy_keystroke_routing_or_duplicate_usage() {
+        let question = omp_question_turn("first");
+        let mut pending = HashMap::new();
+        assert!(!reconcile_terminal_questions_for_pane(
+            &mut pending,
+            7,
+            &[question.clone()]
+        ));
+        assert!(pending.is_empty());
+        let id = question.question.as_ref().unwrap().tool_use_id.clone();
+        pending.insert(
+            id.clone(),
+            super::TerminalQuestion {
+                pane_id: 7,
+                options: vec![("Pick".into(), vec!["A, B".into()])],
+                delivered: false,
+            },
+        );
+        assert_eq!(
+            super::plan_terminal_answer(
+                &pending,
+                &id,
+                &HashMap::from([("Pick".into(), "A, B".into()),])
+            ),
+            super::TerminalAnswerPlan::NotPending
+        );
+        let session = Uuid::new_v4();
+        let conversation = Uuid::new_v4();
+        assert_eq!(
+            super::conversation_turn_to_stream_messages(&question, session, conversation).len(),
+            1
+        );
+        let mut usage = crate::transcript::omp_tool_turn(7, "native-time".into());
+        usage.input_tokens = Some(17);
+        usage.output_tokens = Some(9);
+        usage.cost_usd = Some(0.25);
+        let messages = super::conversation_turn_to_stream_messages(&usage, session, conversation);
+        assert_eq!(
+            messages.len(),
+            1,
+            "tool-only usage must not produce an empty prose turn"
+        );
+        assert!(matches!(&messages[0], CliToServer::StreamMessage {
+            message: ClaudeStreamMessage::Result { total_cost_usd, .. }, ..
+        } if *total_cost_usd == 0.25));
+        let cancelled = super::unavailable_omp_turn(&question, "Native branch changed");
+        let messages =
+            super::conversation_turn_to_stream_messages(&cancelled, session, conversation);
+        assert!(matches!(&messages[0], CliToServer::StreamMessage {
+            message: ClaudeStreamMessage::User { message, .. }, ..
+        } if matches!(message.content[0], ClaudeContentBlock::ToolResult { is_error: true, .. })));
+    }
+
     const FULL_PROMPT: &str =
         "Work on tasks defined in TODO.md.\n1. Analyze\n2. Implement\n3. Test";
     const WEB_PROVIDER_OPTIONS_TS: &str =
@@ -6767,6 +7553,534 @@ mod tests {
             Provider::Claude,
             Some("claude-opus-4-6"),
         ));
+    }
+
+    #[cfg(unix)]
+    struct OmpRebootFixture {
+        root: tempfile::TempDir,
+        source: std::path::PathBuf,
+        prepared: std::path::PathBuf,
+        session_id: Uuid,
+        conversation_id: Uuid,
+        metas: PaneMetas,
+        sessions: Arc<Mutex<HashMap<u32, Uuid>>>,
+        terminals: TerminalPanes,
+        old: crate::terminal_pane::TerminalHandle,
+        pending: HashMap<u32, super::PendingOmpReboot>,
+        shutdown: AtomicBool,
+        server_tx: tokio_mpsc::Sender<CliToServer>,
+        server_rx: tokio_mpsc::Receiver<CliToServer>,
+    }
+
+    #[cfg(unix)]
+    impl OmpRebootFixture {
+        fn new() -> Self {
+            use std::os::unix::fs::PermissionsExt;
+
+            let root = tempfile::tempdir().unwrap();
+            let source = root.path().join("configured-omp");
+            let prepared = root.path().join("verified-omp");
+            for (path, release) in [(&source, "old"), (&prepared, "new")] {
+                std::fs::write(
+                    path,
+                    format!(
+                        "#!/bin/sh\nprintf 'release={release}\\ncwd=%s\\n' \"$PWD\"\nprintf 'arg=%s\\n' \"$@\"\nprintf 'ready\\n'\nwhile IFS= read -r line; do printf '{release}-echo:%s\\n' \"$line\"; done\n"
+                    ),
+                )
+                .unwrap();
+                std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+            }
+            let session_id = Uuid::new_v4();
+            let conversation_id = Uuid::new_v4();
+            let (server_tx, server_rx) = tokio_mpsc::channel(128);
+            let old = crate::terminal_pane::TerminalHandle::spawn(
+                41,
+                session_id,
+                conversation_id,
+                &Provider::Omp,
+                source.to_str().unwrap(),
+                root.path().to_str().unwrap(),
+                &[],
+                false,
+                None,
+                server_tx.clone(),
+            )
+            .unwrap();
+            let mut meta = test_pane_meta(Provider::Omp, false, None, Arc::new(Mutex::new(None)));
+            meta.kind = shared::PaneKind::Terminal;
+            meta.mode = shared::PaneMode::Interactive;
+            meta.worktree_path = None;
+            let mut fixture = Self {
+                root,
+                source,
+                prepared,
+                session_id,
+                conversation_id,
+                metas: Arc::new(Mutex::new(HashMap::from([(41, meta)]))),
+                sessions: Arc::new(Mutex::new(HashMap::from([(41, conversation_id)]))),
+                terminals: Arc::new(Mutex::new(HashMap::from([(
+                    41,
+                    crate::terminal_pane::TerminalRuntimeHandle::Direct(old.clone()),
+                )]))),
+                old,
+                pending: HashMap::new(),
+                shutdown: AtomicBool::new(false),
+                server_tx,
+                server_rx,
+            };
+            fixture.output_until("ready");
+            fixture
+        }
+
+        fn request(&mut self) -> Option<Uuid> {
+            let metas = self.metas.lock().unwrap_or_else(|error| error.into_inner());
+            let runtime_instance_id = self
+                .terminals
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .get(&41)
+                .map(crate::terminal_pane::TerminalRuntimeHandle::instance_id);
+            super::begin_omp_reboot(
+                &mut self.pending,
+                41,
+                &metas[&41],
+                self.source.clone(),
+                runtime_instance_id,
+            )
+        }
+
+        fn complete(
+            &mut self,
+            request_id: Uuid,
+            result: Result<std::path::PathBuf, String>,
+        ) -> Option<String> {
+            super::finish_omp_reboot(
+                &mut self.pending,
+                41,
+                request_id,
+                result,
+                &self.shutdown,
+                &self.metas,
+                &self.sessions,
+                &self.terminals,
+                self.session_id,
+                self.root.path().to_str().unwrap(),
+                &self.server_tx,
+            )
+        }
+
+        fn output_until(&mut self, needle: &str) -> String {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let mut output = String::new();
+            loop {
+                if let Ok(CliToServer::TerminalOutput { data_b64, .. }) = self.server_rx.try_recv()
+                {
+                    let bytes = base64::engine::general_purpose::STANDARD
+                        .decode(data_b64)
+                        .unwrap();
+                    output.push_str(&String::from_utf8_lossy(&bytes));
+                    if output.contains(needle) {
+                        return output;
+                    }
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "missing {needle:?} in {output:?}"
+                );
+                thread::sleep(Duration::from_millis(10));
+            }
+        }
+
+        fn runtime(&self) -> crate::terminal_pane::TerminalRuntimeHandle {
+            self.terminals
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())[&41]
+                .clone()
+        }
+
+        fn assert_old_provider_responds(&mut self) {
+            assert_eq!(self.runtime().instance_id(), self.old.instance_id());
+            assert!(pid_is_alive(self.old.provider_pid().unwrap()));
+            self.old.write_bytes(b"still-running\n").unwrap();
+            self.output_until("echo:still-running");
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for OmpRebootFixture {
+        fn drop(&mut self) {
+            if let Ok(terminals) = self.terminals.lock() {
+                for handle in terminals.values() {
+                    handle.shutdown();
+                }
+            }
+            self.old.shutdown();
+            if let Some(home) = dirs::home_dir() {
+                let _ = std::fs::remove_dir_all(crate::transcript::omp_session_dir(
+                    &home,
+                    self.conversation_id,
+                ));
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn omp_reboot_preparation_failure_keeps_the_live_provider_and_reports_the_error() {
+        let mut fixture = OmpRebootFixture::new();
+        let request = fixture.request().unwrap();
+        let text = fixture
+            .complete(request, Err("update download failed".into()))
+            .unwrap();
+        assert!(fixture.pending.is_empty());
+        fixture.assert_old_provider_responds();
+
+        let (output_tx, _output_rx) = mpsc::channel();
+        super::report_omp_reboot(&output_tx, &fixture.server_tx, fixture.session_id, 41, text);
+        let message = std::iter::from_fn(|| fixture.server_rx.try_recv().ok())
+            .find(|message| matches!(message, CliToServer::Output { .. }))
+            .expect("preparation failure was not delivered to the web");
+        assert!(matches!(message, CliToServer::Output {
+            session_id, pane_id: Some(41), output_type: shared::OutputType::System, data, ..
+        } if session_id == fixture.session_id && data.contains("update download failed")));
+
+        // A verified path that disappears before commit is still a preparation
+        // failure, not permission to kill the provider and fall back to source.
+        let request = fixture.request().unwrap();
+        let missing = fixture.root.path().join("removed-executable");
+        fixture.complete(request, Ok(missing)).unwrap();
+        fixture.assert_old_provider_responds();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn omp_reboot_replaces_once_with_the_prepared_binary_and_current_pane_metadata() {
+        let mut fixture = OmpRebootFixture::new();
+        let request = fixture.request().unwrap();
+        assert!(
+            fixture.request().is_none(),
+            "duplicate reboot started another preparation"
+        );
+        let worktree = fixture.root.path().join("worktree");
+        std::fs::create_dir(&worktree).unwrap();
+        let identity = {
+            let mut metas = fixture
+                .metas
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            let meta = metas.get_mut(&41).unwrap();
+            meta.label = "Renamed while preparing".into();
+            meta.worktree_path = Some(worktree.to_str().unwrap().into());
+            meta.child_process.clone()
+        };
+        let old_pid = fixture.old.provider_pid().unwrap();
+        let prepared = fixture.prepared.clone();
+        let completion = fixture.complete(request, Ok(prepared.clone()));
+        assert!(
+            fixture
+                .terminals
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .contains_key(&41),
+            "replacement runtime was not registered: {completion:?}"
+        );
+        assert!(
+            !pid_is_alive(old_pid),
+            "the old provider survived replacement"
+        );
+        assert_ne!(fixture.runtime().instance_id(), fixture.old.instance_id());
+        let output = fixture.output_until("ready");
+        assert!(output.contains("release=new"), "{output}");
+        assert!(
+            output.contains(&format!("cwd={}", worktree.display())),
+            "{output}"
+        );
+        assert!(output.contains("arg=--continue"), "{output}");
+        let private_session = format!("/apas-{}", fixture.conversation_id);
+        assert!(
+            output
+                .lines()
+                .any(|line| line.starts_with("arg=") && line.ends_with(&private_session)),
+            "{output}"
+        );
+        fixture
+            .runtime()
+            .write_bytes(b"new-version-behavior\n")
+            .unwrap();
+        fixture.output_until("new-echo:new-version-behavior");
+        let instance = fixture.runtime().instance_id();
+        assert!(fixture.complete(request, Ok(prepared)).is_none());
+        assert_eq!(fixture.runtime().instance_id(), instance);
+        let metas = fixture
+            .metas
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        assert_eq!(metas.len(), 1);
+        assert_eq!(metas[&41].label, "Renamed while preparing");
+        assert!(Arc::ptr_eq(&metas[&41].child_process, &identity));
+        let sessions = fixture
+            .sessions
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        assert_eq!(sessions[&41], fixture.conversation_id);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn omp_reboot_stale_completions_cannot_stop_or_resurrect_panes() {
+        for invalidation in ["closed", "recreated", "provider", "kind", "shutdown"] {
+            let mut fixture = OmpRebootFixture::new();
+            let request = fixture.request().unwrap();
+            {
+                let mut metas = fixture
+                    .metas
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
+                match invalidation {
+                    "closed" => {
+                        fixture.pending.remove(&41);
+                        metas.remove(&41);
+                    }
+                    "recreated" => {
+                        metas.get_mut(&41).unwrap().child_process = Arc::new(Mutex::new(None))
+                    }
+                    "provider" => metas.get_mut(&41).unwrap().provider = Provider::Claude,
+                    "kind" => metas.get_mut(&41).unwrap().kind = shared::PaneKind::Agent,
+                    "shutdown" => fixture.shutdown.store(true, Ordering::SeqCst),
+                    _ => unreachable!(),
+                }
+            }
+            let prepared = fixture.prepared.clone();
+            assert!(
+                fixture.complete(request, Ok(prepared)).is_none(),
+                "{invalidation}"
+            );
+            assert!(fixture.pending.is_empty(), "{invalidation}");
+            fixture.assert_old_provider_responds();
+            if invalidation == "closed" {
+                assert!(fixture
+                    .metas
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .is_empty());
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn omp_reboot_completion_cannot_respawn_after_remove_pane_stops_the_runtime() {
+        let mut fixture = OmpRebootFixture::new();
+        let request = fixture.request().unwrap();
+        let old_pid = fixture.old.provider_pid().unwrap();
+        super::invalidate_omp_reboot_generation(&fixture.metas, 41);
+        let removed = fixture
+            .terminals
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(&41)
+            .unwrap();
+        removed.shutdown_for_reboot().unwrap();
+        // RemovePane has stopped the terminal but CloseTab has not yet
+        // consumed the old metadata or pending request.
+        let prepared = fixture.prepared.clone();
+        assert!(fixture.complete(request, Ok(prepared)).is_none());
+        assert!(!pid_is_alive(old_pid));
+        assert!(fixture
+            .terminals
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .is_empty());
+        assert!(fixture
+            .metas
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .contains_key(&41));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn omp_reboot_completion_cannot_replace_a_new_runtime_with_unchanged_metadata() {
+        let mut fixture = OmpRebootFixture::new();
+        let request = fixture.request().unwrap();
+        let mut replacement = OmpRebootFixture::new();
+        fixture.old.shutdown();
+        fixture
+            .terminals
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .insert(41, replacement.runtime());
+        let prepared = fixture.prepared.clone();
+        assert!(fixture.complete(request, Ok(prepared)).is_none());
+        assert_eq!(
+            fixture.runtime().instance_id(),
+            replacement.runtime().instance_id()
+        );
+        replacement.assert_old_provider_responds();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn omp_reboot_old_request_does_not_consume_a_new_request_for_the_same_pane_id() {
+        let mut fixture = OmpRebootFixture::new();
+        let old_request = fixture.request().unwrap();
+        fixture.pending.remove(&41);
+        let request = fixture.request().unwrap();
+        assert_ne!(request, old_request);
+        let prepared = fixture.prepared.clone();
+        assert!(fixture.complete(old_request, Ok(prepared)).is_none());
+        assert_eq!(fixture.pending[&41].request_id, request);
+        fixture.assert_old_provider_responds();
+        assert!(fixture
+            .complete(request, Err("offline".into()))
+            .unwrap()
+            .contains("offline"));
+        assert!(fixture.pending.is_empty());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn omp_reboot_late_runtime_cannot_register_after_removal_during_host_creation() {
+        let mut fixture = OmpRebootFixture::new();
+        fixture.request().unwrap();
+        let request = fixture.pending.remove(&41).unwrap();
+        let previous = fixture
+            .terminals
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(&41)
+            .unwrap();
+        previous.shutdown_for_reboot().unwrap();
+
+        // The registry is empty during host creation. RemovePane must still
+        // invalidate the request before a newly created runtime is registered.
+        super::invalidate_omp_reboot_generation(&fixture.metas, 41);
+        let replacement = OmpRebootFixture::new();
+        let replacement_pid = replacement.old.provider_pid().unwrap();
+        let Err(stale) = super::register_omp_reboot_runtime(
+            &request,
+            41,
+            fixture.conversation_id,
+            &fixture.shutdown,
+            &fixture.metas,
+            &fixture.sessions,
+            &fixture.terminals,
+            replacement.runtime(),
+        ) else {
+            panic!("a removed pane accepted a late replacement runtime");
+        };
+        stale.shutdown_for_reboot().unwrap();
+        assert!(!pid_is_alive(replacement_pid));
+        assert!(fixture
+            .terminals
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .is_empty());
+        assert!(fixture
+            .metas
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .contains_key(&41));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn omp_reboot_configured_launcher_restarts_without_changing_its_version() {
+        let mut fixture = OmpRebootFixture::new();
+        let request = fixture.request().unwrap();
+        let source = fixture.source.clone();
+        let old_pid = fixture.old.provider_pid().unwrap();
+        let completion = fixture.complete(request, Ok(source));
+        assert!(
+            fixture
+                .terminals
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .contains_key(&41),
+            "configured launcher was not restarted: {completion:?}"
+        );
+        assert!(!pid_is_alive(old_pid));
+        assert_ne!(fixture.runtime().instance_id(), fixture.old.instance_id());
+        let output = fixture.output_until("ready");
+        assert!(output.contains("release=old"), "{output}");
+        assert!(output.contains("arg=--continue"), "{output}");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn omp_reboot_startup_failure_keeps_pane_configuration_and_reports_exit() {
+        let mut fixture = OmpRebootFixture::new();
+        let request = fixture.request().unwrap();
+        let old_pid = fixture.old.provider_pid().unwrap();
+        let old_instance = fixture.old.instance_id();
+        // Keep executable discovery valid while forcing the subsequent exec
+        // to fail, as can happen if a package launcher's interpreter vanishes.
+        std::fs::write(
+            &fixture.prepared,
+            format!(
+                "#!{}\n",
+                fixture.root.path().join("missing-interpreter").display()
+            ),
+        )
+        .unwrap();
+        let prepared = fixture.prepared.clone();
+        fixture.complete(request, Ok(prepared.clone())).unwrap();
+        assert!(!pid_is_alive(old_pid));
+        // A PTY backend may report failed exec synchronously or through the
+        // child's exit. Either way, retire the instance actually reported.
+        let runtime = fixture
+            .terminals
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .get(&41)
+            .cloned();
+        let failed_instance = runtime.as_ref().map_or(
+            old_instance,
+            crate::terminal_pane::TerminalRuntimeHandle::instance_id,
+        );
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut exited_state = false;
+        loop {
+            match fixture.server_rx.try_recv() {
+                Ok(CliToServer::TerminalState {
+                    session_id,
+                    pane_id: 41,
+                    instance_id: Some(instance_id),
+                    lifecycle: shared::TerminalLifecycle::Exited,
+                    ..
+                }) if session_id == fixture.session_id && instance_id == failed_instance => {
+                    exited_state = true;
+                }
+                Ok(CliToServer::TerminalExited {
+                    session_id,
+                    pane_id: 41,
+                    instance_id: Some(instance_id),
+                    ..
+                }) if session_id == fixture.session_id && instance_id == failed_instance => break,
+                _ => {}
+            }
+            assert!(
+                Instant::now() < deadline,
+                "failed executable never reported its exit"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(exited_state);
+        if let Some(runtime) = runtime {
+            assert_eq!(runtime.lifecycle(), shared::TerminalLifecycle::Exited);
+        }
+        assert!(fixture
+            .metas
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .contains_key(&41));
+        assert_eq!(
+            fixture
+                .sessions
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())[&41],
+            fixture.conversation_id,
+        );
     }
 
     #[test]
@@ -12364,6 +13678,7 @@ async fn run_server_connection(
     };
     let (summary_result_tx, mut summary_result_rx) =
         tokio_mpsc::channel::<shared::PaneWorkSummaryGenerationResult>(1);
+    let (omp_answer_tx, mut omp_answer_rx) = tokio_mpsc::channel::<CliToServer>(32);
 
     while !shutdown.load(Ordering::SeqCst) {
         let ws_url = format!("{}/ws/cli", server_url);
@@ -12391,6 +13706,7 @@ async fn run_server_connection(
                     shared::OPENCODE_TERMINAL_CAPABILITY.to_string(),
                     shared::PI_TERMINAL_CAPABILITY.to_string(),
                     shared::OMP_TERMINAL_CAPABILITY.to_string(),
+                    shared::OMP_QUESTION_CAPABILITY.to_string(),
                     shared::CLI_LIFECYCLE_CAPABILITY.to_string(),
                 ];
                 if summary_runner.is_some() {
@@ -12665,6 +13981,13 @@ async fn run_server_connection(
                 // Main loop
                 loop {
                     tokio::select! {
+                        Some(result) = omp_answer_rx.recv() => {
+                            if let Ok(text) = serde_json::to_string(&result) {
+                                if ws_sender.send(Message::Text(text.into())).await.is_err() {
+                                    break;
+                                }
+                            }
+                        }
                         prepared = async {
                             match reboot_preparation.as_mut() {
                                 Some((_, _, task)) => Some(task.await),
@@ -13522,6 +14845,23 @@ async fn run_server_connection(
                                                     });
                                                     continue;
                                                 }
+                                                if meta.kind.is_terminal() && meta.provider == Provider::Omp {
+                                                    // Update first, with the live provider retained;
+                                                    // the event loop commits only this pane generation.
+                                                    if let Err(error) = tui_event_tx.send(TuiEvent::RebootOmpPane {
+                                                        pane_id: target,
+                                                        generation: meta.child_process,
+                                                    }) {
+                                                        report_retired_launch_rejection(
+                                                            &status_tx,
+                                                            &mut ws_sender,
+                                                            session_id,
+                                                            target,
+                                                            &format!("[Error preparing OMP reboot: {error}. Running provider was not stopped.]"),
+                                                        ).await;
+                                                    }
+                                                    continue;
+                                                }
                                                 let prior_session_id = {
                                                     let sessions = pane_sessions.lock().unwrap();
                                                     sessions.get(&target).copied()
@@ -13614,6 +14954,7 @@ async fn run_server_connection(
                                                 });
                                             }
                                             ServerToCli::RemovePane { session_id: _, pane_id: remove_id, cleanup_action } => {
+                                                invalidate_omp_reboot_generation(&pane_metas, remove_id);
                                                 // Kill the pty first if this is a terminal pane.
                                                 // Removing it from the registry drops the last
                                                 // handle, and `shutdown` marks the reader so the
@@ -14321,11 +15662,59 @@ async fn run_server_connection(
                                                     let _ = ws_sender.send(Message::Text(text.into())).await;
                                                 }
                                             }
+                                            ServerToCli::AnswerOmpQuestion {
+                                                session_id: target_session, pane_id, tool_use_id,
+                                                dialog_id, request_id, answers, cancel,
+                                            } => {
+                                                let metas = pane_metas.clone();
+                                                let runtimes = terminal_panes.clone();
+                                                let result_tx = omp_answer_tx.clone();
+                                                tokio::task::spawn_blocking(move || {
+                                                    let provider_matches = metas.lock().ok()
+                                                        .and_then(|metas| metas.get(&pane_id).map(|meta|
+                                                            meta.kind.is_terminal() && meta.provider == Provider::Omp
+                                                        )).unwrap_or(false);
+                                                    let runtime = runtimes.lock().ok()
+                                                        .and_then(|runtimes| runtimes.get(&pane_id).cloned());
+                                                    let live = runtime.as_ref().is_some_and(|runtime| matches!(
+                                                        runtime.lifecycle(),
+                                                        shared::TerminalLifecycle::Running
+                                                            | shared::TerminalLifecycle::Disconnected
+                                                    ));
+                                                    #[cfg(target_os = "linux")]
+                                                    let group = runtime.as_ref().and_then(TerminalRuntimeHandle::process_group_id);
+                                                    #[cfg(not(target_os = "linux"))]
+                                                    let group = None;
+                                                    let authorized = target_session == session_id && provider_matches && live;
+                                                    let result = if authorized {
+                                                        crate::omp_activity::submit_answer(
+                                                            session_id, pane_id, group, &tool_use_id,
+                                                            dialog_id, &request_id, &answers, cancel,
+                                                        )
+                                                    } else {
+                                                        Err(anyhow::anyhow!("The exact OMP pane is not running in this project."))
+                                                    };
+                                                    let pending = authorized && crate::omp_activity::reported_question(
+                                                        session_id, pane_id, group,
+                                                    ).is_some_and(|report|
+                                                        report.tool_use_id == tool_use_id
+                                                    );
+                                                    let _ = result_tx.blocking_send(CliToServer::OmpQuestionAnswerResult {
+                                                        session_id: target_session, pane_id, tool_use_id,
+                                                        request_id, accepted: result.is_ok(), pending,
+                                                        error: result.err().map(|error| error.to_string()),
+                                                    });
+                                                });
+                                            }
                                             ServerToCli::AnswerQuestion {
                                                 session_id: _,
                                                 tool_use_id,
                                                 answers,
                                             } => {
+                                                if tool_use_id.starts_with("omp:") {
+                                                    tracing::warn!("rejecting legacy answer for OMP question");
+                                                    continue;
+                                                }
                                                 // Find the pane whose pending_questions map holds
                                                 // this tool_use_id, then build the matching
                                                 // control_response and hand it to that pane's
@@ -14336,6 +15725,7 @@ async fn run_server_connection(
                                                     let metas = pane_metas.lock().unwrap();
                                                     metas
                                                         .iter()
+                                                        .filter(|(_, m)| m.provider == Provider::Claude)
                                                         .map(|(pid, m)| (
                                                             *pid,
                                                             m.pending_questions.clone(),
@@ -14427,6 +15817,14 @@ async fn run_server_connection(
                                                             );
                                                         }
                                                         TerminalAnswerPlan::Deliver { pane_id: pid, keys } => {
+                                                            let is_claude = pane_metas.lock().ok()
+                                                                .and_then(|metas| metas.get(&pid).map(|meta|
+                                                                    meta.kind.is_terminal() && meta.provider == Provider::Claude
+                                                                )).unwrap_or(false);
+                                                            if !is_claude {
+                                                                tracing::warn!(pane_id = pid, "rejecting stale legacy question after provider switch");
+                                                                continue;
+                                                            }
                                                             let handle = terminal_panes
                                                                 .lock()
                                                                 .ok()

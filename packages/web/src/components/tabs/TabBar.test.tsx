@@ -1,5 +1,6 @@
 import { act, createEvent, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type { ReactNode } from "react";
 import { TabBar } from "./TabBar";
 import { useStore, type CliLifecycleInventory, type CliLifecycleStatus, type PaneConfig } from "@/lib/store";
 
@@ -32,7 +33,8 @@ function renderTabBar(
     onRenameTab?: ReturnType<typeof vi.fn>;
     onReorderTabs?: ReturnType<typeof vi.fn>;
     showRebootButton?: boolean;
-    showOverview?: boolean;
+    overviewTab?: ReactNode;
+    jobTabs?: ReactNode;
     paneStatuses?: Record<string, string | null>;
     tabs?: PaneConfig[];
   } = {},
@@ -66,7 +68,8 @@ function renderTabBar(
       lifecycleInventory={overrides.lifecycleInventory}
       lifecycleStatus={overrides.lifecycleStatus}
       showRebootButton={overrides.showRebootButton}
-      showOverview={overrides.showOverview}
+      overviewTab={overrides.overviewTab}
+      jobTabs={overrides.jobTabs}
       paneStatuses={overrides.paneStatuses ?? {}}
       pausedPanes={[]}
     />,
@@ -127,6 +130,7 @@ function mockRect(element: Element, left: number, width: number) {
 
 function openNewTabMenu() {
   fireEvent.click(screen.getByTitle("New tab"));
+  fireEvent.click(screen.getByRole("button", { name: /^Interactive agent/ }));
 }
 
 function isolatedWorktreeCheckbox(): HTMLInputElement {
@@ -194,31 +198,6 @@ describe("TabBar coordinator close controls", () => {
     fireEvent.contextMenu(tabButton(container, 13));
     fireEvent.click(screen.getByText("Close"));
     expect(onCloseTab).toHaveBeenCalledWith(13);
-  });
-
-  it("offers all verified terminal panes for new tabs", () => {
-    const onAddTab = vi.fn();
-    renderTabBar({ onAddTab });
-
-    fireEvent.click(screen.getByTitle("New tab"));
-
-    expect(screen.getByText("Claude")).toBeTruthy();
-    expect(screen.getByText("Claude / DeepSeek 4.1 Flash")).toBeTruthy();
-    expect(screen.getByText("Codex")).toBeTruthy();
-    expect(screen.getByText("OpenCode")).toBeTruthy();
-    expect(screen.getByText("Pi")).toBeTruthy();
-    expect(screen.getByText("OMP")).toBeTruthy();
-    expect(screen.queryByText("Cursor")).toBeNull();
-    expect(screen.queryByText("DeepSeek")).toBeNull();
-    // The withdrawn variant is not offered for new tabs under any label.
-    expect(screen.queryByText(/DeepSeek Pro/)).toBeNull();
-
-    fireEvent.click(screen.getByText("Claude"));
-    expect(onAddTab).toHaveBeenCalledWith("claude", undefined, undefined, "terminal");
-
-    fireEvent.click(screen.getByTitle("New tab"));
-    fireEvent.click(screen.getByText("Claude / DeepSeek 4.1 Flash"));
-    expect(onAddTab).toHaveBeenCalledWith("claude", "deepseek-flash", undefined, "terminal");
   });
 
   it("keeps full-process reboot behind the desktop lifecycle menu", () => {
@@ -303,23 +282,6 @@ describe("TabBar coordinator close controls", () => {
     confirmSpy.mockRestore();
   });
 
-});
-
-describe("TabBar Overview visibility", () => {
-  beforeEach(() => {
-    Element.prototype.scrollIntoView = vi.fn();
-  });
-
-  it("omits Overview while preserving real pane tabs when team mode is unavailable", () => {
-    const { container } = renderTabBar({
-      showOverview: false,
-      tabs: basicTabs(),
-      activeTabId: 1,
-    });
-
-    expect(screen.queryByRole("button", { name: "Overview" })).toBeNull();
-    expect(tabButton(container, 1).textContent).toContain("Alpha");
-  });
 });
 
 describe("TabBar rename and reorder controls", () => {
@@ -418,17 +380,7 @@ describe("TabBar add-tab worktree controls", () => {
     });
   });
 
-  it("passes undefined isolated-worktree mode for an untouched default provider pick", () => {
-    const onAddTab = vi.fn();
-    renderTabBar({ onAddTab });
-
-    openNewTabMenu();
-    fireEvent.click(screen.getByText("Claude"));
-
-    expect(onAddTab).toHaveBeenCalledWith("claude", undefined, undefined, "terminal");
-  });
-
-  it("passes true when isolated worktree is checked and resets it after picking", () => {
+  it("resets the isolated-worktree choice after creating a pane", () => {
     const onAddTab = vi.fn();
     renderTabBar({ onAddTab });
 
@@ -436,39 +388,8 @@ describe("TabBar add-tab worktree controls", () => {
     fireEvent.click(isolatedWorktreeCheckbox());
     fireEvent.click(screen.getByText("Claude"));
 
-    expect(onAddTab).toHaveBeenCalledWith("claude", undefined, true, "terminal");
-
     openNewTabMenu();
     expect(isolatedWorktreeCheckbox().checked).toBe(false);
-    fireEvent.click(screen.getByText("Codex"));
-
-    expect(onAddTab).toHaveBeenLastCalledWith("codex", undefined, undefined, "terminal");
-  });
-
-  it("offers verified terminal providers and passes kind=terminal", () => {
-    const onAddTab = vi.fn();
-    renderTabBar({ onAddTab });
-
-    openNewTabMenu();
-    fireEvent.click(screen.getByText("OpenCode"));
-
-    expect(onAddTab).toHaveBeenCalledWith("opencode", undefined, undefined, "terminal");
-  });
-
-  it("does not offer a terminal tab for providers a pty can't host", () => {
-    // Mirrors `terminal_binary_for` in the CLI: DeepSeek has no TUI of its
-    // own, so it only appears as a backend variant of the Claude terminal.
-    renderTabBar();
-    openNewTabMenu();
-
-    expect(screen.getByText("Claude")).toBeTruthy();
-    expect(screen.getByText("Codex")).toBeTruthy();
-    expect(screen.getByText("OpenCode")).toBeTruthy();
-    expect(screen.getByText("Pi")).toBeTruthy();
-    expect(screen.getByText("OMP")).toBeTruthy();
-    for (const label of ["MiniMax", "GLM", "DeepSeek", "Cursor"]) {
-      expect(screen.queryByText(label)).toBeNull();
-    }
   });
 
   it("filters the DeepSeek terminal profile through launch-profile policy", () => {

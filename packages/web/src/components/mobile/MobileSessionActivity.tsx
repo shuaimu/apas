@@ -23,7 +23,9 @@ import {
   X,
 } from "lucide-react";
 import { AskUserQuestionCard } from "@/components/tools/AskUserQuestionCard";
+import { ProjectJobsWorkspace } from "@/components/jobs/ProjectJobsWorkspace";
 import { readSelectedPane, writeSelectedPane } from "@/lib/mobileSelectedPane";
+import { isOmpQuestionInput, ompQuestionKey, parseOmpQuestionResult } from "@/lib/ompQuestions";
 import {
   resolveMachineProjectTarget,
   type MachineProjectTarget,
@@ -84,6 +86,7 @@ function readActivityScroll(sessionId: string, paneId: number): SavedActivityScr
 }
 
 function writeActivityScroll(sessionId: string, paneId: number, element: HTMLElement, followNewest: boolean) {
+  if (element.closest("[hidden]")) return;
   try {
     window.localStorage.setItem(activityScrollKey(sessionId, paneId), JSON.stringify({
       scrollTop: element.scrollTop,
@@ -167,11 +170,12 @@ function eventDetail(message: Message): string {
   return message.content;
 }
 
-function eventTone(message: Message, answeredQuestions: Map<string, Record<string, string>>): string {
+function eventTone(message: Message, answeredQuestions: Map<string, Record<string, string>>, nativeResolved: boolean): string {
   const output = message.outputType;
   const unansweredQuestion = output?.type === "tool_use"
     && output.tool === "AskUserQuestion"
     && Boolean(output.toolUseId)
+    && !nativeResolved
     && !answeredQuestions.has(output.toolUseId!);
   if (output?.type === "approval_request" || unansweredQuestion) {
     return "border-amber-400 dark:border-amber-700";
@@ -238,12 +242,15 @@ function MobileEventCard({
   const [expanded, setExpanded] = useState(false);
   const { message } = item;
   const output = message.outputType;
+  const nativeState = useStore((state) => message.sessionId && message.paneId !== undefined &&
+    output?.type === "tool_use" && output.toolUseId && isOmpQuestionInput(output.input)
+    ? state.ompQuestions.get(ompQuestionKey(message.sessionId, message.paneId, output.toolUseId)) : undefined);
   const detail = eventDetail(message);
   const label = eventLabel(message);
   const expandable = detail.length > 180 || detail.includes("\n") || output?.type === "tool_use";
 
   return (
-    <article data-message-role={message.role} className={`rounded-2xl border p-3.5 ${eventSurface(message)} ${eventTone(message, answeredQuestions)}`}>
+    <article data-message-role={message.role} className={`rounded-2xl border p-3.5 ${eventSurface(message)} ${eventTone(message, answeredQuestions, !!nativeState?.result)}`}>
       <button
         type="button"
         aria-expanded={expandable ? expanded : undefined}
@@ -282,7 +289,7 @@ function MobileEventCard({
         </div>
       )}
       {output?.type === "tool_use" && output.tool === "AskUserQuestion" && (
-        <AskUserQuestionCard toolUseId={output.toolUseId} input={output.input} />
+        <AskUserQuestionCard key={JSON.stringify([message.sessionId, message.paneId, output.toolUseId])} toolUseId={output.toolUseId} input={output.input} sessionId={message.sessionId} paneId={message.paneId} />
       )}
     </article>
   );
@@ -290,6 +297,7 @@ function MobileEventCard({
 
 export function MobileSessionActivity({ connected, onBack, onReconnect }: MobileSessionActivityProps) {
   const sessionId = useStore((state) => state.sessionId);
+  const accountId = useStore((state) => state.userId);
   const sessions = useStore((state) => state.sessions);
   const paneConfigs = useStore((state) => state.paneConfigs);
   const removePane = useStore((state) => state.removePane);
@@ -321,7 +329,9 @@ export function MobileSessionActivity({ connected, onBack, onReconnect }: Mobile
   const [actionError, setActionError] = useState<string | null>(null);
   const [activityLimit, setActivityLimit] = useState(INITIAL_ACTIVITY_LIMIT);
   const [terminalPaneId, setTerminalPaneId] = useState<number | null>(null);
+  const [mountedTerminal, setMountedTerminal] = useState<{ sessionId: string; paneId: number } | null>(null);
   const [newPaneOpen, setNewPaneOpen] = useState(false);
+  const [interactiveCreation, setInteractiveCreation] = useState(false);
   const [summaryOpen, setSummaryOpen] = useState(false);
   const [manageOpen, setManageOpen] = useState(false);
   const [moreOpen, setMoreOpen] = useState(false);
@@ -383,12 +393,12 @@ export function MobileSessionActivity({ connected, onBack, onReconnect }: Mobile
 
   const activity = useMemo(() => {
     const items: ActivityItem[] = messages
-      .filter((message) => !isRoutineSystemUpdate(message))
+      .filter((message) => !isRoutineSystemUpdate(message) && !(message.outputType?.type === "tool_result" && parseOmpQuestionResult(message.content)))
       .map((message) => ({ key: `0:${message.id}`, message, paneId: MAIN_PANE_ID }));
     for (const [rawPaneId, paneActivity] of Object.entries(paneMessages)) {
       const paneId = Number(rawPaneId);
       for (const message of paneActivity) {
-        if (!isRoutineSystemUpdate(message)) {
+        if (!isRoutineSystemUpdate(message) && !(message.outputType?.type === "tool_result" && parseOmpQuestionResult(message.content))) {
           items.push({ key: `${paneId}:${message.id}`, message, paneId });
         }
       }
@@ -430,10 +440,11 @@ export function MobileSessionActivity({ connected, onBack, onReconnect }: Mobile
   }, [selectedPaneId, sessionId]);
 
   const openRawTerminal = useCallback(() => {
-    if (selectedPaneId === null) return;
+    if (selectedPaneId === null || !sessionId) return;
     persistActivityScroll();
+    setMountedTerminal({ sessionId, paneId: selectedPaneId });
     setTerminalPaneId(selectedPaneId);
-  }, [persistActivityScroll, selectedPaneId]);
+  }, [persistActivityScroll, selectedPaneId, sessionId]);
 
   const handleActivityScroll = useCallback(() => {
     const element = activityScrollRef.current;
@@ -451,7 +462,7 @@ export function MobileSessionActivity({ connected, onBack, onReconnect }: Mobile
   // loaded message. A conversation with no saved position starts at newest.
   useLayoutEffect(() => {
     const element = activityScrollRef.current;
-    if (!sessionId || selectedPaneId === null || !element || visibleActivity.length === 0) return;
+    if (!sessionId || selectedPaneId === null || !element || element.closest("[hidden]") || visibleActivity.length === 0) return;
 
     const scrollContext = `${sessionId}:${selectedPaneId}`;
 
@@ -586,20 +597,6 @@ export function MobileSessionActivity({ connected, onBack, onReconnect }: Mobile
     dismissRename();
   };
 
-  if (terminalPaneId !== null) {
-    return (
-      <section aria-label="Mobile terminal" className="flex h-full min-h-0 flex-col bg-[#0a0a0a] text-white">
-        <div className="flex shrink-0 items-center justify-between border-b border-neutral-800 px-2 py-1.5">
-          <button type="button" onClick={() => setTerminalPaneId(null)} className="flex items-center gap-2 rounded-lg px-2 py-2 text-sm font-bold hover:bg-neutral-800">
-            <ArrowLeft className="h-5 w-5" /> Conversation
-          </button>
-          <span className="truncate px-2 text-xs text-neutral-400">{selectedPane ? paneLabel(selectedPane) : `Pane ${terminalPaneId}`}</span>
-        </div>
-        <div className="flex min-h-0 flex-1 flex-col"><TerminalPane paneId={terminalPaneId} /></div>
-        <MobileTerminalKeyBar paneId={terminalPaneId} connected={connected} />
-      </section>
-    );
-  }
 
   if (!sessionId || !session) {
     return (
@@ -620,8 +617,21 @@ export function MobileSessionActivity({ connected, onBack, onReconnect }: Mobile
     && !machineProjectTarget.isRunning;
   const canCompose = selectedPaneId !== null && !selectedIsBot;
   const canSend = canCompose && connected && sessionIsRunning;
+  const projectId = (session.projectId !== session.id ? session.projectId : undefined)
+    ?? machineProjectTarget?.projectId ?? session.projectId;
+  const projectContext = projectId ? {
+    id: projectId,
+    name: projectName,
+    machineId: machineProjectTarget?.projectId === projectId ? machineProjectTarget?.machineId : undefined,
+  } : undefined;
+  const retainedTerminal = mountedTerminal?.sessionId === sessionId
+    && paneConfigs.some((pane) => pane.pane_id === mountedTerminal.paneId && pane.kind === "terminal")
+    ? mountedTerminal : null;
+  const terminalIsOpen = terminalPaneId !== null && retainedTerminal?.paneId === terminalPaneId;
 
   return (
+    <ProjectJobsWorkspace key={`${accountId}:${projectId ?? sessionId}`} project={projectContext} paneSelectionRequested={false}>
+    {(workspace) => (
     <section aria-label="Mobile session activity" className="flex h-full min-h-0 w-full flex-col overflow-hidden bg-[#f7f7fa] text-[#18181b] dark:bg-[#111115] dark:text-[#f7f7fa]">
       {!connected && (
         <button type="button" onClick={onReconnect} className="flex shrink-0 items-center justify-center gap-2 border-b border-amber-200 bg-amber-50 px-4 py-2 text-xs font-bold text-amber-800 dark:border-amber-900 dark:bg-amber-950/40 dark:text-amber-200">
@@ -633,12 +643,13 @@ export function MobileSessionActivity({ connected, onBack, onReconnect }: Mobile
           top row; the project's identity is read once and takes the small line
           beneath. Account left entirely — it navigates away from the session,
           and the home screen has it. */}
-      <div className="shrink-0 border-b border-[#dedee7] px-4 pt-3 pb-2.5 dark:border-[#383842]">
-        <div className="flex items-center gap-2">
-          <button type="button" aria-label="Back to coding sessions" onClick={onBack} className="-ml-2 shrink-0 rounded-lg p-2 text-[#686873] hover:bg-[#efeff5] dark:text-[#aaaab6] dark:hover:bg-[#25252d]"><ArrowLeft className="h-5 w-5" /></button>
+      <div hidden={terminalIsOpen && !workspace.active} className={terminalIsOpen && !workspace.active ? "hidden" : "shrink-0 border-b border-[#dedee7] px-4 pt-3 pb-2.5 dark:border-[#383842]"}>
+        <div className="flex items-center gap-2" onClickCapture={persistActivityScroll}>
+          <button type="button" aria-label="Back to coding sessions" onClick={onBack} className="-ml-2 flex h-11 w-11 shrink-0 items-center justify-center rounded-lg text-[#686873] hover:bg-[#efeff5] dark:text-[#aaaab6] dark:hover:bg-[#25252d]"><ArrowLeft className="h-5 w-5" /></button>
           <div className="no-scrollbar flex min-w-0 flex-1 items-center gap-2 overflow-x-auto">
+            {workspace.overviewTab}
             {paneConfigs.length > 0 ? paneConfigs.map((pane) => {
-              const selected = pane.pane_id === selectedPaneId;
+              const selected = pane.pane_id === selectedPaneId && !workspace.active;
               const paneStatus = paneStatuses[paneKey(pane.pane_id)];
               const statusSuffix = paneIsAwaitingAnswerStatus(paneStatus)
                 ? " · pending answer"
@@ -646,16 +657,17 @@ export function MobileSessionActivity({ connected, onBack, onReconnect }: Mobile
                   ? " · working"
                   : "";
               return (
-                <button key={pane.pane_id} type="button" aria-pressed={selected} onClick={() => selectPane(pane.pane_id)} className={`shrink-0 rounded-full border px-3 py-1.5 text-xs font-bold ${selected ? "border-[#6d5efc] text-[#6d5efc]" : "border-[#dedee7] text-[#686873] dark:border-[#383842] dark:text-[#aaaab6]"}`}>
+                <button key={pane.pane_id} type="button" aria-pressed={selected} onClick={() => { workspace.selectInteractive(); selectPane(pane.pane_id); }} className={`min-h-11 shrink-0 rounded-full border px-3 py-1.5 text-xs font-bold ${selected ? "border-[#6d5efc] text-[#6d5efc]" : "border-[#dedee7] text-[#686873] dark:border-[#383842] dark:text-[#aaaab6]"}`}>
                   {paneLabel(pane)}{statusSuffix}
                 </button>
               );
             }) : (
               <span className="shrink-0 text-xs text-[#686873] dark:text-[#aaaab6]">Waiting for panes…</span>
             )}
-            <button type="button" aria-label="Create pane" onClick={() => setNewPaneOpen(true)} className="inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-[#6d5efc] text-white"><Plus className="h-4 w-4" /></button>
+            {workspace.tabs}
           </div>
-          <button type="button" aria-label="More actions" onClick={() => setMoreOpen(true)} className="-mr-2 shrink-0 rounded-lg p-2 text-[#686873] hover:bg-[#efeff5] dark:text-[#aaaab6] dark:hover:bg-[#25252d]"><MoreVertical className="h-5 w-5" /></button>
+          <button type="button" aria-label="Add agent" onClick={() => { setInteractiveCreation(false); setNewPaneOpen(true); }} className="inline-flex h-11 w-11 shrink-0 items-center justify-center rounded-full bg-[#6d5efc] text-white"><Plus className="h-4 w-4" /></button>
+          {!workspace.active && <button type="button" aria-label="More actions" onClick={() => setMoreOpen(true)} className="-mr-2 flex h-11 w-11 shrink-0 items-center justify-center rounded-lg text-[#686873] hover:bg-[#efeff5] dark:text-[#aaaab6] dark:hover:bg-[#25252d]"><MoreVertical className="h-5 w-5" /></button>}
         </div>
 
         <div className="mt-1.5 flex items-center gap-2">
@@ -677,6 +689,18 @@ export function MobileSessionActivity({ connected, onBack, onReconnect }: Mobile
 
       {actionError && <div className="mx-4 mt-3 flex shrink-0 items-center gap-2 rounded-xl border border-red-300 bg-red-50 px-3 py-2 text-xs text-red-700 dark:border-red-900 dark:bg-red-950/40 dark:text-red-300"><AlertTriangle className="h-4 w-4 shrink-0" /> {actionError}</div>}
 
+      {workspace.content}
+      {retainedTerminal && (
+        <section hidden={!terminalIsOpen || workspace.active} aria-label="Mobile terminal" className={terminalIsOpen && !workspace.active ? "flex flex-1 min-h-0 flex-col bg-[#0a0a0a] text-white" : "hidden"}>
+          <div className="flex shrink-0 items-center justify-between border-b border-neutral-800 px-2 py-1.5">
+            <button type="button" onClick={() => setTerminalPaneId(null)} className="flex min-h-11 items-center gap-2 rounded-lg px-2 py-2 text-sm font-bold hover:bg-neutral-800"><ArrowLeft className="h-5 w-5" /> Conversation</button>
+            <span className="truncate px-2 text-xs text-neutral-400">{selectedPane ? paneLabel(selectedPane) : `Pane ${retainedTerminal.paneId}`}</span>
+          </div>
+          <div className="flex min-h-0 flex-1 flex-col"><TerminalPane key={`${sessionId}:${retainedTerminal.paneId}`} paneId={retainedTerminal.paneId} visible={terminalIsOpen && !workspace.active} /></div>
+          <MobileTerminalKeyBar paneId={retainedTerminal.paneId} connected={connected} />
+        </section>
+      )}
+      <div hidden={workspace.active || terminalIsOpen} className={workspace.active || terminalIsOpen ? "hidden" : "flex min-h-0 flex-1 flex-col"}>
 
       <div ref={activityScrollRef} role="log" aria-label="Conversation activity" onScroll={handleActivityScroll} className="min-h-0 flex-1 overflow-y-auto px-4 pb-4">
         {selectedPlanReviews.length > 0 && (
@@ -774,15 +798,22 @@ export function MobileSessionActivity({ connected, onBack, onReconnect }: Mobile
           <button type="button" aria-label={selectedIsTerminal ? "Send conversation message" : "Send follow-up"} disabled={!canSend || !followUp.trim()} onClick={sendFollowUp} className="flex h-11 w-11 shrink-0 items-center justify-center rounded-xl bg-[#6d5efc] text-white disabled:opacity-40"><Send className="h-5 w-5" /></button>
         </div>
       </div>
+      </div>
 
       {newPaneOpen && (
         <div className="fixed inset-0 z-[95] flex items-end bg-black/45" onClick={() => setNewPaneOpen(false)}>
-          <div role="dialog" aria-modal="true" aria-label="Create pane" onClick={(event) => event.stopPropagation()} className="max-h-[82dvh] w-full overflow-y-auto rounded-t-[1.4rem] border-t border-[#dedee7] bg-[#f7f7fa] p-4 pb-[max(1rem,env(safe-area-inset-bottom))] shadow-2xl dark:border-[#383842] dark:bg-[#111115]">
-            <div className="flex items-center justify-between"><div><h2 className="text-xl font-extrabold">Create pane</h2><p className="mt-1 text-sm text-[#686873] dark:text-[#aaaab6]">Choose a profile allowed by this project's cluster policy.</p></div><button type="button" aria-label="Close create pane" onClick={() => setNewPaneOpen(false)} className="rounded-lg p-2 hover:bg-[#efeff5] dark:hover:bg-[#25252d]"><X className="h-5 w-5" /></button></div>
+          <div role="dialog" aria-modal="true" aria-label="Add agent" onClick={(event) => event.stopPropagation()} className="max-h-[82dvh] w-full overflow-y-auto rounded-t-[1.4rem] border-t border-[#dedee7] bg-[#f7f7fa] p-4 pb-[max(1rem,env(safe-area-inset-bottom))] shadow-2xl dark:border-[#383842] dark:bg-[#111115]">
+            <div className="flex items-center justify-between"><div><h2 className="text-xl font-extrabold">{interactiveCreation ? "Interactive agent" : "Add agent"}</h2><p className="mt-1 text-sm text-[#686873] dark:text-[#aaaab6]">{interactiveCreation ? "Choose a profile allowed by this project's cluster policy." : "Choose interactive or bounded autonomous work."}</p></div><button type="button" aria-label="Close add agent" onClick={() => setNewPaneOpen(false)} className="flex h-11 w-11 shrink-0 items-center justify-center rounded-lg hover:bg-[#efeff5] dark:hover:bg-[#25252d]"><X className="h-5 w-5" /></button></div>
+            {!interactiveCreation ? <div className="mt-4 space-y-2">
+              <button type="button" onClick={() => setInteractiveCreation(true)} className="min-h-11 w-full rounded-2xl border border-[#dedee7] bg-white p-3.5 text-left dark:border-[#383842] dark:bg-[#1b1b21]"><span className="block font-bold">Interactive agent</span><span className="mt-1 block text-sm">Work directly with a provider in a terminal.</span></button>
+              <button type="button" disabled={!workspace.addAutonomous} onClick={() => { persistActivityScroll(); setNewPaneOpen(false); workspace.addAutonomous?.(); }} className="min-h-11 w-full rounded-2xl border border-[#dedee7] bg-white p-3.5 text-left disabled:opacity-50 dark:border-[#383842] dark:bg-[#1b1b21]"><span className="block font-bold">Autonomous agent</span><span className="mt-1 block text-sm">{workspace.unavailableReason || "Review a bounded task, worker readiness and limits."}</span></button>
+            </div> : <>
+            <button type="button" onClick={() => setInteractiveCreation(false)} className="mt-2 min-h-11 text-sm font-bold text-[#6d5efc]">Back to agent types</button>
             <div className="mt-4 space-y-2">
-              {launchOptions.map((option) => <button key={option.key} type="button" onClick={() => createPane(option)} className="flex w-full items-center justify-between rounded-2xl border border-[#dedee7] bg-white p-3.5 text-left dark:border-[#383842] dark:bg-[#1b1b21]"><span><span className="block font-bold">{option.label}</span><span className="mt-0.5 block text-xs text-[#686873] dark:text-[#aaaab6]">{option.kind === "terminal" ? "Interactive TUI" : "Coding activity pane"}</span></span><Plus className="h-5 w-5 text-[#6d5efc]" /></button>)}
+              {launchOptions.map((option) => <button key={option.key} type="button" onClick={() => { workspace.selectInteractive(); createPane(option); }} className="flex w-full items-center justify-between rounded-2xl border border-[#dedee7] bg-white p-3.5 text-left dark:border-[#383842] dark:bg-[#1b1b21]"><span><span className="block font-bold">{option.label}</span><span className="mt-0.5 block text-xs text-[#686873] dark:text-[#aaaab6]">{option.kind === "terminal" ? "Interactive TUI" : "Coding activity pane"}</span></span><Plus className="h-5 w-5 text-[#6d5efc]" /></button>)}
               {launchOptions.length === 0 && <div className="rounded-2xl border border-[#dedee7] bg-white p-4 text-sm text-[#686873] dark:border-[#383842] dark:bg-[#1b1b21] dark:text-[#aaaab6]">Waiting for the project's launch policy, or no profiles are currently allowed.</div>}
             </div>
+            </>}
           </div>
         </div>
       )}
@@ -820,8 +851,7 @@ export function MobileSessionActivity({ connected, onBack, onReconnect }: Mobile
               <button type="button" aria-label="Open raw terminal" disabled={!selectedIsTerminal} onClick={() => {
                 if (selectedPaneId === null) return;
                 setMoreOpen(false);
-                persistActivityScroll();
-                setTerminalPaneId(selectedPaneId);
+                openRawTerminal();
               }} className="flex w-full items-center gap-3 rounded-2xl border border-[#dedee7] bg-white p-3.5 text-left font-bold disabled:opacity-40 dark:border-[#383842] dark:bg-[#1b1b21]"><SquareTerminal className="h-5 w-5 shrink-0 text-[#686873] dark:text-[#aaaab6]" /> Raw terminal</button>
               {summarySupported && (
                 <button type="button" aria-label="Open work summary" disabled={selectedPaneId === null} onClick={() => { setMoreOpen(false); setSummaryOpen(true); }} className="flex w-full items-center gap-3 rounded-2xl border border-[#dedee7] bg-white p-3.5 text-left font-bold disabled:opacity-40 dark:border-[#383842] dark:bg-[#1b1b21]"><History className="h-5 w-5 shrink-0 text-[#686873] dark:text-[#aaaab6]" /> Work summary</button>
@@ -983,5 +1013,7 @@ export function MobileSessionActivity({ connected, onBack, onReconnect }: Mobile
         />
       )}
     </section>
+    )}
+    </ProjectJobsWorkspace>
   );
 }

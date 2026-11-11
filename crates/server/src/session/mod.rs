@@ -138,6 +138,9 @@ pub struct SessionManager {
     /// Server-authoritative unresolved decisions keyed by the CLI tool id.
     /// Removal is the atomic first-response claim shared by web and mobile.
     pending_decisions: DashMap<(Uuid, String), PendingDecision>,
+    /// One native answer acceptance waiter per pane, removed on receipt,
+    /// disconnect, or the bounded web-handler timeout.
+    omp_answer_waiters: DashMap<(Uuid, u32), OmpAnswerWaiter>,
     /// Per-user mobile mutation request state. A retry with the same opaque
     /// request id either observes the retained acknowledgement or waits for
     /// the original in-flight operation; it never applies the action twice.
@@ -166,6 +169,20 @@ pub struct SessionManager {
 pub struct PendingDecision {
     pub pane_id: Option<u32>,
     pub kind: shared::MutationKind,
+}
+
+struct OmpAnswerWaiter {
+    cli_id: Uuid,
+    tool_use_id: String,
+    request_id: String,
+    sender: oneshot::Sender<OmpAnswerReceipt>,
+}
+
+#[derive(Debug)]
+pub(crate) struct OmpAnswerReceipt {
+    pub accepted: bool,
+    pub pending: bool,
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -357,6 +374,7 @@ impl SessionManager {
             recent_input_ids: DashMap::new(),
             pending_terminal_transcript_echoes: DashMap::new(),
             pending_decisions: DashMap::new(),
+            omp_answer_waiters: DashMap::new(),
             mutation_requests: DashMap::new(),
             mutation_request_order: DashMap::new(),
             lifecycle_requests: DashMap::new(),
@@ -641,6 +659,58 @@ impl SessionManager {
             .or_insert(decision);
     }
 
+    pub(crate) fn begin_omp_answer(
+        &self,
+        session_id: Uuid,
+        pane_id: u32,
+        cli_id: Uuid,
+        tool_use_id: String,
+        request_id: String,
+    ) -> Option<oneshot::Receiver<OmpAnswerReceipt>> {
+        use dashmap::mapref::entry::Entry;
+        let Entry::Vacant(entry) = self.omp_answer_waiters.entry((session_id, pane_id)) else {
+            return None;
+        };
+        let (sender, receiver) = oneshot::channel();
+        entry.insert(OmpAnswerWaiter {
+            cli_id,
+            tool_use_id,
+            request_id,
+            sender,
+        });
+        Some(receiver)
+    }
+
+    pub(crate) fn finish_omp_answer(
+        &self,
+        session_id: Uuid,
+        pane_id: u32,
+        cli_id: Uuid,
+        tool_use_id: &str,
+        request_id: &str,
+        receipt: OmpAnswerReceipt,
+    ) -> bool {
+        self.omp_answer_waiters
+            .remove_if(&(session_id, pane_id), |_, pending| {
+                pending.cli_id == cli_id
+                    && pending.tool_use_id == tool_use_id
+                    && pending.request_id == request_id
+            })
+            .is_some_and(|(_, pending)| pending.sender.send(receipt).is_ok())
+    }
+
+    pub(crate) fn cancel_omp_answer_waiter(
+        &self,
+        session_id: Uuid,
+        pane_id: u32,
+        request_id: &str,
+    ) {
+        self.omp_answer_waiters
+            .remove_if(&(session_id, pane_id), |_, pending| {
+                pending.request_id == request_id
+            });
+    }
+
     /// Atomically reserve an opaque request id before routing a mutation.
     pub fn claim_mutation_request(&self, user_id: Uuid, request_id: &str) -> MutationRequestClaim {
         use dashmap::mapref::entry::Entry;
@@ -749,6 +819,8 @@ impl SessionManager {
         let owner = self.cli_users.remove(cli_id).map(|(_, uid)| uid);
         self.cli_versions.remove(cli_id);
         self.cli_capabilities.remove(cli_id);
+        self.omp_answer_waiters
+            .retain(|_, pending| pending.cli_id != *cli_id);
         let keys_to_remove: Vec<(Uuid, Provider)> = self
             .cli_usage_limits
             .iter()
@@ -2857,11 +2929,17 @@ mod tests {
             let ServerToWeb::Machines { machines } = rx.try_recv().unwrap() else {
                 panic!("expected synchronous inventory broadcast");
             };
-            assert_eq!(machines[0].projects[0].preferred_machine_id, Some(preferred));
+            assert_eq!(
+                machines[0].projects[0].preferred_machine_id,
+                Some(preferred)
+            );
             assert!(machines[0].projects[0].is_running);
             assert_eq!(machines[0].projects[0].pid, Some(123));
         }
-        assert_eq!(mgr.get_machines_for_user(&other_owner)[0].projects[0].preferred_machine_id, None);
+        assert_eq!(
+            mgr.get_machines_for_user(&other_owner)[0].projects[0].preferred_machine_id,
+            None
+        );
         let shared = mgr.get_machines_for_project_refs(
             &HashSet::new(),
             &HashSet::from(["/shared/project".to_string()]),
@@ -2877,9 +2955,15 @@ mod tests {
             machine_id,
             HashSet::from(["project".to_string()]),
         )]));
-        assert_eq!(redacted[0].projects[0].preferred_machine_id, Some(preferred));
+        assert_eq!(
+            redacted[0].projects[0].preferred_machine_id,
+            Some(preferred)
+        );
         mgr.set_project_machine_preferences(owner, HashMap::new());
-        assert_eq!(mgr.get_machines_for_user(&owner)[0].projects[0].preferred_machine_id, None);
+        assert_eq!(
+            mgr.get_machines_for_user(&owner)[0].projects[0].preferred_machine_id,
+            None
+        );
     }
 
     fn sorted_pane_statuses(
@@ -3788,6 +3872,7 @@ mod tests {
                 mutation: shared::MutationKind::Interrupt,
                 accepted: true,
                 error: None,
+                question_pending: None,
             },
         );
 
@@ -3827,6 +3912,7 @@ mod tests {
                     mutation: shared::MutationKind::Question,
                     accepted: false,
                     error: Some("stale".to_string()),
+                    question_pending: None,
                 },
             );
         }

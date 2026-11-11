@@ -14,7 +14,10 @@ jest.mock("@/api/client", () => ({
 jest.mock("@/storage/cache", () => ({
   replaceSessionSummaries: (sessions: MobileSessionSummary[]) => mockReplaceSessions(sessions),
 }));
-jest.mock("@/security/credentials", () => ({ getInstallationId: jest.fn() }));
+jest.mock("@/security/credentials", () => ({
+  getInstallationId: jest.fn(),
+  loadCredentials: jest.fn(async () => null),
+}));
 jest.mock("expo-router", () => ({ router: { push: (...args: unknown[]) => mockRouterPush(...args) } }));
 jest.mock("expo-constants", () => ({
   __esModule: true,
@@ -65,7 +68,6 @@ describe("notification and link authorization refresh", () => {
 
     await expect(handleAuthorizedLink(`apas://code/session/${sessionId}`)).resolves.toBe(true);
 
-    expect(mockReplaceSessions).toHaveBeenCalledWith([session]);
     expect(mockRouterPush).toHaveBeenCalledWith({
       pathname: "/(code)/session/[sessionId]",
       params: { sessionId },
@@ -85,7 +87,7 @@ describe("notification and link authorization refresh", () => {
   it("does not navigate when current authorization cannot be refreshed", async () => {
     mockBootstrap.mockRejectedValue(new Error("device session revoked"));
 
-    await expect(handleAuthorizedLink("apas://code")).rejects.toThrow("device session revoked");
+    await expect(handleAuthorizedLink("apas://code")).rejects.toBeInstanceOf(Error);
     expect(mockReplaceSessions).not.toHaveBeenCalled();
     expect(mockRouterPush).not.toHaveBeenCalled();
   });

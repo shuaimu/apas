@@ -1,0 +1,8 @@
+{
+  "type": "job_subscription_rejected",
+  "project_id": "example-project",
+  "job_id": "06974c2c-cd7d-446b-aac3-e0f550e739f6",
+  "code": "job_access_denied",
+  "message": "This job is not available to this account.",
+  "resync_required": false
+}

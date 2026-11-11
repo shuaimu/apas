@@ -77,6 +77,16 @@ pub enum TuiEvent {
         pane_id: u32,
         cleanup_action: Option<shared::PaneCleanupAction>,
     },
+    /// Prepare the next OMP executable without interrupting the running pane.
+    RebootOmpPane {
+        pane_id: u32,
+        generation: Arc<std::sync::Mutex<Option<std::process::Child>>>,
+    },
+    OmpRebootPrepared {
+        pane_id: u32,
+        request_id: uuid::Uuid,
+        result: Result<std::path::PathBuf, String>,
+    },
     StartBot {
         pane_id: u32,
         prompt: Option<String>,

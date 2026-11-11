@@ -9,6 +9,7 @@ import { UserMessage } from "../chat/UserMessage";
 import { AssistantMessage } from "../chat/AssistantMessage";
 import { ToolGroupCard, groupMessagesForRender, isToolLikeMessage } from "../chat/ToolGroupCard";
 import { TabBar } from "./TabBar";
+import { ProjectJobsWorkspace } from "../jobs/ProjectJobsWorkspace";
 import { WorkerTaskBar } from "./WorkerTaskBar";
 import { UsageLimitsDisplay } from "../UsageLimits";
 import { CodeBlock } from "../code/CodeBlock";
@@ -119,10 +120,6 @@ const TerminalPane = dynamic(
 
 // Sentinel pane_id for the single-pane fallback (no pane system)
 const PANE_ID_MAIN = 0;
-// Sentinel for the Overview pseudo-tab (Phase 5.1). Negative so it
-// can't collide with real pane ids (Rust-side u32, dynamic ids start
-// from 3) and survives the `parseInt` round-trip in localStorage.
-export const OVERVIEW_PANE_ID = -1;
 const DEFAULT_BOT_MIN_INTERVAL_MINUTES = 15;
 const PANE_REBOOT_CONFIRM_MESSAGE =
   "Reboot this pane's agent? The running process is killed and respawned on the SAME session (so the agent resumes with its prior conversation context).";
@@ -223,29 +220,20 @@ export function deriveInitialActiveTabId(args: {
   activeTabId: number | null;
   clientChanged: boolean;
   managerTabId: number | null;
-  overviewAvailable: boolean;
   paneConfigsLength: number;
   /** Whether an authoritative pane roster has arrived for this project. */
   paneListReceived: boolean;
   savedActiveTab: string;
   tabIds: number[];
 }): number | null {
-  // A selected project with no real panes is a valid workspace state. Keep
-  // its navigation anchored on Overview when team mode is available. When
-  // cluster policy disables team mode there is no Overview surface, so leave
-  // the selection empty while the tab bar still exposes the first-pane action.
-  if (args.tabIds.length === 0) {
-    return args.overviewAvailable ? OVERVIEW_PANE_ID : null;
-  }
-
-  const isValidTab = (paneId: number) =>
-    (args.overviewAvailable && paneId === OVERVIEW_PANE_ID) || args.tabIds.includes(paneId);
+  // Overview belongs to the project workspace, never to the pane roster.
+  if (args.tabIds.length === 0) return null;
 
   // Same project, current pick is still valid -> no change.
   if (
     !args.clientChanged &&
     args.activeTabId != null &&
-    isValidTab(args.activeTabId)
+    args.tabIds.includes(args.activeTabId)
   ) {
     return args.activeTabId;
   }
@@ -265,15 +253,12 @@ export function deriveInitialActiveTabId(args: {
   }
 
   const savedNum = args.savedActiveTab ? parseInt(args.savedActiveTab, 10) : NaN;
-  if (!isNaN(savedNum) && isValidTab(savedNum)) {
+  if (!isNaN(savedNum) && args.tabIds.includes(savedNum)) {
     return savedNum;
   }
 
-  // Persisted pref is gone or no longer matches a real pane. Prefer the
-  // Manager pane (chat-first landing). With team mode enabled, Overview is
-  // the secondary landing surface; otherwise use the first real pane.
-  return args.managerTabId
-    ?? (args.overviewAvailable ? OVERVIEW_PANE_ID : args.tabIds[0] ?? null);
+  // Keep the existing Manager preference, otherwise select a real pane.
+  return args.managerTabId ?? args.tabIds[0] ?? null;
 }
 
 export function lazyPaneMessageLoadTargets(args: {
@@ -281,13 +266,12 @@ export function lazyPaneMessageLoadTargets(args: {
   tabIds: number[];
 }): number[] {
   if (args.activeTabId == null) return [];
-  if (args.activeTabId === OVERVIEW_PANE_ID) return [];
   if (!args.tabIds.includes(args.activeTabId)) return [];
   return [args.activeTabId];
 }
 
 export function shouldShowPaneRebootButton(activeTabId: number | null): boolean {
-  return activeTabId != null && activeTabId !== OVERVIEW_PANE_ID;
+  return activeTabId != null;
 }
 
 export function confirmedPaneRebootTarget(
@@ -446,9 +430,9 @@ export function TabbedView({
   mobileTrailing?: React.ReactNode;
 } = {}) {
   const sessionId = useStore((s) => s.sessionId);
+  const accountId = useStore((state) => state.userId);
   const pendingPaneSelection = useStore((s) => s.pendingPaneSelection);
   const clearPendingPaneSelection = useStore((s) => s.clearPendingPaneSelection);
-  const projectPolicies = useStore((s) => s.projectPolicies);
   const negotiatedCapabilities = useStore((s) => s.negotiatedCapabilities);
   const messages = useStore((s) => s.messages);
   const paneConfigs = useStore((s) => s.paneConfigs);
@@ -469,11 +453,6 @@ export function TabbedView({
   const sessions = useStore((s) => s.sessions);
   const machines = useStore((s) => s.machines);
   const isLaunchProfileAllowed = useIsLaunchProfileAllowed();
-  // Overview is a policy-gated team surface. Missing/loading policy must fail
-  // closed so stale state from a previously selected project cannot reveal it.
-  const showOverview = sessionId != null
-    && projectPolicies[sessionId]?.teamAvailable === true;
-
   const sendMessageToPane = useStore((s) => s.sendMessageToPane);
   const loadMoreMessages = useStore((s) => s.loadMoreMessages);
   const loadPaneMessagesIfNeeded = useStore((s) => s.loadPaneMessagesIfNeeded);
@@ -653,7 +632,6 @@ export function TabbedView({
       activeTabId,
       clientChanged,
       managerTabId,
-      overviewAvailable: showOverview,
       paneConfigsLength: paneConfigs.length,
       paneListReceived,
       savedActiveTab: saved,
@@ -662,12 +640,12 @@ export function TabbedView({
     if (activeTabId !== nextActiveTabId) {
       setActiveTabId(nextActiveTabId);
     }
-  }, [activeTabId, cliClientId, managerTabId, paneConfigs.length, paneListReceived, showOverview, tabIds]);
+  }, [activeTabId, cliClientId, managerTabId, paneConfigs.length, paneListReceived, tabIds]);
 
   // Lazy-load: when activeTabId changes (initial pick or user click),
   // fetch that pane's messages if we haven't already. Server's attach
   // reply no longer ships every pane's tail, so each pane opens
-  // on-demand. Skip for the Overview pseudo-tab.
+  // on-demand. Project navigation does not change the selected pane.
   useEffect(() => {
     const targets = lazyPaneMessageLoadTargets({
       activeTabId,
@@ -692,7 +670,7 @@ export function TabbedView({
     prevConnectedRef.current = connected;
     if (!justConnected || !sessionId) return;
     const pid = activeTabIdRef.current;
-    if (pid == null || pid <= OVERVIEW_PANE_ID) return;
+    if (pid == null) return;
     // Let WS auth/attach and the reconnect catchup settle first.
     const t = setTimeout(() => refreshPaneWindow(pid), 600);
     return () => clearTimeout(t);
@@ -707,9 +685,9 @@ export function TabbedView({
 
   // Track which panes have ever been activated for this session. We only
   // render the bodies of mounted panes; visited ones stay mounted (hidden
-  // via CSS) so re-activating them is instant. Overview has its own path.
+  // via CSS) so re-activating them is instant.
   useEffect(() => {
-    if (activeTabId == null || activeTabId === OVERVIEW_PANE_ID) return;
+    if (activeTabId == null) return;
     setMountedPanes((prev) => {
       if (prev.has(activeTabId)) return prev;
       const next = new Set(prev);
@@ -742,10 +720,10 @@ export function TabbedView({
         handleSelectTab(remaining[0].pane_id);
         return;
       }
-      setActiveTabId(showOverview ? OVERVIEW_PANE_ID : null);
+      setActiveTabId(null);
       setProjectLayout(cliClientId, "active_tab", "");
     },
-    [activeTabId, cliClientId, effectiveTabs, handleSelectTab, showOverview],
+    [activeTabId, cliClientId, effectiveTabs, handleSelectTab],
   );
 
   const handleCloseTab = useCallback(
@@ -857,7 +835,6 @@ export function TabbedView({
       && negotiatedCapabilities.has("pane_work_summary_v1")
       && activeConfig
       && activeTabId != null
-      && activeTabId !== OVERVIEW_PANE_ID
       && activeTabId !== PANE_ID_MAIN,
   );
 
@@ -1105,15 +1082,51 @@ export function TabbedView({
     );
   }
 
+  const selectedSession = sessions.find((session) => session.id === sessionId);
+  const projectId = (selectedSession?.projectId !== selectedSession?.id ? selectedSession?.projectId : undefined)
+    ?? bootTarget?.projectId ?? selectedSession?.projectId;
+  const machineId = bootTarget?.projectId === projectId ? bootTarget?.machineId : undefined;
+  const registration = machines.find((item) => item.machine.machineId === machineId)
+    ?.projects.find((project) => project.projectId === projectId);
+  const projectContext = projectId ? {
+    id: projectId,
+    name: registration?.name || selectedSession?.workingDir?.split("/").filter(Boolean).at(-1) || "Selected project",
+    machineId,
+  } : undefined;
+
   return (
+    <ProjectJobsWorkspace
+      key={`${accountId}:${projectId ?? sessionId}`}
+      project={projectContext}
+      paneSelectionRequested={pendingPaneSelection?.sessionId === sessionId}
+      initialOverview={getProjectLayout(cliClientId, "active_tab", "") === "-1"}
+      renderOverviewPanels={(selectInteractive) => (
+        <OverviewView
+          onOpenPane={(paneId) => { selectInteractive(); handleSelectTab(paneId); }}
+          onOpenDiff={(paneId) => {
+            setDiffModalPaneId(paneId);
+            requestPaneDiff(paneId);
+          }}
+          onOpenRole={setRoleModalPaneId}
+          onPausePane={pausePane}
+          onResumePane={resumePane}
+          onRemovePane={handleCloseTab}
+        />
+      )}
+    >
+    {(workspace) => (
     <div className="flex flex-col h-full overflow-hidden">
       {/* Tab bar */}
       <TabBar
         tabs={effectiveTabs}
-        activeTabId={activeTabId}
-        onSelectTab={handleSelectTab}
+        activeTabId={workspace.active ? null : activeTabId}
+        onSelectTab={(paneId) => { workspace.selectInteractive(); handleSelectTab(paneId); }}
         onCloseTab={handleCloseTab}
-        onAddTab={handleAddTab}
+        onAddTab={(...args) => { workspace.selectInteractive(); handleAddTab(...args); }}
+        onAddAutonomous={workspace.addAutonomous}
+        autonomousUnavailableReason={workspace.unavailableReason}
+        jobTabs={workspace.tabs}
+        overviewTab={workspace.overviewTab}
         onRenameTab={handleRenameTab}
         onReorderTabs={handleReorderTabs}
         onBootCli={handleBootCli}
@@ -1124,7 +1137,6 @@ export function TabbedView({
         showBootButton={canBootCurrentProject}
         showCloseProjectButton={canCloseCurrentProject}
         showRebootButton={isAttached}
-        showOverview={showOverview}
         paneStatuses={paneStatuses}
         pausedPanes={pausedPanes}
         leading={mobileLeading}
@@ -1149,6 +1161,8 @@ export function TabbedView({
         </div>
       )}
 
+      {workspace.content}
+      <div hidden={workspace.active} className={workspace.active ? "hidden" : "flex flex-1 min-h-0 flex-col"}>
       {/* Toolbar controls wrap on narrow phones instead of overflowing past
           the right edge of the pane frame. */}
       <div className="flex flex-wrap items-center gap-2 px-3 py-1.5 border-b border-gray-200 dark:border-gray-700 bg-gray-50 dark:bg-gray-800/30 flex-shrink-0">
@@ -1336,26 +1350,9 @@ export function TabbedView({
 
       <div className="flex flex-1 min-h-0">
         <div className="flex flex-1 flex-col min-w-0 min-h-0">
-      {/* Pane bodies: Overview is rendered alone; otherwise every pane's
-          body is mounted once and visibility-toggled via `hidden`, so
-          switching tabs is a CSS class flip instead of an unmount+
-          remount+paint cycle. Avoids the 100-500ms delay that used to
-          look like a server fetch. Keyed by sessionId+paneId so a
-          project switch still resets state cleanly. */}
-      {showOverview && activeTabId === OVERVIEW_PANE_ID ? (
-        <OverviewView
-          key="overview"
-          onOpenPane={handleSelectTab}
-          onOpenDiff={(pid) => {
-            setDiffModalPaneId(pid);
-            requestPaneDiff(pid);
-          }}
-          onOpenRole={(pid) => setRoleModalPaneId(pid)}
-          onPausePane={pausePane}
-          onResumePane={resumePane}
-          onRemovePane={handleCloseTab}
-        />
-      ) : paneListReceived && effectiveTabs.length === 0 ? (
+      {/* Visited pane bodies stay mounted and visibility-toggled, including
+          while the project overview or a job is selected. */}
+      {paneListReceived && effectiveTabs.length === 0 ? (
         // The project really has no panes: either it is new, or the user
         // just closed the last one. Distinct from the case below, where no
         // roster has arrived and the legacy single-pane view is still the
@@ -1384,11 +1381,11 @@ export function TabbedView({
           onLoadMore={handleLoadMore}
           isLoading={isLoadingMore}
           hasMore={hasMoreMessages}
-          isActive
+          isActive={!workspace.active}
         />
       ) : (
         effectiveTabs.map((tab) => {
-          const isActive = tab.pane_id === activeTabId;
+          const isActive = tab.pane_id === activeTabId && !workspace.active;
           const tabIsUnsupported = isRetiredProviderModel(tab.provider, tab.model);
           // Skip mounting panes the user hasn't activated yet for this
           // session — that's the freeze fix. The container <div> still
@@ -1460,8 +1457,8 @@ export function TabbedView({
         })
       )}
 
-      {/* Status bar — never shown on the Overview pseudo-tab */}
-      {activeStatus && activeTabId !== OVERVIEW_PANE_ID && (
+      {/* Status bar for the selected interactive pane. */}
+      {activeStatus && (
         <div className={`flex-shrink-0 border-t px-3 py-2 ${activeIsAwaitingAnswer ? "border-amber-200 bg-amber-50 dark:border-amber-900 dark:bg-amber-950/30" : "border-gray-200 bg-blue-50 dark:border-gray-700 dark:bg-blue-900/20"}`}>
           <div className={`flex items-center gap-2 text-sm ${activeIsAwaitingAnswer ? "text-amber-800 dark:text-amber-200" : "text-blue-700 dark:text-blue-300"}`}>
             <div className={activeIsAwaitingAnswer ? "" : "animate-pulse"}>●</div>
@@ -1470,9 +1467,9 @@ export function TabbedView({
         </div>
       )}
 
-      {/* Input box — disabled for running deadloop panes, hidden on
-          Overview and on terminal panes (which take input in xterm). */}
-      {activeTabId !== OVERVIEW_PANE_ID && !activeIsTerminal && !activeIsUnsupported && (
+      {/* Input box — disabled for running deadloop panes and hidden on
+          terminal panes (which take input in xterm). */}
+      {!activeIsTerminal && !activeIsUnsupported && (
         <div className="p-3 border-t border-gray-200 dark:border-gray-700 flex-shrink-0">
           {activeIsBot ? (
             <div className="text-center text-sm text-gray-400 dark:text-gray-500 py-2">
@@ -1502,6 +1499,7 @@ export function TabbedView({
             />
           </div>
         )}
+      </div>
       </div>
 
       <StartBotPromptModal
@@ -1574,7 +1572,7 @@ export function TabbedView({
         }}
       />
 
-      {planReviewPending.length > 0 && (
+      {!workspace.active && planReviewPending.length > 0 && (
         <div className="fixed inset-x-0 bottom-0 z-40 flex justify-center p-3 pointer-events-none">
           <div className="pointer-events-auto flex w-full max-w-3xl flex-col gap-2">
             {planReviewPending.map((item) => (
@@ -1619,6 +1617,8 @@ export function TabbedView({
         </div>
       )}
     </div>
+    )}
+    </ProjectJobsWorkspace>
   );
 }
 

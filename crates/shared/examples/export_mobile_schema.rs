@@ -1,4 +1,10 @@
 use schemars::{schema_for, JsonSchema};
+use shared::jobs::{
+    EffectiveJobPolicy, JobAdmissionRequest, JobAnswerRequest, JobApiError, JobArtifactContent,
+    JobDetail, JobEventsResponse, JobListResponse, JobMutationReceipt, JobMutationRequest,
+    JobPolicy, JobPolicyManagement, JobPolicyOverride, JobPreview, JobPreviewRequest, JobReview,
+    JobTargetsResponse, MobileJobsBootstrap, ProjectJobListResponse,
+};
 use shared::{
     CodeEvent, MobileAuthResponse, MobileBootstrapResponse, MobileDeviceSession,
     MobileLoginRequest, MobileLogoutRequest, MobileNotificationPreferences, MobilePushTokenRequest,
@@ -23,6 +29,31 @@ struct MobileProtocolContract {
     task_launch_response: MobileTaskLaunchResponse,
     push_token_request: MobilePushTokenRequest,
     notification_preferences: MobileNotificationPreferences,
+    jobs: JobProtocolContract,
+}
+
+#[derive(JsonSchema)]
+#[allow(dead_code)]
+struct JobProtocolContract {
+    preview_request: JobPreviewRequest,
+    preview: JobPreview,
+    admission_request: JobAdmissionRequest,
+    mutation_request: JobMutationRequest,
+    answer_request: JobAnswerRequest,
+    targets: JobTargetsResponse,
+    list: JobListResponse,
+    project_list: ProjectJobListResponse,
+    detail: JobDetail,
+    events: JobEventsResponse,
+    receipt: JobMutationReceipt,
+    review: JobReview,
+    artifact: JobArtifactContent,
+    error: JobApiError,
+    policy: EffectiveJobPolicy,
+    policy_management: JobPolicyManagement,
+    deployment_policy: JobPolicy,
+    policy_override: JobPolicyOverride,
+    bootstrap: MobileJobsBootstrap,
 }
 
 fn write_schema<T: JsonSchema + ?Sized>(output: &Path, name: &str) -> anyhow::Result<()> {
@@ -44,6 +75,7 @@ fn main() -> anyhow::Result<()> {
     write_schema::<WebToServer>(&output, "web-to-server.schema.json")?;
     write_schema::<ServerToWeb>(&output, "server-to-web.schema.json")?;
     write_schema::<CodeEvent>(&output, "code-event.schema.json")?;
+    write_schema::<JobProtocolContract>(&output, "jobs.schema.json")?;
     println!("exported mobile schemas to {}", output.display());
     Ok(())
 }

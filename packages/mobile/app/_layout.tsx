@@ -11,6 +11,7 @@ import { loadCredentials } from "@/security/credentials";
 import { readCachedSnapshot } from "@/storage/cache";
 import { useMobileStore } from "@/state/store";
 
+import { hydrateJobs } from "@/jobs/runtime";
 export default function RootLayout() {
   const theme = useTheme();
   const setHydrated = useMobileStore((state) => state.setHydrated);
@@ -26,6 +27,7 @@ export default function RootLayout() {
         try {
           const cached = await readCachedSnapshot();
           if (active) setCachedSessions(cached.sessions, cached.updatedAt);
+          await hydrateJobs();
         } catch {
           // A missing/corrupt cache is recoverable; bootstrap will replace it.
         }

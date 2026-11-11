@@ -1,0 +1,9 @@
+{
+  "request_id": "7c6d2400-7b4b-455d-b732-7f066dab7a24",
+  "operation": "cancel",
+  "job_id": "06974c2c-cd7d-446b-aac3-e0f550e739f6",
+  "run_id": "37642b7c-2d81-46c6-976f-2874e85919e6",
+  "status": "accepted",
+  "error_code": null,
+  "message": "Cancellation requested; worker stop is not yet confirmed."
+}

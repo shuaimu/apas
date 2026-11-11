@@ -15,6 +15,7 @@
 
 import { isRetiredLaunchProfileKey } from "@/lib/providerOptions";
 import { EffectivePolicy, LaunchProfile, PolicyEditor } from "@/components/PolicyEditor";
+import { AutonomousJobPolicyEditor } from "@/components/AutonomousJobPolicyEditor";
 import { useCallback, useEffect, useState } from "react";
 import { Activity, FolderOpen, RefreshCw, Server, Shield } from "lucide-react";
 
@@ -37,6 +38,7 @@ interface Account {
   email: string;
   account_status: "active" | "suspended";
   created_at?: string;
+  last_login_at?: string | null;
 }
 interface ClusterSummary {
   user_id: string;
@@ -232,7 +234,7 @@ export default function SystemAdminPage() {
     }
     if (!response.ok) {
       const body = await response.json().catch(() => null);
-      throw new Error(body?.message || `Request failed (${response.status})`);
+      throw new Error(body?.error || body?.message || `Request failed (${response.status})`);
     }
     return response.json() as Promise<T>;
   }, [token]);
@@ -388,6 +390,7 @@ export default function SystemAdminPage() {
                 onSave={(policy) => mutate("/admin/policy/default", { method: "PATCH", body: JSON.stringify(policy) })}
               />
             )}
+            <AutonomousJobPolicyEditor title="Deployment autonomous job policy" endpoint="/admin/job-policy" deployment request={api} />
           </section>
         )}
 
@@ -409,11 +412,12 @@ export default function SystemAdminPage() {
             {inviteUrl && <div className="rounded-lg bg-green-50 p-3 text-sm text-green-800 dark:bg-green-950/40 dark:text-green-300">Registration URL: <span className="break-all font-mono">{inviteUrl}</span></div>}
             <div className="overflow-x-auto rounded-xl border border-gray-200 bg-white dark:border-gray-800 dark:bg-gray-900">
               <table className="w-full text-left text-sm">
-                <thead className="bg-gray-100 dark:bg-gray-800"><tr><th className="p-3">Account</th><th className="p-3">Status</th><th className="p-3">Created</th></tr></thead>
+                <thead className="bg-gray-100 dark:bg-gray-800"><tr><th className="p-3">Account</th><th className="p-3">Status</th><th className="p-3">Created</th><th className="p-3">Last login</th></tr></thead>
                 <tbody>{accounts.map((account) => <tr key={account.id} className="border-t border-gray-100 dark:border-gray-800">
                   <td className="p-3"><div>{account.email}</div><div className="text-xs text-gray-400">{account.id}</div></td>
                   <td className="p-3"><button onClick={() => void mutate(`/admin/users/${account.id}`, { method: "PATCH", body: JSON.stringify({ account_status: account.account_status === "active" ? "suspended" : "active" }) })} className={`rounded-full px-3 py-1 text-xs ${account.account_status === "active" ? "bg-green-100 text-green-700" : "bg-amber-100 text-amber-800"}`}>{account.account_status}</button></td>
                   <td className="p-3 text-gray-500">{account.created_at ? new Date(account.created_at).toLocaleString() : "—"}</td>
+                  <td className="p-3 text-gray-500">{account.last_login_at ? new Date(account.last_login_at).toLocaleString() : "—"}</td>
                 </tr>)}</tbody>
               </table>
             </div>
@@ -494,6 +498,12 @@ export default function SystemAdminPage() {
                   profiles={profiles}
                   onSave={(policy) => mutate(`/admin/projects/${selectedProject.project.id}/policy`, { method: "PATCH", body: JSON.stringify(policy) }, () => loadProject(selectedProject.project.id))}
                   onInherit={() => mutate(`/admin/projects/${selectedProject.project.id}/policy`, { method: "PATCH", body: JSON.stringify({ team_available: null, allowed_launch_profiles: null }) }, () => loadProject(selectedProject.project.id))}
+                />
+                <AutonomousJobPolicyEditor
+                  key={selectedProject.project.id}
+                  title="Project autonomous job policy"
+                  endpoint={`/admin/projects/${encodeURIComponent(selectedProject.project.id)}/job-policy`}
+                  request={api}
                 />
                 {selectedProject.policy_override?.legacy_conflict && (
                   <div className="rounded-xl border border-amber-300 bg-amber-50 p-4 text-sm text-amber-800 dark:border-amber-800 dark:bg-amber-950/40 dark:text-amber-300">

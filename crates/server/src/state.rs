@@ -36,6 +36,7 @@ pub struct AppState {
     pub system_admin_auth_attempts: Arc<DashMap<String, (u32, DateTime<Utc>)>>,
     pub mobile_metrics: Arc<MobileMetrics>,
     pub pane_work_summaries: Arc<PaneWorkSummaryService>,
+    pub jobs: Arc<crate::jobs::JobService>,
     mobile_task_launch_gates: Arc<DashMap<Uuid, Arc<Mutex<()>>>>,
     project_mutation_gates: Arc<DashMap<String, Arc<RwLock<()>>>>,
     /// Serialize DB reads/publication with successful local reselections per owner.
@@ -71,6 +72,7 @@ impl AppState {
             system_admin_auth_attempts: Arc::new(DashMap::new()),
             mobile_metrics: Arc::new(MobileMetrics::default()),
             pane_work_summaries,
+            jobs: Arc::new(crate::jobs::JobService::default()),
             mobile_task_launch_gates: Arc::new(DashMap::new()),
             project_mutation_gates: Arc::new(DashMap::new()),
             project_machine_preference_gates: Arc::new(DashMap::new()),

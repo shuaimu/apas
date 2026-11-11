@@ -1356,6 +1356,7 @@ async fn run_connection(
             shared::PANE_HOST_CLEANUP_ACK_CAPABILITY.to_string(),
             shared::SHARED_PROJECT_PROVISIONING_CAPABILITY.to_string(),
             shared::LOCAL_PROJECT_REGISTRATION_CAPABILITY.to_string(),
+            shared::OMP_JOB_WORKER_CAPABILITY.to_string(),
         ],
     };
     ws_sender
@@ -1363,12 +1364,12 @@ async fn run_connection(
         .await?;
 
     // Registration response
-    loop {
+    let job_owner = loop {
         match ws_receiver.next().await {
             Some(Ok(Message::Text(text))) => {
                 let msg: ServerToDaemon = serde_json::from_str(&text)?;
                 match msg {
-                    ServerToDaemon::Registered { .. } => break,
+                    ServerToDaemon::Registered { cluster_owner_user_id, .. } => break cluster_owner_user_id,
                     ServerToDaemon::RegistrationFailed { reason } => {
                         return Err(anyhow::anyhow!("Registration failed: {}", reason));
                     }
@@ -1386,7 +1387,16 @@ async fn run_connection(
             }
             _ => {}
         }
-    }
+    };
+    let mut jobs = job_owner.and_then(|owner| {
+        match crate::jobs::DaemonJobs::start(state.machine_info.machine_id, owner) {
+            Ok(jobs) => Some(jobs),
+            Err(error) => {
+                tracing::warn!(%error, "job host configuration unavailable; terminal service unchanged");
+                None
+            }
+        }
+    });
 
     // Report current state to server. CLI processes are only started explicitly
     // via StartProjectCli and are not auto-started on daemon reconnect.
@@ -1421,6 +1431,15 @@ async fn run_connection(
         crate::daemon_registry::refresh_own_claims(&registry_dir);
 
         tokio::select! {
+            Some(report) = async {
+                match jobs.as_mut() {
+                    Some(jobs) => jobs.reports.recv().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                let message = DaemonToServer::AutonomousJob { report };
+                ws_sender.send(Message::Text(serde_json::to_string(&message)?.into())).await?;
+            }
             Some(project_id) = restart_rx.recv() => {
                 // A pane's "Reboot CLI" asked for the CLI to be replaced.
                 // Projects run inside this process now, so the CLI *is* the
@@ -1484,6 +1503,19 @@ async fn run_connection(
                             ServerToDaemon::Registered { .. } => {}
                             ServerToDaemon::RegistrationFailed { reason } => {
                                 return Err(anyhow::anyhow!("Daemon auth dropped: {}", reason));
+                            }
+                            ServerToDaemon::AutonomousJob { command } => {
+                                if let Some(jobs) = &jobs {
+                                    jobs.send(command).await?;
+                                } else {
+                                    let report = shared::JobWorkerReport::Rejected {
+                                        command_id: crate::jobs::host::command_id(&command),
+                                        identity: crate::jobs::host::command_identity(&command).cloned(),
+                                        code: "job_host_unavailable".into(),
+                                        message: "Authenticated job owner or valid host configuration is unavailable".into(),
+                                    };
+                                    ws_sender.send(Message::Text(serde_json::to_string(&DaemonToServer::AutonomousJob { report })?.into())).await?;
+                                }
                             }
                             ServerToDaemon::StartProjectCli { project_id, policy } => {
                                 let Some(policy) = policy else {

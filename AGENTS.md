@@ -19,13 +19,14 @@
 > it, `next dev` recreates both a guidance file and a `CLAUDE.md` pointer.
 
 APAS runs coding agents against a project, from a browser or a phone. The CLI
-owns local panes and worktrees, the server brokers project/session state, and
-the web UI exposes the pane tabs, conversation and terminal views, the project
-overview, and diff/PR handoff surfaces.
+owns local panes and worktrees, the server brokers project/session/job state,
+and the web UI exposes interactive panes and the separate Jobs/Attention workflow.
 
-A project is a directory with an `.apas` file; the work happens in **panes**,
-each hosting one agent. A pane is created, talked to, rebooted and closed by a
-person — there is no orchestration layer above it.
+A project is a directory with an `.apas` file. Interactive work happens in
+**panes**, each hosting one agent and controlled by a person. **Autonomous jobs**
+are a separate, default-disabled execution path with durable approvals, bounded
+workers, independent verification and draft-PR publication. They never orchestrate
+interactive panes or restore the removed managed-team mode.
 
 **Managed team mode was removed.** Four roles (Manager, Tech Lead, Developer,
 Reviewer) used to coordinate through `project_goal.md`, `team-todo.md` and
@@ -70,6 +71,218 @@ The CLI keeps project-local state in `.apas`, plus optional per-pane worktrees.
 The server caches and broadcasts machine, session and pane state. The web UI
 lets a person open panes, talk to them, inspect their diffs, and hand off to a
 PR.
+
+### Autonomous jobs: deployment remains qualification-gated
+
+The job control plane lives in `crates/server/src/jobs.rs` and `db/jobs.rs`;
+host execution lives in `crates/client-cli/src/jobs/`. Job identities, receipts,
+events and policies are canonical Rust types in `crates/shared/src/jobs.rs`,
+exported through `@apas/protocol`. `/projects/` serves job JSON.
+The project's `+` is the responsive-web creation path; `/code/jobs/` remains
+the cross-project Jobs/Attention workflow. Native screens use the same contracts,
+not a WebView. Jobs are not `.apas` pane entries, terminal hosts or deadloops.
+
+**No worker/verifier image or publication profile has been operationally
+qualified by this implementation.** Keep deployment policy and host
+`[autonomous_jobs].enabled` off until the real-host and device gates in
+`openspec/changes/add-autonomous-jobs/tasks.md` pass. Unit tests, a successful
+Podman `info`, synthetic job records and Expo export do not establish those gates.
+
+#### Using jobs inside a project
+
+On desktop and in the mobile-browser project screen, `+` offers **Interactive
+agent** or **Autonomous agent**. Interactive retains the existing provider
+picker and pane policy. Autonomous opens a project-fixed composer; the current
+machine is preferred only when fresh readiness, admission authority and policy
+permit it. An unavailable host is explained, not silently replaced. A recovered
+draft or explicit target choice takes precedence, including an explicit blank
+selection. Starting still requires an immutable preview and confirmed admission.
+
+Job tabs sit beside interactive panes with phase/attention badges. Progress,
+questions, usage, explicit cancellation, verification, bounded diffs and draft-PR
+handoff remain inside the project. Selecting a job keeps the existing terminal
+mounted but hidden. **Hide removes a view, not an execution**; the project's
+**Overview** reopens hidden/completed work. View preferences and cached labels are
+account/project scoped; older opened results retain their labels even outside
+the loaded history page, and unrefreshed status is marked cached.
+
+**Overview is a project view, not a team-mode pane.** Its visible entry precedes
+interactive and job tabs on desktop and mobile web, independent of the vestigial
+team flag and worker readiness. Each autonomous job shows its approved instruction
+(expandable in full), authoritative phase/attention, host and last confirmed
+update. Hidden and completed jobs stay in the list; **Load older project jobs**
+extends it one bounded page at a time. Cached status is explicitly stale, and a
+loaded page is never presented as a whole-project count. Opening the overview
+or a job does not recreate the terminal. The existing desktop pane, policy and
+usage panels remain below the autonomous list.
+
+`GET /projects/:project/jobs` authorizes project content and filters by project
+before bounded pagination. Its `ProjectJobListResponse` adds each full instruction
+to the summary from the already-loaded durable row, without a detail request per
+job. The global list and stored detail contracts are unchanged. Obsolete cached
+pages lacking descriptions are ignored; their titles are not substituted for
+instructions, and unrelated cached details are not purged. Do not filter the
+global inbox's first page to build an overview: other projects can push every
+result out of that page.
+Access loss purges job content and requires an explicit recheck without remounting the
+interactive terminal. This browser integration does not enable a worker, change
+native navigation, or replace the real-host/device qualification below.
+
+#### Provision the host, not a shared home-directory fallback
+
+- Use a non-root Linux account with working rootless Podman, user namespaces,
+  delegated cgroup-v2 CPU/memory/PID controllers and a private `XDG_RUNTIME_DIR`.
+  A stale runroot belonging to another UID is a provisioning failure, not a
+  reason to run privileged or bypass isolation.
+- Configure `storage_root` (default `/var/lib/apas/users/<uid>/jobs`) on durable,
+  host-local ext4, XFS, Btrfs or ZFS. Control directories must be canonical,
+  owner-private and non-symlinked. NFS and tmpfs are not journal fallbacks.
+- Provision `workspace_roots` as dedicated finite ext4/XFS filesystems, one
+  independently reserved filesystem per active run. Each must have a distinct
+  device from the other slots and from control storage; its total capacity must
+  fit the profile's workspace allowance. Ordinary directories or multiple bind
+  mounts of one filesystem do not provide this boundary. Do not reformat an
+  existing user filesystem to satisfy it.
+- Set both `podman_storage_root` and `podman_runroot` to private, canonical
+  host-local directories outside every workspace slot. APAS uses an isolated
+  `vfs` store, not the account's shared-home container database.
+- Qualify actual CPU, memory, PID, filesystem and bounded-output exhaustion;
+  read-only image and dropped privileges; host/home/metadata access denial;
+  complete container/descendant termination; and lease expiry during transport
+  loss. There is no unrestricted-process fallback when these checks fail.
+
+#### Pin and qualify each execution profile
+
+`deploy/autonomous-jobs/Dockerfile` requires an immutable
+`TOOLCHAIN_IMAGE=registry@sha256:…` plus operator-supplied inputs under
+`deploy/autonomous-jobs/inputs/`: a static APAS binary, Bun, and an OMP source
+archive containing its already-resolved dependencies. Supply their
+`APAS_SHA256`, `BUN_SHA256` and `OMP_SOURCE_SHA256` build arguments. The image
+performs no network package installation. The current worker wrapper is pinned
+to **OMP 18.18.0**; another version requires fresh lifecycle qualification.
+
+Configure `profiles`, `models`, `verifiers` and `publishers` under the CLI's
+`[autonomous_jobs]` configuration; exact fields are in `jobs/config.rs`.
+Workers and independent verifiers require immutable image references. Worker
+profiles bind model/verifier keys, publisher, finite `JobLimits` and explicit
+dependency-host allowlists. Model profiles declare their API, exact model,
+qualified context/reasoning capabilities, fixed upstream and per-million token
+prices. Verification checks are named argv arrays with finite timeouts, not
+worker-authored success claims.
+
+Model and publisher `credential_file` paths must name private operator-owned
+regular files, mode `0600`. Use dedicated, least-privilege credentials, never
+personal provider/GitHub state inherited from the daemon's home. Publisher
+profiles allowlist repositories and protected base refs and require
+`ci_qualified`: even a draft PR can execute repository CI.
+
+Each worker's `qualification_file` records the exact resolved profile digest
+computed by `worker_profile_digest`, a non-future `qualified_at`, and successful
+`omp_rpc`, `child_questions` and `gateway_metering` evidence. Only record these
+after exercising the pinned image with real delegated work, multi-question
+confirmation, no timeout answer, aggregate usage and genuine settlement.
+Changing the worker or resolved model/verifier/publisher profile invalidates
+that qualification. Never create an affirmative evidence file just to make a
+readiness check green.
+
+The worker has no external network route. Its run-scoped bridge reaches the
+trusted gateway over a Unix socket; only fixed model upstreams and explicit
+dependency hosts are reachable. Provider credentials remain in the gateway,
+and publication credentials are used only by the separate publisher. Neither
+worker nor verifier receives the shared repository's `.git`, user home or
+daemon control socket. Readiness is timestamped and expires; launch-sensitive
+checks repeat rather than trusting a stale green badge.
+
+#### Authority, evidence and recovery
+
+Deployment policy (`/admin/job-policy`) defaults disabled. Cluster and project
+overrides may only narrow inherited enablement, profile allowlists, capacity and
+limits; every hosting cluster participates. The system-administrator credential
+controls deployment policy, while hosting operators control their cluster and
+project overrides. Project content access alone does not authorize unattended
+admission on somebody else's machine. Existing management forms show requested
+and effective policy separately.
+
+Admission pins the committed base, task, target, profiles and policy fingerprint.
+Actor-scoped mutation receipts survive restart; recovering a lost reply reads
+that receipt rather than resubmitting the prompt or answer. Unknown provider
+admission or ownership becomes `recovery_required`, never a replacement attempt.
+An answer remains pending until the provider confirms it. Recommendations are
+not answers, and `ask.timeout=0` forbids timeout defaults.
+
+The independent host enforces a **120-second lease**, renewed every **20 seconds**
+while authority remains valid, plus cumulative elapsed/attempt/spend limits.
+All root and delegated model requests share gateway accounting. Spend is a
+reported-usage threshold, **not a guaranteed invoice cap**: in-flight calls can
+overrun it, and missing required metering blocks further dispatch. Do not reset
+consumption when a daemon re-execs or a client reconnects.
+
+Only an immutable retained candidate verified in a fresh independent container
+can proceed to the credential-separated publisher. Checks bind the exact
+candidate SHA; a worker's own test output is insufficient. Publication creates
+a draft PR on `apas/job-<uuid>`, never merges, and reconciles uncertain replies
+without blindly posting another PR.
+
+Retained job evidence has a 30-day policy; clients display explicit expiry.
+Unresolved execution/publication ownership is preserved instead of aged away.
+Cancel/stop receipts prove requests, not termination. A run releases its slot
+only after positive whole-unit stop evidence. Project deletion also waits for
+host purge acknowledgement for every dispatched historical attempt; an offline
+host leaves durable cleanup pending across server restart. Never delete its
+journal or fabricate an acknowledgement to unblock deletion.
+
+#### Rollout, rollback and observed verification
+
+Roll out **server/protocol → web and native clients → CLI/daemon**, leaving jobs
+disabled throughout qualification. `autonomous_jobs_v1` and `omp_job_worker_v1`
+are separate from interactive terminal capabilities. Legacy servers lacking
+the registered cluster-owner identity do not activate job execution. Existing
+mobile bootstrap/mutation/notification/deep-link flags still apply; details and
+device gates are in `docs/mobile-development-and-operations.md`.
+
+For rollback, disable new admission first, retain upgraded controllers and
+hosts until active executions are positively stopped and required purges are
+acknowledged, and preserve SQLite/journals/evidence. Only then replace job-aware
+binaries with older versions. Turning off UI controls or downgrading the server
+does not prove that a disconnected worker stopped. Production deployment is a
+separate authorized operation, not part of implementing this change.
+
+Local verification on **2026-11-08** passed the Rust workspace (761 tests), static
+musl CLI build, protocol/terminal tests, web lint/typecheck/715 tests and
+production build, native lint/typecheck/81 tests and Android export, and clean
+npm/pnpm dependency audits with zero findings. Real Chromium checks covered
+320/390/768/1440px layouts, question/composer draft reloads, offline editing,
+narrow diff paging, policy editing and immediate revocation/cache purge. A local
+nginx instance routed job pages and JSON correctly; real server restarts retained
+receipts and refused to erase a synthetic offline-host record without stop
+evidence. Minimal legacy WebSocket authentication also succeeded.
+
+Those checks did **not** run an actual qualified worker, upstream model request,
+independent verifier or draft-PR publication, and did **not** establish physical
+mobile-browser keyboard/safe-area or iOS/Android interaction accessibility.
+The test host lacks dedicated workspace filesystems and approved credentials,
+images, repository and devices. No qualified image digest or production
+enablement is implied by the local checks.
+
+On **2026-11-09**, server and web **26.11.0** were deployed to production with
+job admission still disabled. Public job pages/JSON, 21 referenced static assets,
+and the Jobs UI passed smoke checks; an existing terminal reattached with the
+same running PTY identity. No project daemon was restarted and no native build
+or autonomous execution profile was enabled by that rollout.
+
+On **2026-11-11**, the project-scoped chooser and embedded job workspace were
+deployed server-first, then as a matching web/protocol pair. The commit-count
+version remains **26.11.0**; this release is identified by
+**20261111T052521Z**, with rollback artifacts under
+`/opt/apas/backups/deploy-20261111T052521Z`.
+Clean npm/pnpm graphs, the staged production build, eight public routes,
+20 referenced static assets and authenticated project-scoped job JSON passed.
+The live desktop/mobile-browser composer and project history worked, with
+admission visibly unavailable. All nine project clients reconnected, including
+two reporting 26.10.9, and the APAS terminal retained the same running PTY
+identity. No project daemon/provider was restarted, no native build was released,
+and no job policy or execution profile was enabled. Worker/device qualification
+remains incomplete.
 
 ### Project sidebar ordering
 
@@ -529,7 +742,8 @@ The APAS server and web UI are deployed on an LXC container:
 ├── data/
 │   ├── apas.db         # SQLite database
 │   └── sessions/       # Message storage
-└── web/                # Next.js web frontend
+├── web/                # Next.js web frontend
+└── protocol/           # Matching @apas/protocol source, schemas and runtime deps
 ```
 
 #### Systemd Services
@@ -553,75 +767,82 @@ journalctl -u nginx -f
 
 #### Deploying Updates
 
+The web's `file:../protocol` dependency makes **web and protocol one release
+pair**. Install the protocol's runtime dependencies separately: npm's linked
+package installation does not install them. Audit that runtime graph as well as
+both complete web graphs, including web development dependencies. A clean web
+audit alone missed an older `fast-uri` in the protocol's own lockfile.
+
+Keep `packages/web/.npmrc` (`install-links=false`) and the parent-directory
+Turbopack root in `next.config.ts`. Production npm 9 defaults to packing file
+dependencies while the reviewed lockfile describes a link; without the explicit
+setting `npm ci` rejects that lockfile. Without the explicit bundler root, a
+deployment outside the repository cannot resolve the sibling package.
+
+Build in a new release directory rather than overwriting the running app's
+source, `node_modules` or `.next`. Inspect both rsync dry-runs. Preserve the
+production environment files rather than copying local development overrides.
+
 ```bash
-# Verify both supported web dependency graphs in separate clean trees before
-# deployment. Both audits include development dependencies and fail on low or
-# higher severity findings.
-(cd packages/web && npm ci && npm run audit:npm)
+# Run these dependency checks in separate clean sibling-package trees.
+(cd packages/web && npm ci --omit=dev --prefix ../protocol && npm audit --omit=dev --audit-level=low --prefix ../protocol && npm ci && npm run audit:npm)
 (cd packages/web && pnpm install --frozen-lockfile && pnpm run audit:pnpm)
 
-# Configure the system administrator BEFORE deploying the server. Without it,
-# /admin cannot be entered at all, and this deploy removes every account's
-# deployment-wide authority. Keep apas-server.toml mode 0600.
-#
-# Check the credential ROW, not the config block: the block being present
-# proves nothing, since a present block with an empty bootstrap_password is
-# exactly how this deployment lost account creation for a month.
-ssh root@apas.mpaxos.com "test \"\$(sqlite3 /opt/apas/data/apas.db 'select count(*) from system_admin_credential;')\" != 0 \
-  || echo 'NO SYSTEM ADMIN CREDENTIAL: /admin is unenterable and nobody can be invited'"
+# A config block is not proof that the administrator can sign in.
+ssh root@apas.mpaxos.com "test \"\$(sqlite3 /opt/apas/data/apas.db 'select count(*) from system_admin_credential;')\" != 0"
 
-# Build locally
-# cargo build -p apas-server --release
-cargo build --release
-
-# Stop server
-ssh root@apas.mpaxos.com "systemctl stop apas-server"
-
-# Copy binary to server
-scp target/release/apas-server root@apas.mpaxos.com:/opt/apas/
-
-sleep 1
-
-# Restart server
-ssh root@apas.mpaxos.com "systemctl restart apas-server"
-
-sleep 1
-
-# Back up the currently deployed web source and build before synchronization.
-web_backup_stamp="$(date -u +%Y%m%dT%H%M%SZ)"
-ssh root@apas.mpaxos.com "install -d -m 700 /opt/apas/backups/web-${web_backup_stamp} && tar -C /opt/apas --exclude='web/node_modules' -czf /opt/apas/backups/web-${web_backup_stamp}/web.tgz web"
-
-# For web updates. `--delete` is important: without it, files removed
-# locally (renamed/retired components) stay on the server and the next
-# `npm run build` fails because those files still reference removed
-# store actions or types. Always inspect the dry-run before synchronizing.
-rsync -avn --delete --exclude 'node_modules' --exclude '.next' --exclude '.apas-version' packages/web/ root@apas.mpaxos.com:/opt/apas/web/
-rsync -av --delete --exclude 'node_modules' --exclude '.next' --exclude '.apas-version' packages/web/ root@apas.mpaxos.com:/opt/apas/web/
-
-# Restart apas-web (compute version locally since server lacks git history).
-# `npm run build` runs `prebuild` first (`eslint .`, packages/web/eslint.config.mjs),
-# which fails the build on React Rules-of-Hooks violations (e.g. a hook after an
-# early return -> React error #310 -> whole-app crash). So a lint failure here
-# aborts the deploy before restart — fix the reported hook error, don't bypass it.
-# `npm ci` installs the exact reviewed package-lock graph, including devDependencies.
+cargo build --release -p apas-server
+stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+stage="/opt/apas/releases/${stamp}"
+backup="/opt/apas/backups/deploy-${stamp}"
 month_start="$(date +%Y-%m-01) 00:00:00"
 web_version="$(date +%y.%m).$(git rev-list --count --since="$month_start" HEAD)"
-ssh root@apas.mpaxos.com "cd /opt/apas/web && npm ci && NEXT_PUBLIC_WEB_UI_VERSION=${web_version} npm run build && systemctl restart apas-web"
 
-# Verify service state, public pages, API health, referenced /_next/static assets,
-# WebSocket/terminal attachment from the UI, and recent service errors.
-for path in / /login /machines /share /admin /health; do curl -fsSL "https://apas.mpaxos.com${path}" >/dev/null; done
-# Then sign in at https://apas.mpaxos.com/admin with the configured credential
-# and rotate it: the surface warns while it is still the bootstrap value, and
-# rotation invalidates every token issued against it.
-ssh root@apas.mpaxos.com "systemctl is-active apas-web apas-server && journalctl -u apas-web --since '5 minutes ago' -p err --no-pager -q && journalctl -u apas-server --since '5 minutes ago' -p err --no-pager -q"
+# Private backups: binary, configuration, a consistent SQLite snapshot, and
+# the matching web/protocol source and build. Keep production config mode 0600.
+ssh root@apas.mpaxos.com "install -d -m 700 '$stage/web' '$stage/protocol' '$backup' && cp -p /opt/apas/apas-server '$backup/apas-server' && cp -p /opt/apas/apas-server.toml '$backup/apas-server.toml' && cp -p /etc/nginx/conf.d/apas.conf '$backup/nginx-apas.conf' && sqlite3 /opt/apas/data/apas.db \".backup '$backup/apas.db'\""
+ssh root@apas.mpaxos.com "if test -d /opt/apas/protocol; then tar -C /opt/apas --exclude=web/node_modules --exclude=protocol/node_modules --exclude=web/.next/cache -czf '$backup/web.tgz' web protocol; else tar -C /opt/apas --exclude=web/node_modules --exclude=web/.next/cache -czf '$backup/web.tgz' web; fi"
+ssh root@apas.mpaxos.com "find /opt/apas/web -maxdepth 1 -type f -name '.env*' -exec cp -p '{}' '$stage/web/' ';'"
+
+rsync -avn --delete --exclude node_modules --exclude .next --exclude .apas-version --exclude '.env*' packages/web/ "root@apas.mpaxos.com:$stage/web/"
+rsync -avn --delete --exclude node_modules --exclude dist packages/protocol/ "root@apas.mpaxos.com:$stage/protocol/"
+rsync -av --delete --exclude node_modules --exclude .next --exclude .apas-version --exclude '.env*' packages/web/ "root@apas.mpaxos.com:$stage/web/"
+rsync -av --delete --exclude node_modules --exclude dist packages/protocol/ "root@apas.mpaxos.com:$stage/protocol/"
+scp target/release/apas-server "root@apas.mpaxos.com:$stage/apas-server"
+
+# Build before touching either live service. prebuild includes the hook lint
+# gate; do not bypass a failure. The remote tree has no git version history.
+ssh root@apas.mpaxos.com "cd '$stage/protocol' && npm ci --omit=dev && npm audit --omit=dev --audit-level=low && cd '$stage/web' && npm ci && npm run audit:npm && NEXT_PUBLIC_WEB_UI_VERSION='$web_version' npm run build"
+
+# Server first. Refresh the database backup while stopped, then replace the
+# executable atomically. On failure, restore the backed-up binary and restart.
+ssh root@apas.mpaxos.com "systemctl stop apas-server && sqlite3 /opt/apas/data/apas.db \".backup '$backup/apas.db'\" && install -m 755 '$stage/apas-server' /opt/apas/apas-server.next && mv /opt/apas/apas-server.next /opt/apas/apas-server && systemctl start apas-server"
+curl --fail --retry 15 --retry-all-errors --retry-delay 1 --max-time 3 https://apas.mpaxos.com/health
+
+# Retain the previous hashed assets for browsers still running the old bundle.
+# Preserve the complete old pair for fast rollback, then activate the staged pair.
+ssh root@apas.mpaxos.com "rsync -a --ignore-existing /opt/apas/web/.next/static/ '$stage/web/.next/static/' && systemctl stop apas-web && mv /opt/apas/web '$backup/web' && { test ! -d /opt/apas/protocol || mv /opt/apas/protocol '$backup/protocol'; } && mv '$stage/protocol' /opt/apas/protocol && mv '$stage/web' /opt/apas/web && systemctl start apas-web"
+
+for path in / /login /machines /share /admin /code/jobs /code/jobs/new /health; do curl -fsSL "https://apas.mpaxos.com${path}" >/dev/null; done
+# Also verify referenced /_next/static assets, authenticated /projects/jobs JSON,
+# WebSocket/terminal attachment from the UI, and effective job policy remaining
+# disabled until qualification. Never print account tokens or terminal contents.
+ssh root@apas.mpaxos.com "systemctl is-active apas-web apas-server nginx && journalctl -u apas-web -u apas-server --since '5 minutes ago' -p err --no-pager -q"
 ```
 
-For rollback, move the failed `/opt/apas/web` directory aside, extract the
-selected `/opt/apas/backups/web-<timestamp>/web.tgz` under `/opt/apas`, run
-`npm ci` and the versioned build from that restored tree, then restart and
-repeat every smoke check above. This emergency rollback restores the previous
-vulnerable dependency graph; follow it with a corrected patched deployment.
+For web rollback, stop `apas-web`, move the failed web/protocol pair aside,
+restore the complete pair retained under the selected `deploy-<timestamp>`
+backup, then restart and repeat every smoke check. If only `web.tgz` remains,
+extract its pair under `/opt/apas`, reinstall the matching protocol runtime and
+web dependencies, and perform the versioned build before restarting. An older
+release without a protocol directory does not need one. A rollback may restore
+older vulnerable dependencies; follow it with a corrected patched deployment.
+
+For server rollback, restore the backed-up binary atomically and restart.
+Do not automatically restore an old SQLite snapshot after traffic has resumed:
+that can discard acknowledged work. Preserve the current database and evaluate
+any schema/data recovery separately. Rotate an administrator credential only
+when its bootstrap state requires it, not as a side effect of routine deployment.
 
 ## Versioning
 
@@ -809,6 +1030,15 @@ never be served. The page renders its own form when it holds no token, and
 keeps that token in `sessionStorage` under its own key — never in the zustand
 store, never in `localStorage`, so it dies with the tab. Nothing in the ordinary
 interface links to it.
+
+The admin Users table shows **Last login** immediately after **Created**.
+`users.last_login_at` records successful web and mobile password sign-ins,
+signup's automatic sign-in, and CLI device-code token issuance as a UTC
+RFC3339 timestamp; the browser displays it in local time. Failed or suspended
+sign-ins, bearer-token checks, reconnects, and mobile token refreshes do not
+advance it. The separate system-administrator credential is not a user login.
+Existing accounts retain `NULL` until their next successful sign-in and show
+`—`; historical login times are not inferred from account creation or activity.
 
 **`cluster_role` no longer means anything.** Every account migrates to `user`,
 and the column plus its wire field survive only so older web and mobile builds
@@ -1200,7 +1430,7 @@ question nobody could see. A question turn is now published as the `tool_use`
 block it already is, so the web's existing `AskUserQuestionCard` renders it
 with no new wire message, storage path, or renderer.
 
-Answering reuses the whole `AnswerQuestion` pipeline agent panes use (web →
+Claude answers reuse the `AnswerQuestion` pipeline agent panes use (web →
 server → CLI); only the last hop differs, because a terminal pane has no
 stream-json control channel. The CLI writes **keystrokes** to the pty instead:
 `↑/↓` to navigate and `Enter` to select, which is the contract the picker
@@ -1214,9 +1444,9 @@ the agent offered.
 write proves only that bytes were accepted, so the acknowledgement is the
 `tool_result` the provider records, republished as `User` + `ToolResult` — the
 one variant the server's converter reads for tool results, which is exactly why
-ordinary non-assistant turns avoid it. A terminal pane has no structured echo,
-so the recorded answer arrives as prose (`The user answered: "Q"="A"`) and is
-parsed, letting the card settle on what the agent *took* rather than on what
+ordinary non-assistant turns avoid it. A Claude terminal pane has no structured
+echo, so its recorded answer arrives as prose (`The user answered: "Q"="A"`)
+and is parsed, letting the card settle on what the agent *took* rather than on what
 was clicked. Pending state is derived the same way — a question is open while
 its `tool_use` has no `tool_result` — which is what makes a blind write safe:
 a stale tab, a retransmit, or a question already answered in the terminal all
@@ -1245,12 +1475,54 @@ provider usage limit: it names the action the human can take now. Merely routing
 answer bytes does not clear it; the matching transcript `tool_result` is the
 proof that moves the pane back to Working until the resumed turn completes.
 
-Answerable conversation cards and terminal answer keystrokes remain
-Claude-specific. OMP's built-in `ask` reports Pending answer, but its tool calls
-are not published as answerable cards. Pi's extension-provided `ask` also has
-no answerable card or keystroke bridge; answer these providers in the terminal
-view. OpenCode has no question interface either. Adding an answer path requires
-verifying that provider's picker contract first, not assuming Claude's.
+**OMP's built-in `ask` uses structured answers, never terminal keystrokes.**
+Its active-branch questions and native results are normalized into the same
+conversation card on desktop and mobile. Native question IDs remain distinct
+even when question text repeats; selected option labels and custom text remain
+separate, including labels containing commas and empty multi-select answers.
+Recommended options, descriptions, and plain-text previews are retained.
+Cancellation is an explicit native result, not a fabricated empty answer.
+
+The embedded activity extension mediates the main agent's real
+`ctx.ui.askDialog` and leaves the native picker usable. Prepared arguments do
+not prove which call is executing: `tool_execution_start` binds the dialog to
+its exact call, whether it arrives before or after the picker opens. Ambiguous
+overlapping calls fail closed to terminal interaction. The first native or web
+response settles the dialog; a late response cannot send stray terminal input.
+This is a local extension bridge, not MCP, an external relay, or an RPC-mode
+replacement for the TUI.
+
+`AnswerOmpQuestion` carries the session, pane, opaque tool ID, dialog generation,
+request ID, and typed answers or cancellation. The server checks live runtime
+access and claims the exact pending question. The CLI validates the launch,
+provider PID/start time, native session, transcript scope, and current dialog
+before using bounded, owner-only local files under the pane's activity runtime.
+Its two-second exchange waits for native acceptance, not just a successful
+write. Acceptance means submitted; only OMP's recorded `tool_result` confirms
+the answer. Rejected or uncertain submissions are never automatically replayed.
+An explicit corrected retry is offered only when the server confirms the
+question is still pending.
+
+Question reconciliation runs independently of the ordinary chat cursor, so
+restore, reconnect, and branch changes recover questions without replaying old
+prose or usage. Repeated metadata updates upsert the same card. Native terminal
+answers, cancellation, and invalidation replace any local submission state;
+an unavailable question is never displayed as answered.
+
+The CLI advertises `omp_question_answers_v1`; older CLIs cannot receive this
+command. A missing native API or old loaded extension leaves a terminal-only
+card. Deploy server → web → CLI, and let existing providers keep running:
+adopting a pane host does not reload its extension. The new bridge becomes
+available on the next normal provider launch, not by silently rebooting agents.
+Verified with real OMP 18.8.7 through mobile and desktop answers, cancellation,
+native-terminal precedence, browser refresh, and a server restart that preserved
+the provider PID. A production mobile answer was also verified with OMP 18.8.9.
+The native UI API remains version-sensitive.
+
+Pi's extension-provided `ask` has no answerable card or keystroke bridge;
+answer it in the terminal view. OpenCode has no question interface either.
+Adding another provider requires verifying its picker contract, not assuming
+Claude's keystrokes or OMP's native API.
 
 **The conversation view is writable, and that is the point on mobile.** An
 xterm TUI on a phone is close to unusable — no modifier keys, tiny hit targets,
@@ -1379,6 +1651,19 @@ continue running their old local image. Failed downloads or checks retain the
 last working copy. Do not replace this with `omp update` against
 `~/.local/bin/omp`: on NFS, removing an executable mapped by a live pane can
 kill it with SIGBUS.
+
+**An explicit OMP agent reboot prepares the update before stopping the agent.**
+It bypasses the background-check throttle, waits for an in-flight updater, and
+then replaces the provider on the exact verified local executable, preserving
+the pane and its conversation directory with `--continue`. It must not silently
+re-adopt the old pane host or fall back to an older executable. Preparation
+failures leave the current provider running and report the error in the pane's
+conversation output. Duplicate requests do not start another preparation;
+closing or changing the pane invalidates a pending completion, so a download
+cannot resurrect it. A replacement-start failure retains the pane and reports
+an exited terminal. Script/package launchers remain package-manager-owned.
+This is different from **Reboot CLI**, which deliberately re-adopts hosted
+providers without replacing them; ordinary new-pane launches remain nonblocking.
 
 **Two different things share the oh-my-pi name; do not conflate them.**
 

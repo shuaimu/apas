@@ -376,6 +376,7 @@ pub async fn revoke_access(
         .db
         .delete_session_share(&session_id, &target_user_id)
         .await?;
+    crate::jobs::reconcile_authority(&state).await?;
 
     if deleted {
         tracing::info!(

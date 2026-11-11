@@ -1,14 +1,10 @@
 "use client";
 
-import { useCallback, useRef, useEffect, useState, type ReactNode } from "react";
+import { useCallback, useRef, useEffect, useState } from "react";
+import type { ReactNode } from "react";
 import { Bot, ChevronDown, LoaderCircle, RefreshCw } from "lucide-react";
-import {
-  type CliLifecycleInventory,
-  type CliLifecycleStatus,
-  PaneConfig,
-  PaneKind,
-  paneKey,
-} from "@/lib/store";
+import { paneKey } from "@/lib/store";
+import type { CliLifecycleInventory, CliLifecycleStatus, PaneConfig, PaneKind } from "@/lib/store";
 import { useIsLaunchProfileAllowed } from "@/lib/tabTypes";
 import { paneIsAwaitingAnswerStatus, paneIsWorkingStatus } from "@/lib/paneStatus";
 import {
@@ -23,6 +19,10 @@ interface TabBarProps {
   onSelectTab: (paneId: number) => void;
   onCloseTab: (paneId: number) => void;
   onAddTab: (provider?: string, model?: string, isolatedWorktree?: boolean, kind?: PaneKind) => void;
+  onAddAutonomous?: () => void;
+  autonomousUnavailableReason?: string;
+  jobTabs?: ReactNode;
+  overviewTab?: ReactNode;
   onRenameTab?: (paneId: number, newLabel: string) => void;
   onReorderTabs?: (orderedIds: number[]) => void;
   onBootCli?: () => void;
@@ -34,9 +34,6 @@ interface TabBarProps {
   showBootButton?: boolean;
   showCloseProjectButton?: boolean;
   showRebootButton?: boolean;
-  /** The Overview pseudo-tab is a team-mode surface. Hide it when the
-   * project's effective cluster policy disables team mode. */
-  showOverview?: boolean;
   paneStatuses: Record<string, string | null>;
   pausedPanes: number[];
   /** Mobile-only controls merged into the tab-bar row so the top header can
@@ -160,6 +157,10 @@ export function TabBar({
   onSelectTab,
   onCloseTab,
   onAddTab,
+  onAddAutonomous,
+  autonomousUnavailableReason,
+  jobTabs,
+  overviewTab,
   onRenameTab,
   onReorderTabs,
   onBootCli,
@@ -170,7 +171,6 @@ export function TabBar({
   showBootButton = false,
   showCloseProjectButton = false,
   showRebootButton = false,
-  showOverview = true,
   paneStatuses,
   pausedPanes,
   leading,
@@ -314,36 +314,15 @@ export function TabBar({
     setDropSide(null);
   }, []);
 
-  // Phase 5.1: pinned Overview pseudo-tab at the front. Sentinel id = -1.
-  const OVERVIEW_PANE_ID = -1;
-  const isOverviewActive = activeTabId === OVERVIEW_PANE_ID;
-
   return (
     <div className="flex items-end border-b border-gray-200 dark:border-gray-700 bg-gray-100 dark:bg-gray-800/50 flex-shrink-0 min-h-[40px]">
       {leading}
       <div
         ref={scrollRef}
-        className="flex-1 flex flex-nowrap items-end overflow-x-auto overflow-y-hidden no-scrollbar"
+        className="flex-1 min-w-0 flex flex-nowrap items-end overflow-x-auto overflow-y-hidden no-scrollbar"
         style={{ scrollbarWidth: "none", msOverflowStyle: "none" }}
       >
-        {showOverview && (
-          <button
-            type="button"
-            onClick={() => onSelectTab(OVERVIEW_PANE_ID)}
-            className={`flex items-center gap-1.5 px-2 sm:px-3 py-1.5 text-xs font-medium border-r border-gray-200 dark:border-gray-700 transition-colors flex-shrink-0 ${
-              isOverviewActive
-                ? "bg-white dark:bg-gray-900 text-gray-900 dark:text-gray-100 border-t-2 border-t-indigo-500"
-                : "text-gray-500 dark:text-gray-400 hover:bg-gray-200 dark:hover:bg-gray-700/50 border-t-2 border-t-transparent"
-            }`}
-            title="Team overview — status of every pane in this project"
-          >
-            <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 6h16M4 10h16M4 14h16M4 18h10" />
-            </svg>
-            {/* Label shows on desktop, or when overview is the active view on mobile. */}
-            <span className={isOverviewActive ? "inline" : "hidden sm:inline"}>Overview</span>
-          </button>
-        )}
+        {overviewTab}
         {tabs.map((tab, index) => {
           const isActive = tab.pane_id === activeTabId;
           const isBot = tab.mode === "deadloop";
@@ -473,6 +452,7 @@ export function TabBar({
             </button>
           );
         })}
+        {jobTabs}
       </div>
 
       {/* Right-click context menu */}
@@ -504,7 +484,7 @@ export function TabBar({
 
       {/* Global tab-bar actions */}
       <div className="flex items-center gap-1 pr-1">
-        <AddTabButton onAddTab={onAddTab} />
+        <AddTabButton onAddTab={onAddTab} onAddAutonomous={onAddAutonomous} autonomousUnavailableReason={autonomousUnavailableReason} />
         {/* One slot, two states: a project is either open or closed. Closing
             stops every agent in it, so it is confirmed and says so — the
             agents are the work, not the process hosting them. */}
@@ -585,92 +565,115 @@ export function TabBar({
   );
 }
 
-function AddTabButton({ onAddTab }: { onAddTab: (provider?: string, model?: string, isolatedWorktree?: boolean, kind?: PaneKind) => void }) {
-  // Presentation filter; the server and CLI independently enforce the same
-  // effective profile policy when a launch is submitted.
+function AddTabButton({
+  onAddTab,
+  onAddAutonomous,
+  autonomousUnavailableReason,
+}: Pick<TabBarProps, "onAddTab" | "onAddAutonomous" | "autonomousUnavailableReason">) {
+  // Presentation only; server/CLI still enforce interactive profile policy,
+  // and autonomous admission has its own authority and readiness checks.
   const isAllowed = useIsLaunchProfileAllowed();
   const [showMenu, setShowMenu] = useState(false);
+  const [interactive, setInteractive] = useState(false);
   const [isolatedWorktree, setIsolatedWorktree] = useState(false);
+  const [position, setPosition] = useState({ top: 0, left: 12 });
   const menuRef = useRef<HTMLDivElement>(null);
+  const buttonRef = useRef<HTMLButtonElement>(null);
 
   useEffect(() => {
     if (!showMenu) return;
-    const handleClick = (e: MouseEvent) => {
-      if (menuRef.current && !menuRef.current.contains(e.target as Node)) {
-        setShowMenu(false);
-      }
+    const handleClick = (event: MouseEvent) => {
+      if (menuRef.current && !menuRef.current.contains(event.target as Node)) setShowMenu(false);
+    };
+    const handleKey = (event: KeyboardEvent) => {
+      if (event.key === "Escape") { setShowMenu(false); buttonRef.current?.focus(); }
     };
     document.addEventListener("mousedown", handleClick);
-    return () => document.removeEventListener("mousedown", handleClick);
+    document.addEventListener("keydown", handleKey);
+    return () => {
+      document.removeEventListener("mousedown", handleClick);
+      document.removeEventListener("keydown", handleKey);
+    };
   }, [showMenu]);
 
-  // isolatedWorktree stays toggled while the menu is open so the user's
-  // choice persists across submenu navigation, but resets after each
-  // tab creation so a second tab doesn't silently get a new worktree.
+  const toggleMenu = () => {
+    const rect = buttonRef.current?.getBoundingClientRect();
+    if (rect) setPosition({ top: rect.bottom + 4, left: Math.max(12, Math.min(rect.right - 288, window.innerWidth - 300)) });
+    setInteractive(false);
+    setShowMenu((value) => !value);
+  };
   const handlePick = (provider: string, model?: string) => {
     onAddTab(provider, model, isolatedWorktree || undefined, "terminal");
     setIsolatedWorktree(false);
     setShowMenu(false);
   };
+  const providers = [
+    { provider: "claude", label: "Claude" },
+    { provider: "claude", label: "Claude / DeepSeek 4.1 Flash", model: DEEPSEEK_FLASH_MODEL },
+    { provider: "codex", label: "Codex" },
+    { provider: "opencode", label: "OpenCode" },
+    { provider: "pi", label: "Pi" },
+    { provider: "omp", label: "OMP" },
+  ].filter((entry) => isAllowed("terminal", entry.provider, entry.model));
 
   return (
     <div className="relative flex-shrink-0" ref={menuRef}>
       <button
-        onClick={() => setShowMenu((v) => !v)}
-        className="flex items-center justify-center w-8 h-8 m-1 rounded text-gray-400 dark:text-gray-500 hover:text-gray-600 dark:hover:text-gray-300 hover:bg-gray-200 dark:hover:bg-gray-700 transition-colors"
+        ref={buttonRef}
+        type="button"
+        onClick={toggleMenu}
+        aria-expanded={showMenu}
+        aria-label="Add agent"
+        className="flex items-center justify-center w-11 h-11 m-1 rounded text-gray-500 dark:text-gray-400 hover:text-gray-700 dark:hover:text-gray-200 hover:bg-gray-200 dark:hover:bg-gray-700 transition-colors"
         title="New tab"
       >
-        <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+        <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true">
           <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 4v16m8-8H4" />
         </svg>
       </button>
       {showMenu && (
-        <div className="absolute right-0 top-full mt-1 bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-lg shadow-lg py-1 z-50 min-w-[220px]">
-          <label
-            className="flex items-center gap-2 px-3 py-2 text-xs text-gray-600 dark:text-gray-300 border-b border-gray-100 dark:border-gray-700 cursor-pointer hover:bg-gray-50 dark:hover:bg-gray-700/50"
-            title="When checked, the new tab spawns in a fresh git worktree (branch apas-pane-<id>) so it can't race other tabs on file edits. Requires the project to be a git repo."
-          >
-            <input
-              type="checkbox"
-              checked={isolatedWorktree}
-              onChange={(e) => setIsolatedWorktree(e.target.checked)}
-              onClick={(e) => e.stopPropagation()}
-              className="h-3.5 w-3.5"
-            />
-            Isolated git worktree
-          </label>
-
-          {/* New panes host the provider's real TUI on a pty. Structured
-              agent panes are reserved for managed team roles. */}
-          <div className="pb-0.5">
-            <div
-              className="px-3 pt-1.5 pb-1 text-[10px] font-semibold uppercase tracking-wide text-gray-400 dark:text-gray-500"
-              title="Runs the provider's real interactive CLI in a terminal."
+        <div
+          aria-label="Add agent choices"
+          className="fixed w-72 max-w-[calc(100vw-24px)] overflow-y-auto bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-lg shadow-lg py-1 z-50"
+          style={{ ...position, maxHeight: `calc(100dvh - ${position.top + 12}px)` }}
+        >
+          {!interactive ? <>
+            <button type="button" onClick={() => setInteractive(true)} className="w-full min-h-11 text-left px-3 py-3 hover:bg-gray-100 dark:hover:bg-gray-700">
+              <span className="block text-sm font-semibold">Interactive agent</span>
+              <span className="block mt-1 text-xs text-gray-500 dark:text-gray-400">Work directly with a provider in a terminal.</span>
+            </button>
+            <button
+              type="button"
+              disabled={!onAddAutonomous}
+              onClick={() => { setShowMenu(false); onAddAutonomous?.(); }}
+              className="w-full min-h-11 text-left px-3 py-3 hover:bg-gray-100 dark:hover:bg-gray-700 disabled:opacity-60 disabled:cursor-not-allowed"
             >
-              New terminal
-            </div>
-            {[
-              { provider: "claude", label: "Claude" },
-              { provider: "claude", label: "Claude / DeepSeek 4.1 Flash", model: DEEPSEEK_FLASH_MODEL },
-              { provider: "codex", label: "Codex" },
-              { provider: "opencode", label: "OpenCode" },
-              { provider: "pi", label: "Pi" },
-              { provider: "omp", label: "OMP" },
-            ]
-              .filter((entry) => isAllowed("terminal", entry.provider, entry.model))
-              .map((entry) => (
+              <span className="block text-sm font-semibold">Autonomous agent</span>
+              <span className="block mt-1 text-xs text-gray-500 dark:text-gray-400">{autonomousUnavailableReason || (onAddAutonomous ? "Review a bounded task, worker readiness and limits." : "Open a project to configure autonomous work.")}</span>
+            </button>
+          </> : <>
+            <button type="button" onClick={() => setInteractive(false)} className="min-h-11 w-full text-left px-3 text-sm text-blue-600 dark:text-blue-400 hover:bg-gray-100 dark:hover:bg-gray-700">Back to agent types</button>
+            <label
+              className="flex min-h-11 items-center gap-2 px-3 py-2 text-xs text-gray-600 dark:text-gray-300 border-y border-gray-100 dark:border-gray-700 cursor-pointer"
+              title="Runs in a fresh git worktree so it cannot race other panes on file edits. Requires a git repository."
+            >
+              <input type="checkbox" checked={isolatedWorktree} onChange={(event) => setIsolatedWorktree(event.target.checked)} className="h-4 w-4" />
+              Isolated git worktree
+            </label>
+            <p className="px-3 pt-2 text-xs font-semibold text-gray-500 dark:text-gray-400">Interactive provider</p>
+            {providers.map((entry) => (
               <button
+                type="button"
                 key={entry.model ? `${entry.provider}/${entry.model}` : entry.provider}
                 onClick={() => handlePick(entry.provider, entry.model)}
-                className="w-full text-left px-3 py-1.5 text-sm hover:bg-gray-100 dark:hover:bg-gray-700 flex items-center gap-2"
+                className="w-full min-h-11 text-left px-3 py-2 text-sm hover:bg-gray-100 dark:hover:bg-gray-700 flex items-center gap-2"
               >
-                <span className="flex-shrink-0 text-gray-500 dark:text-gray-400">
-                  <ProviderIcon provider={entry.provider} className="w-4 h-4" />
-                </span>
+                <span className="flex-shrink-0 text-gray-500 dark:text-gray-400"><ProviderIcon provider={entry.provider} className="w-4 h-4" /></span>
                 {entry.label}
               </button>
             ))}
-          </div>
+            {!providers.length && <p className="px-3 py-3 text-sm">No interactive provider is allowed by this project&apos;s launch policy.</p>}
+          </>}
         </div>
       )}
     </div>

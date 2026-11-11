@@ -1,0 +1,26 @@
+#!/bin/sh
+set -eu
+umask 077
+if [ "${APAS_JOB_BRIDGE:-0}" = 1 ]; then
+    /usr/local/bin/apas job-gateway-bridge \
+        --socket /run/apas-bridge/gateway.sock \
+        --token-file /run/apas-bridge/token \
+        --listen 127.0.0.1:17840 &
+    bridge_pid=$!
+    # Wait for the actual isolated loopback listener, not a fixed startup delay.
+    /usr/bin/python3 - "$bridge_pid" <<'PY'
+import os, socket, sys, time
+pid = int(sys.argv[1])
+deadline = time.monotonic() + 10
+while time.monotonic() < deadline:
+    os.kill(pid, 0)
+    try:
+        with socket.create_connection(('127.0.0.1', 17840), timeout=0.2):
+            break
+    except OSError:
+        time.sleep(0.05)
+else:
+    raise SystemExit('run-scoped bridge did not become ready')
+PY
+fi
+exec "$@"

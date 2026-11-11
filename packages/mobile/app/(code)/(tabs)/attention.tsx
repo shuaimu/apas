@@ -5,11 +5,14 @@ import { deriveAttention, type CodeEvent } from "@apas/protocol";
 import { EmptyState, OfflineBanner, Screen, SectionTitle, StatusBadge } from "@/components/ui";
 import { useTheme } from "@/design/tokens";
 import { useMobileStore } from "@/state/store";
+import { JobAction } from "@/jobs/ui";
+import { useJobs } from "@/jobs/runtime";
 
 export default function AttentionScreen() {
   const theme = useTheme();
   const sessions = useMobileStore((state) => state.sessions);
   const eventsBySession = useMobileStore((state) => state.eventsBySession);
+  const jobs = useJobs((state) => state.inbox.jobs);
   const attentionEvents = Object.values(eventsBySession).flatMap(deriveAttention);
   const open = (event: CodeEvent) => router.push({
     pathname: "/(code)/session/[sessionId]",
@@ -22,6 +25,7 @@ export default function AttentionScreen() {
         <Pressable accessibilityRole="button" onPress={() => router.back()} style={styles.backButton}><Text style={{ color: theme.accent, fontWeight: "700" }}>‹ Coding sessions</Text></Pressable>
         <SectionTitle>Needs attention</SectionTitle>
         <Text style={{ color: theme.textMuted }}>Server-authoritative pending decisions and selected failures</Text>
+        <JobAction onPress={() => router.push({ pathname: "/(code)/jobs", params: { attention: "1" } })}>Job Attention ({jobs.reduce((count, job) => count + job.attention_count, 0)} in current inbox)</JobAction>
       </View>
       <FlatList
         data={attentionEvents}

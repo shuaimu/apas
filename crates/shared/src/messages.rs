@@ -30,6 +30,8 @@ pub const PI_TERMINAL_CAPABILITY: &str = "terminal_pi_v1";
 /// server/web deployment cannot route an OMP pane to an older CLI that would
 /// persist the pane but fail to launch it.
 pub const OMP_TERMINAL_CAPABILITY: &str = "terminal_omp_v1";
+/// The CLI can deliver scoped structured answers to OMP's native question dialog.
+pub const OMP_QUESTION_CAPABILITY: &str = "omp_question_answers_v1";
 /// The CLI understands correlated, transport-only reconnect requests.
 pub const CLI_LIFECYCLE_CAPABILITY: &str = "cli_lifecycle_v1";
 /// The CLI can keep supported terminal providers alive outside the replaceable
@@ -64,6 +66,17 @@ pub const PANE_STATUS_PENDING_ANSWER: &str = "Pending answer";
 
 pub fn pane_status_is_working(status: &str) -> bool {
     status != PANE_STATUS_PENDING_ANSWER
+}
+
+/// A native OMP answer. Question identity and selections must not be flattened
+/// into question text or comma-separated labels.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct OmpQuestionAnswer {
+    pub id: String,
+    pub selected_options: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub custom_input: Option<String>,
 }
 
 fn default_true() -> bool {
@@ -529,6 +542,18 @@ pub enum CliToServer {
     PaneWorkSummaryResult {
         result: crate::PaneWorkSummaryGenerationResult,
     },
+
+    /// Native bridge acceptance, not provider-recorded answer confirmation.
+    OmpQuestionAnswerResult {
+        session_id: Uuid,
+        pane_id: u32,
+        tool_use_id: String,
+        request_id: String,
+        accepted: bool,
+        pending: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
 }
 
 /// Messages sent from server to CLI client
@@ -709,6 +734,19 @@ pub enum ServerToCli {
         answers: std::collections::HashMap<String, String>,
     },
 
+    /// Resolve exactly one current native OMP dialog without terminal input.
+    AnswerOmpQuestion {
+        session_id: Uuid,
+        pane_id: u32,
+        tool_use_id: String,
+        dialog_id: Uuid,
+        request_id: String,
+        #[serde(default)]
+        answers: Vec<OmpQuestionAnswer>,
+        #[serde(default)]
+        cancel: bool,
+    },
+
     /// Compute and return the current `git diff` for a pane's isolated
     /// worktree branch against the project's HEAD. Phase 1.2a.
     RequestPaneDiff { session_id: Uuid, pane_id: u32 },
@@ -825,6 +863,9 @@ pub enum ServerToCli {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum DaemonToServer {
+    /// Capability-gated reports from the independent autonomous job host.
+    AutonomousJob { report: crate::jobs::JobWorkerReport },
+
     /// Daemon registers with the server using auth token + machine info
     Register {
         token: String,
@@ -888,8 +929,15 @@ pub enum DaemonToServer {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerToDaemon {
+    /// Never sent to a daemon without `omp_job_worker_v1`.
+    AutonomousJob { command: crate::jobs::JobWorkerCommand },
+
     /// Registration successful
-    Registered { machine_id: Uuid },
+    Registered {
+        machine_id: Uuid,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cluster_owner_user_id: Option<Uuid>,
+    },
 
     /// Registration failed
     RegistrationFailed { reason: String },
@@ -1014,6 +1062,13 @@ pub enum MobileTelemetryEvent {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum WebToServer {
+    SubscribeJob {
+        project_id: String,
+        job_id: Uuid,
+        after_seq: u64,
+    },
+    UnsubscribeJob { job_id: Uuid },
+
     /// Authenticate with JWT token
     Authenticate {
         token: String,
@@ -1445,6 +1500,20 @@ pub enum WebToServer {
         answers: std::collections::HashMap<String, String>,
     },
 
+    /// Lossless OMP submission. Scope and correlation are required, unlike the
+    /// legacy Claude answer path.
+    AnswerOmpQuestion {
+        session_id: Uuid,
+        pane_id: u32,
+        tool_use_id: String,
+        dialog_id: Uuid,
+        request_id: String,
+        #[serde(default)]
+        answers: Vec<OmpQuestionAnswer>,
+        #[serde(default)]
+        cancel: bool,
+    },
+
     /// Ask the CLI for the current `git diff` between the pane's worktree
     /// branch and the project's HEAD. Returns via `ServerToWeb::PaneDiff`.
     /// Phase 1.2a.
@@ -1628,6 +1697,22 @@ pub enum SessionAttachmentRejectionReason {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerToWeb {
+    JobSnapshot { detail: crate::jobs::JobDetail },
+    JobEvent { event: crate::jobs::JobEvent },
+    JobChanged {
+        project_id: String,
+        job_id: Uuid,
+        state_version: u64,
+        last_event_seq: u64,
+    },
+    JobSubscriptionRejected {
+        project_id: String,
+        job_id: Uuid,
+        code: String,
+        message: String,
+        resync_required: bool,
+    },
+
     /// Authentication successful
     Authenticated {
         user_id: Uuid,
@@ -1672,6 +1757,10 @@ pub enum ServerToWeb {
         accepted: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         error: Option<String>,
+        /// A fresh native bridge check permits an explicit corrected submission
+        /// after rejection. Missing means the question's state is uncertain.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        question_pending: Option<bool>,
     },
 
     /// Latest connected-CLI lifecycle capabilities and per-pane reboot
@@ -3469,7 +3558,10 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(project.preferred_machine_id, None);
-        assert!(serde_json::to_value(&project).unwrap().get("preferred_machine_id").is_none());
+        assert!(serde_json::to_value(&project)
+            .unwrap()
+            .get("preferred_machine_id")
+            .is_none());
         let machine_id = Uuid::new_v4();
         project.preferred_machine_id = Some(machine_id);
         let decoded: MachineProjectInfo =

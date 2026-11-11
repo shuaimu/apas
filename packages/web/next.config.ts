@@ -1,5 +1,6 @@
 import type { NextConfig } from "next";
 import { execSync } from "node:child_process";
+import { resolve } from "node:path";
 
 function resolveWebVersion(): string {
   // Highest priority: explicit environment override.
@@ -25,6 +26,8 @@ function resolveWebVersion(): string {
 }
 
 const nextConfig: NextConfig = {
+  // Production deploys web and its linked protocol package as siblings.
+  turbopack: { root: resolve(__dirname, "..") },
   env: {
     NEXT_PUBLIC_WEB_UI_VERSION: resolveWebVersion(),
   },

@@ -4,6 +4,7 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 mod config;
 mod db;
 mod error;
+mod jobs;
 mod mobile_metrics;
 mod notifications;
 mod project_lifecycle;
@@ -66,6 +67,8 @@ async fn async_main() -> Result<()> {
 
     // Create app state
     let state = AppState::new(db, config.clone());
+    jobs::recover(&state).await?;
+    tokio::spawn(jobs::run_dispatcher(state.clone()));
     project_lifecycle::recover_interrupted_deletions(&state).await?;
     if state.config.mobile.features.notifications {
         let transport = notifications::ExpoPushTransport::new(state.config.mobile.push.clone())?;

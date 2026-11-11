@@ -185,8 +185,11 @@ function renderContent(message: Message, outputType: Message["outputType"]) {
       if (outputType.tool === "AskUserQuestion") {
         return (
           <AskUserQuestionCard
+            key={JSON.stringify([message.sessionId, message.paneId, outputType.toolUseId])}
             toolUseId={outputType.toolUseId}
             input={outputType.input}
+            sessionId={message.sessionId}
+            paneId={message.paneId}
           />
         );
       }

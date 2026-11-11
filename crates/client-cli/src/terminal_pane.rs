@@ -72,34 +72,40 @@ impl TerminalRuntimeHandle {
         resume: bool,
         initial_prompt: Option<&str>,
         server_tx: tokio_mpsc::Sender<CliToServer>,
+        replace_existing_host: bool,
     ) -> Result<Self> {
         #[cfg(unix)]
         if crate::pane_host::persistent_hosting_available() {
-            match HostedTerminalHandle::adopt_existing(pane_id, session_id, server_tx.clone()) {
-                Ok(Some(handle)) => return Ok(Self::Hosted(handle)),
-                Ok(None) => match HostedTerminalHandle::create(
-                    pane_id,
-                    session_id,
-                    conversation_id,
-                    provider,
-                    binary_path,
-                    cwd,
-                    env,
-                    resume,
-                    initial_prompt,
-                    server_tx.clone(),
-                ) {
-                    Ok(handle) => return Ok(Self::Hosted(handle)),
-                    Err(error) => {
-                        tracing::warn!(pane_id, %error, "persistent pane host launch failed; using direct PTY fallback")
-                    }
-                },
+            let existing =
+                HostedTerminalHandle::adopt_existing(pane_id, session_id, server_tx.clone())
+                    .context("existing pane host could not be adopted")?;
+            if let Some(handle) = existing {
+                let handle = Self::Hosted(handle);
+                if !replace_existing_host {
+                    return Ok(handle);
+                }
+                // Even an unregistered host must not bypass an explicit
+                // executable selection by being silently adopted.
+                handle.shutdown_for_reboot()?;
+            }
+            match HostedTerminalHandle::create(
+                pane_id,
+                session_id,
+                conversation_id,
+                provider,
+                binary_path,
+                cwd,
+                env,
+                resume,
+                initial_prompt,
+                server_tx.clone(),
+            ) {
+                Ok(handle) => return Ok(Self::Hosted(handle)),
+                // Creation may have reached the provider before failing.
+                // Explicit replacement must not risk a second process.
+                Err(error) if replace_existing_host => return Err(error),
                 Err(error) => {
-                    // A descriptor for this pane exists but could not be
-                    // exclusively adopted. Starting another provider would
-                    // duplicate a possibly live autonomous agent, so fail
-                    // closed and let the caller surface unavailability.
-                    return Err(error.context("existing pane host could not be adopted"));
+                    tracing::warn!(pane_id, %error, "persistent pane host launch failed; using direct PTY fallback")
                 }
             }
         }
@@ -180,6 +186,45 @@ impl TerminalRuntimeHandle {
             Self::Direct(handle) => handle.shutdown(),
             #[cfg(unix)]
             Self::Hosted(handle) => handle.shutdown(),
+        }
+    }
+
+    /// Explicit provider replacement must finish teardown before `spawn`,
+    /// which would otherwise adopt an existing host instead of the new binary.
+    pub fn shutdown_for_reboot(&self) -> Result<()> {
+        match self {
+            Self::Direct(handle) => {
+                let mut child = handle
+                    .child
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("terminal child mutex poisoned"))?;
+                if child
+                    .try_wait()
+                    .context("checking old terminal process")?
+                    .is_none()
+                {
+                    // Do not suppress exit reporting until kill succeeds.
+                    // The reader checks this flag while holding the child
+                    // mutex, so it cannot race a failed teardown attempt.
+                    child.kill().context("stopping old terminal process")?;
+                    let was_shutting_down = handle.shutting_down.swap(true, Ordering::SeqCst);
+                    if let Err(error) = child.wait() {
+                        handle
+                            .shutting_down
+                            .store(was_shutting_down, Ordering::SeqCst);
+                        return Err(error).context("waiting for old terminal process");
+                    }
+                }
+                Ok(())
+            }
+            #[cfg(unix)]
+            Self::Hosted(handle) => {
+                let _ = handle.write_command(crate::pane_host::ControllerToHost::Shutdown);
+                crate::pane_host::terminate_tmux_host(&handle.descriptor)
+                    .context("removing old terminal host")?;
+                handle.shutting_down.store(true, Ordering::SeqCst);
+                Ok(())
+            }
         }
     }
 
@@ -1066,15 +1111,15 @@ impl TerminalHandle {
                     }
                 }
 
-                if shutting_down.load(Ordering::Relaxed) {
-                    return;
-                }
-
-                let status = child
-                    .lock()
-                    .ok()
-                    .and_then(|mut c| c.wait().ok())
-                    .map(|s| format!("exited with status {s:?}"));
+                let status = {
+                    let child = child.lock().ok();
+                    if shutting_down.load(Ordering::SeqCst) {
+                        return;
+                    }
+                    child
+                        .and_then(|mut c| c.wait().ok())
+                        .map(|s| format!("exited with status {s:?}"))
+                };
 
                 if let Ok(mut state) = lifecycle.lock() {
                     *state = (TerminalLifecycle::Exited, status.clone());

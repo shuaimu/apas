@@ -4,11 +4,14 @@ import * as Notifications from "expo-notifications";
 import { Platform } from "react-native";
 import { router } from "expo-router";
 
-import { bootstrap, registerPushToken } from "@/api/client";
+import { ApiError, bootstrap, registerPushToken } from "@/api/client";
 import { resolveAuthorizedDeepLink } from "@/deepLinks";
 import { getInstallationId } from "@/security/credentials";
 import { replaceSessionSummaries } from "@/storage/cache";
 import { useMobileStore } from "@/state/store";
+import { jobsApi } from "@/jobs/api";
+import { acceptJobsBootstrap, purgeJobAccess, useJobs } from "@/jobs/runtime";
+import { consumeJobLink, parseJobLink, retainJobLink } from "@/jobs/links";
 
 let cleanup: (() => void) | null = null;
 
@@ -22,9 +25,36 @@ Notifications.setNotificationHandler({
 });
 
 export async function handleAuthorizedLink(rawUrl: string): Promise<boolean> {
-  const current = await bootstrap();
+  const destination = parseJobLink(rawUrl);
+  let current;
+  try { current = await bootstrap(); }
+  catch (error) {
+    if (destination) retainJobLink(rawUrl);
+    throw error;
+  }
   useMobileStore.getState().applyBootstrap(current);
   await replaceSessionSummaries(current.sessions);
+  await acceptJobsBootstrap(current);
+  if (destination) {
+    try {
+      const detail = await jobsApi.resolve(destination.job);
+      const params = { jobId: destination.job, project: detail.job.project_id, ...(destination.run ? { run: destination.run } : {}) };
+      if (destination.question) router.push({ pathname: "/(code)/jobs/[jobId]/questions/[questionId]", params: { ...params, questionId: destination.question } });
+      else if (destination.review) router.push({ pathname: "/(code)/jobs/[jobId]/review", params });
+      else router.push({ pathname: "/(code)/jobs/[jobId]", params });
+      return true;
+    } catch (error) {
+      if (error instanceof ApiError && [401, 403, 404, 410].includes(error.status)) {
+        const project = useJobs.getState().entries[destination.job]?.detail.job.project_id
+          ?? useJobs.getState().inbox.jobs.find((job) => job.id === destination.job)?.project_id;
+        if (error.status === 401) await purgeJobAccess();
+        else if (project) await purgeJobAccess(project);
+      }
+      // The exact destination renders a safe unavailable explanation; never attach a session.
+      router.push({ pathname: "/(code)/jobs/[jobId]", params: { jobId: destination.job } });
+      return false;
+    }
+  }
   const target = resolveAuthorizedDeepLink(rawUrl, new Set(current.sessions.map((session) => session.id)));
   if (!target) return false;
   if (target.kind === "home") router.push("/(code)/(tabs)");
@@ -56,6 +86,8 @@ export async function requestAndRegisterNotifications(): Promise<void> {
 
 export function startNotificationAndLinkRuntime(): void {
   if (cleanup) return;
+  const retained = consumeJobLink();
+  if (retained) void handleAuthorizedLink(retained).catch(() => undefined);
   const notificationTap = Notifications.addNotificationResponseReceivedListener((response) => {
     const data = response.notification.request.content.data ?? {};
     if (typeof data.url === "string") void handleAuthorizedLink(data.url).catch(() => undefined);

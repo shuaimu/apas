@@ -4,9 +4,12 @@ import { router } from "expo-router";
 
 import { login } from "@/api/client";
 import { ErrorNotice, FormField, PrimaryButton, Screen } from "@/components/ui";
-import { startConnectionRuntime } from "@/connection/runtime";
+import { startConnectionRuntime, stopConnectionRuntime } from "@/connection/runtime";
 import { useTheme } from "@/design/tokens";
 import { useMobileStore } from "@/state/store";
+import { stopJobsRuntime } from "@/jobs/runtime";
+import { queryClient } from "@/query/client";
+import { wipeCache } from "@/storage/cache";
 
 export default function LoginScreen() {
   const theme = useTheme();
@@ -24,7 +27,13 @@ export default function LoginScreen() {
     setSubmitting(true);
     setError(null);
     try {
+      stopConnectionRuntime();
+      await stopJobsRuntime();
       await login(email, password);
+      await queryClient.cancelQueries();
+      queryClient.clear();
+      await wipeCache();
+      useMobileStore.getState().reset();
       setHydrated(true);
       startConnectionRuntime();
       router.replace("/(code)/(tabs)");

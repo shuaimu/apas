@@ -3,6 +3,104 @@
   "title": "ServerToWeb",
   "oneOf": [
     {
+      "type": "object",
+      "properties": {
+        "detail": {
+          "$ref": "#/$defs/JobDetail"
+        },
+        "type": {
+          "type": "string",
+          "const": "job_snapshot"
+        }
+      },
+      "required": [
+        "type",
+        "detail"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "event": {
+          "$ref": "#/$defs/JobEvent"
+        },
+        "type": {
+          "type": "string",
+          "const": "job_event"
+        }
+      },
+      "required": [
+        "type",
+        "event"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "job_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "last_event_seq": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "project_id": {
+          "type": "string"
+        },
+        "state_version": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "type": {
+          "type": "string",
+          "const": "job_changed"
+        }
+      },
+      "required": [
+        "type",
+        "project_id",
+        "job_id",
+        "state_version",
+        "last_event_seq"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "code": {
+          "type": "string"
+        },
+        "job_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "message": {
+          "type": "string"
+        },
+        "project_id": {
+          "type": "string"
+        },
+        "resync_required": {
+          "type": "boolean"
+        },
+        "type": {
+          "type": "string",
+          "const": "job_subscription_rejected"
+        }
+      },
+      "required": [
+        "type",
+        "project_id",
+        "job_id",
+        "code",
+        "message",
+        "resync_required"
+      ]
+    },
+    {
       "description": "Authentication successful",
       "type": "object",
       "properties": {
@@ -131,6 +229,13 @@
           ],
           "format": "uint32",
           "minimum": 0
+        },
+        "question_pending": {
+          "description": "A fresh native bridge check permits an explicit corrected submission\nafter rejection. Missing means the question's state is uncertain.",
+          "type": [
+            "boolean",
+            "null"
+          ]
         },
         "request_id": {
           "type": "string"
@@ -1705,6 +1810,731 @@
         "team_available",
         "allowed_launch_profiles",
         "version"
+      ]
+    },
+    "JobAllowedActions": {
+      "type": "object",
+      "properties": {
+        "admit": {
+          "type": "boolean"
+        },
+        "answer": {
+          "type": "boolean"
+        },
+        "cancel": {
+          "type": "boolean"
+        },
+        "manage_policy": {
+          "type": "boolean"
+        },
+        "retry": {
+          "type": "boolean"
+        },
+        "retry_publication": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "admit",
+        "answer",
+        "cancel",
+        "retry",
+        "retry_publication",
+        "manage_policy"
+      ]
+    },
+    "JobDetail": {
+      "type": "object",
+      "properties": {
+        "high_watermark": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "job": {
+          "$ref": "#/$defs/JobSummary"
+        },
+        "policy_digest": {
+          "type": "string"
+        },
+        "publication": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/JobPublication"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "questions": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/JobQuestion"
+          }
+        },
+        "runs": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/JobRun"
+          }
+        },
+        "task": {
+          "$ref": "#/$defs/JobTaskSpec"
+        }
+      },
+      "required": [
+        "job",
+        "task",
+        "runs",
+        "questions",
+        "high_watermark",
+        "policy_digest"
+      ]
+    },
+    "JobEvent": {
+      "type": "object",
+      "properties": {
+        "created_at": {
+          "type": "string"
+        },
+        "detail": true,
+        "id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "job_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "kind": {
+          "$ref": "#/$defs/JobEventKind"
+        },
+        "run_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "uuid"
+        },
+        "seq": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "summary": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "job_id",
+        "seq",
+        "kind",
+        "summary",
+        "created_at"
+      ]
+    },
+    "JobEventKind": {
+      "type": "string",
+      "enum": [
+        "admitted",
+        "phase_changed",
+        "progress",
+        "subagent",
+        "question",
+        "answer_confirmed",
+        "usage",
+        "verification",
+        "publication",
+        "cancellation_requested",
+        "stopped",
+        "failed",
+        "recovery_required"
+      ]
+    },
+    "JobLimits": {
+      "type": "object",
+      "properties": {
+        "attempts": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "cpu_millis": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "elapsed_seconds": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "memory_bytes": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "model_concurrency": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "model_output_tokens": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "output_bytes": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "pids": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "spend_micro_usd": {
+          "description": "Reported-spend threshold, not a promise about the provider's final invoice.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "workspace_bytes": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "elapsed_seconds",
+        "spend_micro_usd",
+        "attempts",
+        "cpu_millis",
+        "memory_bytes",
+        "workspace_bytes",
+        "output_bytes",
+        "pids",
+        "model_concurrency",
+        "model_output_tokens"
+      ]
+    },
+    "JobPublication": {
+      "type": "object",
+      "properties": {
+        "base_sha": {
+          "type": "string"
+        },
+        "branch": {
+          "type": "string"
+        },
+        "draft": {
+          "type": "boolean"
+        },
+        "head_sha": {
+          "type": "string"
+        },
+        "number": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "observed_at": {
+          "type": "string"
+        },
+        "repository": {
+          "type": "string"
+        },
+        "state": {
+          "type": "string"
+        },
+        "url": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "repository",
+        "number",
+        "url",
+        "branch",
+        "base_sha",
+        "head_sha",
+        "draft",
+        "state",
+        "observed_at"
+      ]
+    },
+    "JobQuestion": {
+      "type": "object",
+      "properties": {
+        "answers": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "$ref": "#/$defs/JobQuestionAnswer"
+          }
+        },
+        "confirmed_at": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "created_at": {
+          "type": "string"
+        },
+        "dialog_id": {
+          "type": "string"
+        },
+        "epoch": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "questions": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/JobQuestionItem"
+          }
+        },
+        "run_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "state": {
+          "$ref": "#/$defs/JobQuestionState"
+        },
+        "tool_call_id": {
+          "type": "string"
+        },
+        "version": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "id",
+        "run_id",
+        "epoch",
+        "version",
+        "dialog_id",
+        "tool_call_id",
+        "state",
+        "questions",
+        "created_at"
+      ]
+    },
+    "JobQuestionAnswer": {
+      "type": "object",
+      "properties": {
+        "custom_input": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "id": {
+          "type": "string"
+        },
+        "selected_option_ids": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "selected_option_ids"
+      ]
+    },
+    "JobQuestionItem": {
+      "type": "object",
+      "properties": {
+        "header": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "id": {
+          "type": "string"
+        },
+        "multi": {
+          "type": "boolean"
+        },
+        "options": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/JobQuestionOption"
+          }
+        },
+        "question": {
+          "type": "string"
+        },
+        "recommended": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "id",
+        "question",
+        "options",
+        "multi"
+      ]
+    },
+    "JobQuestionOption": {
+      "type": "object",
+      "properties": {
+        "description": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "id": {
+          "type": "string"
+        },
+        "label": {
+          "type": "string"
+        },
+        "preview": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "id",
+        "label"
+      ]
+    },
+    "JobQuestionState": {
+      "type": "string",
+      "enum": [
+        "pending",
+        "answer_accepted",
+        "answer_delivered",
+        "confirmed",
+        "uncertain",
+        "cancelled"
+      ]
+    },
+    "JobRun": {
+      "type": "object",
+      "properties": {
+        "attempt": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "candidate_sha": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "ended_at": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "epoch": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "job_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "reason": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "started_at": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "state": {
+          "$ref": "#/$defs/JobState"
+        },
+        "stop_evidence": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/JobStopEvidence"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "usage": {
+          "$ref": "#/$defs/JobUsage"
+        },
+        "worker_version": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "id",
+        "job_id",
+        "attempt",
+        "epoch",
+        "state",
+        "usage"
+      ]
+    },
+    "JobState": {
+      "type": "string",
+      "enum": [
+        "queued",
+        "preparing",
+        "running",
+        "needs_input",
+        "verifying",
+        "publishing",
+        "review_ready",
+        "blocked",
+        "recovery_required",
+        "cancelling",
+        "cancelled",
+        "failed"
+      ]
+    },
+    "JobStopEvidence": {
+      "type": "object",
+      "properties": {
+        "boot_id": {
+          "type": "string"
+        },
+        "container_id": {
+          "type": "string"
+        },
+        "descendants_stopped": {
+          "type": "boolean"
+        },
+        "reason": {
+          "type": "string"
+        },
+        "stopped_at": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "boot_id",
+        "container_id",
+        "stopped_at",
+        "reason",
+        "descendants_stopped"
+      ]
+    },
+    "JobSummary": {
+      "type": "object",
+      "properties": {
+        "allowed_actions": {
+          "$ref": "#/$defs/JobAllowedActions"
+        },
+        "attention_count": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "cluster_owner_user_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "created_at": {
+          "type": "string"
+        },
+        "current_run_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "hostname": {
+          "type": "string"
+        },
+        "id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "limits": {
+          "$ref": "#/$defs/JobLimits"
+        },
+        "machine_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "project_id": {
+          "type": "string"
+        },
+        "project_name": {
+          "type": "string"
+        },
+        "reason": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "state": {
+          "$ref": "#/$defs/JobState"
+        },
+        "state_version": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "title": {
+          "type": "string"
+        },
+        "updated_at": {
+          "type": "string"
+        },
+        "usage": {
+          "$ref": "#/$defs/JobUsage"
+        }
+      },
+      "required": [
+        "id",
+        "project_id",
+        "project_name",
+        "title",
+        "state",
+        "state_version",
+        "current_run_id",
+        "cluster_owner_user_id",
+        "machine_id",
+        "hostname",
+        "created_at",
+        "updated_at",
+        "usage",
+        "limits",
+        "attention_count",
+        "allowed_actions"
+      ]
+    },
+    "JobTaskSpec": {
+      "type": "object",
+      "properties": {
+        "acceptance_criteria": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "base_ref": {
+          "type": "string"
+        },
+        "base_sha": {
+          "type": "string"
+        },
+        "instruction": {
+          "type": "string"
+        },
+        "model_profile": {
+          "type": "string"
+        },
+        "repository": {
+          "type": "string"
+        },
+        "source_url": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "verification_profile": {
+          "type": "string"
+        },
+        "verification_profile_digest": {
+          "type": "string"
+        },
+        "worker_profile": {
+          "type": "string"
+        },
+        "worker_profile_digest": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "instruction",
+        "acceptance_criteria",
+        "repository",
+        "base_ref",
+        "base_sha",
+        "worker_profile",
+        "worker_profile_digest",
+        "verification_profile",
+        "verification_profile_digest",
+        "model_profile"
+      ]
+    },
+    "JobUsage": {
+      "type": "object",
+      "properties": {
+        "elapsed_seconds": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "estimated": {
+          "type": "boolean"
+        },
+        "input_tokens": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "output_tokens": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "spend_micro_usd": {
+          "description": "None is unknown, not zero.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "elapsed_seconds",
+        "input_tokens",
+        "output_tokens",
+        "estimated"
       ]
     },
     "LocalProjectRegistrationResult": {

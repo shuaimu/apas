@@ -47,3 +47,12 @@
 - [x] 7.3 Render Pending answer in project lists, waiting-agent lists, pane selectors, pane overview cards, and conversation status bars, ahead of ordinary idle and usage-limited panes
 - [x] 7.4 Add Rust and web regression coverage for question → pending → recorded answer → working transitions and list/status presentation
 - [x] 7.5 Update the terminal-pane documentation and run focused Rust/web tests, formatting, lint, and full relevant suites
+
+## 8. OMP native question support
+
+- [x] 8.1 Add a lossless, explicitly scoped OMP answer/cancel protocol and authorized server routing with correlated native acceptance.
+- [x] 8.2 Extend the private OMP activity extension and Rust adapter with a capability-gated native dialog bridge, exact identity validation, first-response semantics, and terminal fallback.
+- [x] 8.3 Capture OMP questions/native results, preserve prose and usage, and reconcile pending questions independently of the chat cursor across restore, reconnect, and branch changes.
+- [x] 8.4 Make desktop/mobile conversation cards provider-aware, support structured OMP answers and cancellation, and reconcile live/history confirmation without duplicate cards or automatic replay.
+- [x] 8.5 Exercise the integrated flow with a real OMP TUI and mobile browser; run focused regressions and required build/lint gates; update the canonical runbook.
+- [x] 8.6 Deploy server → web → CLI, verify production health and conversation behavior, and document any existing panes still needing the updated extension.

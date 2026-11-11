@@ -266,6 +266,10 @@ pub async fn login(
         .await?
         .ok_or_else(|| AppError::Internal("Device session was not persisted".to_string()))?;
     let response = auth_response(&state, &record, user, refresh_token)?;
+    state
+        .db
+        .record_user_login(&response.user_id.to_string())
+        .await?;
     metric.success(MobileMetric::AuthLoginSuccess);
     tracing::info!(
         platform = platform_name(request.platform),
@@ -294,6 +298,9 @@ pub async fn refresh(
     {
         Ok(record) => record,
         Err(failure) => {
+            if matches!(failure, MobileRefreshFailure::Expired | MobileRefreshFailure::Reused | MobileRefreshFailure::InstallationMismatch) {
+                crate::jobs::reconcile_subscriptions(&state).await?;
+            }
             let reason = match failure {
                 MobileRefreshFailure::Invalid => "Invalid refresh token",
                 MobileRefreshFailure::Expired => "Mobile device session expired",
@@ -318,6 +325,7 @@ pub async fn refresh(
             .db
             .revoke_mobile_device_sessions_for_user(&user.id, "account_suspended")
             .await?;
+        crate::jobs::reconcile_authority(&state).await?;
         return Err(AppError::AuthError(
             "Cluster account is suspended".to_string(),
         ));
@@ -354,6 +362,8 @@ pub async fn logout(
         .db
         .revoke_mobile_device_session(&claims.sub, &session_id, false, "logout")
         .await?;
+    // Device authority gates subscriptions, not ownership of admitted runtimes.
+    crate::jobs::reconcile_subscriptions(&state).await?;
     state
         .mobile_metrics
         .increment(MobileMetric::DeviceRevocation);
@@ -400,6 +410,7 @@ pub async fn revoke_device(
             "Mobile device session not found".to_string(),
         ));
     }
+    crate::jobs::reconcile_subscriptions(&state).await?;
     state
         .mobile_metrics
         .increment(MobileMetric::DeviceRevocation);
@@ -457,6 +468,220 @@ mod tests {
             device_name: Some("Test phone".to_string()),
             app_version: "0.1.0".to_string(),
         }
+    }
+
+    const OLD_LOGIN: &str = "2000-01-01T00:00:00.000Z";
+
+    async fn last_login(state: &AppState, user_id: &str) -> Option<String> {
+        state
+            .db
+            .get_cluster_user(user_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .last_login_at
+    }
+
+    async fn seed_old_login(state: &AppState, user_id: &str) {
+        let pool = sqlx::SqlitePool::connect(&format!("sqlite:{}", state.config.database.path))
+            .await
+            .unwrap();
+        sqlx::query("UPDATE users SET last_login_at = ? WHERE id = ?")
+            .bind(OLD_LOGIN)
+            .bind(user_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        pool.close().await;
+    }
+
+    #[tokio::test]
+    async fn last_login_tracks_password_signins_but_not_failures_or_refresh() {
+        let state = state_with_user().await;
+        let user = state
+            .db
+            .get_user_by_email("mobile@example.test")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(last_login(&state, &user.id).await, None);
+        seed_old_login(&state, &user.id).await;
+        let mut bad_request = login_request();
+        bad_request.password = "wrong password".to_string();
+        assert!(login(State(state.clone()), secure_headers(), Json(bad_request))
+            .await
+            .is_err());
+        assert_eq!(last_login(&state, &user.id).await.as_deref(), Some(OLD_LOGIN));
+
+        let Json(initial) = login(
+            State(state.clone()),
+            secure_headers(),
+            Json(login_request()),
+        )
+        .await
+        .unwrap();
+        let recorded = last_login(&state, &user.id).await.unwrap();
+        assert_ne!(recorded, OLD_LOGIN);
+        assert_eq!(
+            chrono::DateTime::parse_from_rfc3339(&recorded)
+                .unwrap()
+                .offset()
+                .local_minus_utc(),
+            0
+        );
+        seed_old_login(&state, &user.id).await;
+        let Json(rotated) = refresh(
+            State(state.clone()),
+            secure_headers(),
+            Json(MobileRefreshRequest {
+                refresh_token: initial.refresh_token,
+                installation_id: "install-1".to_string(),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(last_login(&state, &user.id).await.as_deref(), Some(OLD_LOGIN));
+
+        state
+            .db
+            .update_cluster_user_status(&user.id, &user.id, crate::db::AccountStatus::Suspended)
+            .await
+            .unwrap();
+        assert!(login(
+            State(state.clone()),
+            secure_headers(),
+            Json(login_request()),
+        )
+        .await
+        .is_err());
+        assert!(refresh(
+            State(state.clone()),
+            secure_headers(),
+            Json(MobileRefreshRequest {
+                refresh_token: rotated.refresh_token,
+                installation_id: "install-1".to_string(),
+            }),
+        )
+        .await
+        .is_err());
+        assert_eq!(last_login(&state, &user.id).await.as_deref(), Some(OLD_LOGIN));
+    }
+
+    #[tokio::test]
+    async fn last_login_tracks_web_signup_password_and_device_token_issuance() {
+        use crate::routes::auth;
+
+        let mut state = state_with_user().await;
+        state.config.auth.self_signup_email_domains = vec!["example.test".to_string()];
+        let Json(signup) = auth::register(
+            State(state.clone()),
+            Json(auth::RegisterRequest {
+                email: "signup@example.test".to_string(),
+                password: "correct horse battery staple".to_string(),
+                invitation_code: None,
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(last_login(&state, &signup.user_id).await.is_some());
+        seed_old_login(&state, &signup.user_id).await;
+        let web_request = |password: &str| {
+            Json(auth::LoginRequest {
+                email: "signup@example.test".to_string(),
+                password: password.to_string(),
+            })
+        };
+        assert!(
+            auth::login(State(state.clone()), web_request("wrong password"))
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            last_login(&state, &signup.user_id).await.as_deref(),
+            Some(OLD_LOGIN)
+        );
+        let Json(logged_in) = auth::login(
+            State(state.clone()),
+            web_request("correct horse battery staple"),
+        )
+        .await
+        .unwrap();
+        assert_ne!(last_login(&state, &signup.user_id).await.unwrap(), OLD_LOGIN);
+        seed_old_login(&state, &signup.user_id).await;
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {}", logged_in.token)).unwrap(),
+        );
+        auth::me(State(state.clone()), headers.clone()).await.unwrap();
+        let Json(code) = auth::device_code(State(state.clone())).await;
+        assert!(matches!(
+            auth::device_poll(
+                State(state.clone()),
+                Json(auth::DevicePollRequest {
+                    code: code.code.clone()
+                }),
+            )
+            .await
+            .unwrap()
+            .0,
+            auth::DevicePollResponse::Pending
+        ));
+        auth::device_complete(
+            State(state.clone()),
+            headers,
+            Json(auth::DeviceCompleteRequest {
+                code: code.code.clone(),
+                user_id: signup.user_id.clone(),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            last_login(&state, &signup.user_id).await.as_deref(),
+            Some(OLD_LOGIN)
+        );
+        assert!(matches!(
+            auth::device_poll(
+                State(state.clone()),
+                Json(auth::DevicePollRequest { code: code.code }),
+            )
+            .await
+            .unwrap()
+            .0,
+            auth::DevicePollResponse::Success { .. }
+        ));
+        assert_ne!(last_login(&state, &signup.user_id).await.unwrap(), OLD_LOGIN);
+
+        seed_old_login(&state, &signup.user_id).await;
+        let Json(code) = auth::device_code(State(state.clone())).await;
+        state.device_codes.get_mut(&code.code).unwrap().user_id =
+            Some(Uuid::parse_str(&signup.user_id).unwrap());
+        state
+            .db
+            .update_cluster_user_status(
+                &signup.user_id,
+                &signup.user_id,
+                crate::db::AccountStatus::Suspended,
+            )
+            .await
+            .unwrap();
+        assert!(auth::login(
+            State(state.clone()),
+            web_request("correct horse battery staple"),
+        )
+        .await
+        .is_err());
+        assert!(auth::device_poll(
+            State(state.clone()),
+            Json(auth::DevicePollRequest { code: code.code }),
+        )
+        .await
+        .is_err());
+        assert_eq!(
+            last_login(&state, &signup.user_id).await.as_deref(),
+            Some(OLD_LOGIN)
+        );
     }
 
     #[test]

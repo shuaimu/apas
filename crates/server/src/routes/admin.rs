@@ -228,22 +228,17 @@ pub async fn update_user(
             .update_cluster_user_status(actor_id, &target_user_id, status)
             .await
             .map_err(|error| AppError::BadRequest(error.to_string()))?;
+        crate::jobs::reconcile_authority(&state).await?;
         if status == AccountStatus::Suspended {
             state.sessions.disconnect_user(&target_user_id).await;
         }
     }
     let user = state
         .db
-        .get_user_by_id(&target_user_id)
+        .get_cluster_user(&target_user_id)
         .await?
         .ok_or_else(|| AppError::NotFound("Cluster account not found".to_string()))?;
-    Ok(Json(ClusterUserSummary {
-        id: user.id,
-        email: user.email,
-        cluster_role: user.cluster_role,
-        account_status: user.account_status,
-        created_at: user.created_at,
-    }))
+    Ok(Json(user))
 }
 
 /// Every virtual cluster in the deployment. A cluster is derived, not stored,
@@ -363,6 +358,7 @@ pub async fn remove_project_member(
         .db
         .remove_project_member(actor_id, &project_id, &user_id)
         .await?;
+    crate::jobs::reconcile_authority(&state).await?;
     Ok(Json(serde_json::json!({ "success": removed })))
 }
 
@@ -384,6 +380,7 @@ pub async fn transfer_owner(
         .transfer_project_ownership(actor_id, &project_id, &request.user_id)
         .await
         .map_err(|error| AppError::BadRequest(error.to_string()))?;
+    crate::jobs::reconcile_authority(&state).await?;
     Ok(Json(serde_json::json!({ "success": changed })))
 }
 
@@ -410,8 +407,10 @@ pub async fn update_lifecycle(
         .set_project_lifecycle(actor_id, &project_id, lifecycle)
         .await?;
     if lifecycle == ProjectLifecycle::Suspended {
+        crate::jobs::cancel_project_jobs(&state, &project_id, "project_suspended").await?;
         state.sessions.stop_project_runtime(&project_id).await;
     }
+    crate::jobs::reconcile_authority(&state).await?;
     Ok(Json(
         serde_json::json!({ "success": changed, "status": lifecycle.as_str() }),
     ))
@@ -424,6 +423,7 @@ pub async fn stop_runtime(
 ) -> Result<Json<serde_json::Value>, AppError> {
     require_system_admin(&headers, &state).await?;
     let actor_id = SYSTEM_ADMIN_ACTOR;
+    crate::jobs::cancel_project_jobs(&state, &project_id, "project_stopped").await?;
     let stopped = state.sessions.stop_project_runtime(&project_id).await;
     state
         .db
@@ -464,6 +464,7 @@ pub async fn update_policy(
         )
         .await
         .map_err(|error| AppError::BadRequest(error.to_string()))?;
+    crate::jobs::reconcile_authority(&state).await?;
     state
         .sessions
         .broadcast_project_policy(&project_id, policy.clone())
@@ -501,6 +502,7 @@ pub async fn update_default_policy(
         )
         .await
         .map_err(|error| AppError::BadRequest(error.to_string()))?;
+    crate::jobs::reconcile_authority(&state).await?;
     // Default changes can alter effective policy for every project without an
     // override, so recalculate before fanning out to live web/CLI peers.
     for project_id in state.db.list_project_ids().await? {

@@ -1610,6 +1610,24 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                     .accept_result(cli_id, result)
                                     .await;
                             }
+                            Ok(CliToServer::OmpQuestionAnswerResult {
+                                session_id,
+                                pane_id,
+                                tool_use_id,
+                                request_id,
+                                accepted,
+                                pending,
+                                error,
+                            }) => {
+                                if state.sessions.get_session(&session_id)
+                                    .is_some_and(|session| session.cli_client_id == Some(cli_id))
+                                {
+                                    state.sessions.finish_omp_answer(
+                                        session_id, pane_id, cli_id, &tool_use_id, &request_id,
+                                        crate::session::OmpAnswerReceipt { accepted, pending, error },
+                                    );
+                                }
+                            }
                             Ok(CliToServer::ProjectPolicySnapshot {
                                 session_id,
                                 team_enabled,
