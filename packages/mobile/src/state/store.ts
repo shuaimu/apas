@@ -9,12 +9,14 @@ import {
   type PaneConfig,
   type PaneWorkSummary,
   type ServerToWeb,
+  type SessionInstanceInfo,
 } from "@apas/protocol";
 
 import { paneStatusIsWorking } from "./paneStatus";
 
 export type ConnectionPhase = "offline" | "connecting" | "authenticating" | "synchronizing" | "ready";
 export const PANE_WORK_SUMMARY_CAPABILITY = "pane_work_summary_v1";
+export const PROJECT_INSTANCES_CAPABILITY = "project_instances_v1";
 
 export type PaneWorkSummaryAvailability = NonNullable<Extract<ServerToWeb, {
   type: "pane_work_summaries";
@@ -46,6 +48,7 @@ interface MobileState {
   eventsBySession: Record<string, CodeEvent[]>;
   panesBySession: Record<string, PaneConfig[]>;
   paneStatusesBySession: Record<string, Record<string, string>>;
+  instancesBySession: Record<string, SessionInstanceInfo[]>;
   negotiatedCapabilities: string[];
   paneWorkSummaries: Record<string, PaneWorkSummaryCache>;
   visibleSummaryPane: VisibleSummaryPane | null;
@@ -65,6 +68,7 @@ interface MobileState {
   setPanes: (sessionId: string, panes: PaneConfig[]) => void;
   setPaneStatus: (sessionId: string, paneId: number, status: string | null | undefined) => void;
   setSessionActive: (sessionId: string, active: boolean) => void;
+  setSessionInstances: (sessionId: string, instances: SessionInstanceInfo[]) => void;
   beginPaneWorkSummaryRequest: (sessionId: string, paneId: number) => void;
   setPaneWorkSummaryError: (sessionId: string, paneId: number, error: string | null) => void;
   replacePaneWorkSummaries: (
@@ -107,6 +111,7 @@ const initialState = {
   eventsBySession: {} as Record<string, CodeEvent[]>,
   panesBySession: {} as Record<string, PaneConfig[]>,
   paneStatusesBySession: {} as Record<string, Record<string, string>>,
+  instancesBySession: {} as Record<string, SessionInstanceInfo[]>,
   negotiatedCapabilities: [] as string[],
   paneWorkSummaries: {} as Record<string, PaneWorkSummaryCache>,
   visibleSummaryPane: null as VisibleSummaryPane | null,
@@ -137,6 +142,10 @@ export const useMobileStore = create<MobileState>((set) => ({
         paneStatusesBySession: Object.fromEntries(
           Object.entries(state.paneStatusesBySession).filter(([sessionId]) => allowed.has(sessionId)),
         ),
+        // Each bootstrap session carries its own instance set, which is newer
+        // than anything pushed before this synchronization. Attaching again
+        // brings the live set back for every session that still has one.
+        instancesBySession: {},
         paneWorkSummaries: Object.fromEntries(
           Object.entries(state.paneWorkSummaries).filter(([key]) => allowed.has(summarySessionId(key))),
         ),
@@ -210,6 +219,10 @@ export const useMobileStore = create<MobileState>((set) => ({
         paneStatusesBySession,
       };
     }),
+  setSessionInstances: (sessionId, instances) =>
+    set((state) => state.sessions.some((session) => session.id === sessionId)
+      ? { instancesBySession: { ...state.instancesBySession, [sessionId]: instances } }
+      : state),
   beginPaneWorkSummaryRequest: (sessionId, paneId) =>
     set((state) => {
       const key = paneWorkSummaryKey(sessionId, paneId);

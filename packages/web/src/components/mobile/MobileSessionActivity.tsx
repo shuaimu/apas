@@ -33,6 +33,21 @@ import {
 import {
   unconfirmedDeliveries,
 } from "@/lib/terminalDelivery";
+import { instancesNegotiated, selectSessionInstances } from "@/lib/projectInstances";
+import { buildMachineChoices, sessionCanCloneJoin, type MachineChoice } from "@/lib/machineChoice";
+import {
+  cloneHereCopy,
+  cloneInstanceName,
+  describeTabHosts,
+  forgetMachineTabsCopy,
+  groupMachineChoices,
+  machineChoiceDetail,
+  projectHostLabel,
+  sessionIsOwned,
+  tabHostStateLabel,
+  type ConfirmationCopy,
+} from "@/lib/tabHosts";
+import { AddPaneLaunches } from "@/components/tabs/AddPaneLaunches";
 import { MobileProjectManageSheet } from "./MobileProjectManageSheet";
 import { MobilePaneWorkSummarySheet } from "./MobilePaneWorkSummarySheet";
 import { MobileTerminalKeyBar } from "./MobileTerminalKeyBar";
@@ -321,6 +336,13 @@ export function MobileSessionActivity({ connected, onBack, onReconnect }: Mobile
   const reject = useStore((state) => state.reject);
   const answerPlanReview = useStore((state) => state.answerPlanReview);
   const addPane = useStore((state) => state.addPane);
+  const cloneAndAddPane = useStore((state) => state.cloneAndAddPane);
+  const dismissAddPaneRequest = useStore((state) => state.dismissAddPaneRequest);
+  const forgetMachinePanes = useStore((state) => state.forgetMachinePanes);
+  const addPaneRequests = useStore((state) => state.addPaneRequests);
+  const instances = useStore((state) => selectSessionInstances(state, state.sessionId));
+  const instancesSupported = useStore(instancesNegotiated);
+  const showToast = useStore((state) => state.showToast);
   const startMachineProjectCli = useStore((state) => state.startMachineProjectCli);
   const summarySupported = useStore((state) => state.negotiatedCapabilities.has("pane_work_summary_v1"));
 
@@ -340,6 +362,11 @@ export function MobileSessionActivity({ connected, onBack, onReconnect }: Mobile
   const [closeTarget, setCloseTarget] = useState<PaneConfig | null>(null);
   const [rebootTarget, setRebootTarget] = useState<PaneConfig | null>(null);
   const [openProjectTarget, setOpenProjectTarget] = useState<MachineProjectTarget | null>(null);
+  // The new-agent sheet's machine step, and the two confirmations that act on
+  // a machine rather than a pane.
+  const [machineKey, setMachineKey] = useState<string | null>(null);
+  const [cloneTarget, setCloneTarget] = useState<{ choice: MachineChoice; option: LaunchOption; copy: ConfirmationCopy } | null>(null);
+  const [forgetTarget, setForgetTarget] = useState<{ machineId: string; hostname: string; copy: ConfirmationCopy } | null>(null);
   // Messages written into the pty that the provider has not recorded back.
   const pendingDeliveries = useStore((state) => state.pendingTerminalDeliveries);
   const dismissTerminalDelivery = useStore((state) => state.dismissTerminalDelivery);
@@ -362,6 +389,43 @@ export function MobileSessionActivity({ connected, onBack, onReconnect }: Mobile
   const sessionIsRunning = session?.isActive ?? isAttached;
   const renameTargetExists = renameTarget !== null
     && paneConfigs.some((pane) => pane.pane_id === renameTarget.pane_id);
+
+  // Where each pane runs, and why one cannot be used: its machine is not
+  // running the project, or this viewer may not use that machine. The same
+  // rules the desktop tab bar applies.
+  const tabHosts = useMemo(() => describeTabHosts({
+    panes: paneConfigs,
+    instances,
+    machines,
+    instancesSupported,
+    projectIds: [session?.projectId, sessionId].filter((id): id is string => Boolean(id)),
+    isOwner: sessionIsOwned(session),
+  }), [instances, instancesSupported, machines, paneConfigs, session, sessionId]);
+  const selectedHost = selectedPaneId === null ? undefined : tabHosts.tabs.get(selectedPaneId);
+  const selectedRefusal = selectedHost?.refusal;
+  const machineChoices = useMemo(() => buildMachineChoices({
+    projectId: session?.projectId ?? sessionId ?? "",
+    instances,
+    machines,
+    instancesSupported,
+    canClone: sessionCanCloneJoin(session),
+    selectedPane: selectedPane ?? null,
+    fallbackMachineId: machineProjectTarget?.machineId,
+  }), [instances, instancesSupported, machineProjectTarget?.machineId, machines, selectedPane, session, sessionId]);
+  // The user's pick, else the default (the selected pane's machine), derived
+  // so a default that arrives while the sheet is open still counts. A pick
+  // that disappears while the sheet is open (an instance detaches) is no pick.
+  const selectedMachineKey = machineKey ?? machineChoices.defaultChoice?.key ?? null;
+  const selectedMachine = machineChoices.showChoice
+    ? machineChoices.choices.find((choice) => choice.key === selectedMachineKey && !choice.disabledReason)
+    : undefined;
+  const needsMachine = machineChoices.showChoice && !selectedMachine;
+  const launches = useMemo(
+    () => Object.values(addPaneRequests)
+      .filter((request) => request.sessionId === sessionId)
+      .sort((a, b) => a.startedAt - b.startedAt),
+    [addPaneRequests, sessionId],
+  );
 
   useEffect(() => {
     if (sessionId) loadSessionActivity(sessionId);
@@ -535,6 +599,10 @@ export function MobileSessionActivity({ connected, onBack, onReconnect }: Mobile
       setActionError("Reconnect to the active session before sending a message.");
       return;
     }
+    if (selectedRefusal) {
+      setActionError(selectedRefusal);
+      return;
+    }
     if (selectedPane?.kind === "terminal") {
       const result = sendTerminalConversationMessage(selectedPaneId, followUp);
       if (!result.success) {
@@ -555,6 +623,25 @@ export function MobileSessionActivity({ connected, onBack, onReconnect }: Mobile
   };
 
   const createPane = (option: LaunchOption) => {
+    // The machine step's pick, else the default (the selected pane's
+    // machine). The default is sent even when the step is hidden: it may be a
+    // registered machine that the server starts before adding the pane.
+    const target = selectedMachine ?? machineChoices.defaultChoice;
+    if (target?.kind === "clone") {
+      // Cloning onto a machine is confirmed on its own sheet first.
+      const gitRemote = session?.gitRemote;
+      setNewPaneOpen(false);
+      if (!gitRemote) {
+        setActionError("This project has no repository to clone.");
+        return;
+      }
+      setCloneTarget({ choice: target, option, copy: cloneHereCopy(target.hostname, gitRemote) });
+      return;
+    }
+    if (!target && machineChoices.showChoice) {
+      setActionError("Choose where the new agent runs.");
+      return;
+    }
     const ordinal = paneConfigs.length + 1;
     const result = addPane(
       option.provider,
@@ -566,6 +653,7 @@ export function MobileSessionActivity({ connected, onBack, onReconnect }: Mobile
       undefined,
       false,
       option.kind,
+      target?.machineId,
     );
     if (!result.success) {
       setActionError(result.error || "The pane could not be created.");
@@ -574,6 +662,49 @@ export function MobileSessionActivity({ connected, onBack, onReconnect }: Mobile
     }
     setActionError(null);
     setNewPaneOpen(false);
+  };
+
+  const confirmClone = () => {
+    if (!cloneTarget) return;
+    const { choice, option } = cloneTarget;
+    setCloneTarget(null);
+    const gitRemote = session?.gitRemote;
+    if (!choice.machineId || !gitRemote) {
+      setActionError("This project has no repository to clone.");
+      return;
+    }
+    const result = cloneAndAddPane(
+      {
+        machineId: choice.machineId,
+        gitRemote,
+        instanceName: cloneInstanceName(gitRemote),
+        cloneUrl: session?.gitRemoteUrl,
+      },
+      {
+        provider: option.provider,
+        mode: "interactive",
+        label: `${option.label} ${paneConfigs.length + 1}`,
+        model: option.model,
+        isolatedWorktree: false,
+        managed: false,
+        kind: option.kind,
+      },
+    );
+    setActionError(result.success ? null : result.error || "The clone could not be requested.");
+  };
+
+  // Start on <host> starts that machine only, as the Machines page's Start
+  // does; the project's other machines are untouched.
+  const startOnMachine = (machineId: string, projectId: string, hostname: string) => {
+    startMachineProjectCli(machineId, projectId);
+    setActionError(null);
+    showToast(`Starting this project on ${hostname}…`, "info");
+  };
+
+  const confirmForget = () => {
+    if (!forgetTarget || !sessionId) return;
+    forgetMachinePanes(sessionId, forgetTarget.machineId);
+    setForgetTarget(null);
   };
 
   const dismissRename = () => {
@@ -616,7 +747,9 @@ export function MobileSessionActivity({ connected, onBack, onReconnect }: Mobile
     && machineProjectTarget !== null
     && !machineProjectTarget.isRunning;
   const canCompose = selectedPaneId !== null && !selectedIsBot;
-  const canSend = canCompose && connected && sessionIsRunning;
+  const canSend = canCompose && connected && sessionIsRunning && !selectedRefusal;
+  const hostLabel = projectHostLabel(instances, session.hostname);
+  const stoppedActions = selectedHost?.stopped;
   const projectId = (session.projectId !== session.id ? session.projectId : undefined)
     ?? machineProjectTarget?.projectId ?? session.projectId;
   const projectContext = projectId ? {
@@ -656,9 +789,22 @@ export function MobileSessionActivity({ connected, onBack, onReconnect }: Mobile
                 : paneStatus
                   ? " · working"
                   : "";
+              // The pane's machine, once the project spans machines or the
+              // pane cannot be used there.
+              const host = tabHosts.tabs.get(pane.pane_id);
               return (
-                <button key={pane.pane_id} type="button" aria-pressed={selected} onClick={() => { workspace.selectInteractive(); selectPane(pane.pane_id); }} className={`min-h-11 shrink-0 rounded-full border px-3 py-1.5 text-xs font-bold ${selected ? "border-[#6d5efc] text-[#6d5efc]" : "border-[#dedee7] text-[#686873] dark:border-[#383842] dark:text-[#aaaab6]"}`}>
-                  {paneLabel(pane)}{statusSuffix}
+                <button key={pane.pane_id} type="button" aria-pressed={selected} title={host?.refusal} onClick={() => { workspace.selectInteractive(); selectPane(pane.pane_id); }} className={`min-h-11 shrink-0 rounded-full border px-3 py-1.5 text-xs font-bold ${selected ? "border-[#6d5efc] text-[#6d5efc]" : "border-[#dedee7] text-[#686873] dark:border-[#383842] dark:text-[#aaaab6]"} ${host?.refusal && !selected ? "opacity-60" : ""}`}>
+                  {paneLabel(pane)}
+                  {host?.badge && host.hostname && (
+                    <>
+                      {" · "}
+                      <span className="font-normal">
+                        {host.hostname}
+                        {host.state !== "running" && ` (${tabHostStateLabel(host.state)})`}
+                      </span>
+                    </>
+                  )}
+                  {statusSuffix}
                 </button>
               );
             }) : (
@@ -666,7 +812,7 @@ export function MobileSessionActivity({ connected, onBack, onReconnect }: Mobile
             )}
             {workspace.tabs}
           </div>
-          <button type="button" aria-label="Add agent" onClick={() => { setInteractiveCreation(false); setNewPaneOpen(true); }} className="inline-flex h-11 w-11 shrink-0 items-center justify-center rounded-full bg-[#6d5efc] text-white"><Plus className="h-4 w-4" /></button>
+          <button type="button" aria-label="Add agent" onClick={() => { setInteractiveCreation(false); setMachineKey(null); setNewPaneOpen(true); }} className="inline-flex h-11 w-11 shrink-0 items-center justify-center rounded-full bg-[#6d5efc] text-white"><Plus className="h-4 w-4" /></button>
           {!workspace.active && <button type="button" aria-label="More actions" onClick={() => setMoreOpen(true)} className="-mr-2 flex h-11 w-11 shrink-0 items-center justify-center rounded-lg text-[#686873] hover:bg-[#efeff5] dark:text-[#aaaab6] dark:hover:bg-[#25252d]"><MoreVertical className="h-5 w-5" /></button>}
         </div>
 
@@ -677,8 +823,8 @@ export function MobileSessionActivity({ connected, onBack, onReconnect }: Mobile
               the screen keeps a heading that names one thing. */}
           <div className="flex min-w-0 flex-1 items-baseline gap-1.5">
             <h1 className="shrink-0 max-w-[55%] truncate text-sm font-bold">{projectName}</h1>
-            <span className="min-w-0 flex-1 truncate text-xs text-[#686873] dark:text-[#aaaab6]">
-              {session.hostname || session.workingDir || "Unknown target"}
+            <span className="min-w-0 flex-1 truncate text-xs text-[#686873] dark:text-[#aaaab6]" title={hostLabel.title}>
+              {hostLabel.text || session.workingDir || "Unknown target"}
             </span>
           </div>
           <span className={`shrink-0 rounded-full px-2.5 py-1 text-[0.68rem] font-extrabold ${session.isActive ? "bg-emerald-100 text-emerald-700 dark:bg-emerald-950/60 dark:text-emerald-300" : "bg-[#efeff5] text-[#686873] dark:bg-[#25252d] dark:text-[#aaaab6]"}`}>
@@ -688,6 +834,51 @@ export function MobileSessionActivity({ connected, onBack, onReconnect }: Mobile
       </div>
 
       {actionError && <div className="mx-4 mt-3 flex shrink-0 items-center gap-2 rounded-xl border border-red-300 bg-red-50 px-3 py-2 text-xs text-red-700 dark:border-red-900 dark:bg-red-950/40 dark:text-red-300"><AlertTriangle className="h-4 w-4 shrink-0" /> {actionError}</div>}
+
+      {/* The selected pane belongs to a machine that is not running the
+          project, or that this viewer may not use. Its history still reads;
+          say which machine it needs and offer it. */}
+      {selectedRefusal && !workspace.active && !terminalIsOpen && (
+        <div role="status" className="mx-4 mt-3 shrink-0 rounded-xl border border-amber-300 bg-amber-50 px-3 py-2 text-xs text-amber-900 dark:border-amber-900 dark:bg-amber-950/40 dark:text-amber-200">
+          <p className="flex items-start gap-2"><AlertTriangle aria-hidden="true" className="mt-px h-4 w-4 shrink-0" /> {selectedRefusal}</p>
+          {(stoppedActions?.canStart || stoppedActions?.canForget) && (
+            <div className="mt-2 flex flex-wrap gap-2">
+              {stoppedActions.canStart && (
+                <button
+                  type="button"
+                  disabled={!connected || Boolean(stoppedActions.startDisabledReason) || !stoppedActions.projectId}
+                  title={stoppedActions.startDisabledReason}
+                  onClick={() => {
+                    if (stoppedActions.projectId) startOnMachine(stoppedActions.machineId, stoppedActions.projectId, stoppedActions.hostname);
+                  }}
+                  className="min-h-11 rounded-xl bg-[#6d5efc] px-3 py-2 text-xs font-bold text-white disabled:opacity-40"
+                >
+                  Start on {stoppedActions.hostname}
+                </button>
+              )}
+              {stoppedActions.canForget && (
+                <button
+                  type="button"
+                  disabled={!connected}
+                  onClick={() => setForgetTarget({
+                    machineId: stoppedActions.machineId,
+                    hostname: stoppedActions.hostname,
+                    copy: forgetMachineTabsCopy(stoppedActions.hostname),
+                  })}
+                  className="min-h-11 rounded-xl border border-amber-300 px-3 py-2 text-xs font-bold disabled:opacity-40 dark:border-amber-800"
+                >
+                  Forget {stoppedActions.hostname}&apos;s tabs
+                </button>
+              )}
+            </div>
+          )}
+          {stoppedActions?.canStart && stoppedActions.startDisabledReason && (
+            <p className="mt-1.5">{stoppedActions.startDisabledReason}</p>
+          )}
+        </div>
+      )}
+
+      <AddPaneLaunches launches={launches} onDismiss={dismissAddPaneRequest} variant="mobile" />
 
       {workspace.content}
       {retainedTerminal && (
@@ -793,6 +984,7 @@ export function MobileSessionActivity({ connected, onBack, onReconnect }: Mobile
         {connected && selectedStatus && <div role="status" aria-live="polite" className={`mb-1.5 flex w-fit max-w-full items-center gap-1.5 rounded-full px-2.5 py-1 text-xs font-bold ${selectedIsAwaitingAnswer ? "bg-amber-100 text-amber-800 dark:bg-amber-950/60 dark:text-amber-200" : "bg-[#eeecff] text-[#5b4de0] dark:bg-[#292452] dark:text-[#c8c1ff]"}`}>{selectedIsAwaitingAnswer ? <AlertTriangle aria-hidden="true" className="h-3.5 w-3.5 shrink-0" /> : <LoaderCircle aria-hidden="true" className="h-3.5 w-3.5 shrink-0 animate-spin" />}<span className="truncate">{selectedStatus}</span></div>}
         {!connected && canCompose && <p className="mb-1.5 text-[11px] text-amber-700 dark:text-amber-300">You can keep drafting while offline. Reconnect to send.</p>}
         {connected && !sessionIsRunning && canCompose && <p className="mb-1.5 text-[11px] text-amber-700 dark:text-amber-300">You can draft a message, but this project must be running before it can be sent.</p>}
+        {connected && sessionIsRunning && canCompose && selectedRefusal && <p className="mb-1.5 text-[11px] text-amber-700 dark:text-amber-300">You can draft a message, but it cannot be sent: {selectedRefusal}</p>}
         <div className="flex items-end gap-2">
           <textarea value={followUp} onChange={(event) => setFollowUp(event.target.value)} rows={2} placeholder={selectedIsBot ? "Stop the bot before steering it" : selectedIsTerminal ? "Message this terminal conversation" : "Steer this session and pane"} disabled={!canCompose} className="min-h-[2.75rem] flex-1 resize-none rounded-xl border border-[#dedee7] bg-white px-3 py-2 text-sm outline-none focus:border-[#6d5efc] disabled:opacity-50 dark:border-[#383842] dark:bg-[#1b1b21]" />
           <button type="button" aria-label={selectedIsTerminal ? "Send conversation message" : "Send follow-up"} disabled={!canSend || !followUp.trim()} onClick={sendFollowUp} className="flex h-11 w-11 shrink-0 items-center justify-center rounded-xl bg-[#6d5efc] text-white disabled:opacity-40"><Send className="h-5 w-5" /></button>
@@ -809,8 +1001,38 @@ export function MobileSessionActivity({ connected, onBack, onReconnect }: Mobile
               <button type="button" disabled={!workspace.addAutonomous} onClick={() => { persistActivityScroll(); setNewPaneOpen(false); workspace.addAutonomous?.(); }} className="min-h-11 w-full rounded-2xl border border-[#dedee7] bg-white p-3.5 text-left disabled:opacity-50 dark:border-[#383842] dark:bg-[#1b1b21]"><span className="block font-bold">Autonomous agent</span><span className="mt-1 block text-sm">{workspace.unavailableReason || "Review a bounded task, worker readiness and limits."}</span></button>
             </div> : <>
             <button type="button" onClick={() => setInteractiveCreation(false)} className="mt-2 min-h-11 text-sm font-bold text-[#6d5efc]">Back to agent types</button>
+            {/* Where the agent runs, when there is a real choice: the same
+                choices, groups and reasons as the desktop new-tab menu. */}
+            {machineChoices.showChoice && (
+              <fieldset className="mt-3">
+                <legend className="text-sm font-bold">Run on</legend>
+                {groupMachineChoices(machineChoices.choices).map((group) => (
+                  <div key={group.key} role="group" aria-label={group.label} className="mt-2 space-y-2">
+                    <p aria-hidden="true" className="text-[0.68rem] font-extrabold uppercase tracking-wide text-[#686873] dark:text-[#aaaab6]">{group.label}</p>
+                    {group.choices.map((choice) => (
+                      <label key={choice.key} title={choice.disabledReason} className={`flex min-h-11 items-start gap-3 rounded-2xl border p-3 ${selectedMachineKey === choice.key && !choice.disabledReason ? "border-[#6d5efc]" : "border-[#dedee7] dark:border-[#383842]"} bg-white dark:bg-[#1b1b21] ${choice.disabledReason ? "opacity-50" : ""}`}>
+                        <input
+                          type="radio"
+                          name="mobile-new-agent-machine"
+                          value={choice.key}
+                          checked={selectedMachineKey === choice.key}
+                          disabled={Boolean(choice.disabledReason)}
+                          onChange={() => setMachineKey(choice.key)}
+                          className="mt-1 h-4 w-4 shrink-0 accent-[#6d5efc]"
+                        />
+                        <span className="min-w-0">
+                          <span className="block truncate font-bold">{choice.hostname}</span>
+                          <span className="mt-0.5 block text-xs text-[#686873] dark:text-[#aaaab6]">{machineChoiceDetail(choice)}</span>
+                        </span>
+                      </label>
+                    ))}
+                  </div>
+                ))}
+              </fieldset>
+            )}
+            {needsMachine && <p className="mt-3 text-xs text-[#686873] dark:text-[#aaaab6]">Choose where the agent runs first.</p>}
             <div className="mt-4 space-y-2">
-              {launchOptions.map((option) => <button key={option.key} type="button" onClick={() => { workspace.selectInteractive(); createPane(option); }} className="flex w-full items-center justify-between rounded-2xl border border-[#dedee7] bg-white p-3.5 text-left dark:border-[#383842] dark:bg-[#1b1b21]"><span><span className="block font-bold">{option.label}</span><span className="mt-0.5 block text-xs text-[#686873] dark:text-[#aaaab6]">{option.kind === "terminal" ? "Interactive TUI" : "Coding activity pane"}</span></span><Plus className="h-5 w-5 text-[#6d5efc]" /></button>)}
+              {launchOptions.map((option) => <button key={option.key} type="button" disabled={needsMachine} onClick={() => { workspace.selectInteractive(); createPane(option); }} className="flex w-full items-center justify-between rounded-2xl border border-[#dedee7] bg-white p-3.5 text-left disabled:opacity-40 dark:border-[#383842] dark:bg-[#1b1b21]"><span><span className="block font-bold">{option.label}</span><span className="mt-0.5 block text-xs text-[#686873] dark:text-[#aaaab6]">{option.kind === "terminal" ? "Interactive TUI" : "Coding activity pane"}</span></span><Plus className="h-5 w-5 text-[#6d5efc]" /></button>)}
               {launchOptions.length === 0 && <div className="rounded-2xl border border-[#dedee7] bg-white p-4 text-sm text-[#686873] dark:border-[#383842] dark:bg-[#1b1b21] dark:text-[#aaaab6]">Waiting for the project's launch policy, or no profiles are currently allowed.</div>}
             </div>
             </>}
@@ -859,16 +1081,16 @@ export function MobileSessionActivity({ connected, onBack, onReconnect }: Mobile
               <button
                 type="button"
                 aria-label="Rename conversation"
-                disabled={!selectedPane || !connected || !sessionIsRunning}
+                disabled={!selectedPane || !connected || !sessionIsRunning || Boolean(selectedRefusal)}
                 title={!selectedPane
                   ? "Select a pane to rename its conversation"
                   : !connected
                     ? "Reconnect before renaming this conversation"
                     : !sessionIsRunning
                       ? "Open this project before renaming its conversation"
-                      : "Rename this conversation"}
+                      : selectedRefusal ?? "Rename this conversation"}
                 onClick={() => {
-                  if (!selectedPane || !connected || !sessionIsRunning) return;
+                  if (!selectedPane || !connected || !sessionIsRunning || selectedRefusal) return;
                   setMoreOpen(false);
                   setRenameTarget(selectedPane);
                   setRenameDraft(paneLabel(selectedPane));
@@ -877,8 +1099,8 @@ export function MobileSessionActivity({ connected, onBack, onReconnect }: Mobile
               >
                 <Pencil className="h-5 w-5 shrink-0 text-[#686873] dark:text-[#aaaab6]" /> Rename conversation
               </button>
-              <button type="button" aria-label="Reboot this pane" disabled={!selectedPane} onClick={() => { setMoreOpen(false); setRebootTarget(selectedPane ?? null); }} className="flex w-full items-center gap-3 rounded-2xl border border-[#dedee7] bg-white p-3.5 text-left font-bold disabled:opacity-40 dark:border-[#383842] dark:bg-[#1b1b21]"><RotateCcw className="h-5 w-5 shrink-0 text-[#686873] dark:text-[#aaaab6]" /> Reboot this pane</button>
-              <button type="button" aria-label="Close this pane" disabled={!selectedPane} onClick={() => { setMoreOpen(false); setCloseTarget(selectedPane ?? null); }} className="flex w-full items-center gap-3 rounded-2xl border border-red-200 bg-white p-3.5 text-left font-bold text-red-700 disabled:opacity-40 dark:border-red-900 dark:bg-[#1b1b21] dark:text-red-300"><Trash2 className="h-5 w-5 shrink-0" /> Close this pane</button>
+              <button type="button" aria-label="Reboot this pane" disabled={!selectedPane || Boolean(selectedRefusal)} title={selectedRefusal} onClick={() => { setMoreOpen(false); setRebootTarget(selectedPane ?? null); }} className="flex w-full items-center gap-3 rounded-2xl border border-[#dedee7] bg-white p-3.5 text-left font-bold disabled:opacity-40 dark:border-[#383842] dark:bg-[#1b1b21]"><RotateCcw className="h-5 w-5 shrink-0 text-[#686873] dark:text-[#aaaab6]" /> Reboot this pane</button>
+              <button type="button" aria-label="Close this pane" disabled={!selectedPane || Boolean(selectedRefusal)} title={selectedRefusal} onClick={() => { setMoreOpen(false); setCloseTarget(selectedPane ?? null); }} className="flex w-full items-center gap-3 rounded-2xl border border-red-200 bg-white p-3.5 text-left font-bold text-red-700 disabled:opacity-40 dark:border-red-900 dark:bg-[#1b1b21] dark:text-red-300"><Trash2 className="h-5 w-5 shrink-0" /> Close this pane</button>
               {/* Different scope from the four above, and the only place it can
                   live: project management is per-project, so there is no
                   session-independent screen to move it to. */}
@@ -937,15 +1159,53 @@ export function MobileSessionActivity({ connected, onBack, onReconnect }: Mobile
           <div role="dialog" aria-modal="true" aria-label={`Open ${projectName}`} onClick={(event) => event.stopPropagation()} className="w-full rounded-t-[1.4rem] border-t border-[#dedee7] bg-[#f7f7fa] p-4 pb-[max(1rem,env(safe-area-inset-bottom))] shadow-2xl dark:border-[#383842] dark:bg-[#111115]">
             <h2 className="text-lg font-extrabold">Open {projectName}?</h2>
             <p className="mt-1.5 text-sm leading-5 text-[#686873] dark:text-[#aaaab6]">
-              Its APAS process starts on {session.hostname || "the selected host"}, and its saved panes become available again.
+              {/* Opening the project starts every machine that has its tabs,
+                  not only the one this screen names. */}
+              {tabHosts.spansMachines
+                ? "Its APAS process starts on each online machine that has its tabs, and their saved panes become available again."
+                : `Its APAS process starts on ${session.hostname || "the selected host"}, and its saved panes become available again.`}
             </p>
             <div className="mt-4 flex gap-2.5">
               <button type="button" onClick={() => setOpenProjectTarget(null)} className="flex-1 rounded-xl border border-[#dedee7] px-4 py-2.5 text-sm font-bold dark:border-[#383842]">Cancel</button>
               <button type="button" onClick={() => {
-                startMachineProjectCli(openProjectTarget.machineId, openProjectTarget.projectId);
+                startMachineProjectCli(
+                  openProjectTarget.machineId,
+                  openProjectTarget.projectId,
+                  { allInstances: true },
+                );
                 setOpenProjectTarget(null);
                 setActionError(null);
               }} className="flex-1 rounded-xl bg-[#6d5efc] px-4 py-2.5 text-sm font-bold text-white">Open project</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {cloneTarget && (
+        <div className="fixed inset-0 z-[96] flex items-end bg-black/45" onClick={() => setCloneTarget(null)}>
+          <div role="dialog" aria-modal="true" aria-label={cloneTarget.copy.title} onClick={(event) => event.stopPropagation()} className="w-full rounded-t-[1.4rem] border-t border-[#dedee7] bg-[#f7f7fa] p-4 pb-[max(1rem,env(safe-area-inset-bottom))] shadow-2xl dark:border-[#383842] dark:bg-[#111115]">
+            <h2 className="text-lg font-extrabold">{cloneTarget.copy.title}</h2>
+            {cloneTarget.copy.body.map((paragraph) => (
+              <p key={paragraph} className="mt-1.5 break-words text-sm leading-5 text-[#686873] dark:text-[#aaaab6]">{paragraph}</p>
+            ))}
+            <div className="mt-4 flex gap-2.5">
+              <button type="button" onClick={() => setCloneTarget(null)} className="flex-1 rounded-xl border border-[#dedee7] px-4 py-2.5 text-sm font-bold dark:border-[#383842]">Cancel</button>
+              <button type="button" disabled={!connected} onClick={confirmClone} className="flex-1 rounded-xl bg-[#6d5efc] px-4 py-2.5 text-sm font-bold text-white disabled:opacity-40">Clone and start</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {forgetTarget && (
+        <div className="fixed inset-0 z-[96] flex items-end bg-black/45" onClick={() => setForgetTarget(null)}>
+          <div role="dialog" aria-modal="true" aria-label={forgetTarget.copy.title} onClick={(event) => event.stopPropagation()} className="w-full rounded-t-[1.4rem] border-t border-[#dedee7] bg-[#f7f7fa] p-4 pb-[max(1rem,env(safe-area-inset-bottom))] shadow-2xl dark:border-[#383842] dark:bg-[#111115]">
+            <h2 className="text-lg font-extrabold">{forgetTarget.copy.title}</h2>
+            {forgetTarget.copy.body.map((paragraph) => (
+              <p key={paragraph} className="mt-1.5 text-sm leading-5 text-[#686873] dark:text-[#aaaab6]">{paragraph}</p>
+            ))}
+            <div className="mt-4 flex gap-2.5">
+              <button type="button" onClick={() => setForgetTarget(null)} className="flex-1 rounded-xl border border-[#dedee7] px-4 py-2.5 text-sm font-bold dark:border-[#383842]">Cancel</button>
+              <button type="button" disabled={!connected} onClick={confirmForget} className="flex-1 rounded-xl bg-red-600 px-4 py-2.5 text-sm font-bold text-white disabled:opacity-40">Forget tabs</button>
             </div>
           </div>
         </div>

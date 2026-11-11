@@ -2,7 +2,7 @@
 
 import React, { useRef, useCallback, useEffect, useState, useMemo, memo } from "react";
 import dynamic from "next/dynamic";
-import { useStore, Message, PaneConfig, PaneCleanupAction, PaneKind, PlanReviewMode, PANE_ID_DEADLOOP, PANE_ID_INTERACTIVE, paneKey, type SupportedProvider } from "@/lib/store";
+import { useStore, Message, PaneConfig, PaneCleanupAction, PaneKind, PlanReviewMode, PANE_ID_DEADLOOP, PANE_ID_INTERACTIVE, paneKey, selectCliLifecycleInventory, type SupportedProvider } from "@/lib/store";
 import { useTerminalViewModes, type TerminalViewMode } from "@/lib/terminalViewMode";
 import { OverviewView } from "../overview/OverviewView";
 import { UserMessage } from "../chat/UserMessage";
@@ -21,6 +21,18 @@ import {
 } from "@/lib/providerOptions";
 import { resolveMachineProjectTarget } from "@/lib/machineProjectTarget";
 import { paneIsAwaitingAnswerStatus } from "@/lib/paneStatus";
+import { instancesNegotiated, selectSessionInstances } from "@/lib/projectInstances";
+import { buildMachineChoices, sessionCanCloneJoin, type MachineChoice } from "@/lib/machineChoice";
+import {
+  cloneHereCopy,
+  cloneInstanceName,
+  confirmationText,
+  describeTabHosts,
+  forgetMachineTabsCopy,
+  instanceRebootTargets,
+  sessionIsOwned,
+} from "@/lib/tabHosts";
+import { AddPaneLaunches } from "./AddPaneLaunches";
 
 // xterm.js touches `document` at import time, so it can't be part of the
 // server bundle. Loading it lazily also keeps the ~300 KB emulator out of
@@ -61,6 +73,7 @@ function TerminalPaneWithViews({
   onLoadMore,
   isLoading,
   hasMore,
+  disabledReason,
 }: {
   sessionId: string | null;
   paneId: number;
@@ -71,6 +84,9 @@ function TerminalPaneWithViews({
   onLoadMore: () => void;
   isLoading: boolean;
   hasMore: boolean;
+  /** Why the pane cannot take input now, e.g. its machine is not running
+   *  the project. */
+  disabledReason?: string;
 }) {
   return (
     <>
@@ -99,7 +115,7 @@ function TerminalPaneWithViews({
           />
           {/* Writes go into the pty, not through MCP — a tool server can only
               answer calls, never push a turn into a live conversation. */}
-          <TerminalChatInput paneId={paneId} />
+          <TerminalChatInput paneId={paneId} disabledReason={disabledReason} />
         </>
       )}
     </>
@@ -471,9 +487,18 @@ export function TabbedView({
   const startMachineProjectCli = useStore((s) => s.startMachineProjectCli);
   const stopMachineProjectCli = useStore((s) => s.stopMachineProjectCli);
   const rebootCli = useStore((s) => s.rebootCli);
-  const lifecycleInventory = useStore((s) =>
+  const cloneAndAddPane = useStore((s) => s.cloneAndAddPane);
+  const dismissAddPaneRequest = useStore((s) => s.dismissAddPaneRequest);
+  const forgetMachinePanes = useStore((s) => s.forgetMachinePanes);
+  const addPaneRequests = useStore((s) => s.addPaneRequests);
+  // The project's attached instances, one per machine. Selector-safe: an
+  // unchanged set keeps its identity.
+  const instances = useStore((s) => selectSessionInstances(s, s.sessionId));
+  const instancesSupported = useStore(instancesNegotiated);
+  const lifecycleInventoriesByMachine = useStore((s) =>
     s.sessionId ? s.cliLifecycleInventories[s.sessionId] : undefined,
   );
+  const lifecycleInventory = useStore((s) => selectCliLifecycleInventory(s, s.sessionId));
   const lifecycleStatus = useStore((s) => {
     if (!s.sessionId) return undefined;
     const requestId = s.cliLifecycleLatestBySession[s.sessionId];
@@ -508,6 +533,20 @@ export function TabbedView({
   const [botEffortDraft, setBotEffortDraft] = useState<string>("default");
   const [inputDrafts, setInputDrafts] = useState<Record<string, string>>({});
   const [addTabError, setAddTabError] = useState<string | null>(null);
+  const addTabErrorTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Shown in the tab bar's notice slot: a new tab that could not be sent, or
+  // a tab control refused before it was sent.
+  const showTabError = useCallback((message: string) => {
+    setAddTabError(message);
+    if (addTabErrorTimer.current) clearTimeout(addTabErrorTimer.current);
+    addTabErrorTimer.current = setTimeout(() => {
+      addTabErrorTimer.current = null;
+      setAddTabError(null);
+    }, 4000);
+  }, []);
+  useEffect(() => () => {
+    if (addTabErrorTimer.current) clearTimeout(addTabErrorTimer.current);
+  }, []);
   // 3-option cleanup dialog shown when closing a pane that owns a worktree.
   // null = closed. paneId/worktreePath populated when open.
   const [cleanupDialog, setCleanupDialog] = useState<
@@ -578,6 +617,61 @@ export function TabbedView({
     () => effectiveTabs.map((t) => t.pane_id).join(","),
     [effectiveTabs],
   );
+
+  const currentSession = useMemo(
+    () => sessions.find((item) => item.id === sessionId),
+    [sessionId, sessions],
+  );
+
+  // The machine the project view's Open and Close address. Both act on every
+  // machine with the project's tabs; this one is the fallback.
+  const bootTarget = useMemo(() => {
+    if (!sessionId) return null;
+    return resolveMachineProjectTarget(currentSession, machines);
+  }, [currentSession, machines, sessionId]);
+
+  // Where each tab runs, and why a tab cannot be used: its machine is not
+  // running the project, or this viewer may not use that machine. Empty for an
+  // older server and for a single-machine project with nothing attached, so
+  // the tab bar is then what it always was.
+  const tabHosts = useMemo(() => describeTabHosts({
+    panes: effectiveTabs,
+    instances,
+    machines,
+    instancesSupported,
+    projectIds: [currentSession?.projectId, sessionId].filter((id): id is string => Boolean(id)),
+    isOwner: sessionIsOwned(currentSession),
+  }), [currentSession, effectiveTabs, instances, instancesSupported, machines, sessionId]);
+
+  const selectedTabConfig = activeTabId != null
+    ? effectiveTabs.find((tab) => tab.pane_id === activeTabId)
+    : undefined;
+  // The new-tab menu's machine step; a new tab defaults to the selected tab's
+  // machine.
+  const machineChoices = useMemo(() => buildMachineChoices({
+    projectId: currentSession?.projectId ?? sessionId ?? "",
+    instances,
+    machines,
+    instancesSupported,
+    canClone: sessionCanCloneJoin(currentSession),
+    selectedPane: selectedTabConfig ?? null,
+    fallbackMachineId: bootTarget?.machineId,
+  }), [bootTarget?.machineId, currentSession, instances, instancesSupported, machines, selectedTabConfig, sessionId]);
+
+  const rebootTargets = useMemo(
+    () => instanceRebootTargets(instances, lifecycleInventoriesByMachine),
+    [instances, lifecycleInventoriesByMachine],
+  );
+
+  const launches = useMemo(
+    () => Object.values(addPaneRequests)
+      .filter((request) => request.sessionId === sessionId)
+      .sort((a, b) => a.startedAt - b.startedAt),
+    [addPaneRequests, sessionId],
+  );
+
+  const activeTabHost = activeTabId != null ? tabHosts.tabs.get(activeTabId) : undefined;
+  const activeRefusal = activeTabHost?.refusal;
 
   // The interactive Manager pane — its tab is the preferred default
   // landing surface for a fresh project, so the user can chat the goal
@@ -728,6 +822,13 @@ export function TabbedView({
 
   const handleCloseTab = useCallback(
     (paneId: number) => {
+      // Refused before asking anything: the machine that holds this tab is
+      // not running the project, so a confirmed close could only fail.
+      const refusal = tabHosts.tabs.get(paneId)?.refusal;
+      if (refusal) {
+        showTabError(refusal);
+        return;
+      }
       const pane = effectiveTabs.find((t) => t.pane_id === paneId);
       const worktreePath = pane?.worktree_path;
       if (worktreePath) {
@@ -741,7 +842,7 @@ export function TabbedView({
     },
     // `effectiveTabs` is read above to find the pane's worktree; leaving it out
     // would let a stale closure miss one and skip the cleanup dialog.
-    [effectiveTabs, removePane, selectAfterClosing],
+    [effectiveTabs, removePane, selectAfterClosing, showTabError, tabHosts],
   );
 
   const handleConfirmCleanup = useCallback(
@@ -755,7 +856,13 @@ export function TabbedView({
     [cleanupDialog, removePane, selectAfterClosing],
   );
 
-  const handleAddTab = useCallback((provider: string = "claude", model?: string, isolatedWorktree?: boolean, kind: PaneKind = "terminal") => {
+  const handleAddTab = useCallback((
+    provider: string = "claude",
+    model?: string,
+    isolatedWorktree?: boolean,
+    kind: PaneKind = "terminal",
+    machine?: MachineChoice,
+  ) => {
     const isDeepseek = provider === "deepseek" || (provider === "claude" && isDeepseekModel(model));
     const deepseekModel = canonicalDeepseekModel(model);
     const basePrefix = provider === "codex"
@@ -770,14 +877,56 @@ export function TabbedView({
               ? "DeepSeek"
               : "Claude";
     const label = `${basePrefix} ${effectiveTabs.length + 1}`;
-    const result = addPane(provider, "interactive", label, undefined, model, isolatedWorktree, undefined, false, kind);
+    // The machine step's pick, else the default (the selected tab's machine).
+    // The default is sent even when the step is hidden: it may be a
+    // registered machine whose instance the server starts before adding the
+    // tab, and naming it keeps the tab off any other machine.
+    const target = machine ?? machineChoices.defaultChoice;
+    let result: { success: boolean; error?: string };
+    if (target?.kind === "clone") {
+      const gitRemote = currentSession?.gitRemote;
+      if (!target.machineId || !gitRemote) {
+        result = { success: false, error: "This project has no repository to clone." };
+      } else if (!confirm(confirmationText(cloneHereCopy(target.hostname, gitRemote)))) {
+        return;
+      } else {
+        result = cloneAndAddPane(
+          {
+            machineId: target.machineId,
+            gitRemote,
+            instanceName: cloneInstanceName(gitRemote),
+            cloneUrl: currentSession?.gitRemoteUrl,
+          },
+          { provider, mode: "interactive", label, model, isolatedWorktree, managed: false, kind },
+        );
+      }
+    } else if (!target && machineChoices.showChoice) {
+      result = { success: false, error: "Choose where the new tab runs." };
+    } else {
+      result = addPane(
+        provider, "interactive", label, undefined, model, isolatedWorktree, undefined, false, kind,
+        target?.machineId,
+      );
+    }
     if (result.success) {
       setAddTabError(null);
     } else {
-      setAddTabError(result.error || "Failed to create tab");
-      setTimeout(() => setAddTabError(null), 4000);
+      showTabError(result.error || "Failed to create tab");
     }
-  }, [addPane, effectiveTabs.length]);
+  }, [addPane, cloneAndAddPane, currentSession, effectiveTabs.length, machineChoices, showTabError]);
+
+  // Start on <host> starts that machine only, as the Machines page's Start
+  // does; the project's other machines are untouched.
+  const handleStartMachine = useCallback((machineId: string, projectId: string, hostname: string) => {
+    startMachineProjectCli(machineId, projectId);
+    useStore.getState().showToast(`Starting this project on ${hostname}…`, "info");
+  }, [startMachineProjectCli]);
+
+  const handleForgetMachine = useCallback((machineId: string, hostname: string) => {
+    if (!sessionId) return;
+    if (!confirm(confirmationText(forgetMachineTabsCopy(hostname)))) return;
+    forgetMachinePanes(sessionId, machineId);
+  }, [forgetMachinePanes, sessionId]);
 
   const handleRenameTab = useCallback(
     (paneId: number, newLabel: string) => {
@@ -933,25 +1082,21 @@ export function TabbedView({
     setBotEffortDraft(activeBotEffortOption);
   }, [activeBotEffortOption, activeTabId]);
 
-  const bootTarget = useMemo(() => {
-    if (!sessionId) return null;
-    const session = sessions.find((item) => item.id === sessionId);
-    return resolveMachineProjectTarget(session, machines);
-  }, [machines, sessionId, sessions]);
-
   const canBootCurrentProject = !isAttached && bootTarget != null && !bootTarget.isRunning;
 
   // Closing is the same target as opening, in the other direction.
   const canCloseCurrentProject = bootTarget != null && bootTarget.isRunning;
 
+  // The project view starts and stops the project as a whole, on every
+  // machine with an instance of it, not only on the resolved machine.
   const handleCloseProject = useCallback(() => {
     if (!bootTarget) return;
-    stopMachineProjectCli(bootTarget.machineId, bootTarget.projectId);
+    stopMachineProjectCli(bootTarget.machineId, bootTarget.projectId, { allInstances: true });
   }, [bootTarget, stopMachineProjectCli]);
 
   const handleBootCli = useCallback(() => {
     if (!bootTarget) return;
-    startMachineProjectCli(bootTarget.machineId, bootTarget.projectId);
+    startMachineProjectCli(bootTarget.machineId, bootTarget.projectId, { allInstances: true });
   }, [bootTarget, startMachineProjectCli]);
 
   const handleLoadMore = useCallback(() => {
@@ -966,6 +1111,7 @@ export function TabbedView({
   const handleSend = useCallback(
     (text: string) => {
       if (activeTabId == null) return { success: false, error: "No active tab" };
+      if (activeRefusal) return { success: false, error: activeRefusal };
       if (activeIsUnsupported) {
         return {
           success: false,
@@ -997,7 +1143,7 @@ export function TabbedView({
       }
       return sendMessageToPane(text, activeTabId);
     },
-    [activeIsBot, activeIsUnsupported, activeTabId, effectiveTabs, sendMessageToPane],
+    [activeIsBot, activeIsUnsupported, activeRefusal, activeTabId, effectiveTabs, sendMessageToPane],
   );
 
   const handleStartBot = useCallback(() => {
@@ -1082,7 +1228,7 @@ export function TabbedView({
     );
   }
 
-  const selectedSession = sessions.find((session) => session.id === sessionId);
+  const selectedSession = currentSession;
   const projectId = (selectedSession?.projectId !== selectedSession?.id ? selectedSession?.projectId : undefined)
     ?? bootTarget?.projectId ?? selectedSession?.projectId;
   const machineId = bootTarget?.projectId === projectId ? bootTarget?.machineId : undefined;
@@ -1093,6 +1239,18 @@ export function TabbedView({
     name: registration?.name || selectedSession?.workingDir?.split("/").filter(Boolean).at(-1) || "Selected project",
     machineId,
   } : undefined;
+
+  // The overview's pause and resume reach the pane's machine as well; say
+  // why instead of sending what the server can only refuse.
+  const paneControlAllowed = (paneId: number) => {
+    const refusal = tabHosts.tabs.get(paneId)?.refusal;
+    if (refusal) showTabError(refusal);
+    return !refusal;
+  };
+  const stoppedActions = activeTabHost?.stopped;
+  // The selected tab's machine is not running the project, or this viewer
+  // may not use it: its controls stay visible, disabled, with the reason.
+  const paneControlsDisabled = Boolean(activeRefusal);
 
   return (
     <ProjectJobsWorkspace
@@ -1108,8 +1266,8 @@ export function TabbedView({
             requestPaneDiff(paneId);
           }}
           onOpenRole={setRoleModalPaneId}
-          onPausePane={pausePane}
-          onResumePane={resumePane}
+          onPausePane={(paneId) => { if (paneControlAllowed(paneId)) pausePane(paneId); }}
+          onResumePane={(paneId) => { if (paneControlAllowed(paneId)) resumePane(paneId); }}
           onRemovePane={handleCloseTab}
         />
       )}
@@ -1134,14 +1292,22 @@ export function TabbedView({
         onRebootCli={rebootCli}
         lifecycleInventory={lifecycleInventory}
         lifecycleStatus={lifecycleStatus}
+        rebootTargets={rebootTargets}
         showBootButton={canBootCurrentProject}
         showCloseProjectButton={canCloseCurrentProject}
         showRebootButton={isAttached}
+        multiMachine={tabHosts.spansMachines || instances.length > 1}
+        tabHosts={tabHosts.tabs}
+        onStartMachine={handleStartMachine}
+        onForgetMachine={handleForgetMachine}
+        machineChoices={machineChoices}
         paneStatuses={paneStatuses}
         pausedPanes={pausedPanes}
         leading={mobileLeading}
         trailing={mobileTrailing}
       />
+
+      <AddPaneLaunches launches={launches} onDismiss={dismissAddPaneRequest} />
 
       {/* Add tab error notification */}
       {addTabError && (
@@ -1180,8 +1346,9 @@ export function TabbedView({
               {activeStopRequested ? (
                 <button
                   onClick={handleStopBot}
-                  className="flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium rounded transition-colors bg-amber-600 hover:bg-amber-700 text-white"
-                  title="Force stop immediately — kill the current process"
+                  disabled={paneControlsDisabled}
+                  className="flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium rounded transition-colors bg-amber-600 hover:bg-amber-700 text-white disabled:cursor-not-allowed disabled:opacity-50"
+                  title={activeRefusal ?? "Force stop immediately — kill the current process"}
                 >
                   <svg className="w-3 h-3" fill="none" stroke="currentColor" strokeWidth="2.5" viewBox="0 0 24 24"><path d="M6 18L18 6M6 6l12 12" /></svg>
                   Force Stop
@@ -1189,8 +1356,9 @@ export function TabbedView({
               ) : (
                 <button
                   onClick={handleStopBot}
-                  className="flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium rounded transition-colors bg-red-500 hover:bg-red-600 text-white"
-                  title="Stop after current work finishes (click again to force stop)"
+                  disabled={paneControlsDisabled}
+                  className="flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium rounded transition-colors bg-red-500 hover:bg-red-600 text-white disabled:cursor-not-allowed disabled:opacity-50"
+                  title={activeRefusal ?? "Stop after current work finishes (click again to force stop)"}
                 >
                   <svg className="w-3 h-3" fill="currentColor" viewBox="0 0 24 24"><path d="M6 6h12v12H6z" /></svg>
                   Stop Bot
@@ -1210,8 +1378,9 @@ export function TabbedView({
               {!activeIsTerminal && (
                 <button
                   onClick={handleStartBot}
-                  className="flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium rounded transition-colors bg-green-500 hover:bg-green-600 text-white"
-                  title="Start autonomous bot execution in this tab"
+                  disabled={paneControlsDisabled}
+                  className="flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium rounded transition-colors bg-green-500 hover:bg-green-600 text-white disabled:cursor-not-allowed disabled:opacity-50"
+                  title={activeRefusal ?? "Start autonomous bot execution in this tab"}
                 >
                   <svg className="w-3 h-3" fill="currentColor" viewBox="0 0 24 24"><path d="M8 5v14l11-7z" /></svg>
                   Bot
@@ -1235,8 +1404,9 @@ export function TabbedView({
                     // makes sense for Claude).
                     updatePaneModel(activeTabId, null, next);
                   }}
-                  className="rounded border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-800 px-1.5 py-1 text-xs focus:outline-none focus:ring-2 focus:ring-blue-500"
-                  title="Agent backend — switching kills the current agent child and respawns with a fresh session id"
+                  disabled={paneControlsDisabled}
+                  className="rounded border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-800 px-1.5 py-1 text-xs focus:outline-none focus:ring-2 focus:ring-blue-500 disabled:cursor-not-allowed disabled:opacity-50"
+                  title={activeRefusal ?? "Agent backend — switching kills the current agent child and respawns with a fresh session id"}
                 >
                   {visibleProviderOptions.map((option) => (
                     <option
@@ -1263,8 +1433,9 @@ export function TabbedView({
                       interruptPane(activeTabId);
                     }
                   }}
-                  className="flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium rounded transition-colors bg-red-500 hover:bg-red-600 text-white"
-                  title="Interrupt the current agent run (SIGINT). Use when a turn is wedged on a hung tool call."
+                  disabled={paneControlsDisabled}
+                  className="flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium rounded transition-colors bg-red-500 hover:bg-red-600 text-white disabled:cursor-not-allowed disabled:opacity-50"
+                  title={activeRefusal ?? "Interrupt the current agent run (SIGINT). Use when a turn is wedged on a hung tool call."}
                 >
                   <svg className="w-3 h-3" fill="currentColor" viewBox="0 0 24 24"><path d="M6 6h12v12H6z" /></svg>
                   Interrupt
@@ -1277,8 +1448,9 @@ export function TabbedView({
                     setDiffModalPaneId(activeTabId);
                     requestPaneDiff(activeTabId);
                   }}
-                  className="flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium rounded transition-colors bg-emerald-600 hover:bg-emerald-700 text-white"
-                  title={`View git diff for branch (worktree at ${activeConfig.worktree_path})`}
+                  disabled={paneControlsDisabled}
+                  className="flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium rounded transition-colors bg-emerald-600 hover:bg-emerald-700 text-white disabled:cursor-not-allowed disabled:opacity-50"
+                  title={activeRefusal ?? `View git diff for branch (worktree at ${activeConfig.worktree_path})`}
                 >
                   Diff
                 </button>
@@ -1286,8 +1458,9 @@ export function TabbedView({
               {!activeIsTerminal && activeTabId != null && activeConfig && (
                 <button
                   onClick={() => setRoleModalPaneId(activeTabId)}
-                  className="flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium rounded transition-colors bg-purple-600 hover:bg-purple-700 text-white"
-                  title="Edit role / goal / backstory for this pane (composed into --append-system-prompt at next spawn)"
+                  disabled={paneControlsDisabled}
+                  className="flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium rounded transition-colors bg-purple-600 hover:bg-purple-700 text-white disabled:cursor-not-allowed disabled:opacity-50"
+                  title={activeRefusal ?? "Edit role / goal / backstory for this pane (composed into --append-system-prompt at next spawn)"}
                 >
                   Role
                 </button>
@@ -1340,13 +1513,53 @@ export function TabbedView({
                 rebootPane,
               );
             }}
-            className="inline-flex items-center px-2.5 py-1 text-xs font-medium rounded transition-colors bg-rose-600 hover:bg-rose-700 text-white"
-            title="Reboot just this pane's agent — kills the running process and respawns with --resume on the same session so prior context is preserved. Use when a pane is wedged and you don't want to recycle the entire CLI."
+            disabled={paneControlsDisabled}
+            className="inline-flex items-center px-2.5 py-1 text-xs font-medium rounded transition-colors bg-rose-600 hover:bg-rose-700 text-white disabled:cursor-not-allowed disabled:opacity-50"
+            title={activeRefusal ?? "Reboot just this pane's agent — kills the running process and respawns with --resume on the same session so prior context is preserved. Use when a pane is wedged and you don't want to recycle the entire CLI."}
           >
             Reboot
           </button>
         )}
       </div>
+
+      {/* The selected tab belongs to a machine that is not running the
+          project (or that this viewer may not use). Its history still reads;
+          what it needs is that machine, so say which and offer it. */}
+      {activeRefusal && (
+        <div
+          role="status"
+          className="flex flex-shrink-0 flex-wrap items-center gap-2 border-b border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-900 dark:border-amber-900 dark:bg-amber-950/30 dark:text-amber-200"
+        >
+          <span className="min-w-0 flex-1 basis-56">{activeRefusal}</span>
+          {stoppedActions?.canStart && (
+            <button
+              type="button"
+              disabled={Boolean(stoppedActions.startDisabledReason) || !stoppedActions.projectId}
+              title={stoppedActions.startDisabledReason ?? `Start this project on ${stoppedActions.hostname} only`}
+              onClick={() => {
+                if (stoppedActions.projectId) {
+                  handleStartMachine(stoppedActions.machineId, stoppedActions.projectId, stoppedActions.hostname);
+                }
+              }}
+              className="rounded bg-blue-600 px-2.5 py-1 text-xs font-medium text-white hover:bg-blue-700 disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              Start on {stoppedActions.hostname}
+            </button>
+          )}
+          {stoppedActions?.startDisabledReason && stoppedActions.canStart && (
+            <span className="text-xs">{stoppedActions.startDisabledReason}</span>
+          )}
+          {stoppedActions?.canForget && (
+            <button
+              type="button"
+              onClick={() => handleForgetMachine(stoppedActions.machineId, stoppedActions.hostname)}
+              className="rounded border border-amber-300 px-2.5 py-1 text-xs font-medium hover:bg-amber-100 dark:border-amber-800 dark:hover:bg-amber-900/40"
+            >
+              Forget {stoppedActions.hostname}&apos;s tabs
+            </button>
+          )}
+        </div>
+      )}
 
       <div className="flex flex-1 min-h-0">
         <div className="flex flex-1 flex-col min-w-0 min-h-0">
@@ -1436,6 +1649,7 @@ export function TabbedView({
                   onLoadMore={() => loadMoreMessages(tab.pane_id)}
                   isLoading={loadingMorePane === tab.pane_id}
                   hasMore={paneHasMore[paneKey(tab.pane_id)] || false}
+                  disabledReason={tabHosts.tabs.get(tab.pane_id)?.refusal}
                 />
               ) : (
                 <>
@@ -1484,6 +1698,7 @@ export function TabbedView({
               draft={activeInputDraft}
               onDraftChange={handleInputDraftChange}
               onSend={handleSend}
+              disabledReason={activeRefusal}
             />
           )}
         </div>
@@ -2586,9 +2801,11 @@ interface InteractiveInputProps {
   draft: string;
   onDraftChange: (value: string) => void;
   onSend: (text: string) => { success: boolean; error?: string };
+  /** Why the pane cannot take input now; the draft stays editable. */
+  disabledReason?: string;
 }
 
-function InteractiveInput({ draft, onDraftChange, onSend }: InteractiveInputProps) {
+function InteractiveInput({ draft, onDraftChange, onSend, disabledReason }: InteractiveInputProps) {
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const [error, setError] = useState<string | null>(null);
 
@@ -2644,14 +2861,17 @@ function InteractiveInput({ draft, onDraftChange, onSend }: InteractiveInputProp
           ref={textareaRef}
           value={draft}
           rows={1}
-          placeholder="Type a message..."
+          placeholder={disabledReason ?? "Type a message..."}
+          title={disabledReason}
           className="flex-1 resize-none rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-800 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
           onKeyDown={handleKeyDown}
           onChange={(e) => handleInput(e.target.value)}
         />
         <button
           onClick={handleSubmit}
-          className="px-4 py-2 bg-blue-500 hover:bg-blue-600 text-white rounded-lg text-sm font-medium transition-colors"
+          disabled={Boolean(disabledReason)}
+          title={disabledReason}
+          className="px-4 py-2 bg-blue-500 hover:bg-blue-600 text-white rounded-lg text-sm font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-50 disabled:hover:bg-blue-500"
         >
           Send
         </button>

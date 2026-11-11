@@ -44,6 +44,7 @@ export default function CodeHomeScreen() {
   const tablet = width >= 768;
   const sessions = useMobileStore((state) => state.sessions);
   const paneStatusesBySession = useMobileStore((state) => state.paneStatusesBySession);
+  const instancesBySession = useMobileStore((state) => state.instancesBySession);
   const [filter, setFilter] = useState<Filter>("all");
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const filtered = useMemo(() => sessions
@@ -80,7 +81,7 @@ export default function CodeHomeScreen() {
           contentContainerStyle={filtered.length ? styles.list : styles.emptyList}
           data={filtered}
           keyExtractor={(item) => item.id}
-          renderItem={({ item }) => <SessionCard session={item} paneStatuses={paneStatusesBySession[item.id]} onPress={() => open(item)} />}
+          renderItem={({ item }) => <SessionCard session={item} paneStatuses={paneStatusesBySession[item.id]} instances={instancesBySession[item.id]} onPress={() => open(item)} />}
           ListEmptyComponent={<EmptyState title={sessions.length ? "No idle projects" : "No coding sessions yet"} body={sessions.length ? "All connected projects are currently working." : "Start the first task from an eligible project and follow its activity here."} action={<PrimaryButton onPress={() => router.push("/(code)/new")}>Start a task</PrimaryButton>} />}
         />
         {tablet ? <View style={[styles.detail, { borderColor: theme.border }]}>{selected ? <><Text style={[styles.detailTitle, { color: theme.text }]}>{selected.project_name ?? "Coding session"}</Text><Text style={{ color: theme.textMuted }}>{selected.latest_summary ?? "Open the full activity timeline to inspect this session."}</Text><PrimaryButton onPress={() => router.push({ pathname: "/(code)/session/[sessionId]", params: { sessionId: selected.id } })}>Open activity</PrimaryButton></> : <EmptyState title="Choose a session" body="Session details will appear here." />}</View> : null}

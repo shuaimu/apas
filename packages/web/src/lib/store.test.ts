@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { handleServerMessage, launchProfileKey, storeDebugLog, useStore, paneWatermarksToRecord, type Message, type CliClient, type TeamRecord, type SessionCacheEntry } from './store';
 import { buildProjectList } from './projectList';
+import { LEGACY_MACHINE_KEY } from './projectInstances';
 
 describe('useStore', () => {
   beforeEach(() => {
@@ -1117,10 +1118,14 @@ describe('useStore', () => {
             noncompliantPaneIds: [],
           },
         },
+        // An older server names no machine, so its inventory is the
+        // session's only one, under the legacy key.
         cliLifecycleInventories: {
           'session-lifecycle-reboot': {
-            persistent_terminal_hosting: true,
-            panes: [{ pane_id: 1, mode: 'live_adoptable' }],
+            [LEGACY_MACHINE_KEY]: {
+              persistent_terminal_hosting: true,
+              panes: [{ pane_id: 1, mode: 'live_adoptable' }],
+            },
           },
         },
       });
@@ -1181,8 +1186,10 @@ describe('useStore', () => {
           },
           cliLifecycleInventories: {
             'session-timeout': {
-              persistent_terminal_hosting: false,
-              panes: [],
+              [LEGACY_MACHINE_KEY]: {
+                persistent_terminal_hosting: false,
+                panes: [],
+              },
             },
           },
         });

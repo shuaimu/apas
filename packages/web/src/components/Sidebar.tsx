@@ -22,6 +22,7 @@ import {
   type ProjectRole,
 } from "@/lib/projectList";
 import { useProjectOrder } from "@/lib/useProjectOrder";
+import { projectHostLabel } from "@/lib/tabHosts";
 
 // Truncate path in the middle to preserve the folder name at the end
 // e.g., "/home/shuai/workspace/long-project" -> "/home/.../long-project"
@@ -198,6 +199,8 @@ export function Sidebar({ onClose, onCollapse, width }: SidebarProps) {
     usageLimit,
   }: (typeof waitingAgents)[number]) => {
     const name = projectNameFor(session);
+    // The agent's own machine: a project's panes can run on several.
+    const paneHost = pane.hostname || session.hostname;
     const resetLabel = !awaitingAnswer && usageLimit
       ? usageLimitResetLabel(usageLimit, availabilityNow)
       : null;
@@ -233,9 +236,9 @@ export function Sidebar({ onClose, onCollapse, width }: SidebarProps) {
             {awaitingAnswer ? "Pending answer" : usageLimit ? usageLimitedLabel(usageLimit) : "Idle"}
           </span>
         </div>
-        {(session.hostname || resetLabel) && (
+        {(paneHost || resetLabel) && (
           <div className="mt-1 truncate text-xs text-gray-500 dark:text-gray-400">
-            {[session.hostname, resetLabel].filter(Boolean).join(" · ")}
+            {[paneHost, resetLabel].filter(Boolean).join(" · ")}
           </div>
         )}
       </button>
@@ -887,11 +890,21 @@ export function Sidebar({ onClose, onCollapse, width }: SidebarProps) {
                     }`}
                   />
                   <div className="flex-1 min-w-0">
-                    {project.hostname && (
-                      <div className="text-xs text-gray-500 truncate">
-                        {project.hostname}
-                      </div>
-                    )}
+                    {(() => {
+                      // One row per project however many machines run it:
+                      // the primary host plus how many more ("zoo-005 +1").
+                      const host = projectHostLabel(project.instances, project.hostname);
+                      return host.primaryHost && (
+                        <div className="text-xs text-gray-500 truncate" title={host.title}>
+                          {host.additionalCount > 0 ? (
+                            <>
+                              <span aria-hidden="true">{host.text}</span>
+                              <span className="sr-only">{host.spoken}</span>
+                            </>
+                          ) : host.primaryHost}
+                        </div>
+                      );
+                    })()}
                     <div className="font-medium overflow-hidden whitespace-nowrap flex items-center gap-1.5" title={project.workingDir}>
                       <span className="truncate">
                         {truncatePath(project.workingDir, width ? Math.max(12, Math.floor((width - 56) / 7.5)) : 22)}

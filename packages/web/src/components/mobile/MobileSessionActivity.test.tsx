@@ -875,7 +875,11 @@ describe("MobileSessionActivity", () => {
     expect(within(dialog).getByText(/saved panes become available again/)).toBeTruthy();
     fireEvent.click(within(dialog).getByRole("button", { name: "Open project" }));
 
-    expect(actions.startMachineProjectCli).toHaveBeenCalledWith("machine-b", "project-a");
+    expect(actions.startMachineProjectCli).toHaveBeenCalledWith(
+      "machine-b",
+      "project-a",
+      { allInstances: true },
+    );
   });
 
   it("does not offer Open project while the project is running", () => {

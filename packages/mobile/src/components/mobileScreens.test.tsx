@@ -1,6 +1,6 @@
 import { FlatList, ScrollView, StyleSheet } from "react-native";
 import { act, cleanup, fireEvent, render, waitFor } from "@testing-library/react-native";
-import type { CodeEvent, MobileLaunchTarget, MobileSessionSummary, PaneConfig, PaneWorkSummary, WebToServer } from "@apas/protocol";
+import type { CodeEvent, MobileLaunchTarget, MobileSessionSummary, PaneConfig, PaneWorkSummary, SessionInstanceInfo, WebToServer } from "@apas/protocol";
 
 import CodeHomeScreen from "@/../app/(code)/(tabs)/index";
 import NewTaskScreen from "@/../app/(code)/new";
@@ -88,6 +88,13 @@ const terminalPane: PaneConfig = {
   managed: false,
 };
 
+const ZOO_005 = "50000000-0000-4000-8000-000000000001";
+const ZOO_006 = "50000000-0000-4000-8000-000000000002";
+const zoo005: SessionInstanceInfo = { machine_id: ZOO_005, hostname: "zoo-005", working_dir: "/workspace/mobile-test", primary: true, runtime_access: true };
+const zoo006: SessionInstanceInfo = { machine_id: ZOO_006, hostname: "zoo-006", working_dir: "/workspace/mobile-test", primary: false, runtime_access: true };
+const zoo005Pane: PaneConfig = { ...terminalPane, pane_id: 3, provider: "claude", label: "Claude 3", machine_id: ZOO_005, hostname: "zoo-005" };
+const zoo006Pane: PaneConfig = { ...terminalPane, pane_id: 4, label: "Codex 4", machine_id: ZOO_006, hostname: "zoo-006" };
+
 function event(index: number): CodeEvent {
   return {
     id: `event-${index}`,
@@ -139,6 +146,7 @@ describe("mobile code screens", () => {
       eventsBySession: {},
       panesBySession: {},
       paneStatusesBySession: {},
+      instancesBySession: {},
       negotiatedCapabilities: [],
       paneWorkSummaries: {},
       visibleSummaryPane: null,
@@ -656,6 +664,202 @@ describe("mobile code screens", () => {
     fireEvent.press(view.getByText("Approve"));
     await waitFor(() => expect(view.getByText("This approval was already resolved")).toBeTruthy());
     expect(view.getByText("Approve command?")).toBeTruthy();
+  });
+
+  it("shows each tab's host once the project's tabs span machines", async () => {
+    mockParams = { sessionId: session.id };
+    mockReadCachedSnapshot.mockReturnValue(new Promise(() => undefined));
+    useMobileStore.setState({
+      sessions: [session],
+      panesBySession: {
+        [session.id]: [
+          zoo005Pane,
+          zoo006Pane,
+          // Written before multi-machine instances: one pane the server
+          // attributed to zoo-005, and one it never attributed to any host.
+          { ...terminalPane, pane_id: 5, label: "Legacy 5", hostname: "zoo-005" },
+          { ...terminalPane, pane_id: 6, label: "Legacy 6" },
+        ],
+      },
+    });
+    const view = render(<SessionActivityScreen />);
+
+    await waitFor(() => expect(view.getByText("✓ Claude 3 · zoo-005")).toBeTruthy());
+    expect(view.getByText("Codex 4 · zoo-006")).toBeTruthy();
+    expect(view.getByText("Legacy 5 · zoo-005")).toBeTruthy();
+    expect(view.getByText("Legacy 6")).toBeTruthy();
+  });
+
+  it("keeps tabs unbadged while every tab runs on one host", async () => {
+    mockParams = { sessionId: session.id };
+    mockReadCachedSnapshot.mockReturnValue(new Promise(() => undefined));
+    useMobileStore.setState({
+      sessions: [session],
+      panesBySession: {
+        [session.id]: [zoo005Pane, { ...terminalPane, pane_id: 5, label: "Legacy 5", hostname: "zoo-005" }],
+      },
+    });
+    const view = render(<SessionActivityScreen />);
+
+    await waitFor(() => expect(view.getByText("✓ Claude 3")).toBeTruthy());
+    expect(view.getByText("Legacy 5")).toBeTruthy();
+    expect(view.queryByText(/zoo-005/)).toBeNull();
+  });
+
+  it("shows bootstrap tabs with their hosts until a live roster replaces them", async () => {
+    mockParams = { sessionId: session.id };
+    mockReadCachedSnapshot.mockReturnValue(new Promise(() => undefined));
+    useMobileStore.setState({
+      sessions: [{
+        ...session,
+        panes: [
+          { pane_id: 3, kind: "terminal", provider: "claude", label: "Claude 3", is_working: false, awaiting_answer: false, machine_id: ZOO_005, hostname: "zoo-005" },
+          { pane_id: 4, kind: "terminal", provider: "codex", label: "Codex 4", is_working: false, awaiting_answer: false, machine_id: ZOO_006, hostname: "zoo-006" },
+        ],
+      }],
+    });
+    const view = render(<SessionActivityScreen />);
+
+    await waitFor(() => expect(view.getByText("✓ Claude 3 · zoo-005")).toBeTruthy());
+    expect(view.getByText("Codex 4 · zoo-006")).toBeTruthy();
+
+    // An explicitly empty live roster means no tabs, not "keep the summary".
+    act(() => useMobileStore.getState().setPanes(session.id, []));
+    await waitFor(() => expect(view.queryByText(/Codex 4/)).toBeNull());
+    expect(view.queryByText("Conversation:")).toBeNull();
+  });
+
+  it("refuses a stopped machine's tab with the reason until that machine runs again", async () => {
+    mockParams = { sessionId: session.id };
+    mockReadCachedSnapshot.mockReturnValue(new Promise(() => undefined));
+    mockSendAcknowledged.mockResolvedValue({ type: "user_input" });
+    useMobileStore.setState({
+      sessions: [session],
+      features: { terminal: true, coding_mutations: true },
+      negotiatedCapabilities: ["project_instances_v1"],
+      instancesBySession: { [session.id]: [zoo005] },
+      panesBySession: { [session.id]: [zoo005Pane, zoo006Pane] },
+    });
+    const view = render(<SessionActivityScreen />);
+
+    await waitFor(() => expect(view.getByText("Codex 4 · zoo-006 · stopped")).toBeTruthy());
+    expect(view.queryByTestId("pane-unavailable")).toBeNull();
+    fireEvent.press(view.getByText("Codex 4 · zoo-006 · stopped"));
+    await waitFor(() => expect(view.getByText("zoo-006 is not running this project. Start it on zoo-006 first.")).toBeTruthy());
+    fireEvent.changeText(view.getByPlaceholderText("Message this terminal conversation"), "Run the suite.");
+    expect(view.getByRole("button", { name: "Send message" })).toBeDisabled();
+    fireEvent.press(view.getByText("Send message"));
+    expect(mockSendAcknowledged).not.toHaveBeenCalled();
+
+    // zoo-006 attaches again, and the live set brings its tab back.
+    act(() => useMobileStore.getState().setSessionInstances(session.id, [zoo005, zoo006]));
+    await waitFor(() => expect(view.queryByTestId("pane-unavailable")).toBeNull());
+    expect(view.getByText("✓ Codex 4 · zoo-006")).toBeTruthy();
+    fireEvent.press(view.getByText("Send message"));
+    await waitFor(() => expect(mockSendAcknowledged).toHaveBeenCalledWith(expect.objectContaining({
+      type: "terminal_conversation_input",
+      session_id: session.id,
+      pane_id: 4,
+      text: "Run the suite.",
+    }), expect.any(String)));
+  });
+
+  it("keeps a machine this viewer cannot use read-only, decisions included", async () => {
+    const approval: CodeEvent = {
+      ...event(12),
+      pane_id: 4,
+      kind: "approval",
+      summary: "Approve command?",
+      requires_attention: true,
+      detail: { type: "output", output_type: { approval_request: { tool_call_id: "tool-12" } } },
+    };
+    mockParams = { sessionId: session.id, paneId: "4" };
+    mockReadCachedSnapshot.mockReturnValue(new Promise(() => undefined));
+    useMobileStore.setState({
+      sessions: [session],
+      features: { terminal: true, coding_mutations: true },
+      negotiatedCapabilities: ["project_instances_v1"],
+      instancesBySession: { [session.id]: [zoo005, { ...zoo006, runtime_access: false }] },
+      panesBySession: { [session.id]: [zoo005Pane, zoo006Pane] },
+      eventsBySession: { [session.id]: [approval] },
+    });
+    const view = render(<SessionActivityScreen />);
+
+    await waitFor(() => expect(view.getByText("✓ Codex 4 · zoo-006 · no access")).toBeTruthy());
+    expect(view.getByText("Your access does not cover zoo-006, so this tab is read-only here.")).toBeTruthy();
+    expect(view.getByRole("button", { name: "Approve" })).toBeDisabled();
+    fireEvent.press(view.getByText("Approve"));
+    expect(mockSendAcknowledged).not.toHaveBeenCalled();
+    expect(view.getByText("Claude 3 · zoo-005")).toBeTruthy();
+  });
+
+  it("calls no machine stopped when the server did not negotiate instances", async () => {
+    mockParams = { sessionId: session.id, paneId: "4" };
+    mockReadCachedSnapshot.mockReturnValue(new Promise(() => undefined));
+    useMobileStore.setState({
+      sessions: [{ ...session, instances: [zoo005] }],
+      features: { terminal: true, coding_mutations: true },
+      panesBySession: { [session.id]: [zoo005Pane, zoo006Pane] },
+    });
+    const view = render(<SessionActivityScreen />);
+
+    await waitFor(() => expect(view.getByText("✓ Codex 4 · zoo-006")).toBeTruthy());
+    expect(view.queryByTestId("pane-unavailable")).toBeNull();
+    fireEvent.changeText(view.getByPlaceholderText("Message this terminal conversation"), "Status?");
+    expect(view.getByRole("button", { name: "Send message" })).not.toBeDisabled();
+  });
+
+  it("names the primary host and how many other machines run the project", async () => {
+    useMobileStore.setState({
+      sessions: [
+        { ...session, project_name: "two-hosts", instances: [zoo005, zoo006] },
+        {
+          ...session,
+          id: "9478d3c9-8527-437c-a7c4-93437f3a2e2f",
+          project_id: "a70f916e-a160-4a82-9738-a63c76e2fc33",
+          project_name: "one-host",
+          hostname: "builder",
+        },
+      ],
+    });
+    const view = render(<CodeHomeScreen />);
+
+    expect(view.getByText("zoo-005 +1")).toBeTruthy();
+    expect(view.getByText("builder")).toBeTruthy();
+
+    // The live set from session_instances replaces the bootstrap's.
+    act(() => useMobileStore.getState().setSessionInstances(session.id, [
+      zoo005,
+      zoo006,
+      { machine_id: "50000000-0000-4000-8000-000000000003", hostname: "laptop", primary: false },
+    ]));
+    await waitFor(() => expect(view.getByText("zoo-005 +2")).toBeTruthy());
+  });
+
+  it("sends the chosen machine and shows the server's reason when it refuses that target", async () => {
+    useMobileStore.setState({
+      launchTargets: [launchTarget],
+      features: { coding_mutations: true },
+      sessions: [session],
+    });
+    mockLaunchTask.mockRejectedValueOnce(new Error("builder cannot run this project beside the instance on zoo-005; reboot builder to update it"));
+    const view = render(<NewTaskScreen />);
+    await waitFor(() => expect(mockLoadTaskDraft).toHaveBeenCalled());
+
+    fireEvent.press(view.getByText(launchTarget.project_name));
+    fireEvent.press(view.getByText("Codex terminal"));
+    fireEvent.changeText(view.getByPlaceholderText(/diagnose the failing login test/), "Run the slow suite here");
+    fireEvent.press(view.getByText("Review task"));
+    fireEvent.press(view.getByText("Submit task"));
+
+    await waitFor(() => expect(view.getByText("builder cannot run this project beside the instance on zoo-005; reboot builder to update it")).toBeTruthy());
+    expect(mockLaunchTask).toHaveBeenCalledTimes(1);
+    expect(mockLaunchTask.mock.calls[0]?.[0]).toMatchObject({
+      machine_id: launchTarget.machine_id,
+      project_id: launchTarget.project_id,
+      profile_key: "terminal:codex:official:default",
+    });
+    expect(mockDeleteTaskDraft).not.toHaveBeenCalled();
   });
 
 });

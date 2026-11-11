@@ -1,6 +1,26 @@
-import type { MobileBootstrapResponse } from "@apas/protocol";
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
+import type { MobileBootstrapResponse, ServerToWeb } from "@apas/protocol";
 
 import { ConnectionSupervisor, type SocketLike } from "./supervisor";
+
+// The server frames added for multi-machine project instances, as the shared
+// crate's golden fixtures spell them.
+const PROJECT_INSTANCE_FRAMES = [
+  "server-session-instances.json",
+  "server-session-instances-legacy.json",
+  "server-pane-list-instances.json",
+  "server-sessions-instances.json",
+  "server-machines-instances.json",
+  "server-cli-lifecycle-inventory-instance.json",
+  "server-cli-lifecycle-status-instance.json",
+  "server-add-pane-starting.json",
+  "server-add-pane-failed.json",
+];
+
+function fixture(name: string): ServerToWeb {
+  return JSON.parse(readFileSync(resolve(__dirname, "../../../protocol/fixtures", name), "utf8")) as ServerToWeb;
+}
 
 class FakeSocket implements SocketLike {
   readyState = 0;
@@ -65,6 +85,45 @@ describe("ConnectionSupervisor", () => {
     expect(phases).toEqual(expect.arrayContaining(["connecting", "authenticating", "synchronizing", "ready"]));
     expect(setNegotiatedCapabilities).toHaveBeenCalledWith(["terminal", "pane_work_summary_v1"]);
     expect(onSynchronized).toHaveBeenCalledTimes(1);
+  });
+
+  it("advertises project instances and keeps the socket open for every frame they bring", async () => {
+    const sockets: FakeSocket[] = [];
+    const onMessage = jest.fn();
+    const supervisor = new ConnectionSupervisor({
+      createSocket: () => { const socket = new FakeSocket(); sockets.push(socket); return socket; },
+      accessToken: async () => "access",
+      bootstrap: async () => emptyBootstrap,
+      persistBootstrap: async () => undefined,
+      setPhase: jest.fn(),
+      setMutationsAllowed: jest.fn(),
+      applyBootstrap: jest.fn(),
+      onMessage,
+      random: () => 0.5,
+    });
+    supervisor.start();
+    sockets[0].open();
+    await Promise.resolve();
+    expect(JSON.parse(sockets[0].sent[0]).capabilities).toContain("project_instances_v1");
+    sockets[0].receive({
+      type: "authenticated",
+      user_id: emptyBootstrap.user_id,
+      mutations_allowed: true,
+      negotiated_capabilities: ["project_instances_v1"],
+    });
+    await Promise.resolve();
+    await Promise.resolve();
+
+    const frames = PROJECT_INSTANCE_FRAMES.map(fixture);
+    for (const frame of frames) sockets[0].receive(frame);
+    expect(onMessage.mock.calls.map(([message]) => message)).toEqual(frames);
+    expect(sockets[0].closed).toBe(false);
+
+    // The hazard the server's capability gate exists for: a frame the bundled
+    // schema does not list drops the socket.
+    sockets[0].receive({ type: "session_instances_v2", session_id: emptyBootstrap.user_id });
+    expect(sockets[0].closed).toBe(true);
+    expect(onMessage).toHaveBeenCalledTimes(frames.length);
   });
 
   it("makes the socket unusable immediately in the background", () => {

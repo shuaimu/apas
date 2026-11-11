@@ -1,12 +1,22 @@
 "use client";
 
-import { useCallback, useRef, useEffect, useState } from "react";
+import { useCallback, useId, useRef, useEffect, useState } from "react";
 import type { ReactNode } from "react";
 import { Bot, ChevronDown, LoaderCircle, RefreshCw } from "lucide-react";
 import { paneKey } from "@/lib/store";
 import type { CliLifecycleInventory, CliLifecycleStatus, PaneConfig, PaneKind } from "@/lib/store";
 import { useIsLaunchProfileAllowed } from "@/lib/tabTypes";
 import { paneIsAwaitingAnswerStatus, paneIsWorkingStatus } from "@/lib/paneStatus";
+import type { MachineChoice, MachineChoiceModel } from "@/lib/machineChoice";
+import {
+  groupMachineChoices,
+  machineChoiceDetail,
+  tabHostDescription,
+  tabHostStateLabel,
+  type RebootTarget,
+  type TabHost,
+  type TabHostState,
+} from "@/lib/tabHosts";
 import {
   DEEPSEEK_FLASH_MODEL,
   isDeepseekModel,
@@ -18,7 +28,15 @@ interface TabBarProps {
   activeTabId: number | null;
   onSelectTab: (paneId: number) => void;
   onCloseTab: (paneId: number) => void;
-  onAddTab: (provider?: string, model?: string, isolatedWorktree?: boolean, kind?: PaneKind) => void;
+  /** `machine` is the machine picked in the new-tab menu's machine step;
+   *  absent when the step was not shown, which means the default machine. */
+  onAddTab: (
+    provider?: string,
+    model?: string,
+    isolatedWorktree?: boolean,
+    kind?: PaneKind,
+    machine?: MachineChoice,
+  ) => void;
   onAddAutonomous?: () => void;
   autonomousUnavailableReason?: string;
   jobTabs?: ReactNode;
@@ -28,12 +46,30 @@ interface TabBarProps {
   onBootCli?: () => void;
   /** Shut the project down: every agent in it stops. */
   onCloseProject?: () => void;
-  onRebootCli?: () => void;
+  /** Reboot one instance's CLI; absent machine = the primary's. */
+  onRebootCli?: (machineId?: string) => void;
   lifecycleInventory?: CliLifecycleInventory;
   lifecycleStatus?: CliLifecycleStatus;
+  /** One entry per attached instance, primary first. With more than one,
+   *  the CLI menu offers a reboot per machine, each confirmed against that
+   *  machine's own inventory. */
+  rebootTargets?: RebootTarget[];
   showBootButton?: boolean;
   showCloseProjectButton?: boolean;
   showRebootButton?: boolean;
+  /** The project has tabs on more than one machine, or runs on several:
+   *  Open and Close act on all of them, and say so. */
+  multiMachine?: boolean;
+  /** Where each tab runs (see `describeTabHosts`). Without an entry a tab
+   *  renders as it always has. */
+  tabHosts?: Map<number, TabHost>;
+  /** Start the project on one machine that is not running it. */
+  onStartMachine?: (machineId: string, projectId: string, hostname: string) => void;
+  /** Forget one stopped machine's tabs; the handler confirms first. */
+  onForgetMachine?: (machineId: string, hostname: string) => void;
+  /** The new-tab machine step. Shown only when `showChoice`; otherwise the
+   *  menu is exactly what it was with one machine. */
+  machineChoices?: MachineChoiceModel;
   paneStatuses: Record<string, string | null>;
   pausedPanes: number[];
   /** Mobile-only controls merged into the tab-bar row so the top header can
@@ -43,12 +79,27 @@ interface TabBarProps {
   trailing?: ReactNode;
 }
 
-function rebootConfirmation(inventory?: CliLifecycleInventory): string {
+function rebootConfirmation(
+  inventory?: CliLifecycleInventory,
+  target?: { hostname: string; otherHosts: string[] },
+): string {
+  const on = target ? ` on ${target.hostname}` : "";
+  // A daemon runs every project on its machine, so a reboot restarts all of
+  // them there; the project's other machines are not touched.
+  const scope = target
+    ? [
+        "",
+        `Every project running on ${target.hostname} restarts with it.${target.otherHosts.length > 0
+          ? ` The instance${target.otherHosts.length === 1 ? "" : "s"} on ${target.otherHosts.join(", ")} keep${target.otherHosts.length === 1 ? "s" : ""} running.`
+          : ""}`,
+      ]
+    : [];
   if (!inventory) {
     return [
-      "Reboot this older project CLI?",
+      `Reboot this older project CLI${on}?`,
       "",
       "All panes may restart. Upgrade the CLI on the project host to see preservation details and use transport-only reconnect.",
+      ...scope,
     ].join("\n");
   }
   const adoptable = inventory.panes.filter((pane) => pane.mode === "live_adoptable").length;
@@ -59,19 +110,49 @@ function rebootConfirmation(inventory?: CliLifecycleInventory): string {
     (pane) => pane.mode === "structured_pane_may_resume",
   ).length;
   return [
-    "Reboot the project CLI?",
+    `Reboot the project CLI${on}?`,
     "",
     `${adoptable} terminal pane${adoptable === 1 ? "" : "s"} will stay live and be reattached.`,
     `${restarting} terminal pane${restarting === 1 ? "" : "s"} will restart and resume where supported.`,
     `${structured} structured pane${structured === 1 ? "" : "s"} may restart and resume.`,
+    ...scope,
   ].join("\n");
 }
 
-function lifecyclePhaseLabel(status?: CliLifecycleStatus): string | null {
-  if (!status) return null;
-  if (status.message) return status.message;
-  return `CLI reboot: ${status.phase.replaceAll("_", " ")}`;
+function lifecycleInFlight(status?: CliLifecycleStatus): boolean {
+  return Boolean(status && !["succeeded", "failed", "timed_out"].includes(status.phase));
 }
+
+/** Whether a lifecycle operation is for this reboot target. One that names
+ *  no machine went to the primary. */
+function lifecycleTargets(status: CliLifecycleStatus, target: RebootTarget): boolean {
+  return status.machineId ? status.machineId === target.machineId : target.primary;
+}
+
+function lifecyclePhaseLabel(status?: CliLifecycleStatus, hostname?: string): string | null {
+  if (!status) return null;
+  const label = status.message || `CLI reboot: ${status.phase.replaceAll("_", " ")}`;
+  return hostname ? `${hostname}: ${label}` : label;
+}
+
+const HOST_BADGE_TONES: Record<TabHostState, { badge: string; dot: string }> = {
+  running: {
+    badge: "bg-gray-200 text-gray-600 dark:bg-gray-700 dark:text-gray-300",
+    dot: "bg-green-500",
+  },
+  no_access: {
+    badge: "bg-amber-100 text-amber-800 dark:bg-amber-950/60 dark:text-amber-200",
+    dot: "bg-amber-500",
+  },
+  stopped: {
+    badge: "bg-gray-100 text-gray-500 dark:bg-gray-800 dark:text-gray-400",
+    dot: "bg-gray-400",
+  },
+  offline: {
+    badge: "bg-gray-100 text-gray-500 dark:bg-gray-800 dark:text-gray-400",
+    dot: "border border-gray-400 bg-transparent",
+  },
+};
 
 function isDeepseekTab(provider: string, model?: string, label?: string): boolean {
   if (provider === "deepseek") return true;
@@ -168,9 +249,15 @@ export function TabBar({
   onRebootCli,
   lifecycleInventory,
   lifecycleStatus,
+  rebootTargets,
   showBootButton = false,
   showCloseProjectButton = false,
   showRebootButton = false,
+  multiMachine = false,
+  tabHosts,
+  onStartMachine,
+  onForgetMachine,
+  machineChoices,
   paneStatuses,
   pausedPanes,
   leading,
@@ -333,6 +420,11 @@ export function TabBar({
           const isAwaitingAnswer = paneIsAwaitingAnswerStatus(status);
           const label = tab.label || `Tab ${index + 1}`;
           const isRenaming = renamingPaneId === tab.pane_id;
+          const host = tabHosts?.get(tab.pane_id);
+          // Why this tab's controls do not work: its machine is not running
+          // the project, or this viewer may not use that machine.
+          const refusal = host?.refusal;
+          const hostTone = host ? HOST_BADGE_TONES[host.state] : undefined;
 
           return (
             <button
@@ -345,11 +437,17 @@ export function TabBar({
               onDragEnd={handleDragEnd}
               onClick={() => { if (!isRenaming) onSelectTab(tab.pane_id); }}
               onContextMenu={(e) => handleContextMenu(e, tab.pane_id)}
+              title={refusal}
+              // Spelled out once a host badge shows: joined from the
+              // visible spans, the label and host would run together.
+              aria-label={host?.badge && host.hostname
+                ? `${label}${isBot ? " (Bot)" : ""} — ${tabHostDescription(host)}`
+                : undefined}
               className={`group relative flex items-center gap-1.5 px-3 py-2 text-sm font-medium transition-colors flex-shrink-0 border-r border-gray-200 dark:border-gray-700 max-w-[200px] ${
                 isActive
                   ? "bg-white dark:bg-gray-900 text-gray-900 dark:text-gray-100 border-b-2 border-b-blue-500 -mb-px"
                   : "text-gray-500 dark:text-gray-400 hover:bg-gray-200 dark:hover:bg-gray-700/50 hover:text-gray-700 dark:hover:text-gray-300"
-              } ${draggedPaneId === tab.pane_id ? "opacity-40" : ""}`}
+              } ${draggedPaneId === tab.pane_id ? "opacity-40" : refusal && !isActive ? "opacity-60" : ""}`}
               style={{ scrollSnapAlign: "start" }}
             >
               {/* Drop indicator */}
@@ -423,6 +521,24 @@ export function TabBar({
                 </span>
               )}
 
+              {/* Which machine runs the tab, once that is worth saying: the
+                  roster spans machines, or this tab cannot be used. Like the
+                  label, phones show it on the active tab only. */}
+              {host?.badge && host.hostname && hostTone && (
+                <span
+                  data-testid="tab-host-badge"
+                  title={tabHostDescription(host)}
+                  className={`${isActive ? "inline-flex" : "hidden sm:inline-flex"} ${host.state === "running" ? "max-w-[96px]" : "max-w-[136px]"} min-w-0 flex-shrink-0 items-center gap-1 rounded px-1 py-px text-[10px] font-normal leading-tight ${hostTone.badge}`}
+                >
+                  <span aria-hidden="true" className={`h-1.5 w-1.5 flex-shrink-0 rounded-full ${hostTone.dot}`} />
+                  <span className="truncate">{host.hostname}</span>
+                  {/* In words as well as colour; the host name gives way first. */}
+                  {host.state !== "running" && (
+                    <span className="flex-shrink-0">· {tabHostStateLabel(host.state)}</span>
+                  )}
+                </span>
+              )}
+
               {/* Close button - visible on hover or when active.
                   Every tab can be closed, including the last one: a project
                   with no panes is a real state that the workspace explains
@@ -430,19 +546,24 @@ export function TabBar({
                   made any tab that reappeared alone impossible to dismiss.
                   The old exemption for managed Manager/Tech Lead tabs went
                   with team mode; nothing creates a managed pane now, so it
-                  could only strand a pane from a legacy `.apas`. */}
+                  could only strand a pane from a legacy `.apas`.
+                  A tab whose machine is not running the project cannot be
+                  closed until it is: that machine's instance holds the tab. */}
               {(
                 <span
                   onClick={(e) => {
                     e.stopPropagation();
-                    onCloseTab(tab.pane_id);
+                    if (!refusal) onCloseTab(tab.pane_id);
                   }}
-                  className={`ml-1 p-0.5 rounded hover:bg-gray-300 dark:hover:bg-gray-600 flex-shrink-0 ${
+                  aria-disabled={refusal ? true : undefined}
+                  className={`ml-1 p-0.5 rounded flex-shrink-0 ${
+                    refusal ? "cursor-not-allowed" : "hover:bg-gray-300 dark:hover:bg-gray-600"
+                  } ${
                     isActive
-                      ? "opacity-60 hover:opacity-100"
-                      : "opacity-0 group-hover:opacity-60 hover:!opacity-100"
+                      ? refusal ? "opacity-30" : "opacity-60 hover:opacity-100"
+                      : refusal ? "opacity-0 group-hover:opacity-30" : "opacity-0 group-hover:opacity-60 hover:!opacity-100"
                   }`}
-                  title="Close tab"
+                  title={refusal ?? "Close tab"}
                 >
                   <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                     <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
@@ -456,42 +577,86 @@ export function TabBar({
       </div>
 
       {/* Right-click context menu */}
-      {contextMenu && (
-        <div
-          ref={contextMenuRef}
-          className="fixed bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-lg shadow-lg py-1 z-50 min-w-[120px]"
-          style={{ left: contextMenu.x, top: contextMenu.y }}
-        >
-          {onRenameTab && (
-            <button
-              onClick={handleStartRename}
-              className="w-full text-left px-3 py-1.5 text-sm hover:bg-gray-100 dark:hover:bg-gray-700"
-            >
-              Rename
-            </button>
-          )}
-          <button
-            onClick={() => {
-              if (contextMenu) onCloseTab(contextMenu.paneId);
-              setContextMenu(null);
-            }}
-            className="w-full text-left px-3 py-1.5 text-sm hover:bg-gray-100 dark:hover:bg-gray-700 text-red-600 dark:text-red-400"
+      {contextMenu && (() => {
+        const menuHost = tabHosts?.get(contextMenu.paneId);
+        const menuRefusal = menuHost?.refusal;
+        const stopped = menuHost?.stopped;
+        return (
+          <div
+            ref={contextMenuRef}
+            className="fixed bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-lg shadow-lg py-1 z-50 min-w-[120px] max-w-[min(18rem,calc(100vw-24px))]"
+            style={{ left: contextMenu.x, top: contextMenu.y }}
           >
-            Close
-          </button>
-        </div>
-      )}
+            {menuRefusal && (
+              <p className="px-3 py-1.5 text-xs text-gray-500 dark:text-gray-400">{menuRefusal}</p>
+            )}
+            {stopped?.canStart && onStartMachine && (
+              <button
+                disabled={Boolean(stopped.startDisabledReason) || !stopped.projectId}
+                title={stopped.startDisabledReason ?? `Start this project on ${stopped.hostname} only`}
+                onClick={() => {
+                  if (stopped.projectId) onStartMachine(stopped.machineId, stopped.projectId, stopped.hostname);
+                  setContextMenu(null);
+                }}
+                className="w-full text-left px-3 py-1.5 text-sm hover:bg-gray-100 dark:hover:bg-gray-700 disabled:opacity-50 disabled:hover:bg-transparent"
+              >
+                Start on {stopped.hostname}
+              </button>
+            )}
+            {stopped?.canForget && onForgetMachine && (
+              <button
+                onClick={() => {
+                  onForgetMachine(stopped.machineId, stopped.hostname);
+                  setContextMenu(null);
+                }}
+                className="w-full text-left px-3 py-1.5 text-sm hover:bg-gray-100 dark:hover:bg-gray-700"
+              >
+                Forget {stopped.hostname}&apos;s tabs…
+              </button>
+            )}
+            {onRenameTab && (
+              <button
+                disabled={Boolean(menuRefusal)}
+                title={menuRefusal}
+                onClick={handleStartRename}
+                className="w-full text-left px-3 py-1.5 text-sm hover:bg-gray-100 dark:hover:bg-gray-700 disabled:opacity-50 disabled:hover:bg-transparent"
+              >
+                Rename
+              </button>
+            )}
+            <button
+              disabled={Boolean(menuRefusal)}
+              title={menuRefusal}
+              onClick={() => {
+                if (contextMenu) onCloseTab(contextMenu.paneId);
+                setContextMenu(null);
+              }}
+              className="w-full text-left px-3 py-1.5 text-sm hover:bg-gray-100 dark:hover:bg-gray-700 text-red-600 dark:text-red-400 disabled:opacity-50 disabled:hover:bg-transparent"
+            >
+              Close
+            </button>
+          </div>
+        );
+      })()}
 
       {/* Global tab-bar actions */}
       <div className="flex items-center gap-1 pr-1">
-        <AddTabButton onAddTab={onAddTab} onAddAutonomous={onAddAutonomous} autonomousUnavailableReason={autonomousUnavailableReason} />
+        <AddTabButton
+          onAddTab={onAddTab}
+          onAddAutonomous={onAddAutonomous}
+          autonomousUnavailableReason={autonomousUnavailableReason}
+          machineChoices={machineChoices}
+        />
         {/* One slot, two states: a project is either open or closed. Closing
             stops every agent in it, so it is confirmed and says so — the
-            agents are the work, not the process hosting them. */}
+            agents are the work, not the process hosting them. Both act on
+            every machine the project's tabs run on. */}
         {showBootButton && onBootCli && (
           <button
             onClick={() => {
-              if (confirm("Open this project? Its APAS CLI starts on the host.")) onBootCli();
+              if (confirm(multiMachine
+                ? "Open this project? Its APAS CLI starts on each online machine that has its tabs."
+                : "Open this project? Its APAS CLI starts on the host.")) onBootCli();
             }}
             className="px-2.5 h-8 my-1 text-xs font-medium rounded transition-colors bg-blue-500 hover:bg-blue-600 text-white"
             title="Open this project"
@@ -503,8 +668,9 @@ export function TabBar({
           <button
             onClick={() => {
               if (
-                confirm(
-                  "Close this project? Every agent in it is shut down, and it stops appearing in the idle list until you open it again.",
+                confirm(multiMachine
+                  ? "Close this project? Every agent in it is shut down on every machine running it, and it stops appearing in the idle list until you open it again."
+                  : "Close this project? Every agent in it is shut down, and it stops appearing in the idle list until you open it again.",
                 )
               ) {
                 onCloseProject();
@@ -524,7 +690,7 @@ export function TabBar({
               title="Project CLI lifecycle actions"
               aria-expanded={lifecycleMenuOpen}
             >
-              {lifecycleStatus && !["succeeded", "failed", "timed_out"].includes(lifecycleStatus.phase)
+              {lifecycleInFlight(lifecycleStatus)
                 ? <LoaderCircle className="h-3.5 w-3.5 animate-spin" aria-label="CLI operation pending" />
                 : <RefreshCw className="h-3.5 w-3.5" />}
               CLI
@@ -532,29 +698,69 @@ export function TabBar({
             </button>
             {lifecycleMenuOpen && (
               <div className="absolute right-0 top-full z-50 w-80 rounded-lg border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800 shadow-xl p-1.5">
-                <button
-                  disabled={Boolean(lifecycleStatus && !["succeeded", "failed", "timed_out"].includes(lifecycleStatus.phase))}
-                  onClick={() => {
-                    if (confirm(rebootConfirmation(lifecycleInventory))) {
-                      onRebootCli();
-                      setLifecycleMenuOpen(false);
-                    }
-                  }}
-                  className="w-full rounded px-3 py-2 text-left text-sm text-red-700 dark:text-red-300 hover:bg-red-50 dark:hover:bg-red-950/40 disabled:opacity-50"
-                >
-                  <span className="font-medium">Reboot CLI</span>
-                  <span className="mt-0.5 block text-xs text-gray-500 dark:text-gray-400">
-                    Replace the CLI process; unsupported panes may restart or resume.
-                  </span>
-                </button>
-                {lifecyclePhaseLabel(lifecycleStatus) && (
-                  <div
-                    className="mt-1 border-t border-gray-200 dark:border-gray-700 px-3 py-2 text-xs text-gray-600 dark:text-gray-300"
-                    role="status"
+                {rebootTargets && rebootTargets.length > 1 ? (
+                  // One instance per machine: each reboot restarts that
+                  // machine's daemon only, so each is confirmed against that
+                  // machine's own panes.
+                  rebootTargets.map((target) => {
+                    const pending = lifecycleStatus != null
+                      && lifecycleInFlight(lifecycleStatus)
+                      && lifecycleTargets(lifecycleStatus, target);
+                    const otherHosts = rebootTargets
+                      .filter((other) => other.key !== target.key)
+                      .map((other) => other.hostname);
+                    return (
+                      <button
+                        key={target.key}
+                        disabled={pending || Boolean(target.disabledReason)}
+                        title={target.disabledReason}
+                        onClick={() => {
+                          if (confirm(rebootConfirmation(target.inventory, { hostname: target.hostname, otherHosts }))) {
+                            onRebootCli(target.machineId);
+                            setLifecycleMenuOpen(false);
+                          }
+                        }}
+                        className="w-full rounded px-3 py-2 text-left text-sm text-red-700 dark:text-red-300 hover:bg-red-50 dark:hover:bg-red-950/40 disabled:opacity-50"
+                      >
+                        <span className="font-medium">Reboot CLI on {target.hostname}</span>
+                        <span className="mt-0.5 block text-xs text-gray-500 dark:text-gray-400">
+                          {target.disabledReason
+                            ?? `${target.primary ? "Primary instance. " : ""}Replaces that machine's CLI; the other machines keep running.`}
+                        </span>
+                      </button>
+                    );
+                  })
+                ) : (
+                  <button
+                    disabled={lifecycleInFlight(lifecycleStatus)}
+                    onClick={() => {
+                      if (confirm(rebootConfirmation(lifecycleInventory))) {
+                        onRebootCli();
+                        setLifecycleMenuOpen(false);
+                      }
+                    }}
+                    className="w-full rounded px-3 py-2 text-left text-sm text-red-700 dark:text-red-300 hover:bg-red-50 dark:hover:bg-red-950/40 disabled:opacity-50"
                   >
-                    {lifecyclePhaseLabel(lifecycleStatus)}
-                  </div>
+                    <span className="font-medium">Reboot CLI</span>
+                    <span className="mt-0.5 block text-xs text-gray-500 dark:text-gray-400">
+                      Replace the CLI process; unsupported panes may restart or resume.
+                    </span>
+                  </button>
                 )}
+                {(() => {
+                  const statusHost = rebootTargets && rebootTargets.length > 1 && lifecycleStatus
+                    ? rebootTargets.find((target) => lifecycleTargets(lifecycleStatus, target))?.hostname
+                    : undefined;
+                  const label = lifecyclePhaseLabel(lifecycleStatus, statusHost);
+                  return label && (
+                    <div
+                      className="mt-1 border-t border-gray-200 dark:border-gray-700 px-3 py-2 text-xs text-gray-600 dark:text-gray-300"
+                      role="status"
+                    >
+                      {label}
+                    </div>
+                  );
+                })()}
               </div>
             )}
           </div>
@@ -565,20 +771,82 @@ export function TabBar({
   );
 }
 
+/**
+ * Where a new tab runs: the project's running instances, machines where it is
+ * registered (started first), and owned machines without it (cloned first).
+ * Shown only when there is a real choice to make.
+ */
+function MachineChoiceFieldset({
+  model,
+  selectedKey,
+  onSelect,
+}: {
+  model: MachineChoiceModel;
+  selectedKey: string | null;
+  onSelect: (key: string) => void;
+}) {
+  const name = useId();
+  return (
+    <fieldset className="border-b border-gray-100 px-3 pb-2 dark:border-gray-700">
+      <legend className="px-0 pt-2 text-xs font-semibold text-gray-500 dark:text-gray-400">Run on</legend>
+      {groupMachineChoices(model.choices).map((group) => (
+        <div key={group.key} role="group" aria-label={group.label} className="mt-1">
+          <p aria-hidden="true" className="text-[11px] font-medium uppercase tracking-wide text-gray-400 dark:text-gray-500">{group.label}</p>
+          {group.choices.map((choice) => (
+            <label
+              key={choice.key}
+              title={choice.disabledReason}
+              className={`flex min-h-11 items-start gap-2 rounded px-1 py-1.5 text-sm ${
+                choice.disabledReason ? "cursor-not-allowed opacity-60" : "cursor-pointer hover:bg-gray-100 dark:hover:bg-gray-700"
+              }`}
+            >
+              <input
+                type="radio"
+                name={name}
+                value={choice.key}
+                checked={selectedKey === choice.key}
+                disabled={Boolean(choice.disabledReason)}
+                onChange={() => onSelect(choice.key)}
+                className="mt-0.5 h-4 w-4 flex-shrink-0"
+              />
+              <span className="min-w-0">
+                <span className="block truncate font-medium">{choice.hostname}</span>
+                <span className="block text-xs text-gray-500 dark:text-gray-400">{machineChoiceDetail(choice)}</span>
+              </span>
+            </label>
+          ))}
+        </div>
+      ))}
+    </fieldset>
+  );
+}
+
 function AddTabButton({
   onAddTab,
   onAddAutonomous,
   autonomousUnavailableReason,
-}: Pick<TabBarProps, "onAddTab" | "onAddAutonomous" | "autonomousUnavailableReason">) {
+  machineChoices,
+}: Pick<TabBarProps, "onAddTab" | "onAddAutonomous" | "autonomousUnavailableReason" | "machineChoices">) {
   // Presentation only; server/CLI still enforce interactive profile policy,
   // and autonomous admission has its own authority and readiness checks.
   const isAllowed = useIsLaunchProfileAllowed();
   const [showMenu, setShowMenu] = useState(false);
   const [interactive, setInteractive] = useState(false);
   const [isolatedWorktree, setIsolatedWorktree] = useState(false);
+  const [machineKey, setMachineKey] = useState<string | null>(null);
   const [position, setPosition] = useState({ top: 0, left: 12 });
   const menuRef = useRef<HTMLDivElement>(null);
   const buttonRef = useRef<HTMLButtonElement>(null);
+  const showMachineStep = machineChoices?.showChoice === true;
+  // The user's pick, else the default (the selected tab's machine). Derived
+  // rather than copied at opening, so a default that arrives while the menu is
+  // open still counts. A pick that disappears or becomes unavailable while
+  // the menu is open (an instance detaches) is no pick at all.
+  const selectedKey = machineKey ?? machineChoices?.defaultChoice?.key ?? null;
+  const selectedMachine = showMachineStep
+    ? machineChoices?.choices.find((choice) => choice.key === selectedKey && !choice.disabledReason)
+    : undefined;
+  const needsMachine = showMachineStep && !selectedMachine;
 
   useEffect(() => {
     if (!showMenu) return;
@@ -600,10 +868,13 @@ function AddTabButton({
     const rect = buttonRef.current?.getBoundingClientRect();
     if (rect) setPosition({ top: rect.bottom + 4, left: Math.max(12, Math.min(rect.right - 288, window.innerWidth - 300)) });
     setInteractive(false);
+    // Each opening starts from the default: the selected tab's machine.
+    setMachineKey(null);
     setShowMenu((value) => !value);
   };
   const handlePick = (provider: string, model?: string) => {
-    onAddTab(provider, model, isolatedWorktree || undefined, "terminal");
+    if (needsMachine) return;
+    onAddTab(provider, model, isolatedWorktree || undefined, "terminal", selectedMachine);
     setIsolatedWorktree(false);
     setShowMenu(false);
   };
@@ -660,13 +931,21 @@ function AddTabButton({
               <input type="checkbox" checked={isolatedWorktree} onChange={(event) => setIsolatedWorktree(event.target.checked)} className="h-4 w-4" />
               Isolated git worktree
             </label>
+            {showMachineStep && machineChoices && (
+              <MachineChoiceFieldset model={machineChoices} selectedKey={selectedKey} onSelect={setMachineKey} />
+            )}
             <p className="px-3 pt-2 text-xs font-semibold text-gray-500 dark:text-gray-400">Interactive provider</p>
+            {needsMachine && (
+              <p className="px-3 pt-1 text-xs text-gray-500 dark:text-gray-400">Choose where the tab runs first.</p>
+            )}
             {providers.map((entry) => (
               <button
                 type="button"
                 key={entry.model ? `${entry.provider}/${entry.model}` : entry.provider}
+                disabled={needsMachine}
+                title={needsMachine ? "Choose where the tab runs first" : undefined}
                 onClick={() => handlePick(entry.provider, entry.model)}
-                className="w-full min-h-11 text-left px-3 py-2 text-sm hover:bg-gray-100 dark:hover:bg-gray-700 flex items-center gap-2"
+                className="w-full min-h-11 text-left px-3 py-2 text-sm hover:bg-gray-100 dark:hover:bg-gray-700 flex items-center gap-2 disabled:cursor-not-allowed disabled:opacity-50 disabled:hover:bg-transparent"
               >
                 <span className="flex-shrink-0 text-gray-500 dark:text-gray-400"><ProviderIcon provider={entry.provider} className="w-4 h-4" /></span>
                 {entry.label}

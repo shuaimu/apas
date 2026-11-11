@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { ActivityIndicator, FlatList, type NativeScrollEvent, type NativeSyntheticEvent, StyleSheet, Text, View } from "react-native";
 import { router, useLocalSearchParams } from "expo-router";
 import * as Crypto from "expo-crypto";
-import type { CodeEvent, PaneConfig } from "@apas/protocol";
+import type { CodeEvent, MobilePaneSummary, PaneConfig } from "@apas/protocol";
 
 import { DecisionActions, type DecisionResponse } from "@/components/DecisionActions";
 import { EventCard } from "@/components/EventCard";
@@ -13,17 +13,36 @@ import { connectionSupervisor } from "@/connection/runtime";
 import { useTheme } from "@/design/tokens";
 import { readCachedSnapshot, readConversationPosition, readSelectedConversationPane, saveConversationPosition, saveSelectedConversationPane, type ConversationPosition } from "@/storage/cache";
 import { paneStatusIsPendingAnswer } from "@/state/paneStatus";
-import { mutationsAllowed, useMobileStore } from "@/state/store";
+import {
+  instancesForSession,
+  paneHostname,
+  paneReachability,
+  paneUnavailableReason,
+  rosterSpansHosts,
+  sessionHostSummary,
+  type PaneReachability,
+} from "@/state/projectInstances";
+import { mutationsAllowed, PROJECT_INSTANCES_CAPABILITY, useMobileStore } from "@/state/store";
 
 const EMPTY_EVENTS: CodeEvent[] = [];
-const EMPTY_PANES: PaneConfig[] = [];
+const EMPTY_PANES: (PaneConfig | MobilePaneSummary)[] = [];
+
+function paneChipState(reachability: PaneReachability, status: string | undefined): string {
+  if (reachability === "stopped") return " · stopped";
+  if (reachability === "no_access") return " · no access";
+  if (!status) return "";
+  return paneStatusIsPendingAnswer(status) ? " · pending answer" : " · working";
+}
 
 export default function SessionActivityScreen() {
   const { sessionId, eventId, paneId: requestedPaneId } = useLocalSearchParams<{ sessionId: string; eventId?: string; paneId?: string }>();
   const theme = useTheme();
   const session = useMobileStore((state) => state.sessions.find((item) => item.id === sessionId));
   const events = useMobileStore((state) => state.eventsBySession[sessionId] ?? EMPTY_EVENTS);
-  const paneConfigs = useMobileStore((state) => state.panesBySession[sessionId] ?? EMPTY_PANES);
+  // Undefined until a live roster arrives; an explicitly empty one stays empty.
+  const livePanes = useMobileStore((state) => state.panesBySession[sessionId]);
+  const liveInstances = useMobileStore((state) => state.instancesBySession[sessionId]);
+  const instancesSupported = useMobileStore((state) => state.negotiatedCapabilities.includes(PROJECT_INSTANCES_CAPABILITY));
   const paneStatuses = useMobileStore((state) => state.paneStatusesBySession[sessionId]);
   const setEvents = useMobileStore((state) => state.setEvents);
   const connection = useMobileStore((state) => state.connection);
@@ -49,14 +68,29 @@ export default function SessionActivityScreen() {
   const followNewest = useRef(true);
   const restoredPosition = useRef(false);
   const requestedSelection = paneSelection.sessionId === sessionId ? paneSelection.paneId : null;
+  const instances = useMemo(() => instancesForSession(session, liveInstances), [liveInstances, session]);
+  // Only a connection that negotiated instances keeps the set current enough
+  // to call a machine stopped.
+  const instancesLive = instancesSupported && Boolean(session?.is_active);
+  const bootstrapPanes = session?.panes;
   const panes = useMemo(() => {
     const seen = new Set<number>();
-    const options = paneConfigs.map((pane) => {
+    // The bootstrap's pane detail stands in until the live roster arrives.
+    const roster = livePanes ?? bootstrapPanes ?? EMPTY_PANES;
+    const options: {
+      id: number;
+      kind: "agent" | "terminal";
+      label: string;
+      host: string | null;
+      reachability: PaneReachability;
+    }[] = roster.map((pane) => {
       seen.add(pane.pane_id);
       return {
         id: pane.pane_id,
         kind: pane.kind ?? "agent",
         label: pane.label?.trim() || `${pane.kind === "terminal" ? "Terminal" : "Pane"} ${pane.pane_id}`,
+        host: paneHostname(pane, instances),
+        reachability: paneReachability(pane, instances, instancesLive),
       };
     });
     for (const event of events) {
@@ -66,10 +100,20 @@ export default function SessionActivityScreen() {
         id: event.pane_id,
         kind: event.kind === "terminal" ? "terminal" : "agent",
         label: `Pane ${event.pane_id}`,
+        host: null,
+        reachability: "usable",
       });
     }
-    return options;
-  }, [events, paneConfigs]);
+    // A tab that cannot take input always names its host: the reason is
+    // about that machine.
+    const spansHosts = rosterSpansHosts(options.map((option) => option.host));
+    return options.map((option) => ({
+      ...option,
+      displayLabel: option.host && (spansHosts || option.reachability !== "usable")
+        ? `${option.label} · ${option.host}`
+        : option.label,
+    }));
+  }, [bootstrapPanes, events, instances, instancesLive, livePanes]);
   const preferredPane = panes.find((pane) => pane.kind !== "terminal") ?? panes[0];
   const deepLinkedPaneId = eventId ? events.find((event) => event.id === eventId)?.pane_id : undefined;
   const desiredPaneId = requestedSelection ?? deepLinkedPaneId ?? null;
@@ -82,6 +126,7 @@ export default function SessionActivityScreen() {
     ? savedPositionResult.position
     : undefined;
   const selectedPane = panes.find((pane) => pane.id === activePaneId);
+  const selectedUnavailable = selectedPane ? paneUnavailableReason(selectedPane.reachability, selectedPane.host) : null;
   const selectedIsTerminal = selectedPane?.kind === "terminal";
   const selectedStatus = activePaneId === null ? null : paneStatuses?.[String(activePaneId)] ?? null;
   const selectedAwaitingAnswer = paneStatusIsPendingAnswer(selectedStatus);
@@ -189,7 +234,7 @@ export default function SessionActivityScreen() {
   };
 
   const steer = async () => {
-    if (!mutationsAllowed() || !followUp.trim() || activePaneId === null) return;
+    if (!mutationsAllowed() || !followUp.trim() || activePaneId === null || selectedUnavailable) return;
     const supervisor = connectionSupervisor();
     if (!supervisor) {
       setActionError("Reconnect before sending this message.");
@@ -258,6 +303,8 @@ export default function SessionActivityScreen() {
 
   const respondToDecision = async (event: CodeEvent, response: DecisionResponse, answer?: string) => {
     if (!mutationsAllowed() || event.pane_id === undefined) throw new Error("Reconnect and refresh this decision before responding.");
+    // The timeline only shows the selected pane, so its machine is this one's.
+    if (selectedUnavailable) throw new Error(selectedUnavailable);
     const detail = event.detail as Record<string, unknown> | undefined;
     const requestId = Crypto.randomUUID();
     const supervisor = connectionSupervisor();
@@ -306,13 +353,13 @@ export default function SessionActivityScreen() {
       <OfflineBanner />
       {actionError ? <View style={styles.error}><ErrorNotice message={actionError} /></View> : null}
       <View style={[styles.summary, { borderColor: theme.border }]}> 
-        <View style={styles.row}><View style={{ flex: 1 }}><Text style={[styles.title, { color: theme.text }]}>{session.project_name ?? "Coding session"}</Text><Text style={{ color: theme.textMuted }}>{session.hostname ?? session.working_dir}</Text></View><StatusBadge label={sessionActivityLabel} tone={sessionActivity === "working" ? "success" : sessionActivity === "pending" ? "warning" : sessionActivity === "offline" ? "danger" : "neutral"} /></View>
+        <View style={styles.row}><View style={{ flex: 1 }}><Text style={[styles.title, { color: theme.text }]}>{session.project_name ?? "Coding session"}</Text><Text style={{ color: theme.textMuted }}>{sessionHostSummary(session, instances)}</Text></View><StatusBadge label={sessionActivityLabel} tone={sessionActivity === "working" ? "success" : sessionActivity === "pending" ? "warning" : sessionActivity === "offline" ? "danger" : "neutral"} /></View>
         <View style={styles.actions}>
           {summarySupported ? <SecondaryButton disabled={activePaneId === null} onPress={() => setSummaryOpen(true)}>Summary</SecondaryButton> : null}
           <SecondaryButton disabled={!selectedIsTerminal || !terminalEnabled} onPress={() => { if (!selectedIsTerminal || activePaneId === null) return; persistTimelinePosition(); router.push({ pathname: "/(code)/session/[sessionId]/terminal", params: { sessionId, paneId: String(activePaneId) } }); }}>Raw terminal</SecondaryButton>
         </View>
       </View>
-      {panes.length > 0 ? <View style={styles.panes}><Text style={{ color: theme.textMuted }}>Conversation:</Text>{panes.map((pane) => <SecondaryButton key={pane.id} onPress={() => selectConversationPane(pane.id)}>{`${activePaneId === pane.id ? "✓ " : ""}${pane.label}${paneStatuses?.[String(pane.id)] ? paneStatusIsPendingAnswer(paneStatuses[String(pane.id)]) ? " · pending answer" : " · working" : ""}`}</SecondaryButton>)}</View> : null}
+      {panes.length > 0 ? <View style={styles.panes}><Text style={{ color: theme.textMuted }}>Conversation:</Text>{panes.map((pane) => <SecondaryButton key={pane.id} onPress={() => selectConversationPane(pane.id)}>{`${activePaneId === pane.id ? "✓ " : ""}${pane.displayLabel}${paneChipState(pane.reachability, paneStatuses?.[String(pane.id)])}`}</SecondaryButton>)}</View> : null}
       <FlatList
         ref={timeline}
         data={conversationEvents}
@@ -330,22 +377,23 @@ export default function SessionActivityScreen() {
             timeline.current?.scrollToEnd({ animated: false });
           }
         }}
-        renderItem={({ item }) => <View style={styles.event}><EventCard event={item} expanded={expanded.has(item.id)} onPress={() => setExpanded((current) => { const next = new Set(current); if (next.has(item.id)) next.delete(item.id); else next.add(item.id); return next; })} /><DecisionActions event={item} disabled={!mutationsAllowed()} onRespond={(response, answer) => respondToDecision(item, response, answer)} /></View>}
+        renderItem={({ item }) => <View style={styles.event}><EventCard event={item} expanded={expanded.has(item.id)} onPress={() => setExpanded((current) => { const next = new Set(current); if (next.has(item.id)) next.delete(item.id); else next.add(item.id); return next; })} /><DecisionActions event={item} disabled={!mutationsAllowed() || selectedUnavailable !== null} onRespond={(response, answer) => respondToDecision(item, response, answer)} /></View>}
         ListHeaderComponent={conversationEvents.length ? <SecondaryButton onPress={() => { const first = conversationEvents[0]?.detail as { id?: unknown } | undefined; connectionSupervisor()?.send({ type: "get_session_messages", session_id: sessionId, pane_id: activePaneId, before_id: typeof first?.id === "string" ? first.id : null, limit: 100 }); }}>Load older activity</SecondaryButton> : null}
         onScrollToIndexFailed={({ index }) => setTimeout(() => timeline.current?.scrollToOffset({ offset: Math.max(0, index * 120), animated: true }), 50)}
         ListEmptyComponent={<EmptyState title={connection === "ready" ? "No activity yet" : "No cached activity"} body={connection === "ready" ? "Agent instructions and tool activity for this pane will appear here." : "Reconnect to retrieve this pane's activity."} />}
       />
       <View style={[styles.composer, { borderColor: theme.border, backgroundColor: theme.background }]}> 
         {connection === "ready" && selectedStatus ? <View testID="pane-working-status" accessibilityLiveRegion="polite" style={[styles.workingStatus, { backgroundColor: theme.surface }]}>{selectedAwaitingAnswer ? <Text style={[styles.pendingIcon, { color: theme.warning }]}>?</Text> : <ActivityIndicator size="small" color={theme.accent} />}<Text numberOfLines={1} style={[styles.workingText, { color: selectedAwaitingAnswer ? theme.warning : theme.accent }]}>{selectedStatus}</Text></View> : null}
+        {selectedUnavailable ? <View testID="pane-unavailable" accessibilityLiveRegion="polite" style={[styles.unavailable, { backgroundColor: theme.surfaceMuted, borderColor: theme.warning }]}><Text style={{ color: theme.text }}>{selectedUnavailable}</Text></View> : null}
         <FormField label="Message" value={followUp} onChangeText={(value) => { setFollowUp(value); setFollowUpRequestId(null); }} placeholder={selectedIsTerminal ? "Message this terminal conversation" : "Steer this exact session and pane"} multiline />
-        <PrimaryButton disabled={!mutationsAllowed() || activePaneId === null || !followUp.trim() || (selectedIsTerminal && !terminalEnabled)} onPress={() => void steer()}>{followUpRequestId ? "Retry message safely" : "Send message"}</PrimaryButton>
+        <PrimaryButton disabled={!mutationsAllowed() || activePaneId === null || !followUp.trim() || (selectedIsTerminal && !terminalEnabled) || selectedUnavailable !== null} onPress={() => void steer()}>{followUpRequestId ? "Retry message safely" : "Send message"}</PrimaryButton>
       </View>
       <PaneWorkSummarySheet
         visible={summaryOpen}
         sessionId={sessionId}
         paneId={activePaneId}
-        paneLabel={selectedPane?.label ?? null}
-        panes={panes.map((pane) => ({ id: pane.id, label: pane.label }))}
+        paneLabel={selectedPane?.displayLabel ?? null}
+        panes={panes.map((pane) => ({ id: pane.id, label: pane.displayLabel }))}
         onSelectPane={selectConversationPane}
         onClose={() => setSummaryOpen(false)}
       />
@@ -364,6 +412,7 @@ const styles = StyleSheet.create({
   empty: { flexGrow: 1 },
   error: { paddingHorizontal: 16, paddingTop: 10 },
   composer: { borderTopWidth: 1, padding: 12, gap: 8 },
+  unavailable: { borderWidth: 1, borderRadius: 10, paddingHorizontal: 10, paddingVertical: 8 },
   workingStatus: { alignSelf: "flex-start", flexDirection: "row", alignItems: "center", gap: 6, borderRadius: 999, paddingHorizontal: 9, paddingVertical: 4 },
   workingText: { maxWidth: 260, fontSize: 12, fontWeight: "700" },
   pendingIcon: { fontSize: 14, fontWeight: "900" },

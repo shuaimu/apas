@@ -20,6 +20,8 @@ import type {
 import { writeSelectedPane } from "@/lib/mobileSelectedPane";
 import { compareRecentlyIdle } from "@/lib/idlePaneOrdering";
 import { buildProjectList } from "@/lib/projectList";
+import { parseSessionInstances, type SessionInstance } from "@/lib/projectInstances";
+import { projectHostLabel } from "@/lib/tabHosts";
 import {
   paneUsageLimit,
   usageLimitedLabel,
@@ -61,6 +63,9 @@ interface MobileSessionSummary {
   is_shared?: boolean;
   owner_email?: string | null;
   panes?: SessionPaneSummary[];
+  /** Attached instances, one per machine, parsed from the wire. Absent from
+   *  older servers and when nothing is attached. */
+  instances?: SessionInstance[];
 }
 
 interface MobileMachineProject {
@@ -159,6 +164,7 @@ function adaptSession(session: SessionInfo): MobileSessionSummary {
     is_shared: session.isShared,
     owner_email: session.ownerEmail,
     panes: session.panes,
+    instances: session.instances,
   };
 }
 
@@ -188,8 +194,12 @@ function paneRowLabel(pane: SessionPaneSummary): string {
   return pane.label?.trim() || `${pane.kind === "terminal" ? "Terminal" : "Pane"} ${pane.pane_id}`;
 }
 
+/// One card per project however many machines run it: the primary host plus
+/// how many more ("zoo-005 +1").
 function sessionTarget(session: MobileSessionSummary): string {
-  return session.hostname || session.working_dir || "Unknown target";
+  return projectHostLabel(session.instances, session.hostname || undefined).text
+    || session.working_dir
+    || "Unknown target";
 }
 
 function formatUpdatedAt(value?: string | null): string {
@@ -361,7 +371,12 @@ export function MobileCodeHome({
       });
       if (!response.ok) throw new Error(`Request failed (${response.status})`);
       const bootstrap = await response.json() as MobileBootstrapResponse;
-      setRemoteSessions(Array.isArray(bootstrap.sessions) ? bootstrap.sessions : []);
+      setRemoteSessions(Array.isArray(bootstrap.sessions)
+        ? bootstrap.sessions.map((session) => ({
+          ...session,
+          instances: parseSessionInstances((session as { instances?: unknown }).instances),
+        }))
+        : []);
       setBootstrapMachines(Array.isArray(bootstrap.machines) ? bootstrap.machines : []);
       setLoadError(null);
     } catch (error) {
@@ -400,6 +415,9 @@ export function MobileCodeHome({
         hostname: live.hostname ?? session.hostname,
         working_dir: live.workingDir ?? session.working_dir,
         panes: live.panes ?? session.panes,
+        // The live list says which instances are attached now, including
+        // none; a bootstrap snapshot only stands in until it arrives.
+        instances: live.instances,
       };
     }), ...legacySessions.filter((session) => !remoteIds.has(session.id)).map(adaptSession)];
   }, [legacySessions, remoteSessions]);
@@ -525,7 +543,7 @@ export function MobileCodeHome({
           </span>
         </div>
         <p className="mt-2 truncate text-sm text-[#686873] dark:text-[#aaaab6]">
-          {[sessionTarget(session), resetLabel].filter(Boolean).join(" · ")}
+          {[pane.hostname || sessionTarget(session), resetLabel].filter(Boolean).join(" · ")}
         </p>
       </button>
     );

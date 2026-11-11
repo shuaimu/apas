@@ -13,6 +13,7 @@ import {
 } from "@/lib/projectList";
 import { CreateInstanceModal } from "./CreateInstanceModal";
 import { useProjectOrder } from "@/lib/useProjectOrder";
+import { projectHostLabel } from "@/lib/tabHosts";
 
 interface SidebarRailProps {
   onExpand: () => void;
@@ -125,7 +126,8 @@ function ProjectIcon({
   // itself can only fit two letters.
   const tooltip = [
     project.name,
-    project.hostname,
+    // The primary host plus how many more machines run it ("zoo-005 +1").
+    projectHostLabel(project.instances, project.hostname).text,
     project.workingDir !== project.name ? project.workingDir : undefined,
     project.isShared && project.ownerEmail ? `Shared by ${project.ownerEmail}` : undefined,
     project.sessionId === null ? project.isActive ? "Running" : "Stopped" : project.isActive ? "Active" : undefined,

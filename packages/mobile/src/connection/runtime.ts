@@ -4,6 +4,7 @@ import { AppState } from "react-native";
 import { ApiError, bootstrap, validAccessToken } from "@/api/client";
 import { applyCodeEvents, normalizeServerMessage } from "@apas/protocol";
 import { endpoints } from "@/config/endpoints";
+import { handleSessionInstancesMessage } from "@/connection/sessionInstances";
 import { ConnectionSupervisor, type SocketLike } from "@/connection/supervisor";
 import { handlePaneWorkSummaryMessage, reconcileVisiblePaneWorkSummaries } from "@/connection/workSummaries";
 import {
@@ -45,6 +46,7 @@ export function startConnectionRuntime(): ConnectionSupervisor {
     },
     onMessage: (message) => {
       if (handlePaneWorkSummaryMessage(message)) return;
+      if (handleSessionInstancesMessage(message)) return;
       if (message.type === "session_attached") {
         useMobileStore.getState().setSessionActive(message.session_id, message.has_active_cli);
       }

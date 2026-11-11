@@ -26,6 +26,15 @@ import {
   paneIsAwaitingAnswerStatus,
   paneIsWorkingStatus,
 } from "./paneStatus";
+import {
+  LEGACY_MACHINE_KEY,
+  PROJECT_INSTANCES_CAPABILITY,
+  parseSessionInstances,
+  primaryInstance,
+  resolvePaneInstance,
+  selectSessionInstances,
+  type SessionInstance,
+} from "./projectInstances";
 
 // UUID generator with fallback for environments without crypto.randomUUID
 function generateId(): string {
@@ -88,6 +97,9 @@ export interface CliLifecycleInventory {
 export interface CliLifecycleStatus {
   sessionId: string;
   requestId: string;
+  /** The instance the operation is for. Absent for the primary of an older
+   *  server, which names no machine. */
+  machineId?: string;
   operation: CliLifecycleOperation;
   phase: CliLifecyclePhase;
   message?: string;
@@ -122,6 +134,11 @@ export interface SessionInfo {
   /** The session's panes and whether each is working. `isWorking` above only
    *  says whether *anything* is, which cannot answer which agent is idle. */
   panes?: SessionPaneSummary[];
+  /** The project's attached instances, one per machine. Absent from older
+   *  servers and when nothing is attached; `hostname` then describes the
+   *  session. Pushed `session_instances` frames update it in place, so read
+   *  it through `selectSessionInstances`. */
+  instances?: SessionInstance[];
 }
 
 export interface SessionPaneSummary {
@@ -130,6 +147,10 @@ export interface SessionPaneSummary {
   kind: string;
   provider: string;
   model?: string | null;
+  /** See `PaneConfig.machine_id`. */
+  machine_id?: string | null;
+  /** See `PaneConfig.hostname`. */
+  hostname?: string | null;
   is_working?: boolean;
   awaiting_answer?: boolean;
   idle_since?: string | null;
@@ -214,6 +235,10 @@ export interface MachineProject {
   /** Resident-set size in KiB, reported by daemon in heartbeat. */
   memoryKb?: number;
   lastError?: string;
+  /** Canonical `host/owner/repo` of the checkout's origin, so a project that
+   *  has never started still groups under its repository. Absent without an
+   *  origin and from older daemons. */
+  gitRemote?: string;
 }
 
 export interface MachineWithProjects {
@@ -223,6 +248,13 @@ export interface MachineWithProjects {
   clusterAccess?: "owner" | "member";
   sharedProvisioningAvailable?: boolean;
   localProjectRegistrationAvailable?: boolean;
+  /** The machine's daemon is connected to the server now. A machine's
+   *  `lastSeen` cannot say this: disconnects stamp it too. */
+  daemonConnected?: boolean;
+  /** Connected and able to run a project's instance beside instances on
+   *  other machines. Connected without it means an older daemon that needs a
+   *  reboot to update. */
+  projectInstancesAvailable?: boolean;
 }
 
 // Map tool_use_id (e.g. "toolu_01Xwe...") to human-readable tool name (e.g. "Read", "Bash")
@@ -421,6 +453,84 @@ export interface PaneConfig {
    *  Overview Pane Grid). false (default for legacy / TabBar + side
    *  chats) = not part of the team queue. */
   managed?: boolean;
+  /** Machine whose project instance runs this pane, assigned by the server.
+   *  Absent from older servers and for panes written before multi-machine
+   *  instances; see `resolvePaneInstance` for where those are routed. */
+  machine_id?: string | null;
+  /** Display name of the pane's host. On an untagged pane it is the host the
+   *  server last recorded the pane under, never proof of ownership. */
+  hostname?: string | null;
+}
+
+/** A new tab, as `addPane` takes it. */
+export interface AddPaneSpec {
+  provider: string;
+  mode: string;
+  label?: string;
+  prompt?: string;
+  model?: string;
+  isolatedWorktree?: boolean;
+  initialRole?: {
+    role?: string;
+    goal?: string;
+    backstory?: string;
+    planReviewMode?: PlanReviewMode;
+  };
+  managed?: boolean;
+  kind?: PaneKind;
+}
+
+/**
+ * One correlated new-tab launch. `cloning` is the clone step of
+ * `cloneAndAddPane`; `pending` waits for the server's first answer;
+ * `starting` waits for the target machine's instance to start. `routed`,
+ * `failed` and `unconfirmed` are final. `unconfirmed` means the answer was
+ * lost (the connection dropped, or nothing came back in time) and the launch
+ * may or may not have happened: it is reported, never resent.
+ */
+export type AddPaneRequestStatus =
+  | "cloning"
+  | "pending"
+  | "starting"
+  | "routed"
+  | "failed"
+  | "unconfirmed";
+
+export interface AddPaneRequest {
+  /** Key: the launch's first wire request id (the clone's, for a clone and
+   *  add). */
+  requestId: string;
+  sessionId: string;
+  /** The machine the tab was requested on; absent for the primary. Updated
+   *  to the machine the server routed to. */
+  machineId?: string;
+  /** Host name to show for `machineId`, when known. */
+  hostname?: string;
+  status: AddPaneRequestStatus;
+  /** The `add_pane` request id the server answers; unset until a clone and
+   *  add has finished cloning. */
+  addRequestId?: string;
+  /** The clone step's request id, for a clone and add. */
+  cloneRequestId?: string;
+  provider: string;
+  kind: PaneKind;
+  label?: string;
+  /** The pane id the server allocated, once there is one. */
+  paneId?: number;
+  error?: string;
+  startedAt: number;
+  updatedAt: number;
+}
+
+/** Where `cloneAndAddPane` clones the project. */
+export interface CloneAndAddPaneTarget {
+  machineId: string;
+  /** Canonical `host/owner/repo`; the daemon also uses it to find a sibling
+   *  checkout's URL when `cloneUrl` is absent. */
+  gitRemote: string;
+  instanceName: string;
+  cloneUrl?: string;
+  basePath?: string;
 }
 
 export type PaneWorkSummaryStatus =
@@ -631,12 +741,23 @@ interface AppState {
 
   // Capability and correlated progress for project CLI lifecycle controls.
   // Operations are keyed by request ID so they survive project navigation.
-  cliLifecycleInventories: Record<string, CliLifecycleInventory>;
+  // Inventories are per session, then per instance machine
+  // (`LEGACY_MACHINE_KEY` for one that names no machine): each instance has
+  // its own hosting capability and panes. Read through
+  // `selectCliLifecycleInventory`.
+  cliLifecycleInventories: Record<string, Record<string, CliLifecycleInventory>>;
   cliLifecycleOperations: Record<string, CliLifecycleStatus>;
   cliLifecycleLatestBySession: Record<string, string>;
 
   // Persisted sessions
   sessions: SessionInfo[];
+  /** The latest pushed `session_instances` set per session. Also applied to
+   *  the session's list entry; this record covers a session the list does
+   *  not contain yet. Read through `selectSessionInstances`. */
+  sessionInstances: Record<string, SessionInstance[]>;
+  /** Correlated new-tab launches by `AddPaneRequest.requestId`, for every
+   *  session. In memory only, and never resent. */
+  addPaneRequests: Record<string, AddPaneRequest>;
 
   // Messages (single pane mode / fallback)
   messages: Message[];
@@ -817,8 +938,27 @@ interface AppState {
   forgetProject: (projectId: string) => void;
   refreshCliClients: () => void;
   listMachines: () => void;
-  startMachineProjectCli: (machineId: string, projectId: string) => void;
-  stopMachineProjectCli: (machineId: string, projectId: string) => void;
+  /** Start a project on a machine. `allInstances` is what the project view's
+   *  Start means: every online machine that owns tabs of the project, with
+   *  `machineId` as the fallback when none does. Without it only `machineId`
+   *  starts, which is what the Machines page's per-machine Start means. */
+  startMachineProjectCli: (
+    machineId: string,
+    projectId: string,
+    options?: { allInstances?: boolean },
+  ) => void;
+  /** Stop a project on a machine; `allInstances` stops every attached
+   *  instance, as the project view's Close means. */
+  stopMachineProjectCli: (
+    machineId: string,
+    projectId: string,
+    options?: { allInstances?: boolean },
+  ) => void;
+  /** Drop a stopped machine's tabs from the project roster after the owner
+   *  confirms. The server refuses while that machine runs the project, and
+   *  the tabs come back if it runs the project again. Returns whether the
+   *  request was sent; the next pane list is the confirmation. */
+  forgetMachinePanes: (sessionId: string, machineId: string) => boolean;
   createProjectInstance: (
     machineId: string,
     gitRemote: string,
@@ -886,7 +1026,20 @@ interface AppState {
     },
     managed?: boolean,
     kind?: PaneKind,
-  ) => { success: boolean; error?: string };
+    /** Machine whose instance runs the tab; absent = the primary. Needs a
+     *  server that negotiated `project_instances_v1`. A registered machine
+     *  that is not running the project is started first. */
+    machineId?: string,
+  ) => { success: boolean; error?: string; requestId?: string };
+  /** Clone the project onto an owned machine as another instance of it, then
+   *  add a tab there: one launch in `addPaneRequests`, going cloning →
+   *  pending → starting → routed or failed. */
+  cloneAndAddPane: (
+    target: CloneAndAddPaneTarget,
+    pane: AddPaneSpec,
+  ) => { success: boolean; error?: string; requestId?: string };
+  /** Forget a launch that is no longer in flight. */
+  dismissAddPaneRequest: (requestId: string) => void;
   removePane: (paneId: number, cleanupAction?: PaneCleanupAction) => void;
   updatePaneLabel: (paneId: number, label: string) => void;
   updatePaneEffort: (paneId: number, effort: string | null) => void;
@@ -911,7 +1064,10 @@ interface AppState {
     effort?: string,
   ) => void;
   stopBot: (paneId: number) => void;
-  rebootCli: () => string | null;
+  /** Reboot the CLI of one of the project's instances; absent = the
+   *  primary's. A daemon runs every project on its machine, so this restarts
+   *  them all there. */
+  rebootCli: (machineId?: string) => string | null;
   /// Reboot the daemon on a machine, targeted by machine id.
   rebootDaemon: (machineId: string) => void;
   /// Reboot every supplied machine daemon through the same per-machine,
@@ -1011,12 +1167,41 @@ function isTerminalLifecyclePhase(phase: CliLifecyclePhase): boolean {
   return phase === "succeeded" || phase === "failed" || phase === "timed_out";
 }
 
+function lifecycleMachineKey(machineId: string | null | undefined): string {
+  return machineId || LEGACY_MACHINE_KEY;
+}
+
+/**
+ * The lifecycle inventory of one instance: `machineId`'s, or with none the
+ * primary's, which is where a request naming no machine goes. An older server
+ * names no machine at all, so its inventory sits under the legacy key.
+ */
+export function selectCliLifecycleInventory(
+  state: Pick<AppState, "cliLifecycleInventories" | "sessions" | "sessionInstances">,
+  sessionId: string | null | undefined,
+  machineId?: string,
+): CliLifecycleInventory | undefined {
+  if (!sessionId) return undefined;
+  const bySession = state.cliLifecycleInventories[sessionId];
+  if (!bySession) return undefined;
+  if (machineId) return bySession[machineId];
+  const primary = primaryInstance(selectSessionInstances(state, sessionId));
+  if (primary) {
+    return bySession[lifecycleMachineKey(primary.machineId)] ?? bySession[LEGACY_MACHINE_KEY];
+  }
+  if (bySession[LEGACY_MACHINE_KEY]) return bySession[LEGACY_MACHINE_KEY];
+  // Nothing says which instance is primary yet; one instance is unambiguous.
+  const inventories = Object.values(bySession);
+  return inventories.length === 1 ? inventories[0] : undefined;
+}
+
 function sendCliLifecycleRequest(
   get: () => AppState,
   set: (partial: Partial<AppState> | ((state: AppState) => Partial<AppState>)) => void,
   operation: CliLifecycleOperation,
+  machineId?: string,
 ): string | null {
-  const { ws, sessionId, cliLifecycleInventories, showToast } = get();
+  const { ws, sessionId, showToast } = get();
   if (!sessionId) {
     showToast("Select a project before using CLI lifecycle controls", "error");
     return null;
@@ -1025,7 +1210,7 @@ function sendCliLifecycleRequest(
     showToast("Not connected — manage the CLI manually on the project host", "error");
     return null;
   }
-  const inventory = cliLifecycleInventories[sessionId];
+  const inventory = selectCliLifecycleInventory(get(), sessionId, machineId);
   if (!inventory) {
     showToast(
       "This project CLI is too old for safe lifecycle controls. Upgrade it on the project host.",
@@ -1039,6 +1224,7 @@ function sendCliLifecycleRequest(
   const optimistic: CliLifecycleStatus = {
     sessionId,
     requestId,
+    machineId,
     operation,
     phase: "accepted",
     message: "Requesting a full CLI reboot",
@@ -1063,6 +1249,7 @@ function sendCliLifecycleRequest(
       session_id: sessionId,
       request_id: requestId,
       operation,
+      machine_id: machineId || undefined,
     }));
   } catch {
     set((state) => ({
@@ -1101,6 +1288,412 @@ function sendCliLifecycleRequest(
   return requestId;
 }
 
+type StoreSet = (partial: Partial<AppState> | ((state: AppState) => Partial<AppState>)) => void;
+
+/**
+ * Each socket `connect()` opens gets a generation. A launch records the one it
+ * was sent on, so the late close of a socket that was already replaced cannot
+ * mark launches sent on its successor unconfirmed.
+ */
+let wsGeneration = 0;
+
+// How long a correlated launch waits for each answer before it is reported
+// unconfirmed (and never resent). The server answers an `add_pane` at once;
+// it bounds starting a machine's instance at 90 s; cloning a large repository
+// can take minutes.
+const ADD_PANE_ANSWER_TIMEOUT_MS = 30_000;
+const ADD_PANE_START_TIMEOUT_MS = 150_000;
+const ADD_PANE_CLONE_TIMEOUT_MS = 15 * 60_000;
+// `routed` is delivery, not creation: the tab exists once its instance lists
+// it. A routed launch is dropped when that happens, or after this long if the
+// instance never lists it (the instance reports its own refusal).
+const ADD_PANE_ROUTED_SETTLE_MS = 30_000;
+
+const IN_FLIGHT_ADD_PANE_STATUSES = new Set<AddPaneRequestStatus>(["cloning", "pending", "starting"]);
+const addPaneTimers = new Map<string, ReturnType<typeof setTimeout>>();
+const addPaneGenerations = new Map<string, number>();
+/** What a clone and add sends once its clone is confirmed. */
+const pendingCloneAdds = new Map<string, { joinProjectId: string; spec: AddPaneSpec }>();
+
+function clearAddPaneTimer(requestId: string) {
+  const timer = addPaneTimers.get(requestId);
+  if (timer) clearTimeout(timer);
+  addPaneTimers.delete(requestId);
+}
+
+function scheduleAddPaneTimer(requestId: string, delayMs: number, onExpire: () => void) {
+  clearAddPaneTimer(requestId);
+  const timer = setTimeout(() => {
+    addPaneTimers.delete(requestId);
+    onExpire();
+  }, delayMs);
+  // Node-based component tests should not stay alive solely for this UI timer.
+  (timer as unknown as { unref?: () => void }).unref?.();
+  addPaneTimers.set(requestId, timer);
+}
+
+function releaseAddPaneRequest(requestId: string) {
+  clearAddPaneTimer(requestId);
+  addPaneGenerations.delete(requestId);
+  pendingCloneAdds.delete(requestId);
+}
+
+function withoutAddPaneRequests(
+  requests: Record<string, AddPaneRequest>,
+  drop: (request: AddPaneRequest) => boolean,
+): Record<string, AddPaneRequest> {
+  let changed = false;
+  const kept: Record<string, AddPaneRequest> = {};
+  for (const [id, request] of Object.entries(requests)) {
+    if (drop(request)) {
+      releaseAddPaneRequest(id);
+      changed = true;
+    } else {
+      kept[id] = request;
+    }
+  }
+  return changed ? kept : requests;
+}
+
+function patchAddPaneRequest(set: StoreSet, requestId: string, patch: Partial<AddPaneRequest>) {
+  set((state) => {
+    const current = state.addPaneRequests[requestId];
+    if (!current) return {};
+    return {
+      addPaneRequests: {
+        ...state.addPaneRequests,
+        [requestId]: { ...current, ...patch, updatedAt: Date.now() },
+      },
+    };
+  });
+}
+
+function addPaneHostLabel(request: Pick<AddPaneRequest, "hostname">): string {
+  return request.hostname || "the project host";
+}
+
+function unconfirmedAddPaneMessage(request: AddPaneRequest, cause: "connection" | "timeout"): string {
+  const host = addPaneHostLabel(request);
+  if (request.status === "cloning") {
+    return cause === "connection"
+      ? `Connection lost before the clone onto ${host} was confirmed. The checkout may exist there without a tab. Nothing was resent; check the Machines page before trying again.`
+      : `${host} did not confirm the clone in time. The checkout may exist there without a tab. Nothing was resent; check the Machines page before trying again.`;
+  }
+  if (cause === "connection") {
+    return "Connection lost before the server confirmed this tab. It was not resent; check the tab bar before trying again.";
+  }
+  return request.status === "starting"
+    ? `${host} did not confirm starting this project in time. The tab was not resent; check the tab bar before trying again.`
+    : "The server did not confirm this tab. It was not resent; check the tab bar before trying again.";
+}
+
+/** Report in-flight launches as unconfirmed. Their answers can no longer
+ *  arrive: the server sends them only to the connection that asked. */
+function markAddPaneRequestsUnconfirmed(
+  set: StoreSet,
+  get: () => AppState,
+  shouldMark: (request: AddPaneRequest, generation: number | undefined) => boolean,
+) {
+  let marked = 0;
+  set((state) => {
+    let changed = false;
+    const next = { ...state.addPaneRequests };
+    for (const [id, request] of Object.entries(state.addPaneRequests)) {
+      if (!IN_FLIGHT_ADD_PANE_STATUSES.has(request.status)) continue;
+      if (!shouldMark(request, addPaneGenerations.get(id))) continue;
+      clearAddPaneTimer(id);
+      next[id] = {
+        ...request,
+        status: "unconfirmed",
+        error: unconfirmedAddPaneMessage(request, "connection"),
+        updatedAt: Date.now(),
+      };
+      changed = true;
+      marked += 1;
+    }
+    return changed ? { addPaneRequests: next } : {};
+  });
+  if (marked > 0) {
+    get().showToast(
+      marked === 1
+        ? "A new tab was not confirmed before the connection dropped. It was not resent."
+        : `${marked} new tabs were not confirmed before the connection dropped. They were not resent.`,
+      "error",
+    );
+  }
+}
+
+function expireAddPaneRequest(
+  set: StoreSet,
+  get: () => AppState,
+  requestId: string,
+  status: AddPaneRequestStatus,
+) {
+  const request = get().addPaneRequests[requestId];
+  if (!request || request.status !== status) return;
+  const message = unconfirmedAddPaneMessage(request, "timeout");
+  patchAddPaneRequest(set, requestId, { status: "unconfirmed", error: message });
+  get().showToast(message, "error");
+}
+
+function failAddPaneRequest(set: StoreSet, get: () => AppState, requestId: string, error: string) {
+  clearAddPaneTimer(requestId);
+  pendingCloneAdds.delete(requestId);
+  patchAddPaneRequest(set, requestId, { status: "failed", error });
+  get().showToast(error, "error");
+}
+
+function machineHostname(state: AppState, sessionId: string, machineId: string | undefined): string | undefined {
+  if (!machineId) return primaryInstance(selectSessionInstances(state, sessionId))?.hostname;
+  return selectSessionInstances(state, sessionId).find((instance) => instance.machineId === machineId)?.hostname
+    ?? state.machines.find((entry) => entry.machine.machineId === machineId)?.machine.hostname;
+}
+
+/** Why a new tab cannot be requested, or null. A tab on a named machine does
+ *  not need the project running: the server starts that machine's instance. */
+function newTabRefusal(
+  state: AppState,
+  sessionId: string,
+  spec: AddPaneSpec,
+  machineId: string | undefined,
+): string | null {
+  const kind = spec.kind ?? "agent";
+  const managed = spec.managed ?? false;
+  if (machineId) {
+    if (!state.negotiatedCapabilities.has(PROJECT_INSTANCES_CAPABILITY)) {
+      return "Choosing a machine for a new tab needs a newer APAS server.";
+    }
+    const instance = selectSessionInstances(state, sessionId)
+      .find((candidate) => candidate.machineId === machineId);
+    if (instance?.runtimeAccess === false) {
+      return `You do not have access to run tabs on ${instance.hostname}.`;
+    }
+  } else if (!state.isAttached) {
+    return "Project is not running. Start the CLI client first.";
+  }
+  const policy = state.projectPolicies[sessionId];
+  const typedProvider = spec.provider as Provider;
+  if (isRetiredProviderModel(spec.provider, spec.model)) {
+    return "MiniMax and GLM providers are no longer supported.";
+  }
+  if (!policy) {
+    return "Waiting for an authoritative cluster policy; reload or update the project host CLI.";
+  }
+  if (policy.projectSuspended) {
+    return "This project is suspended by a cluster administrator.";
+  }
+  if (managed && !policy.teamAvailable) {
+    return `Team launch is disabled by cluster policy v${policy.version}.`;
+  }
+  if (!managed && kind === "agent") {
+    return "Conversation-only panes are retired. Create a Claude, Codex, or OpenCode terminal pane instead.";
+  }
+  if (!policyAllowsLaunch(policy, kind, typedProvider, spec.model)) {
+    return `Launch profile ${launchProfileKey(kind, typedProvider, spec.model)} is disabled by cluster policy v${policy.version}.`;
+  }
+  return null;
+}
+
+/**
+ * Send one `add_pane`. Against a server that negotiated instances it carries a
+ * fresh request id, and the launch is tracked until the correlated answer; an
+ * older server answers nothing, so its adds stay fire-and-forget as before.
+ * `launchId` continues an existing launch (a clone and add) instead of
+ * starting a new one.
+ */
+function sendAddPane(
+  set: StoreSet,
+  get: () => AppState,
+  sessionId: string,
+  spec: AddPaneSpec,
+  machineId: string | undefined,
+  launchId?: string,
+): { success: boolean; error?: string; requestId?: string } {
+  const state = get();
+  const { ws } = state;
+  if (!ws || ws.readyState !== WebSocket.OPEN) {
+    return { success: false, error: "Not connected to server" };
+  }
+  const correlated = state.negotiatedCapabilities.has(PROJECT_INSTANCES_CAPABILITY);
+  const addRequestId = correlated ? generateId() : undefined;
+  const kind = spec.kind ?? "agent";
+  try {
+    ws.send(JSON.stringify({
+      type: "add_pane",
+      session_id: sessionId,
+      provider: spec.provider,
+      mode: spec.mode,
+      label: spec.label || undefined,
+      prompt: spec.prompt || undefined,
+      model: spec.model || undefined,
+      isolated_worktree: spec.isolatedWorktree === true ? true : undefined,
+      role: spec.initialRole?.role || undefined,
+      goal: spec.initialRole?.goal || undefined,
+      backstory: spec.initialRole?.backstory || undefined,
+      plan_review_mode: spec.initialRole?.planReviewMode || undefined,
+      managed: kind === "terminal" ? false : (spec.managed ?? false),
+      kind,
+      machine_id: correlated ? machineId || undefined : undefined,
+      request_id: addRequestId,
+    }));
+  } catch {
+    return { success: false, error: "The new tab could not be sent. Try again." };
+  }
+  if (!addRequestId) return { success: true };
+
+  const requestId = launchId ?? addRequestId;
+  const now = Date.now();
+  set((current) => {
+    const existing = current.addPaneRequests[requestId];
+    return {
+      addPaneRequests: {
+        ...current.addPaneRequests,
+        [requestId]: {
+          ...(existing ?? {
+            requestId,
+            sessionId,
+            provider: spec.provider,
+            kind,
+            label: spec.label || undefined,
+            startedAt: now,
+          }),
+          machineId,
+          hostname: machineHostname(current, sessionId, machineId) ?? existing?.hostname,
+          status: "pending",
+          addRequestId,
+          error: undefined,
+          updatedAt: now,
+        },
+      },
+    };
+  });
+  addPaneGenerations.set(requestId, wsGeneration);
+  scheduleAddPaneTimer(requestId, ADD_PANE_ANSWER_TIMEOUT_MS, () =>
+    expireAddPaneRequest(set, get, requestId, "pending"));
+  return { success: true, requestId };
+}
+
+/** Apply a correlated `add_pane_result`. Answers for launches that are no
+ *  longer in flight (dismissed, or already unconfirmed) are ignored. */
+function applyAddPaneResult(data: Record<string, unknown>, set: StoreSet, get: () => AppState) {
+  const addRequestId = data.request_id;
+  const sessionId = data.session_id;
+  if (typeof addRequestId !== "string" || typeof sessionId !== "string") return;
+  const request = Object.values(get().addPaneRequests).find((candidate) =>
+    candidate.addRequestId === addRequestId && candidate.sessionId === sessionId);
+  if (!request || (request.status !== "pending" && request.status !== "starting")) return;
+  const machineId = typeof data.machine_id === "string" && data.machine_id
+    ? data.machine_id
+    : request.machineId;
+  const paneId = typeof data.pane_id === "number" ? data.pane_id : request.paneId;
+  const hostname = machineId === request.machineId
+    ? request.hostname
+    : machineHostname(get(), sessionId, machineId) ?? request.hostname;
+  switch (data.status) {
+    case "starting": {
+      if (request.status !== "pending") return;
+      patchAddPaneRequest(set, request.requestId, { status: "starting", machineId, hostname, paneId });
+      scheduleAddPaneTimer(request.requestId, ADD_PANE_START_TIMEOUT_MS, () =>
+        expireAddPaneRequest(set, get, request.requestId, "starting"));
+      return;
+    }
+    case "routed": {
+      clearAddPaneTimer(request.requestId);
+      const listed = paneId != null
+        && get().sessionId === sessionId
+        && get().paneConfigs.some((pane) => pane.pane_id === paneId);
+      if (listed || paneId == null) {
+        // The tab is already in the roster, or there is nothing to wait for.
+        set((state) => ({
+          addPaneRequests: withoutAddPaneRequests(
+            state.addPaneRequests,
+            (candidate) => candidate.requestId === request.requestId,
+          ),
+        }));
+        return;
+      }
+      patchAddPaneRequest(set, request.requestId, { status: "routed", machineId, hostname, paneId });
+      scheduleAddPaneTimer(request.requestId, ADD_PANE_ROUTED_SETTLE_MS, () => {
+        set((state) => ({
+          addPaneRequests: withoutAddPaneRequests(
+            state.addPaneRequests,
+            (candidate) => candidate.requestId === request.requestId && candidate.status === "routed",
+          ),
+        }));
+      });
+      return;
+    }
+    case "failed": {
+      patchAddPaneRequest(set, request.requestId, { machineId, hostname, paneId });
+      const reason = typeof data.error === "string" && data.error.trim()
+        ? data.error
+        : "The server did not create the tab.";
+      failAddPaneRequest(set, get, request.requestId, reason);
+      return;
+    }
+    default:
+      return;
+  }
+}
+
+/**
+ * Advance a clone and add when its clone is acknowledged. Returns whether the
+ * acknowledgement belonged to one, so it is not also treated as a separate
+ * project's creation.
+ */
+function applyCloneAndAddCreated(data: Record<string, unknown>, set: StoreSet, get: () => AppState): boolean {
+  const cloneRequestId = data.request_id;
+  if (typeof cloneRequestId !== "string") return false;
+  const request = Object.values(get().addPaneRequests)
+    .find((candidate) => candidate.cloneRequestId === cloneRequestId);
+  if (!request) return false;
+  if (request.machineId !== data.machine_id) return true;
+  const host = addPaneHostLabel(request);
+  const error = typeof data.error === "string" && data.error.trim() ? data.error : undefined;
+  const projectId = typeof data.project_id === "string" ? data.project_id : undefined;
+  const pending = pendingCloneAdds.get(request.requestId);
+  if (request.status !== "cloning" || !pending) {
+    // The launch was already reported unconfirmed; it never continues. A late
+    // success still tells the user where the checkout ended up.
+    if (request.status === "unconfirmed" && !error && projectId) {
+      patchAddPaneRequest(set, request.requestId, {
+        error: `The clone onto ${host} finished, but no tab was added. Add one there from the new-tab menu.`,
+      });
+      get().listMachines();
+    }
+    return true;
+  }
+  clearAddPaneTimer(request.requestId);
+  pendingCloneAdds.delete(request.requestId);
+  if (error) {
+    failAddPaneRequest(set, get, request.requestId, `Cloning onto ${host} failed: ${error}`);
+    return true;
+  }
+  get().listMachines();
+  if (projectId !== pending.joinProjectId) {
+    failAddPaneRequest(
+      set,
+      get,
+      request.requestId,
+      `${host} registered the clone as a separate project instead of joining this one, so no tab was added.`,
+    );
+    return true;
+  }
+  const refusal = newTabRefusal(get(), request.sessionId, pending.spec, request.machineId);
+  const sent = refusal
+    ? { success: false, error: refusal }
+    : sendAddPane(set, get, request.sessionId, pending.spec, request.machineId, request.requestId);
+  if (!sent.success) {
+    failAddPaneRequest(
+      set,
+      get,
+      request.requestId,
+      `Cloned onto ${host}, but the tab was not added: ${sent.error ?? "the request could not be sent"}`,
+    );
+  }
+  return true;
+}
+
 const WS_URL = process.env.NEXT_PUBLIC_WS_URL || "wss://apas.mpaxos.com";
 const DEEPSEEK_API_BASE_URL = "https://api.deepseek.com/anthropic";
 
@@ -1132,6 +1725,8 @@ export const useStore = create<AppState>((set, get) => ({
   cliLifecycleOperations: {},
   cliLifecycleLatestBySession: {},
   sessions: [],
+  sessionInstances: {},
+  addPaneRequests: {},
   messages: [],
   hasMoreMessages: false,
   isLoadingMore: false,
@@ -1249,6 +1844,8 @@ export const useStore = create<AppState>((set, get) => ({
       cliLifecycleOperations: {},
       cliLifecycleLatestBySession: {},
       sessions: [],
+      sessionInstances: {},
+      addPaneRequests: withoutAddPaneRequests(get().addPaneRequests, () => true),
       workingPanesBySession: new Map(),
       machines: [],
       machineListReceived: false,
@@ -1282,6 +1879,7 @@ export const useStore = create<AppState>((set, get) => ({
     }
 
     const ws = new WebSocket(`${WS_URL}/ws/web`);
+    const generation = ++wsGeneration;
 
     // Liveness loop: a silently-stale WS (mobile OS throttling, NAT
     // timeout, server-side TCP RST swallowed) keeps readyState === OPEN
@@ -1330,7 +1928,13 @@ export const useStore = create<AppState>((set, get) => ({
       ws.send(JSON.stringify({
         type: "authenticate",
         token,
-        capabilities: ["project_policy_v1", "pane_work_summary_v1", "cli_lifecycle_v1", "autonomous_jobs_v1"],
+        capabilities: [
+          "project_policy_v1",
+          "pane_work_summary_v1",
+          "cli_lifecycle_v1",
+          "autonomous_jobs_v1",
+          PROJECT_INSTANCES_CAPABILITY,
+        ],
         client_kind: "web",
         app_version: process.env.NEXT_PUBLIC_WEB_UI_VERSION || "development",
         protocol_version: 1,
@@ -1368,7 +1972,14 @@ export const useStore = create<AppState>((set, get) => ({
             ? { ...operation, status: "unconfirmed" as const, error: "Connection lost before confirmation. Your folder is retained. Reconnect and retry manually to confirm registration." }
             : operation,
         ])),
+        // Pushed instance sets stop arriving with the socket; the next
+        // attach replays them.
+        sessionInstances: {},
       }));
+      // New-tab answers go only to the connection that asked, so any still
+      // outstanding on this socket are lost. Report them; never resend.
+      markAddPaneRequestsUnconfirmed(set, get, (_request, sentOn) =>
+        sentOn === undefined || sentOn <= generation);
 
       // Auto-reconnect with exponential backoff (unless intentionally disconnected)
       if (event.code !== 1000) {
@@ -1461,6 +2072,8 @@ export const useStore = create<AppState>((set, get) => ({
       cliLifecycleInventories: {},
       cliLifecycleOperations: {},
       cliLifecycleLatestBySession: {},
+      sessionInstances: {},
+      addPaneRequests: withoutAddPaneRequests(get().addPaneRequests, () => true),
       machines: [],
       machineListReceived: false,
       paneModes: {},
@@ -1728,6 +2341,15 @@ export const useStore = create<AppState>((set, get) => ({
       );
       const ompQuestions = new Map([...state.ompQuestions].filter(([, question]) => !removedSessionIds.has(question.sessionId)));
       saveOmpQuestionStates(ompQuestions);
+      const sessionInstances = Object.fromEntries(
+        Object.entries(state.sessionInstances).filter(
+          ([sessionId]) => !removedSessionIds.has(sessionId),
+        ),
+      );
+      const addPaneRequests = withoutAddPaneRequests(
+        state.addPaneRequests,
+        (request) => removedSessionIds.has(request.sessionId),
+      );
       for (const id of removedSessionIds) {
         sessionCache.delete(id);
         teamRecordsBySession.delete(id);
@@ -1755,6 +2377,8 @@ export const useStore = create<AppState>((set, get) => ({
         cliLifecycleInventories,
         cliLifecycleOperations,
         cliLifecycleLatestBySession,
+        sessionInstances,
+        addPaneRequests,
         ...(pendingRemoved
           ? {
               pendingSessionAttachment: null,
@@ -1803,7 +2427,11 @@ export const useStore = create<AppState>((set, get) => ({
     ws.send(JSON.stringify({ type: "list_machines" }));
   },
 
-  startMachineProjectCli: (machineId: string, projectId: string) => {
+  startMachineProjectCli: (
+    machineId: string,
+    projectId: string,
+    options?: { allInstances?: boolean },
+  ) => {
     const { ws } = get();
     if (!ws || ws.readyState !== WebSocket.OPEN) {
       return;
@@ -1812,10 +2440,17 @@ export const useStore = create<AppState>((set, get) => ({
       type: "start_machine_project_cli",
       machine_id: machineId,
       project_id: projectId,
+      // Only the project view's Start sends the flag: a per-machine Start on
+      // the Machines page must never start other machines too.
+      ...(options?.allInstances ? { all_instances: true } : {}),
     }));
   },
 
-  stopMachineProjectCli: (machineId: string, projectId: string) => {
+  stopMachineProjectCli: (
+    machineId: string,
+    projectId: string,
+    options?: { allInstances?: boolean },
+  ) => {
     const { ws } = get();
     if (!ws || ws.readyState !== WebSocket.OPEN) {
       return;
@@ -1824,7 +2459,28 @@ export const useStore = create<AppState>((set, get) => ({
       type: "stop_machine_project_cli",
       machine_id: machineId,
       project_id: projectId,
+      ...(options?.allInstances ? { all_instances: true } : {}),
     }));
+  },
+
+  forgetMachinePanes: (sessionId: string, machineId: string) => {
+    const { ws, showToast } = get();
+    if (!sessionId || !machineId) return false;
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
+      showToast("Not connected — try again in a moment", "error");
+      return false;
+    }
+    try {
+      ws.send(JSON.stringify({
+        type: "forget_machine_panes",
+        session_id: sessionId,
+        machine_id: machineId,
+      }));
+    } catch {
+      showToast("The request could not be sent. Try again.", "error");
+      return false;
+    }
+    return true;
   },
 
   createProjectInstance: (
@@ -2618,60 +3274,127 @@ export const useStore = create<AppState>((set, get) => ({
      *  headless stream-json worker. Such panes are never managed — they
      *  publish no stream events, so the Tech Lead can't delegate to them. */
     kind: PaneKind = "agent",
+    /** Machine whose instance runs the tab; absent = the primary. */
+    machineId?: string,
   ) => {
-    const { ws, sessionId, isAttached, projectPolicies } = get();
+    const state = get();
+    const { ws, sessionId } = state;
     if (!ws || ws.readyState !== WebSocket.OPEN) {
       return { success: false, error: "Not connected to server" };
     }
     if (!sessionId) {
       return { success: false, error: "No session selected" };
     }
-    if (!isAttached) {
-      return { success: false, error: "Project is not running. Start the CLI client first." };
-    }
-    const policy = projectPolicies[sessionId];
-    const typedProvider = provider as Provider;
-    if (isRetiredProviderModel(provider, model)) {
-      return { success: false, error: "MiniMax and GLM providers are no longer supported." };
-    }
-    if (!policy) {
-      return { success: false, error: "Waiting for an authoritative cluster policy; reload or update the project host CLI." };
-    }
-    if (policy.projectSuspended) {
-      return { success: false, error: "This project is suspended by a cluster administrator." };
-    }
-    if (managed && !policy.teamAvailable) {
-      return { success: false, error: `Team launch is disabled by cluster policy v${policy.version}.` };
-    }
-    if (!managed && kind === "agent") {
-      return {
-        success: false,
-        error: "Conversation-only panes are retired. Create a Claude, Codex, or OpenCode terminal pane instead.",
-      };
-    }
-    if (!policyAllowsLaunch(policy, kind, typedProvider, model)) {
-      return {
-        success: false,
-        error: `Launch profile ${launchProfileKey(kind, typedProvider, model)} is disabled by cluster policy v${policy.version}.`,
-      };
-    }
-    ws.send(JSON.stringify({
-      type: "add_pane",
-      session_id: get().sessionId,
+    const spec: AddPaneSpec = {
       provider,
       mode,
-      label: label || undefined,
-      prompt: prompt || undefined,
-      model: model || undefined,
-      isolated_worktree: isolatedWorktree === true ? true : undefined,
-      role: initialRole?.role || undefined,
-      goal: initialRole?.goal || undefined,
-      backstory: initialRole?.backstory || undefined,
-      plan_review_mode: initialRole?.planReviewMode || undefined,
-      managed: kind === "terminal" ? false : managed,
+      label,
+      prompt,
+      model,
+      isolatedWorktree,
+      initialRole,
+      managed,
       kind,
+    };
+    const refusal = newTabRefusal(state, sessionId, spec, machineId);
+    if (refusal) return { success: false, error: refusal };
+    return sendAddPane(set, get, sessionId, spec, machineId);
+  },
+
+  cloneAndAddPane: (target: CloneAndAddPaneTarget, pane: AddPaneSpec) => {
+    const state = get();
+    const { ws, sessionId } = state;
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
+      return { success: false, error: "Not connected to server" };
+    }
+    if (!sessionId) {
+      return { success: false, error: "No session selected" };
+    }
+    if (!state.negotiatedCapabilities.has(PROJECT_INSTANCES_CAPABILITY)) {
+      return { success: false, error: "Cloning onto another machine needs a newer APAS server." };
+    }
+    if (!target.gitRemote.trim()) {
+      return { success: false, error: "This project has no repository to clone." };
+    }
+    // An older server or daemon would ignore the join and create a separate
+    // project, so only a connected daemon that advertises instances is asked.
+    const entry = state.machines.find((candidate) => candidate.machine.machineId === target.machineId);
+    if (!entry || entry.clusterAccess === "member") {
+      return { success: false, error: "Only your own machines can clone this project." };
+    }
+    const host = entry.machine.hostname;
+    if (!entry.daemonConnected) {
+      return { success: false, error: `${host} is offline.` };
+    }
+    if (!entry.projectInstancesAvailable) {
+      return { success: false, error: `Reboot ${host} to update it before cloning onto it.` };
+    }
+    const session = state.sessions.find((candidate) => candidate.id === sessionId);
+    const joinProjectId = session?.projectId ?? sessionId;
+    // One instance per machine: a second checkout there would be a second
+    // copy of the same project on one host.
+    if (entry.projects.some((project) => project.projectId === joinProjectId)) {
+      return { success: false, error: `${host} already has this project. Add the tab there instead.` };
+    }
+    const refusal = newTabRefusal(state, sessionId, pane, target.machineId);
+    if (refusal) return { success: false, error: refusal };
+
+    const requestId = generateId();
+    try {
+      ws.send(JSON.stringify({
+        type: "create_project_instance",
+        machine_id: target.machineId,
+        git_remote: target.gitRemote,
+        instance_name: target.instanceName,
+        // Joining creates no branch; the field is required on the wire.
+        branch: "",
+        clone_url: target.cloneUrl || undefined,
+        base_path: target.basePath || undefined,
+        request_id: requestId,
+        join_project_id: joinProjectId,
+      }));
+    } catch {
+      return { success: false, error: "The clone request could not be sent. Try again." };
+    }
+    const now = Date.now();
+    set((current) => ({
+      addPaneRequests: {
+        ...current.addPaneRequests,
+        [requestId]: {
+          requestId,
+          cloneRequestId: requestId,
+          sessionId,
+          machineId: target.machineId,
+          hostname: host,
+          status: "cloning",
+          provider: pane.provider,
+          kind: pane.kind ?? "agent",
+          label: pane.label || undefined,
+          startedAt: now,
+          updatedAt: now,
+        },
+      },
     }));
-    return { success: true };
+    pendingCloneAdds.set(requestId, { joinProjectId, spec: pane });
+    addPaneGenerations.set(requestId, wsGeneration);
+    scheduleAddPaneTimer(requestId, ADD_PANE_CLONE_TIMEOUT_MS, () =>
+      expireAddPaneRequest(set, get, requestId, "cloning"));
+    return { success: true, requestId };
+  },
+
+  dismissAddPaneRequest: (requestId: string) => {
+    set((state) => {
+      const request = state.addPaneRequests[requestId];
+      // An in-flight launch keeps its record so its answer has somewhere to
+      // land; it becomes dismissable once it is final.
+      if (!request || IN_FLIGHT_ADD_PANE_STATUSES.has(request.status)) return {};
+      return {
+        addPaneRequests: withoutAddPaneRequests(
+          state.addPaneRequests,
+          (candidate) => candidate.requestId === requestId,
+        ),
+      };
+    });
   },
 
   removePane: (paneId: number, cleanupAction?: PaneCleanupAction) => {
@@ -3046,17 +3769,30 @@ export const useStore = create<AppState>((set, get) => ({
     }
   },
 
-  rebootCli: () => {
+  rebootCli: (machineId?: string) => {
+    const state = get();
     const {
       ws,
       sessionId,
       paneConfigs,
       projectPolicies,
-      cliLifecycleInventories,
       showToast,
-    } = get();
+    } = state;
+    if (machineId && !state.negotiatedCapabilities.has(PROJECT_INSTANCES_CAPABILITY)) {
+      showToast("Rebooting one of several machines needs a newer APAS server", "error");
+      return null;
+    }
     const policy = sessionId ? projectPolicies[sessionId] : undefined;
-    if (!policy || paneConfigs.some((pane) =>
+    // A reboot relaunches only the panes of the instance it reaches: the named
+    // machine's, else the primary's. Panes of other machines are untouched.
+    const instances = selectSessionInstances(state, sessionId);
+    const targetMachineId = machineId ?? primaryInstance(instances)?.machineId;
+    const affectedPanes = targetMachineId
+      ? paneConfigs.filter((pane) =>
+        (pane.machine_id ?? resolvePaneInstance(pane, instances, state.machines)?.machineId)
+          === targetMachineId)
+      : paneConfigs;
+    if (!policy || affectedPanes.some((pane) =>
       (pane.managed && !policy.teamAvailable)
       || !policyAllowsLaunch(policy, pane.kind ?? "agent", pane.provider, pane.model)
     )) {
@@ -3069,13 +3805,17 @@ export const useStore = create<AppState>((set, get) => ({
     }
     // A new CLI publishes an inventory on attach. Use the correlated path so
     // progress and preservation outcomes remain visible across navigation.
-    if (sessionId && cliLifecycleInventories[sessionId]) {
-      return sendCliLifecycleRequest(get, set, "reboot_cli");
+    if (selectCliLifecycleInventory(state, sessionId, machineId)) {
+      return sendCliLifecycleRequest(get, set, "reboot_cli", machineId);
     }
     // Mixed-version rollout: old CLIs retain the explicit legacy reboot path.
     // Reconnect never uses this fallback because it would be destructive.
     try {
-      ws.send(JSON.stringify({ type: "reboot_cli", session_id: get().sessionId }));
+      ws.send(JSON.stringify({
+        type: "reboot_cli",
+        session_id: get().sessionId,
+        machine_id: machineId || undefined,
+      }));
     } catch {
       showToast("The reboot request could not be sent — reboot the CLI manually on the project host", "error");
     }
@@ -3982,6 +4722,10 @@ export function handleServerMessage(
       if (data.account_status) {
         localStorage.setItem("apas_account_status", data.account_status as string);
       }
+      // Answers to launches sent on an earlier socket can never arrive on this
+      // one; its close normally reported them already.
+      markAddPaneRequestsUnconfirmed(set, get, (_request, sentOn) =>
+        sentOn === undefined || sentOn < wsGeneration);
       storeDebugLog("Authenticated as user:", data.user_id);
       get().refreshCliClients();
       get().listMachines();
@@ -4068,10 +4812,18 @@ export function handleServerMessage(
       const lifecycleSessionId = data.session_id as string | undefined;
       if (!lifecycleSessionId) break;
       const inventory = parseCliLifecycleInventory(data.inventory);
+      // One per instance: a per-session inventory would flip to whichever
+      // machine reported last.
+      const machineKey = lifecycleMachineKey(
+        typeof data.machine_id === "string" ? data.machine_id : undefined,
+      );
       set((state) => ({
         cliLifecycleInventories: {
           ...state.cliLifecycleInventories,
-          [lifecycleSessionId]: inventory,
+          [lifecycleSessionId]: {
+            ...state.cliLifecycleInventories[lifecycleSessionId],
+            [machineKey]: inventory,
+          },
         },
       }));
       break;
@@ -4087,9 +4839,13 @@ export function handleServerMessage(
       const inventory = data.inventory == null
         ? prior?.inventory
         : parseCliLifecycleInventory(data.inventory);
+      const lifecycleMachineId = typeof data.machine_id === "string" && data.machine_id
+        ? data.machine_id
+        : prior?.machineId;
       const next: CliLifecycleStatus = {
         sessionId: lifecycleSessionId,
         requestId,
+        machineId: lifecycleMachineId,
         operation,
         phase,
         message: typeof data.message === "string" ? data.message : undefined,
@@ -4106,10 +4862,14 @@ export function handleServerMessage(
           ...state.cliLifecycleLatestBySession,
           [lifecycleSessionId]: requestId,
         },
+        // A carried inventory replaces only the machine the request was for.
         ...(inventory ? {
           cliLifecycleInventories: {
             ...state.cliLifecycleInventories,
-            [lifecycleSessionId]: inventory,
+            [lifecycleSessionId]: {
+              ...state.cliLifecycleInventories[lifecycleSessionId],
+              [lifecycleMachineKey(lifecycleMachineId)]: inventory,
+            },
           },
         } : {}),
       }));
@@ -4213,11 +4973,17 @@ export function handleServerMessage(
             pid: project.pid as number | undefined,
             memoryKb: project.memory_kb as number | undefined,
             lastError: project.last_error as string | undefined,
+            gitRemote: typeof project.git_remote === "string" && project.git_remote
+              ? project.git_remote
+              : undefined,
           })),
           clusterOwnerUserId: item.cluster_owner_user_id as string | undefined,
           clusterAccess: (item.cluster_access as "owner" | "member" | undefined) || "owner",
           sharedProvisioningAvailable: Boolean(item.shared_provisioning_available),
           localProjectRegistrationAvailable: Boolean(item.local_project_registration_available),
+          // Older servers send neither; both then read as unavailable.
+          daemonConnected: item.daemon_connected === true,
+          projectInstancesAvailable: item.project_instances_available === true,
         };
       });
 
@@ -4366,7 +5132,14 @@ export function handleServerMessage(
           set((state) => {
             const sessionCache = new Map(state.sessionCache);
             sessionCache.delete(rejectedSessionId);
+            const sessionInstances = { ...state.sessionInstances };
+            delete sessionInstances[rejectedSessionId];
             return {
+              sessionInstances,
+              addPaneRequests: withoutAddPaneRequests(
+                state.addPaneRequests,
+                (request) => request.sessionId === rejectedSessionId,
+              ),
               sessionId: null,
               cliClientId: null,
               isAttached: false,
@@ -4405,6 +5178,48 @@ export function handleServerMessage(
       );
       break;
     }
+
+    case "session_instances": {
+      const instancesSessionId = data.session_id as string | undefined;
+      const instances = parseSessionInstances(data.instances);
+      if (!instancesSessionId || !instances) break;
+      set((state) => {
+        // An instance that left can no longer be rebooted through its old
+        // inventory; one that comes back publishes a fresh one.
+        let cliLifecycleInventories = state.cliLifecycleInventories;
+        const inventories = state.cliLifecycleInventories[instancesSessionId];
+        if (inventories) {
+          const attachedKeys = new Set(
+            instances.map((instance) => lifecycleMachineKey(instance.machineId)),
+          );
+          const kept = Object.fromEntries(
+            Object.entries(inventories).filter(([key]) => attachedKeys.has(key)),
+          );
+          if (Object.keys(kept).length !== Object.keys(inventories).length) {
+            cliLifecycleInventories = {
+              ...state.cliLifecycleInventories,
+              [instancesSessionId]: kept,
+            };
+          }
+        }
+        return {
+          sessionInstances: { ...state.sessionInstances, [instancesSessionId]: instances },
+          // The list entry carries whichever of the polled list and this push
+          // arrived last, so readers of `SessionInfo.instances` stay current.
+          sessions: state.sessions.some((session) => session.id === instancesSessionId)
+            ? state.sessions.map((session) => session.id === instancesSessionId
+              ? { ...session, instances }
+              : session)
+            : state.sessions,
+          cliLifecycleInventories,
+        };
+      });
+      break;
+    }
+
+    case "add_pane_result":
+      applyAddPaneResult(data, set, get);
+      break;
 
     case "plan_review_request": {
       const paneId = data.pane_id as number | undefined;
@@ -4672,6 +5487,7 @@ export function handleServerMessage(
     }
 
     case "project_instance_created": {
+      if (applyCloneAndAddCreated(data, set, get)) break;
       const error = data.error as string | undefined;
       const requestId = data.request_id as string | undefined;
       const { showToast } = get();
@@ -4765,9 +5581,26 @@ export function handleServerMessage(
     }
 
     case "pane_list": {
-      // Drop pane_list events for sessions we're not currently viewing.
       const msgSid = data.session_id as string | undefined;
       const curSid = get().sessionId;
+      // A routed launch is done once its instance lists the tab, in whichever
+      // session that is.
+      if (msgSid && Array.isArray(data.panes)) {
+        const listedPaneIds = new Set(
+          (data.panes as PaneConfig[]).map((pane) => pane.pane_id),
+        );
+        set((state) => {
+          const addPaneRequests = withoutAddPaneRequests(
+            state.addPaneRequests,
+            (request) => request.sessionId === msgSid
+              && request.status === "routed"
+              && request.paneId != null
+              && listedPaneIds.has(request.paneId),
+          );
+          return addPaneRequests === state.addPaneRequests ? {} : { addPaneRequests };
+        });
+      }
+      // Drop pane_list events for sessions we're not currently viewing.
       if (msgSid && curSid && msgSid !== curSid) {
         break;
       }
@@ -4916,6 +5749,7 @@ export function handleServerMessage(
         isActive: s.is_active as boolean | undefined,
         isWorking: s.is_working as boolean | undefined,
         panes: Array.isArray(s.panes) ? (s.panes as SessionPaneSummary[]) : undefined,
+        instances: parseSessionInstances(s.instances),
       }));
 
       set((state) => {

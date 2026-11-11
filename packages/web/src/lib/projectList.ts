@@ -1,5 +1,6 @@
 import type { CliClient, MachineWithProjects, SessionInfo, SessionPaneSummary } from "@/lib/store";
 import { machineProjectHref } from "./machineProjectTarget";
+import type { SessionInstance } from "./projectInstances";
 
 /**
  * The project list the sidebar shows, derived once so the expanded list and
@@ -24,6 +25,9 @@ interface ProjectDetails {
   shareRole?: ProjectRole;
   cliClientId?: string;
   panes?: SessionPaneSummary[];
+  /** Attached instances, one per machine; `instanceHostSummary` turns them
+   *  into "zoo-005 +1". Absent for registration-only entries. */
+  instances?: SessionInstance[];
 }
 
 /** Only session-backed entries may be attached or carry session actions. */
@@ -101,6 +105,7 @@ export function buildProjectList(
         shareRole: session.shareRole,
         cliClientId: session.cliClientId,
         panes: session.panes,
+        instances: session.instances,
       });
     }
   }
@@ -130,6 +135,9 @@ export function buildProjectList(
       const existing = projectMap.get(mp.projectId);
       if (existing && existing.sessionId !== null) {
         if (mp.isRunning) existing.isActive = true;
+        // A session started by an older CLI may not carry its remote; the
+        // checkout's inventory still knows which repository it belongs to.
+        if (!existing.gitRemote && mp.gitRemote) existing.gitRemote = mp.gitRemote;
         continue;
       }
       // A shared compute grant is not a project-content grant. Real sessions
@@ -139,7 +147,12 @@ export function buildProjectList(
       if (existing && (
         existing.isActive
         || (!mp.isRunning && (preferredInventoryProjects.has(mp.projectId) || !isPreferred))
-      )) continue;
+      )) {
+        // Every checkout of a project shares its repository, even when only
+        // an updated daemon reports it.
+        if (!existing.gitRemote && mp.gitRemote) existing.gitRemote = mp.gitRemote;
+        continue;
+      }
       if (isPreferred) preferredInventoryProjects.add(mp.projectId);
 
       projectMap.set(mp.projectId, {
@@ -148,6 +161,9 @@ export function buildProjectList(
         name: mp.name?.trim() || mp.path.split("/").pop() || `Project ${mp.projectId.slice(0, 8)}`,
         workingDir: mp.path,
         hostname: machine.machine.hostname,
+        // Without this, a checkout that has never started files under
+        // "(no remote)" instead of beside its repository's other projects.
+        gitRemote: mp.gitRemote ?? existing?.gitRemote,
         isActive: mp.isRunning,
         machinesHref: machineProjectHref({
           machineId: machine.machine.machineId,

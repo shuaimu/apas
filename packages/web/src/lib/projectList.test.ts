@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { buildProjectList, projectHue, projectInitials } from "./projectList";
+import { buildProjectList, groupProjectsByRepo, NO_REMOTE_KEY, projectHue, projectInitials } from "./projectList";
 import type { MachineWithProjects, SessionInfo } from "./store";
 
 describe("projectInitials", () => {
@@ -159,5 +159,62 @@ describe("registered project visibility", () => {
       panes: [{ pane_id: 42, is_working: true }],
     });
     expect(projects[0]).not.toHaveProperty("machinesHref");
+  });
+});
+
+describe("repository grouping", () => {
+  const remote = "github.com/example/chiral-network";
+
+  it("files a checkout that never started under its repository, not \"(no remote)\"", () => {
+    // The laptop checkout registered as its own project and has no session to
+    // carry its remote; only the daemon inventory knows it.
+    const laptop: MachineWithProjects = {
+      machine: { machineId: "laptop", hostname: "laptop", os: "darwin", arch: "arm64" },
+      clusterAccess: "owner",
+      projects: [{ projectId: "laptop-project", path: "/Users/me/chiral-network", isRunning: false, gitRemote: remote }],
+    };
+    const zoo: SessionInfo = {
+      id: "zoo-session",
+      projectId: "zoo-project",
+      workingDir: "/home/me/chiral-network",
+      status: "active",
+      isActive: true,
+      hostname: "zoo-005",
+      gitRemote: remote,
+    };
+    const groups = groupProjectsByRepo(buildProjectList([zoo], [], [laptop]));
+    expect(groups.map((group) => [group.key, group.projects.map((project) => project.projectId)]))
+      .toEqual([[remote, ["zoo-project", "laptop-project"]]]);
+    expect(groups.some((group) => group.key === NO_REMOTE_KEY)).toBe(false);
+  });
+
+  it("takes the remote from any checkout that reports it", () => {
+    const preferredOld = registration("machine-old", "zoo-002");
+    preferredOld.projects[0].preferredMachineId = "machine-old";
+    const updated = registration("machine-new", "zoo-003");
+    updated.projects[0].preferredMachineId = "machine-old";
+    updated.projects[0].gitRemote = remote;
+    for (const machines of [[preferredOld, updated], [updated, preferredOld]]) {
+      const [project] = buildProjectList([], [], machines);
+      expect(project).toMatchObject({ hostname: "zoo-002", gitRemote: remote });
+    }
+
+    // A session from an older CLI that never sent its remote groups by its
+    // checkout's.
+    const session: SessionInfo = { id: "s", projectId: "registered-project", status: "inactive" };
+    expect(buildProjectList([session], [], [updated])[0]).toMatchObject({ sessionId: "s", gitRemote: remote });
+  });
+
+  it("carries a session's attached instances for its host summary", () => {
+    const instances = [
+      { machineId: "zoo-5", hostname: "zoo-005", primary: true },
+      { machineId: "zoo-6", hostname: "zoo-006", primary: false },
+    ];
+    const [project] = buildProjectList(
+      [{ id: "s", projectId: "p", status: "active", isActive: true, hostname: "zoo-005", instances }],
+      [],
+      [],
+    );
+    expect(project.instances).toBe(instances);
   });
 });

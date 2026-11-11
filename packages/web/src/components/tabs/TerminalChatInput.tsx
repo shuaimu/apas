@@ -22,7 +22,15 @@ import { useStore } from "@/lib/store";
  * mid-turn may queue or be swallowed, and text arriving while a menu or prompt
  * is open is interpreted as commands rather than a message.
  */
-export function TerminalChatInput({ paneId }: { paneId: number }) {
+export function TerminalChatInput({
+  paneId,
+  disabledReason,
+}: {
+  paneId: number;
+  /** Why the pane cannot take a message now: its machine is not running the
+   *  project, or this viewer may not use it. The draft is kept. */
+  disabledReason?: string;
+}) {
   const [text, setText] = useState("");
   const sendTerminalConversationMessage = useStore((s) => s.sendTerminalConversationMessage);
   const connected = useStore((s) => s.connected);
@@ -37,13 +45,18 @@ export function TerminalChatInput({ paneId }: { paneId: number }) {
 
   const send = () => {
     const body = text.trim();
-    if (!body || !connected) return;
+    if (!body || !connected || disabledReason) return;
 
     if (sendTerminalConversationMessage(paneId, body).success) setText("");
   };
 
   return (
     <div className="border-t border-gray-200 bg-white px-3 py-2 dark:border-gray-700 dark:bg-gray-900">
+      {/* Said beside the box too: once a draft is typed the placeholder is
+          gone, and Enter would otherwise do nothing without saying why. */}
+      {disabledReason && (
+        <p className="mb-1.5 text-xs text-amber-700 dark:text-amber-300">{disabledReason}</p>
+      )}
       <div className="flex items-end gap-2">
         <textarea
           ref={ref}
@@ -59,7 +72,8 @@ export function TerminalChatInput({ paneId }: { paneId: number }) {
             }
           }}
           rows={1}
-          placeholder="Message the agent…"
+          placeholder={disabledReason ?? "Message the agent…"}
+          title={disabledReason}
           enterKeyHint="send"
           autoCapitalize="sentences"
           className="min-h-[40px] flex-1 resize-none rounded border border-gray-300 px-3 py-2 text-base outline-none focus:border-gray-500 disabled:opacity-50 dark:border-gray-600 dark:bg-gray-800 dark:text-gray-100"
@@ -67,7 +81,8 @@ export function TerminalChatInput({ paneId }: { paneId: number }) {
         <button
           type="button"
           onClick={send}
-          disabled={!connected || !text.trim()}
+          title={disabledReason}
+          disabled={!connected || !text.trim() || Boolean(disabledReason)}
           // Deliberately a large tap target: this is the phone path.
           className="h-10 rounded bg-gray-700 px-4 text-sm font-medium text-white transition-colors hover:bg-gray-600 disabled:cursor-not-allowed disabled:opacity-40 dark:bg-gray-600 dark:hover:bg-gray-500"
         >

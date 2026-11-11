@@ -1,9 +1,10 @@
 import { Pressable, StyleSheet, Text, View } from "react-native";
-import type { MobileSessionSummary } from "@apas/protocol";
+import type { MobileSessionSummary, SessionInstanceInfo } from "@apas/protocol";
 
 import { StatusBadge } from "@/components/ui";
 import { useTheme } from "@/design/tokens";
 import { paneStatusIsPendingAnswer, paneStatusIsWorking } from "@/state/paneStatus";
+import { instancesForSession, sessionHostSummary } from "@/state/projectInstances";
 
 export type MobileSessionActivityStatus = "pending" | "working" | "idle" | "offline";
 
@@ -24,10 +25,12 @@ export function sessionActivityStatus(
 export function SessionCard({
   session,
   paneStatuses,
+  instances,
   onPress,
 }: {
   session: MobileSessionSummary;
   paneStatuses?: Record<string, string>;
+  instances?: SessionInstanceInfo[];
   onPress: () => void;
 }) {
   const theme = useTheme();
@@ -53,7 +56,7 @@ export function SessionCard({
         <Text numberOfLines={1} style={[styles.title, { color: theme.text }]}>{session.project_name ?? "Coding session"}</Text>
         <StatusBadge label={label} tone={tone} />
       </View>
-      <Text numberOfLines={1} style={{ color: theme.textMuted }}>{session.hostname ?? session.working_dir ?? "Unknown target"}</Text>
+      <Text numberOfLines={1} style={{ color: theme.textMuted }}>{sessionHostSummary(session, instancesForSession(session, instances)) ?? "Unknown target"}</Text>
       {session.latest_summary ? <Text numberOfLines={2} style={[styles.summary, { color: theme.text }]}>{session.latest_summary}</Text> : null}
       <View style={styles.row}>
         <Text style={[styles.meta, { color: theme.textMuted }]}>{session.latest_update_at ? new Date(session.latest_update_at).toLocaleString() : "No recent activity"}</Text>
