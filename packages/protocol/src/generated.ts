@@ -153,12 +153,30 @@ export type ServerToWeb =
     }
   | {
       inventory?: CliLifecycleInventory;
+      /**
+       * The instance that reported this inventory, which the server tags
+       * from the sending attachment. Each instance has its own hosting
+       * capability and panes, so clients keep one inventory per (session,
+       * machine). A per-session one would flip to whichever instance
+       * reported last, and a reboot confirmation would count another
+       * machine's panes. On attach the server replays one per attached
+       * instance. `None` from older servers and for an attachment that
+       * reported no machine, i.e. the session's only instance.
+       */
+      machine_id?: string | null;
       session_id: string;
       type: "cli_lifecycle_inventory";
       [k: string]: unknown;
     }
   | {
       inventory?: CliLifecycleInventory1 | null;
+      /**
+       * The instance the request was for (see
+       * `WebToServer::CliLifecycleRequest::machine_id`), so a carried
+       * `inventory` replaces that machine's entry. `None` as for
+       * [`ServerToWeb::CliLifecycleInventory`].
+       */
+      machine_id?: string | null;
       message?: string | null;
       operation: CliLifecycleOperation;
       phase: CliLifecyclePhase;
@@ -190,6 +208,12 @@ export type ServerToWeb =
       reason: SessionAttachmentRejectionReason;
       session_id: string;
       type: "session_attachment_rejected";
+      [k: string]: unknown;
+    }
+  | {
+      instances: SessionInstanceInfo[];
+      session_id: string;
+      type: "session_instances";
       [k: string]: unknown;
     }
   | {
@@ -322,6 +346,27 @@ export type ServerToWeb =
       panes: PaneConfig[];
       session_id: string;
       type: "pane_list";
+      [k: string]: unknown;
+    }
+  | {
+      /**
+       * Why no tab was created; set with `Failed`.
+       */
+      error?: string | null;
+      /**
+       * The machine the tab was routed to, or is waiting for.
+       */
+      machine_id?: string | null;
+      /**
+       * The pane id the server allocated, once there is one. Ids are
+       * allocated against the whole project, so they are unique across
+       * machines and concurrent requests.
+       */
+      pane_id?: number | null;
+      request_id: string;
+      session_id: string;
+      status: AddPaneStatus;
+      type: "add_pane_result";
       [k: string]: unknown;
     }
   | {
@@ -597,6 +642,10 @@ export type ClaudeContentBlock =
  */
 export type ProjectAccessChange = "transferred" | "revoked" | "deleted";
 /**
+ * Outcome of one correlated [`WebToServer::AddPane`].
+ */
+export type AddPaneStatus = "routed" | "starting" | "failed";
+/**
  * A registration cannot simultaneously succeed and carry an error.
  */
 export type LocalProjectRegistrationResult =
@@ -777,6 +826,15 @@ export type WebToServer =
       kind?: "agent" | "terminal";
       label?: string | null;
       /**
+       * Machine whose project instance should run the new pane. `None` =
+       * the session's primary instance, the only target an older server
+       * knows. A machine other than the primary is honoured only when its
+       * daemon advertises [`PROJECT_INSTANCES_CAPABILITY`]; otherwise the
+       * request fails with a correlated reason rather than landing on the
+       * primary, which would run the tab on a machine the user did not pick.
+       */
+      machine_id?: string | null;
+      /**
        * v3.5 — true when this pane is being added as part of the
        * project team, false for ordinary user-created terminal work. See
        * PaneConfig::managed.
@@ -792,6 +850,14 @@ export type WebToServer =
       plan_review_mode?: "always" | "risky_only" | "never";
       prompt?: string | null;
       provider: Provider;
+      /**
+       * Client correlation id. When present the server answers with
+       * [`ServerToWeb::AddPaneResult`] carrying it. An older server ignores
+       * it and answers nothing, so a client that sees no result must report
+       * the launch as unconfirmed, never resend it: a replay can create a
+       * second tab.
+       */
+      request_id?: string | null;
       /**
        * Initial role/goal/backstory/plan_review_mode applied to the new
        * pane BEFORE the first spawn — so a templated worker (Add Worker
@@ -809,6 +875,12 @@ export type WebToServer =
       pane_id: number;
       session_id?: string | null;
       type: "remove_pane";
+      [k: string]: unknown;
+    }
+  | {
+      machine_id: string;
+      session_id: string;
+      type: "forget_machine_panes";
       [k: string]: unknown;
     }
   | {
@@ -862,11 +934,24 @@ export type WebToServer =
       [k: string]: unknown;
     }
   | {
+      /**
+       * Which of the project's instances to reboot. `None` = the primary
+       * instance, today's single-machine behaviour. Projects run inside
+       * their machine's daemon, so this also picks which host's daemon,
+       * and every project in it, is replaced.
+       */
+      machine_id?: string | null;
       session_id?: string | null;
       type: "reboot_cli";
       [k: string]: unknown;
     }
   | {
+      /**
+       * Which of the project's instances the operation is for. `None` = the
+       * primary instance, today's single-machine behaviour. See
+       * `RebootCli::machine_id`.
+       */
+      machine_id?: string | null;
       /**
        * `None` when the client asked for an operation this build retired.
        */
@@ -877,12 +962,38 @@ export type WebToServer =
       [k: string]: unknown;
     }
   | {
+      /**
+       * Start the project as a whole rather than on `machine_id` alone,
+       * as the project view's Start means. Tabs never move between
+       * machines, so the server starts an instance on every online machine
+       * that owns tabs of the project and advertises
+       * [`PROJECT_INSTANCES_CAPABILITY`], and on `machine_id` (the view's
+       * resolved machine) only when no machine qualifies. Each machine is
+       * authorized as a single-machine request would be.
+       *
+       * False, and absent from every older client, starts only on
+       * `machine_id`, which is what a per-machine Start on the Machines
+       * page means. The two must stay distinguishable: fanning out on the
+       * plain message would make that per-machine button start other
+       * machines too. An older server ignores the flag and starts only
+       * `machine_id`.
+       */
+      all_instances?: boolean;
       machine_id: string;
       project_id: string;
       type: "start_machine_project_cli";
       [k: string]: unknown;
     }
   | {
+      /**
+       * Stop the project as a whole, as the project view's Close means:
+       * every machine with an instance of it attached, each authorized as a
+       * single-machine request would be. False, and absent from every older
+       * client, stops only `machine_id`, as a per-machine Stop on the
+       * Machines page does. An older server ignores the flag and stops only
+       * `machine_id`.
+       */
+      all_instances?: boolean;
       machine_id: string;
       project_id: string;
       type: "stop_machine_project_cli";
@@ -904,6 +1015,31 @@ export type WebToServer =
       cluster_owner_user_id?: string | null;
       git_remote: string;
       instance_name: string;
+      /**
+       * Clone onto the machine as another instance of this existing project
+       * instead of creating a new project. The checkout takes this project's
+       * identity with no panes, creates no `branch`, and is not started.
+       * Owner path only: the requester must host the project and own the
+       * target machine. An older server ignores the field and creates a
+       * separate project. Clients therefore send it only for a machine
+       * whose entry reports `project_instances_available`, which older
+       * servers never set.
+       *
+       * The tab is a second, client-chained step rather than part of this
+       * request:
+       * 1. Send this with a `request_id`.
+       * 2. Wait for [`ServerToWeb::ProjectInstanceCreated`] carrying that
+       *    `request_id`, `project_id` equal to `join_project_id`, and no
+       *    `error`.
+       * 3. Send [`WebToServer::AddPane`] with this `machine_id` and a fresh
+       *    `request_id`. The server starts the instance, answers
+       *    [`AddPaneStatus::Starting`], then `Routed` or `Failed`.
+       *
+       * "Clone, start and add" is one launch only in the UI. If the client
+       * loses the acknowledgement, the checkout may exist without a tab;
+       * report that as unconfirmed and never resend the clone.
+       */
+      join_project_id?: string | null;
       machine_id: string;
       request_id?: string | null;
       type: "create_project_instance";
@@ -1249,8 +1385,26 @@ export interface MobileLaunchProfile {
 export interface MachineWithProjects {
   cluster_access?: "owner" | "member";
   cluster_owner_user_id?: string | null;
+  /**
+   * The machine's daemon holds a live connection to this server now.
+   * `MachineInfo::last_seen` is stamped on connect, heartbeat and
+   * disconnect alike, so a just-disconnected daemon looks freshly seen.
+   * It cannot separate "offline" from "connected but too old", which a
+   * disabled machine choice has to explain differently. False from older
+   * servers.
+   */
+  daemon_connected?: boolean;
   local_project_registration_available?: boolean;
   machine: MachineInfo;
+  /**
+   * The machine's daemon is connected and advertises
+   * [`PROJECT_INSTANCES_CAPABILITY`], so a project's tabs can be started on
+   * it beside instances on other machines. Clients offer a machine choice
+   * for new tabs only where this is true. False on a connected daemon
+   * (`daemon_connected`) means an older daemon: reboot it to update. False
+   * from older servers.
+   */
+  project_instances_available?: boolean;
   projects: MachineProjectInfo[];
   shared_provisioning_available?: boolean;
   [k: string]: unknown;
@@ -1281,6 +1435,15 @@ export interface DeepseekBackendInfo {
  * APAS project discovered on a machine
  */
 export interface MachineProjectInfo {
+  /**
+   * Canonical lowercase `host/owner/repo` of the checkout's `origin`,
+   * normalized exactly like `CliToServer::SessionStart::git_remote`. A
+   * registered project that has never started has no session to carry its
+   * remote, so without this the web files it under "(no remote)" instead
+   * of beside the repository's other projects, and `apas register` cannot
+   * match it. `None` without an origin and from older daemons.
+   */
+  git_remote?: string | null;
   is_running?: boolean;
   last_error?: string | null;
   /**
@@ -1320,6 +1483,13 @@ export interface MobileSessionSummary {
   git_remote_url?: string | null;
   hostname?: string | null;
   id: string;
+  /**
+   * The project's attached (running) instances, one per machine, so a
+   * project list can name every host instead of only the primary's
+   * `hostname`. Omitted by older servers and when nothing is attached; in
+   * both cases `hostname`/`working_dir` remain the description to show.
+   */
+  instances?: SessionInstanceInfo[];
   /**
    * True if this session has an active CLI client connected
    */
@@ -1367,6 +1537,51 @@ export interface MobileSessionSummary {
   [k: string]: unknown;
 }
 /**
+ * One attached (running) instance of a session's project on one machine.
+ */
+export interface SessionInstanceInfo {
+  /**
+   * Display name of `machine_id`; never used for routing.
+   */
+  hostname: string;
+  /**
+   * `None` for an attached CLI that reported no machine: standalone and
+   * older CLIs omit it, and the server's legacy inference fails closed
+   * when ambiguous. Such a CLI lacks [`PROJECT_INSTANCES_CAPABILITY`], so
+   * it is always the session's only instance and therefore its primary.
+   * Requests that name no machine reach it, and so do controls for
+   * untagged panes. No machine-addressed request can target it. Listing
+   * it keeps the set complete: a live session never looks as if nothing
+   * were attached.
+   */
+  machine_id?: string | null;
+  /**
+   * True for the earliest attached instance. It supplies the session's
+   * legacy single-valued `hostname`/`working_dir` and receives every
+   * control that names no machine; when it leaves, the next earliest
+   * becomes primary.
+   */
+  primary?: boolean;
+  /**
+   * Whether the viewer this was sent to may use this instance's runtime:
+   * type into its tabs, add tabs on it, reboot it. The server computes it
+   * per connection, because runtime access is evaluated per machine. On a
+   * third-party host it needs cluster membership that covers this exact
+   * machine, so one viewer can use some of a project's instances and not
+   * others. Clients disable the instance's tabs and its machine choice
+   * when it is `Some(false)`, and say why. They do not offer controls that
+   * can only fail with "Access denied". `None` means not evaluated; treat
+   * the instance as usable and let the server decide.
+   */
+  runtime_access?: boolean | null;
+  /**
+   * The instance's checkout. Instances on a shared filesystem report the
+   * same path; separate checkouts report their own.
+   */
+  working_dir?: string | null;
+  [k: string]: unknown;
+}
+/**
  * One agent pane, as mobile needs to list it.
  */
 export interface MobilePaneSummary {
@@ -1376,6 +1591,10 @@ export interface MobilePaneSummary {
    * over provider availability.
    */
   awaiting_answer?: boolean;
+  /**
+   * Display name for the pane's host badge; see [`PaneConfig::hostname`].
+   */
+  hostname?: string | null;
   /**
    * Most recent working-to-idle transition observed by the server. Older
    * servers omit it; clients keep those panes visible after timestamped ones.
@@ -1392,6 +1611,13 @@ export interface MobilePaneSummary {
    * and id, exactly as the session screen does.
    */
   label?: string | null;
+  /**
+   * Machine whose project instance runs this pane; see
+   * [`PaneConfig::machine_id`]. Absent from older servers and for panes
+   * written before multi-machine instances, which no machine owns yet and
+   * whose controls go to the session's primary instance.
+   */
+  machine_id?: string | null;
   /**
    * Model/backend override used to associate provider-scoped availability
    * with the same usage account the pane actually consumes.
@@ -1937,6 +2163,13 @@ export interface SessionInfo {
   hostname?: string | null;
   id: string;
   /**
+   * The project's attached (running) instances, one per machine, so a
+   * project list can name every host instead of only the primary's
+   * `hostname`. Omitted by older servers and when nothing is attached; in
+   * both cases `hostname`/`working_dir` remain the description to show.
+   */
+  instances?: SessionInstanceInfo[];
+  /**
    * True if this session has an active CLI client connected
    */
   is_active?: boolean;
@@ -2008,6 +2241,14 @@ export interface PaneConfig {
    * (later) on the pane header.
    */
   goal?: string | null;
+  /**
+   * Hostname of `machine_id`, for display only. Hosts get renamed, so
+   * routing and ownership always use `machine_id`. On an untagged pane the
+   * server may keep the host it last recorded the pane under, so the tab is
+   * not shown under whichever instance happens to be primary. It never
+   * implies ownership.
+   */
+  hostname?: string | null;
   is_paused?: boolean;
   /**
    * How a pane hosts its agent process. Orthogonal to [`Provider`] (which
@@ -2033,6 +2274,35 @@ export interface PaneConfig {
    */
   kind?: "agent" | "terminal";
   label?: string | null;
+  /**
+   * Machine whose project instance runs this pane. A project can run one
+   * instance per machine under one session, and a pane's process, terminal
+   * and controls live on exactly one of them for the pane's lifetime. The
+   * server assigns this from the authenticated instance that reports the
+   * pane, overriding whatever the pane data says, so no instance can claim
+   * another machine's panes.
+   *
+   * `None` = written before multi-machine instances. No machine owns such
+   * a pane yet. Its controls go to the session's primary instance as a
+   * fallback, and the first instance that reports it adopts it. When
+   * instance M reports its roster, the server:
+   * - replaces every pane tagged M, so a pane tagged M that M no longer
+   *   reports is gone;
+   * - tags M on a reported pane whose roster entry is untagged (adoption
+   *   from the `.apas`, surfacing on the server);
+   * - drops and logs a reported pane whose roster entry is tagged for
+   *   another machine;
+   * - leaves alone every untagged pane M did not report.
+   *
+   * The last rule is why "untagged" does not mean "the primary's". A
+   * separate checkout can join, and become primary, while the pre-upgrade
+   * host is stopped. If the primary owned untagged panes, that checkout's
+   * first, empty roster would erase every tab the host still has, with no
+   * stopped badge and nothing to forget. A CLI without
+   * [`PROJECT_INSTANCES_CAPABILITY`] is only ever the session's sole
+   * instance and still replaces the whole roster, as before.
+   */
+  machine_id?: string | null;
   /**
    * v3.5 — managed vs. unmanaged. `true` = this pane is part of the
    * project team, usually created by the Overview Start team role
@@ -2348,6 +2618,21 @@ export interface PaneWorkSummary {
 }
 export interface MobileTaskLaunchRequest {
   instruction: string;
+  /**
+   * The machine of the chosen [`MobileLaunchTarget`]. Until an instance
+   * advertising [`crate::PROJECT_INSTANCES_CAPABILITY`] runs the project,
+   * this keeps its original meaning: start the project here when nothing
+   * runs it, otherwise add the task to the running session. That is the
+   * rule that nothing changes for a project before a capable instance runs
+   * it.
+   *
+   * Once one does, it means what `WebToServer::AddPane::machine_id`
+   * means. The instance running here receives the task, and a registered
+   * but stopped machine whose daemon advertises the capability is started
+   * first. A machine that cannot run an instance beside the attached ones
+   * fails the launch with the reason. A target picked by machine must
+   * never land silently on another machine.
+   */
   machine_id: string;
   profile_key: string;
   project_id: string;

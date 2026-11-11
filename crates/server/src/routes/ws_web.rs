@@ -286,6 +286,8 @@ fn infer_panes_from_messages(
                 plan_review_mode: shared::PlanReviewMode::default(),
                 manual_mode: false,
                 managed: false,
+                machine_id: None,
+                hostname: None,
             }
         })
         .collect()
@@ -601,6 +603,7 @@ mod machine_access_tests {
             pid: None,
             memory_kb: None,
             last_error: None,
+            git_remote: None,
         }
     }
 
@@ -1333,6 +1336,8 @@ pub(crate) fn pane_summaries(
                     .then(|| idle_since.get(&pane.pane_id).cloned())
                     .flatten(),
                 usage_limited,
+                machine_id: None,
+                hostname: None,
             }
         })
         .collect()
@@ -1707,6 +1712,8 @@ mod retired_launch_authorization_tests {
             plan_review_mode: shared::PlanReviewMode::default(),
             manual_mode: false,
             managed,
+            machine_id: None,
+            hostname: None,
         }
     }
 
@@ -4217,6 +4224,9 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                 }
                 Ok(WebToServer::RebootCli {
                     session_id: msg_sid,
+                    // Until sessions hold per-machine attachments, the only
+                    // instance is the primary one that `None` names.
+                    machine_id: _,
                 }) => {
                     if let Some(sid) =
                         resolve_target_session(&state, &connection_id, msg_sid, session_id).await
@@ -4280,6 +4290,8 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     session_id: sid,
                     request_id,
                     operation,
+                    // See `RebootCli`: one instance per session for now.
+                    machine_id: _,
                 }) => {
                     // A client running a bundle from before an operation was
                     // retired decodes to `None`. Drop the request; the socket
@@ -4325,6 +4337,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                     inventory: state
                                         .sessions
                                         .lifecycle_inventory(&target_sid),
+                                    machine_id: None,
                                 },
                             )
                             .await;
@@ -4384,6 +4397,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                                 .to_string(),
                                         ),
                                         inventory: None,
+                                        machine_id: None,
                                     },
                                 )
                                 .await;
@@ -4455,6 +4469,10 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                 Ok(WebToServer::StartMachineProjectCli {
                     machine_id,
                     project_id,
+                    // A project-wide start fans out once sessions hold
+                    // per-machine attachments; until then the project runs
+                    // on one machine, so both meanings start `machine_id`.
+                    all_instances: _,
                 }) => {
                     let Some(uid) = user_id else {
                         state
@@ -4561,6 +4579,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             ServerToDaemon::StartProjectCli {
                                 project_id,
                                 policy: Some(daemon_policy),
+                                request_id: None,
                             },
                         )
                         .await
@@ -4579,6 +4598,9 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                 Ok(WebToServer::StopMachineProjectCli {
                     machine_id,
                     project_id,
+                    // See `StartMachineProjectCli`: one instance per project
+                    // for now, so both meanings stop `machine_id`.
+                    all_instances: _,
                 }) => {
                     let Some(uid) = user_id else {
                         state
@@ -4710,6 +4732,9 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     clone_url,
                     base_path,
                     request_id,
+                    // Clone-to-join is not implemented on this server yet; the
+                    // request creates a separate project, as older servers do.
+                    join_project_id: _,
                 }) => {
                     let Some(uid) = user_id else {
                         state
@@ -4870,6 +4895,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                 request_id: Some(provisioning.request_id),
                                 project_id: Some(provisioning.project_id),
                                 provisioning_mode: shared::ProjectProvisioningMode::PublicGithub,
+                                join_existing: false,
                             },
                             Some(provisioning_request),
                         )
@@ -4884,6 +4910,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                 request_id,
                                 project_id: None,
                                 provisioning_mode: shared::ProjectProvisioningMode::TrustedOwner,
+                                join_existing: false,
                             },
                             None,
                         )
@@ -5085,6 +5112,12 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     plan_review_mode,
                     managed,
                     kind,
+                    // Machine targeting and correlated results arrive with
+                    // per-machine attachments; until then every new pane goes
+                    // to the session's one instance and nothing answers the
+                    // request id, exactly as on an older server.
+                    machine_id: _,
+                    request_id: _,
                 }) => {
                     if let Some(sid) =
                         resolve_target_session(&state, &connection_id, msg_sid, session_id).await
@@ -5139,6 +5172,8 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             plan_review_mode,
                             manual_mode: false,
                             managed,
+                            machine_id: None,
+                            hostname: None,
                         };
                         tracing::info!(
                             "Adding pane {} to session {} (isolated_worktree={})",
@@ -6269,6 +6304,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                     ServerToWeb::CliLifecycleInventory {
                                         session_id: sid,
                                         inventory,
+                                        machine_id: None,
                                     },
                                 )
                                 .await;
@@ -6541,6 +6577,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                 is_active,
                                 is_working,
                                 panes: pane_summaries(&state, &session_id, is_active),
+                                instances: Vec::new(),
                             }
                         })
                         .collect();
@@ -6576,6 +6613,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             is_active,
                             is_working,
                             panes: pane_summaries(&state, &session_id, is_active),
+                            instances: Vec::new(),
                         });
                     }
 
@@ -6904,6 +6942,19 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             )
                             .await;
                     }
+                }
+                Ok(WebToServer::ForgetMachinePanes {
+                    session_id: sid,
+                    machine_id,
+                }) => {
+                    // Ignored, as older servers ignore the unknown message:
+                    // until sessions hold per-machine attachments every pane
+                    // belongs to the one instance, so there is nothing to forget.
+                    tracing::warn!(
+                        session_id = %sid,
+                        %machine_id,
+                        "Ignoring forget_machine_panes: multi-machine project instances are not supported by this server yet"
+                    );
                 }
                 Err(e) => {
                     tracing::warn!("Failed to parse message: {}", e);

@@ -1,0 +1,9 @@
+{
+  "type": "add_pane",
+  "session_id": "20000000-0000-4000-8000-000000000001",
+  "provider": "claude",
+  "mode": "interactive",
+  "kind": "terminal",
+  "machine_id": "50000000-0000-4000-8000-000000000002",
+  "request_id": "add-pane-1"
+}

@@ -1,0 +1,8 @@
+{
+  "type": "cli_lifecycle_status",
+  "session_id": "20000000-0000-4000-8000-000000000001",
+  "request_id": "70000000-0000-4000-8000-000000000001",
+  "operation": "reboot_cli",
+  "phase": "accepted",
+  "machine_id": "50000000-0000-4000-8000-000000000002"
+}

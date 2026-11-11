@@ -112,6 +112,9 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     Ok(DaemonToServer::ProjectRuntimeStopped { .. }) => {
                         tracing::warn!("Daemon sent project-runtime stop result before register");
                     }
+                    Ok(DaemonToServer::ProjectRuntimeStarted { .. }) => {
+                        tracing::warn!("Daemon sent project-runtime start result before register");
+                    }
                     Ok(DaemonToServer::AutonomousJob { .. }) => {
                         tracing::warn!("Daemon sent job report before register");
                     }
@@ -428,6 +431,7 @@ async fn apply_registered_daemon_message(
                                 ServerToDaemon::StartProjectCli {
                                     project_id: project_id.clone(),
                                     policy,
+                                    request_id: None,
                                 },
                             )
                             .await;
@@ -498,6 +502,23 @@ async fn apply_registered_daemon_message(
                 success,
                 remaining_pane_hosts,
                 error,
+            );
+        }
+        DaemonToServer::ProjectRuntimeStarted {
+            request_id,
+            project_id,
+            success,
+            error,
+        } => {
+            // Answers only a start that carried a request id, and this server
+            // sends none yet, so nothing is waiting on it.
+            tracing::debug!(
+                %machine_id,
+                %request_id,
+                %project_id,
+                success,
+                error = error.as_deref().unwrap_or(""),
+                "ignoring uncorrelated project-runtime start result"
             );
         }
     }
@@ -599,6 +620,7 @@ mod tests {
             pid: is_running.then_some(1234),
             memory_kb: None,
             last_error: None,
+            git_remote: None,
         }
     }
 
@@ -919,6 +941,7 @@ mod tests {
         let ServerToDaemon::StartProjectCli {
             project_id: started,
             policy: Some(_),
+            request_id: _,
         } = daemon_rx.recv().await.unwrap()
         else {
             panic!("finalization must be followed by a policy-bound start")

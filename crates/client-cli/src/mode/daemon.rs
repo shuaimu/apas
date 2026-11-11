@@ -773,6 +773,7 @@ impl DaemonState {
                 pid,
                 memory_kb,
                 last_error: project.last_error.clone(),
+                git_remote: None,
             });
         }
 
@@ -1517,7 +1518,15 @@ async fn run_connection(
                                     ws_sender.send(Message::Text(serde_json::to_string(&DaemonToServer::AutonomousJob { report })?.into())).await?;
                                 }
                             }
-                            ServerToDaemon::StartProjectCli { project_id, policy } => {
+                            ServerToDaemon::StartProjectCli {
+                                project_id,
+                                policy,
+                                // Servers correlate starts only with daemons
+                                // advertising `project_instances_v1`, which
+                                // this one does not yet, so nothing waits on a
+                                // `ProjectRuntimeStarted` from it.
+                                request_id: _,
+                            } => {
                                 let Some(policy) = policy else {
                                     tracing::warn!(
                                         "Refusing to start project {} without authoritative cluster policy",
@@ -1600,6 +1609,10 @@ async fn run_connection(
                                 request_id,
                                 project_id,
                                 provisioning_mode,
+                                // Joining an existing project is sent only to
+                                // daemons advertising `project_instances_v1`,
+                                // which this one does not yet.
+                                join_existing: _,
                             } => {
                                 // NOTE: clone runs inline on the message loop; a
                                 // very large clone briefly delays heartbeats.

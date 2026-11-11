@@ -1,0 +1,8 @@
+{
+  "type": "add_pane_result",
+  "session_id": "20000000-0000-4000-8000-000000000001",
+  "request_id": "add-pane-1",
+  "status": "failed",
+  "machine_id": "50000000-0000-4000-8000-000000000002",
+  "error": "zoo-006 runs an older APAS daemon; reboot it from the Machines page to update it"
+}

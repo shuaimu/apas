@@ -1,0 +1,15 @@
+{
+  "type": "cli_lifecycle_inventory",
+  "session_id": "20000000-0000-4000-8000-000000000001",
+  "inventory": {
+    "persistent_terminal_hosting": true,
+    "panes": [
+      {
+        "pane_id": 4,
+        "mode": "live_adoptable",
+        "runtime_id": "80000000-0000-4000-8000-000000000004"
+      }
+    ]
+  },
+  "machine_id": "50000000-0000-4000-8000-000000000002"
+}

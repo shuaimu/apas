@@ -178,6 +178,8 @@ impl ProjectMetadata {
                     plan_review_mode: shared::PlanReviewMode::default(),
                     manual_mode: false,
                     managed: false,
+                    machine_id: None,
+                    hostname: None,
                 },
                 PaneConfig {
                     pane_id: shared::PANE_ID_INTERACTIVE,
@@ -199,6 +201,8 @@ impl ProjectMetadata {
                     plan_review_mode: shared::PlanReviewMode::default(),
                     manual_mode: false,
                     managed: false,
+                    machine_id: None,
+                    hostname: None,
                 },
             ];
         }

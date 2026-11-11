@@ -4313,6 +4313,8 @@ fn save_pane_configs(
                     plan_review_mode,
                     manual_mode,
                     managed,
+                    machine_id: None,
+                    hostname: None,
                 }
             })
             .collect();
@@ -5768,6 +5770,8 @@ fn build_pane_list(
             plan_review_mode: meta.plan_review_mode,
             manual_mode: meta.manual_mode,
             managed: meta.managed,
+            machine_id: None,
+            hostname: None,
         });
     }
 
@@ -5798,6 +5802,8 @@ fn build_pane_list(
                 plan_review_mode: shared::PlanReviewMode::default(),
                 manual_mode: false,
                 managed: false,
+                machine_id: None,
+                hostname: None,
             });
         }
     }
@@ -6734,6 +6740,8 @@ mod tests {
             plan_review_mode: shared::PlanReviewMode::default(),
             manual_mode: false,
             managed: true,
+            machine_id: None,
+            hostname: None,
         };
         managed.label = Some("Tech Lead".to_string());
         metadata.panes.push(managed);
@@ -7032,6 +7040,8 @@ mod tests {
             plan_review_mode: shared::PlanReviewMode::default(),
             manual_mode: false,
             managed: false,
+            machine_id: None,
+            hostname: None,
         }
     }
 
@@ -8514,6 +8524,8 @@ mod tests {
             plan_review_mode: shared::PlanReviewMode::RiskyOnly,
             manual_mode: true,
             managed: true,
+            machine_id: None,
+            hostname: None,
         }];
         let original_pane = metadata.panes[0].clone();
         save_project(dir.path(), &metadata).expect("seed metadata");

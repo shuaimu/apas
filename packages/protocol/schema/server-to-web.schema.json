@@ -268,6 +268,14 @@
             "persistent_terminal_hosting": false
           }
         },
+        "machine_id": {
+          "description": "The instance that reported this inventory, which the server tags\nfrom the sending attachment. Each instance has its own hosting\ncapability and panes, so clients keep one inventory per (session,\nmachine). A per-session one would flip to whichever instance\nreported last, and a reboot confirmation would count another\nmachine's panes. On attach the server replays one per attached\ninstance. `None` from older servers and for an attachment that\nreported no machine, i.e. the session's only instance.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "uuid"
+        },
         "session_id": {
           "type": "string",
           "format": "uuid"
@@ -295,6 +303,14 @@
               "type": "null"
             }
           ]
+        },
+        "machine_id": {
+          "description": "The instance the request was for (see\n`WebToServer::CliLifecycleRequest::machine_id`), so a carried\n`inventory` replaces that machine's entry. `None` as for\n[`ServerToWeb::CliLifecycleInventory`].",
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "uuid"
         },
         "message": {
           "type": [
@@ -429,6 +445,31 @@
         "session_id",
         "reason",
         "message"
+      ]
+    },
+    {
+      "description": "The session's attached project instances. Always the complete set\nrather than a delta, so an empty list means no instance is attached.\n\nSent only to connections that advertised\n[`PROJECT_INSTANCES_CAPABILITY`] in `Authenticate.capabilities`. Older\nnative builds reject an unknown frame and reconnect, and a replay on\nevery attach would keep them reconnecting. For an attached connection\nthat advertised it, the server sends the set right after\n`SessionAttached`, and again whenever the set changes: an instance\nattaches or detaches, or the primary hands over. A client without the\ncapability uses `SessionInfo::instances` from the session list and the\npane tags in `PaneList`, which older schemas accept.",
+      "type": "object",
+      "properties": {
+        "instances": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/SessionInstanceInfo"
+          }
+        },
+        "session_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "type": {
+          "type": "string",
+          "const": "session_instances"
+        }
+      },
+      "required": [
+        "type",
+        "session_id",
+        "instances"
       ]
     },
     {
@@ -854,6 +895,56 @@
         "type",
         "session_id",
         "panes"
+      ]
+    },
+    {
+      "description": "Answer to a [`WebToServer::AddPane`] that carried a `request_id`.\n`Starting` is followed by a final `Routed` or `Failed` for the same\nrequest; see [`AddPaneStatus`].\n\nSent only to the connection that sent the request, never to the\nsession's other viewers. Only a client that understands this frame\nsends a `request_id`, and older native builds drop their socket on a\nframe their schema does not list. If that connection is gone when a\nlater result is ready, the result is dropped, and the client reports\nthe launch as unconfirmed.",
+      "type": "object",
+      "properties": {
+        "error": {
+          "description": "Why no tab was created; set with `Failed`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "machine_id": {
+          "description": "The machine the tab was routed to, or is waiting for.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "uuid"
+        },
+        "pane_id": {
+          "description": "The pane id the server allocated, once there is one. Ids are\nallocated against the whole project, so they are unique across\nmachines and concurrent requests.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        },
+        "request_id": {
+          "type": "string"
+        },
+        "session_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "status": {
+          "$ref": "#/$defs/AddPaneStatus"
+        },
+        "type": {
+          "type": "string",
+          "const": "add_pane_result"
+        }
+      },
+      "required": [
+        "type",
+        "session_id",
+        "request_id",
+        "status"
       ]
     },
     {
@@ -1430,6 +1521,26 @@
     }
   ],
   "$defs": {
+    "AddPaneStatus": {
+      "description": "Outcome of one correlated [`WebToServer::AddPane`].",
+      "oneOf": [
+        {
+          "description": "Delivered to the target machine's running instance. This is delivery,\nnot creation: the tab appears when that instance reports it in the\nproject's pane list.",
+          "type": "string",
+          "const": "routed"
+        },
+        {
+          "description": "The target machine has the project but was not running it, so its\ninstance is being started and the tab will be created when it\nattaches. Starting is asynchronous and bounded, so this is never the\nlast word: `Routed` or `Failed` follows for the same `request_id`.\nPending starts live in server memory and a server restart drops them\nwithout a reply, which a client must show as unconfirmed rather than\nresend.",
+          "type": "string",
+          "const": "starting"
+        },
+        {
+          "description": "No tab was created; `error` says why.",
+          "type": "string",
+          "const": "failed"
+        }
+      ]
+    },
     "ClaudeAssistantMessage": {
       "description": "Claude assistant message structure",
       "type": "object",
@@ -2632,6 +2743,13 @@
       "description": "APAS project discovered on a machine",
       "type": "object",
       "properties": {
+        "git_remote": {
+          "description": "Canonical lowercase `host/owner/repo` of the checkout's `origin`,\nnormalized exactly like `CliToServer::SessionStart::git_remote`. A\nregistered project that has never started has no session to carry its\nremote, so without this the web files it under \"(no remote)\" instead\nof beside the repository's other projects, and `apas register` cannot\nmatch it. `None` without an origin and from older daemons.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "is_running": {
           "type": "boolean",
           "default": false
@@ -2699,12 +2817,22 @@
             "null"
           ]
         },
+        "daemon_connected": {
+          "description": "The machine's daemon holds a live connection to this server now.\n`MachineInfo::last_seen` is stamped on connect, heartbeat and\ndisconnect alike, so a just-disconnected daemon looks freshly seen.\nIt cannot separate \"offline\" from \"connected but too old\", which a\ndisabled machine choice has to explain differently. False from older\nservers.",
+          "type": "boolean",
+          "default": false
+        },
         "local_project_registration_available": {
           "type": "boolean",
           "default": false
         },
         "machine": {
           "$ref": "#/$defs/MachineInfo"
+        },
+        "project_instances_available": {
+          "description": "The machine's daemon is connected and advertises\n[`PROJECT_INSTANCES_CAPABILITY`], so a project's tabs can be started on\nit beside instances on other machines. Clients offer a machine choice\nfor new tabs only where this is true. False on a connected daemon\n(`daemon_connected`) means an older daemon: reboot it to update. False\nfrom older servers.",
+          "type": "boolean",
+          "default": false
         },
         "projects": {
           "type": "array",
@@ -2775,6 +2903,13 @@
           "type": "boolean",
           "default": false
         },
+        "hostname": {
+          "description": "Display name for the pane's host badge; see [`PaneConfig::hostname`].",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "idle_since": {
           "description": "Most recent working-to-idle transition observed by the server. Older\nservers omit it; clients keep those panes visible after timestamped ones.",
           "type": [
@@ -2796,6 +2931,14 @@
             "string",
             "null"
           ]
+        },
+        "machine_id": {
+          "description": "Machine whose project instance runs this pane; see\n[`PaneConfig::machine_id`]. Absent from older servers and for panes\nwritten before multi-machine instances, which no machine owns yet and\nwhose controls go to the session's primary instance.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "uuid"
         },
         "model": {
           "description": "Model/backend override used to associate provider-scoped availability\nwith the same usage account the pane actually consumes.",
@@ -2970,6 +3113,13 @@
             "null"
           ]
         },
+        "hostname": {
+          "description": "Hostname of `machine_id`, for display only. Hosts get renamed, so\nrouting and ownership always use `machine_id`. On an untagged pane the\nserver may keep the host it last recorded the pane under, so the tab is\nnot shown under whichever instance happens to be primary. It never\nimplies ownership.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "is_paused": {
           "type": "boolean",
           "default": false
@@ -2985,6 +3135,14 @@
             "null"
           ],
           "default": null
+        },
+        "machine_id": {
+          "description": "Machine whose project instance runs this pane. A project can run one\ninstance per machine under one session, and a pane's process, terminal\nand controls live on exactly one of them for the pane's lifetime. The\nserver assigns this from the authenticated instance that reports the\npane, overriding whatever the pane data says, so no instance can claim\nanother machine's panes.\n\n`None` = written before multi-machine instances. No machine owns such\na pane yet. Its controls go to the session's primary instance as a\nfallback, and the first instance that reports it adopts it. When\ninstance M reports its roster, the server:\n- replaces every pane tagged M, so a pane tagged M that M no longer\n  reports is gone;\n- tags M on a reported pane whose roster entry is untagged (adoption\n  from the `.apas`, surfacing on the server);\n- drops and logs a reported pane whose roster entry is tagged for\n  another machine;\n- leaves alone every untagged pane M did not report.\n\nThe last rule is why \"untagged\" does not mean \"the primary's\". A\nseparate checkout can join, and become primary, while the pre-upgrade\nhost is stopped. If the primary owned untagged panes, that checkout's\nfirst, empty roster would erase every tab the host still has, with no\nstopped badge and nothing to forget. A CLI without\n[`PROJECT_INSTANCES_CAPABILITY`] is only ever the session's sole\ninstance and still replaces the whole roster, as before.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "uuid"
         },
         "managed": {
           "description": "v3.5 — managed vs. unmanaged. `true` = this pane is part of the\nproject team, usually created by the Overview Start team role\nslots or by accepted worker suggestions / manual managed-worker\nflows. Such panes show up on the Overview Pane Grid and the Tech\nLead may consider them for delegation. `false` (the compatibility\ndefault and the value for user-created terminal panes) = not part of\nthe team queue and never a Tech Lead delegation target.",
@@ -3528,6 +3686,13 @@
           "type": "string",
           "format": "uuid"
         },
+        "instances": {
+          "description": "The project's attached (running) instances, one per machine, so a\nproject list can name every host instead of only the primary's\n`hostname`. Omitted by older servers and when nothing is attached; in\nboth cases `hostname`/`working_dir` remain the description to show.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/SessionInstanceInfo"
+          }
+        },
         "is_active": {
           "description": "True if this session has an active CLI client connected",
           "type": "boolean",
@@ -3585,6 +3750,46 @@
       "required": [
         "id",
         "status"
+      ]
+    },
+    "SessionInstanceInfo": {
+      "description": "One attached (running) instance of a session's project on one machine.",
+      "type": "object",
+      "properties": {
+        "hostname": {
+          "description": "Display name of `machine_id`; never used for routing.",
+          "type": "string"
+        },
+        "machine_id": {
+          "description": "`None` for an attached CLI that reported no machine: standalone and\nolder CLIs omit it, and the server's legacy inference fails closed\nwhen ambiguous. Such a CLI lacks [`PROJECT_INSTANCES_CAPABILITY`], so\nit is always the session's only instance and therefore its primary.\nRequests that name no machine reach it, and so do controls for\nuntagged panes. No machine-addressed request can target it. Listing\nit keeps the set complete: a live session never looks as if nothing\nwere attached.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "uuid"
+        },
+        "primary": {
+          "description": "True for the earliest attached instance. It supplies the session's\nlegacy single-valued `hostname`/`working_dir` and receives every\ncontrol that names no machine; when it leaves, the next earliest\nbecomes primary.",
+          "type": "boolean",
+          "default": false
+        },
+        "runtime_access": {
+          "description": "Whether the viewer this was sent to may use this instance's runtime:\ntype into its tabs, add tabs on it, reboot it. The server computes it\nper connection, because runtime access is evaluated per machine. On a\nthird-party host it needs cluster membership that covers this exact\nmachine, so one viewer can use some of a project's instances and not\nothers. Clients disable the instance's tabs and its machine choice\nwhen it is `Some(false)`, and say why. They do not offer controls that\ncan only fail with \"Access denied\". `None` means not evaluated; treat\nthe instance as usable and let the server decide.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "working_dir": {
+          "description": "The instance's checkout. Instances on a shared filesystem report the\nsame path; separate checkouts report their own.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "hostname"
       ]
     },
     "SessionStatus": {

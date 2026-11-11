@@ -1332,7 +1332,13 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                 route_lifecycle_to_authorized_web(
                                     &state,
                                     session_id,
-                                    ServerToWeb::CliLifecycleInventory { session_id, inventory },
+                                    ServerToWeb::CliLifecycleInventory {
+                                        session_id,
+                                        inventory,
+                                        // One instance per session until sessions
+                                        // hold per-machine attachments.
+                                        machine_id: None,
+                                    },
                                 )
                                 .await;
                             }

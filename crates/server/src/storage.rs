@@ -2438,6 +2438,8 @@ mod pane_roster_tests {
             plan_review_mode: shared::PlanReviewMode::default(),
             manual_mode: false,
             managed: false,
+            machine_id: None,
+            hostname: None,
         }
     }
 

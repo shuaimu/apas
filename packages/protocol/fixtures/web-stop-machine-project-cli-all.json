@@ -1,0 +1,6 @@
+{
+  "type": "stop_machine_project_cli",
+  "machine_id": "50000000-0000-4000-8000-000000000001",
+  "project_id": "30000000-0000-4000-8000-000000000001",
+  "all_instances": true
+}

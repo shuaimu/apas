@@ -182,6 +182,19 @@ pub enum CodeEventKind {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct MobileTaskLaunchRequest {
     pub request_id: Uuid,
+    /// The machine of the chosen [`MobileLaunchTarget`]. Until an instance
+    /// advertising [`crate::PROJECT_INSTANCES_CAPABILITY`] runs the project,
+    /// this keeps its original meaning: start the project here when nothing
+    /// runs it, otherwise add the task to the running session. That is the
+    /// rule that nothing changes for a project before a capable instance runs
+    /// it.
+    ///
+    /// Once one does, it means what `WebToServer::AddPane::machine_id`
+    /// means. The instance running here receives the task, and a registered
+    /// but stopped machine whose daemon advertises the capability is started
+    /// first. A machine that cannot run an instance beside the attached ones
+    /// fails the launch with the reason. A target picked by machine must
+    /// never land silently on another machine.
     pub machine_id: Uuid,
     pub project_id: String,
     pub instruction: String,

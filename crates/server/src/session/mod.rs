@@ -231,6 +231,7 @@ impl LifecycleRequestState {
             phase: self.phase,
             message: self.message.clone(),
             inventory: self.inventory.clone(),
+            machine_id: None,
         }
     }
 }
@@ -1907,6 +1908,8 @@ impl SessionManager {
                     &machine_id,
                     shared::LOCAL_PROJECT_REGISTRATION_CAPABILITY,
                 ),
+            project_instances_available: false,
+            daemon_connected: false,
         }
     }
 
@@ -1981,6 +1984,8 @@ impl SessionManager {
                         cluster_access: shared::MachineClusterAccess::Member,
                         shared_provisioning_available: false,
                         local_project_registration_available: false,
+                        project_instances_available: false,
+                        daemon_connected: false,
                     })
                 }
             })
@@ -2015,6 +2020,8 @@ impl SessionManager {
                         shared::SHARED_PROJECT_PROVISIONING_CAPABILITY,
                     ),
                     local_project_registration_available: false,
+                    project_instances_available: false,
+                    daemon_connected: false,
                 })
             })
             .collect()
@@ -2821,6 +2828,8 @@ mod pane_roster_pruning_tests {
             plan_review_mode: shared::PlanReviewMode::default(),
             manual_mode: false,
             managed: false,
+            machine_id: None,
+            hostname: None,
         }
     }
 
@@ -2892,6 +2901,7 @@ mod tests {
             pid: None,
             memory_kb: None,
             last_error: None,
+            git_remote: None,
         }
     }
 
@@ -2996,6 +3006,8 @@ mod tests {
             plan_review_mode: shared::PlanReviewMode::default(),
             manual_mode: false,
             managed: false,
+            machine_id: None,
+            hostname: None,
         }
     }
 

@@ -47,6 +47,7 @@ fn project(id: &str) -> MachineProjectInfo {
         pid: None,
         memory_kb: None,
         last_error: None,
+        git_remote: None,
     }
 }
 
@@ -1052,11 +1053,13 @@ async fn websocket_no_git_registration_is_ready_for_a_subsequent_explicit_start(
         &WebToServer::StartMachineProjectCli {
             machine_id: f.machine,
             project_id: snapshot.project_id.clone(),
+            all_instances: false,
         },
     )
     .await;
-    let ServerToDaemon::StartProjectCli { project_id, policy } =
-        socket_read::<ServerToDaemon>(&mut daemon).await
+    let ServerToDaemon::StartProjectCli {
+        project_id, policy, ..
+    } = socket_read::<ServerToDaemon>(&mut daemon).await
     else {
         panic!("explicit Start must pass the normal authorization gate");
     };

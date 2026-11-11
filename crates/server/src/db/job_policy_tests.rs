@@ -1113,6 +1113,7 @@ async fn deletion_stops_reachable_interactive_host_while_job_host_is_offline() {
             pid: None,
             memory_kb: None,
             last_error: None,
+            git_remote: None,
         }],
     );
     state

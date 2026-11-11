@@ -81,6 +81,7 @@ async fn fixture() -> (
             pid: None,
             memory_kb: None,
             last_error: None,
+            git_remote: None,
         }],
     );
     state

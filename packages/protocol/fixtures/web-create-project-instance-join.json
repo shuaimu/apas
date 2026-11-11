@@ -1,0 +1,10 @@
+{
+  "type": "create_project_instance",
+  "machine_id": "50000000-0000-4000-8000-000000000003",
+  "git_remote": "github.com/example/project",
+  "instance_name": "project",
+  "branch": "",
+  "clone_url": "https://github.com/example/project.git",
+  "request_id": "clone-join-1",
+  "join_project_id": "30000000-0000-4000-8000-000000000001"
+}

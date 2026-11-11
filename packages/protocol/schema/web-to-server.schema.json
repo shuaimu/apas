@@ -591,6 +591,14 @@
             "null"
           ]
         },
+        "machine_id": {
+          "description": "Machine whose project instance should run the new pane. `None` =\nthe session's primary instance, the only target an older server\nknows. A machine other than the primary is honoured only when its\ndaemon advertises [`PROJECT_INSTANCES_CAPABILITY`]; otherwise the\nrequest fails with a correlated reason rather than landing on the\nprimary, which would run the tab on a machine the user did not pick.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "uuid"
+        },
         "managed": {
           "description": "v3.5 — true when this pane is being added as part of the\nproject team, false for ordinary user-created terminal work. See\nPaneConfig::managed.",
           "type": "boolean",
@@ -617,6 +625,13 @@
         },
         "provider": {
           "$ref": "#/$defs/Provider"
+        },
+        "request_id": {
+          "description": "Client correlation id. When present the server answers with\n[`ServerToWeb::AddPaneResult`] carrying it. An older server ignores\nit and answers nothing, so a client that sees no result must report\nthe launch as unconfirmed, never resend it: a replay can create a\nsecond tab.",
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "role": {
           "description": "Initial role/goal/backstory/plan_review_mode applied to the new\npane BEFORE the first spawn — so a templated worker (Add Worker\nmodal on Overview) uses the right system prompt immediately\ninstead of needing a close+reopen. All optional; missing fields\nkeep the legacy \"set via Role modal later\" path.",
@@ -677,6 +692,29 @@
       "required": [
         "type",
         "pane_id"
+      ]
+    },
+    {
+      "description": "Drop every pane owned by `machine_id` from the project roster, after\nthe owner confirms `Forget <host>'s tabs` for a machine that will not\ncome back. Tabs never move between machines and a stopped machine's\ntabs cannot be closed one by one (their state lives on that machine),\nso this is the only way to clear them. Refused while `machine_id` has a\nrunning instance, which is authoritative for its own panes and would\nreport them again. Running instances receive\n[`ServerToCli::ForgetMachinePanes`].",
+      "type": "object",
+      "properties": {
+        "machine_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "session_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "type": {
+          "type": "string",
+          "const": "forget_machine_panes"
+        }
+      },
+      "required": [
+        "type",
+        "session_id",
+        "machine_id"
       ]
     },
     {
@@ -923,6 +961,14 @@
       "description": "Reboot the CLI process",
       "type": "object",
       "properties": {
+        "machine_id": {
+          "description": "Which of the project's instances to reboot. `None` = the primary\ninstance, today's single-machine behaviour. Projects run inside\ntheir machine's daemon, so this also picks which host's daemon,\nand every project in it, is replaced.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "uuid"
+        },
         "session_id": {
           "type": [
             "string",
@@ -943,6 +989,14 @@
       "description": "Capability-gated project lifecycle operation. `session_id` is\nrequired so multi-attached web connections cannot accidentally target\nthe last session that happened to attach.",
       "type": "object",
       "properties": {
+        "machine_id": {
+          "description": "Which of the project's instances the operation is for. `None` = the\nprimary instance, today's single-machine behaviour. See\n`RebootCli::machine_id`.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "uuid"
+        },
         "operation": {
           "description": "`None` when the client asked for an operation this build retired.",
           "anyOf": [
@@ -977,6 +1031,11 @@
       "description": "Start APAS CLI for a daemon project",
       "type": "object",
       "properties": {
+        "all_instances": {
+          "description": "Start the project as a whole rather than on `machine_id` alone,\nas the project view's Start means. Tabs never move between\nmachines, so the server starts an instance on every online machine\nthat owns tabs of the project and advertises\n[`PROJECT_INSTANCES_CAPABILITY`], and on `machine_id` (the view's\nresolved machine) only when no machine qualifies. Each machine is\nauthorized as a single-machine request would be.\n\nFalse, and absent from every older client, starts only on\n`machine_id`, which is what a per-machine Start on the Machines\npage means. The two must stay distinguishable: fanning out on the\nplain message would make that per-machine button start other\nmachines too. An older server ignores the flag and starts only\n`machine_id`.",
+          "type": "boolean",
+          "default": false
+        },
         "machine_id": {
           "type": "string",
           "format": "uuid"
@@ -999,6 +1058,11 @@
       "description": "Stop APAS CLI for a daemon project",
       "type": "object",
       "properties": {
+        "all_instances": {
+          "description": "Stop the project as a whole, as the project view's Close means:\nevery machine with an instance of it attached, each authorized as a\nsingle-machine request would be. False, and absent from every older\nclient, stops only `machine_id`, as a per-machine Stop on the\nMachines page does. An older server ignores the flag and stops only\n`machine_id`.",
+          "type": "boolean",
+          "default": false
+        },
         "machine_id": {
           "type": "string",
           "format": "uuid"
@@ -1066,6 +1130,14 @@
         },
         "instance_name": {
           "type": "string"
+        },
+        "join_project_id": {
+          "description": "Clone onto the machine as another instance of this existing project\ninstead of creating a new project. The checkout takes this project's\nidentity with no panes, creates no `branch`, and is not started.\nOwner path only: the requester must host the project and own the\ntarget machine. An older server ignores the field and creates a\nseparate project. Clients therefore send it only for a machine\nwhose entry reports `project_instances_available`, which older\nservers never set.\n\nThe tab is a second, client-chained step rather than part of this\nrequest:\n1. Send this with a `request_id`.\n2. Wait for [`ServerToWeb::ProjectInstanceCreated`] carrying that\n   `request_id`, `project_id` equal to `join_project_id`, and no\n   `error`.\n3. Send [`WebToServer::AddPane`] with this `machine_id` and a fresh\n   `request_id`. The server starts the instance, answers\n   [`AddPaneStatus::Starting`], then `Routed` or `Failed`.\n\n\"Clone, start and add\" is one launch only in the UI. If the client\nloses the acknowledgement, the checkout may exist without a tab;\nreport that as unconfirmed and never resend the clone.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "uuid"
         },
         "machine_id": {
           "type": "string",

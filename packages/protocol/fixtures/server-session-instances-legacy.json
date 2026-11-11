@@ -1,0 +1,11 @@
+{
+  "type": "session_instances",
+  "session_id": "20000000-0000-4000-8000-000000000001",
+  "instances": [
+    {
+      "hostname": "laptop",
+      "working_dir": "/workspace/project",
+      "primary": true
+    }
+  ]
+}

@@ -59,6 +59,7 @@ fn session_info(
         // and "these panes are working" cannot disagree — and the same helper
         // the web list uses, so the two surfaces cannot either.
         panes: super::ws_web::pane_summaries(state, &session_id, is_active),
+        instances: Vec::new(),
     }
 }
 
@@ -359,6 +360,7 @@ pub async fn launch_task(
                 ServerToDaemon::StartProjectCli {
                     project_id: request.project_id.clone(),
                     policy: Some(policy),
+                    request_id: None,
                 },
             )
             .await
@@ -436,6 +438,8 @@ pub async fn launch_task(
             plan_review_mode: PlanReviewMode::default(),
             manual_mode: false,
             managed: false,
+            machine_id: None,
+            hostname: None,
         };
         if !state
             .sessions
@@ -575,6 +579,8 @@ mod tests {
             plan_review_mode: shared::PlanReviewMode::default(),
             manual_mode: false,
             managed: false,
+            machine_id: None,
+            hostname: None,
         }
     }
     use crate::{

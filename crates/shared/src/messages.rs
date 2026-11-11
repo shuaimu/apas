@@ -58,6 +58,26 @@ pub const TERMINAL_SUBMIT_SETTLE_MS: u64 = 100;
 pub const SHARED_PROJECT_PROVISIONING_CAPABILITY: &str = "shared_project_provisioning_v1";
 /// Existing-directory registration without cloning or starting a runtime.
 pub const LOCAL_PROJECT_REGISTRATION_CAPABILITY: &str = "local_project_registration_v1";
+/// The CLI/daemon can run one instance of a project per machine, every one of
+/// them attached to the project's single session: it tags the panes it owns
+/// with its machine id, saves only those into a shared `.apas`, and holds a
+/// per-machine claim.
+///
+/// An instance without it sends its whole roster untagged and assumes it is
+/// the project's only runtime, so the server must never attach it beside
+/// another machine's instance, route a tab to it by machine, or ask its daemon
+/// to clone a checkout that joins an existing project. A host configured with
+/// an explicit `daemon.machine_id` must not advertise it either: that setting
+/// lives in the shared `config.toml`, so every host on a shared home would
+/// report the same machine.
+///
+/// Web and mobile clients advertise it too, in `Authenticate.capabilities`,
+/// to receive [`ServerToWeb::SessionInstances`]; a server that implements
+/// instances echoes it in `Authenticated.negotiated_capabilities`, so a client
+/// can tell whether that frame will come. The gate is what keeps older native
+/// builds connected: they validate every frame against their bundled schema
+/// and drop the socket on a variant it does not list.
+pub const PROJECT_INSTANCES_CAPABILITY: &str = "project_instances_v1";
 /// Canonical non-working pane status used while an agent is blocked on a
 /// question only the human can answer. Keep the wire value stable: older web
 /// clients safely render it as an ordinary non-empty status, while newer ones
@@ -645,6 +665,15 @@ pub enum ServerToCli {
         cleanup_action: Option<PaneCleanupAction>,
     },
 
+    /// Forget every pane owned by `machine_id`, a machine with no running
+    /// instance that the owner confirmed will not come back. Sent to every
+    /// attached instance: one sharing the same `.apas` removes that machine's
+    /// entries from it under the project lock, so they are neither restored
+    /// nor shown again. A separate checkout's `.apas` holds none of them and
+    /// is left alone; if that machine ever returns, its instance reports its
+    /// own tabs again, because each instance is authoritative for its panes.
+    ForgetMachinePanes { session_id: Uuid, machine_id: Uuid },
+
     /// Start bot (deadloop) on a pane
     StartBot {
         session_id: Uuid,
@@ -855,6 +884,132 @@ pub enum ServerToCli {
     },
 }
 
+/// Which attached instance of a session a [`ServerToCli`] message is for.
+///
+/// A session can have one project instance attached per machine, each owning
+/// the panes tagged with its machine id, so "the session's CLI" no longer
+/// names one connection. Sending a pane's input or reboot to whichever
+/// instance happens to be primary would act on the wrong machine's process,
+/// and sending a policy change to only one instance would leave the others
+/// enforcing a stale one. The server therefore routes every message it
+/// addresses by session according to this classification.
+///
+/// [`ServerToCli::scope`] matches every variant without a wildcard arm, so a
+/// new variant does not compile until someone decides which class it is in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ServerToCliScope {
+    /// The message is for one existing pane: deliver it to the instance that
+    /// owns that pane and to no other, whichever instance is primary. A pane
+    /// with no `machine_id`, or one the roster does not list, has no owner
+    /// yet and goes to the primary instance as a fallback; see
+    /// [`PaneConfig::machine_id`]. The legacy deadloop pause/resume carry no
+    /// pane id but act only on [`PANE_ID_DEADLOOP`], so they are in this
+    /// class with that id.
+    Pane(u32),
+    /// `AddPane`: deliver it to the instance on `machine_id`, the
+    /// `pane_config.machine_id` the server assigned to the new pane, or to the
+    /// primary instance when that is `None`. Unlike [`Self::Process`] this
+    /// carries the machine, because the instance that receives the pane is the
+    /// one that tags, persists and runs it.
+    NewPane { machine_id: Option<Uuid> },
+    /// Project-wide state that every instance must hold (policy, flags and
+    /// operations updates, roster requests, forgotten machines): fan it out to
+    /// every attached instance.
+    Project,
+    /// Addressed to one instance process rather than to a pane (reboot,
+    /// lifecycle, signals): deliver it to the machine the originating request
+    /// named explicitly, else the primary instance. The server picks that
+    /// machine from the web request, which is why the CLI-bound message itself
+    /// carries none.
+    Process,
+    /// Session-level work aimed at a pane the message does not name, such as
+    /// a question or plan answer, or `Input` without a pane id. The server
+    /// resolves the target pane itself from its pending decision, so the
+    /// caller supplies the target; without one it goes to the primary.
+    ///
+    /// A CLI applies `Input` without a pane id to [`PANE_ID_INTERACTIVE`]. A
+    /// caller with no pending decision to resolve therefore routes it to the
+    /// owner of the legacy pane it means (`pane_type` through
+    /// [`PaneConfig::pane_id_from_legacy`], else [`PANE_ID_INTERACTIVE`])
+    /// before falling back to the primary.
+    Unscoped,
+    /// Addressed to one CLI connection and never routed by session:
+    /// registration, version refusal, session assignment and rejection, and
+    /// heartbeats.
+    Connection,
+}
+
+impl ServerToCli {
+    /// How the server routes this message among a session's attached
+    /// instances. See [`ServerToCliScope`].
+    pub fn scope(&self) -> ServerToCliScope {
+        use ServerToCliScope::{Connection, NewPane, Pane, Process, Project, Unscoped};
+        match self {
+            Self::Registered { .. }
+            | Self::RegistrationFailed { .. }
+            | Self::VersionUnsupported { .. }
+            | Self::SessionRejected { .. }
+            | Self::SessionAssigned { .. }
+            | Self::Heartbeat => Connection,
+
+            Self::Input {
+                pane_id: Some(pane_id),
+                ..
+            } => Pane(*pane_id),
+            Self::Input { pane_id: None, .. }
+            | Self::AnswerQuestion { .. }
+            | Self::PlanReviewAnswer { .. } => Unscoped,
+
+            Self::PausePane { pane_id, .. }
+            | Self::ResumePane { pane_id, .. }
+            | Self::RebootPane { pane_id, .. }
+            | Self::RemovePane { pane_id, .. }
+            | Self::StartBot { pane_id, .. }
+            | Self::StopBot { pane_id, .. }
+            | Self::UpdatePaneEffort { pane_id, .. }
+            | Self::UpdatePaneLabel { pane_id, .. }
+            | Self::UpdatePaneModel { pane_id, .. }
+            | Self::InterruptPane { pane_id, .. }
+            | Self::AnswerOmpQuestion { pane_id, .. }
+            | Self::RequestPaneDiff { pane_id, .. }
+            | Self::CreatePr { pane_id, .. }
+            | Self::UpdatePaneRole { pane_id, .. }
+            | Self::UpdatePaneReviewMode { pane_id, .. }
+            | Self::UpdatePaneManualMode { pane_id, .. }
+            | Self::TerminalInput { pane_id, .. }
+            | Self::TerminalResize { pane_id, .. } => Pane(*pane_id),
+            // The summarizer runs no tools, but it hands this pane's
+            // conversation to a provider under the receiving host's own
+            // summary configuration, including whether a provider other than
+            // the pane's may see it. That decision belongs to the pane's host.
+            Self::GeneratePaneWorkSummary { job } => Pane(job.pane_id),
+            // No pane id on the wire, but the CLI pauses or resumes only
+            // `PANE_ID_DEADLOOP` (and writes that pane's state), and the web
+            // pairs each with a `pause_pane`/`resume_pane` for the same pane.
+            // Sent to the primary, they would act on a pane another machine
+            // owns.
+            Self::PauseDeadloop { .. } | Self::ResumeDeadloop { .. } => Pane(PANE_ID_DEADLOOP),
+
+            Self::AddPane { pane_config, .. } => NewPane {
+                machine_id: pane_config.machine_id,
+            },
+
+            // `SessionDisconnected` is never sent today; were it sent, a web
+            // viewer leaving concerns every instance equally.
+            Self::RequestPaneList { .. }
+            | Self::UpdateProjectFlags { .. }
+            | Self::UpdateProjectOperations { .. }
+            | Self::ProjectPolicy { .. }
+            | Self::ForgetMachinePanes { .. }
+            | Self::SessionDisconnected { .. } => Project,
+
+            Self::Signal { .. } | Self::RebootCli { .. } | Self::CliLifecycleRequest { .. } => {
+                Process
+            }
+        }
+    }
+}
+
 // ============================================================================
 // Daemon <-> Server Messages
 // ============================================================================
@@ -923,6 +1078,27 @@ pub enum DaemonToServer {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         error: Option<String>,
     },
+
+    /// Outcome of a `StartProjectCli` that carried a `request_id`, sent only by
+    /// daemons advertising [`PROJECT_INSTANCES_CAPABILITY`]. The server waits
+    /// on it when a tab is added on a machine whose instance is stopped:
+    /// heartbeats carry only a sticky `last_error` that a successful spawn
+    /// clears, so they cannot say whether a failure belongs to this attempt or
+    /// an earlier one, and several refusals set no error at all.
+    ///
+    /// `success` = the project now runs in this daemon, including when it
+    /// already did. It is the start, not the attachment: the instance still
+    /// has to send `SessionStart`. Otherwise `error` says why nothing started,
+    /// for example a missing or suspended policy, a live claim held by
+    /// another host, an externally started `--headless` run, or a failed
+    /// spawn.
+    ProjectRuntimeStarted {
+        request_id: Uuid,
+        project_id: String,
+        success: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
 }
 
 /// Messages sent from server to machine daemon
@@ -950,6 +1126,13 @@ pub enum ServerToDaemon {
         /// closed instead of reviving a suspended project.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         policy: Option<EffectiveProjectPolicy>,
+        /// Correlates this start with
+        /// [`DaemonToServer::ProjectRuntimeStarted`]. Sent only to daemons
+        /// advertising [`PROJECT_INSTANCES_CAPABILITY`]; an older daemon
+        /// ignores it and reports nothing beyond its heartbeat. `None` asks for
+        /// no report, as every start did before.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        request_id: Option<Uuid>,
     },
 
     /// Stop APAS CLI for a project on this machine
@@ -979,6 +1162,28 @@ pub enum ServerToDaemon {
         project_id: Option<String>,
         #[serde(default)]
         provisioning_mode: ProjectProvisioningMode,
+        /// When true, `project_id` is an existing project this checkout joins
+        /// as another instance: clone without creating a branch, write `.apas`
+        /// with that id and zero panes, register, and do not start. Nothing
+        /// here carries a tab. The web adds one afterwards with an ordinary
+        /// [`WebToServer::AddPane`] naming this machine, which starts the
+        /// instance; see [`WebToServer::CreateProjectInstance`]'s
+        /// `join_project_id`.
+        ///
+        /// For that follow-up to find the checkout, the daemon sends a
+        /// `Heartbeat` listing it *before* `ProjectInstanceCreated`. The server
+        /// handles one daemon's messages in order, so it already lists the
+        /// project on this machine when the acknowledgement reaches the web.
+        /// Acknowledging first would race the web's next request against the
+        /// inventory refresh.
+        ///
+        /// A separate flag because a present `project_id` already means a
+        /// fresh identity reserved for two-phase provisioning. The server only
+        /// sends it to daemons advertising [`PROJECT_INSTANCES_CAPABILITY`]: an
+        /// older daemon ignores it and, on the owner path, would branch, mint
+        /// an unrelated project, and start it.
+        #[serde(default)]
+        join_existing: bool,
     },
 
     /// Register an existing directory in place, without starting its project.
@@ -1276,6 +1481,21 @@ pub enum WebToServer {
         /// no system prompt to inject into a pty-hosted TUI.
         #[serde(default)]
         kind: PaneKind,
+        /// Machine whose project instance should run the new pane. `None` =
+        /// the session's primary instance, the only target an older server
+        /// knows. A machine other than the primary is honoured only when its
+        /// daemon advertises [`PROJECT_INSTANCES_CAPABILITY`]; otherwise the
+        /// request fails with a correlated reason rather than landing on the
+        /// primary, which would run the tab on a machine the user did not pick.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        machine_id: Option<Uuid>,
+        /// Client correlation id. When present the server answers with
+        /// [`ServerToWeb::AddPaneResult`] carrying it. An older server ignores
+        /// it and answers nothing, so a client that sees no result must report
+        /// the launch as unconfirmed, never resend it: a replay can create a
+        /// second tab.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        request_id: Option<String>,
     },
 
     /// Remove a pane. When the pane has an isolated worktree assigned
@@ -1288,6 +1508,19 @@ pub enum WebToServer {
         pane_id: u32,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         cleanup_action: Option<PaneCleanupAction>,
+    },
+
+    /// Drop every pane owned by `machine_id` from the project roster, after
+    /// the owner confirms `Forget <host>'s tabs` for a machine that will not
+    /// come back. Tabs never move between machines and a stopped machine's
+    /// tabs cannot be closed one by one (their state lives on that machine),
+    /// so this is the only way to clear them. Refused while `machine_id` has a
+    /// running instance, which is authoritative for its own panes and would
+    /// report them again. Running instances receive
+    /// [`ServerToCli::ForgetMachinePanes`].
+    ForgetMachinePanes {
+        session_id: Uuid,
+        machine_id: Uuid,
     },
 
     /// Update a pane's custom label
@@ -1376,6 +1609,12 @@ pub enum WebToServer {
     RebootCli {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         session_id: Option<Uuid>,
+        /// Which of the project's instances to reboot. `None` = the primary
+        /// instance, today's single-machine behaviour. Projects run inside
+        /// their machine's daemon, so this also picks which host's daemon,
+        /// and every project in it, is replaced.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        machine_id: Option<Uuid>,
     },
 
     /// Capability-gated project lifecycle operation. `session_id` is
@@ -1387,18 +1626,47 @@ pub enum WebToServer {
         /// `None` when the client asked for an operation this build retired.
         #[serde(deserialize_with = "lenient_lifecycle_operation")]
         operation: Option<CliLifecycleOperation>,
+        /// Which of the project's instances the operation is for. `None` = the
+        /// primary instance, today's single-machine behaviour. See
+        /// `RebootCli::machine_id`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        machine_id: Option<Uuid>,
     },
 
     /// Start APAS CLI for a daemon project
     StartMachineProjectCli {
         machine_id: Uuid,
         project_id: String,
+        /// Start the project as a whole rather than on `machine_id` alone,
+        /// as the project view's Start means. Tabs never move between
+        /// machines, so the server starts an instance on every online machine
+        /// that owns tabs of the project and advertises
+        /// [`PROJECT_INSTANCES_CAPABILITY`], and on `machine_id` (the view's
+        /// resolved machine) only when no machine qualifies. Each machine is
+        /// authorized as a single-machine request would be.
+        ///
+        /// False, and absent from every older client, starts only on
+        /// `machine_id`, which is what a per-machine Start on the Machines
+        /// page means. The two must stay distinguishable: fanning out on the
+        /// plain message would make that per-machine button start other
+        /// machines too. An older server ignores the flag and starts only
+        /// `machine_id`.
+        #[serde(default)]
+        all_instances: bool,
     },
 
     /// Stop APAS CLI for a daemon project
     StopMachineProjectCli {
         machine_id: Uuid,
         project_id: String,
+        /// Stop the project as a whole, as the project view's Close means:
+        /// every machine with an instance of it attached, each authorized as a
+        /// single-machine request would be. False, and absent from every older
+        /// client, stops only `machine_id`, as a per-machine Stop on the
+        /// Machines page does. An older server ignores the flag and stops only
+        /// `machine_id`.
+        #[serde(default)]
+        all_instances: bool,
     },
 
     /// Restart the daemon on one machine, applying an available update first.
@@ -1429,6 +1697,30 @@ pub enum WebToServer {
         base_path: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         request_id: Option<String>,
+        /// Clone onto the machine as another instance of this existing project
+        /// instead of creating a new project. The checkout takes this project's
+        /// identity with no panes, creates no `branch`, and is not started.
+        /// Owner path only: the requester must host the project and own the
+        /// target machine. An older server ignores the field and creates a
+        /// separate project. Clients therefore send it only for a machine
+        /// whose entry reports `project_instances_available`, which older
+        /// servers never set.
+        ///
+        /// The tab is a second, client-chained step rather than part of this
+        /// request:
+        /// 1. Send this with a `request_id`.
+        /// 2. Wait for [`ServerToWeb::ProjectInstanceCreated`] carrying that
+        ///    `request_id`, `project_id` equal to `join_project_id`, and no
+        ///    `error`.
+        /// 3. Send [`WebToServer::AddPane`] with this `machine_id` and a fresh
+        ///    `request_id`. The server starts the instance, answers
+        ///    [`AddPaneStatus::Starting`], then `Routed` or `Failed`.
+        ///
+        /// "Clone, start and add" is one launch only in the UI. If the client
+        /// loses the acknowledgement, the checkout may exist without a tab;
+        /// report that as unconfirmed and never resend the clone.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        join_project_id: Option<Uuid>,
     },
 
     /// Owner-only registration of an existing directory on the selected host.
@@ -1694,6 +1986,26 @@ pub enum SessionAttachmentRejectionReason {
     SessionNotFound,
 }
 
+/// Outcome of one correlated [`WebToServer::AddPane`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum AddPaneStatus {
+    /// Delivered to the target machine's running instance. This is delivery,
+    /// not creation: the tab appears when that instance reports it in the
+    /// project's pane list.
+    Routed,
+    /// The target machine has the project but was not running it, so its
+    /// instance is being started and the tab will be created when it
+    /// attaches. Starting is asynchronous and bounded, so this is never the
+    /// last word: `Routed` or `Failed` follows for the same `request_id`.
+    /// Pending starts live in server memory and a server restart drops them
+    /// without a reply, which a client must show as unconfirmed rather than
+    /// resend.
+    Starting,
+    /// No tab was created; `error` says why.
+    Failed,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerToWeb {
@@ -1769,6 +2081,16 @@ pub enum ServerToWeb {
         session_id: Uuid,
         #[serde(default)]
         inventory: CliLifecycleInventory,
+        /// The instance that reported this inventory, which the server tags
+        /// from the sending attachment. Each instance has its own hosting
+        /// capability and panes, so clients keep one inventory per (session,
+        /// machine). A per-session one would flip to whichever instance
+        /// reported last, and a reboot confirmation would count another
+        /// machine's panes. On attach the server replays one per attached
+        /// instance. `None` from older servers and for an attachment that
+        /// reported no machine, i.e. the session's only instance.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        machine_id: Option<Uuid>,
     },
 
     /// Authoritative progress/outcome for one lifecycle request.
@@ -1781,6 +2103,12 @@ pub enum ServerToWeb {
         message: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         inventory: Option<CliLifecycleInventory>,
+        /// The instance the request was for (see
+        /// `WebToServer::CliLifecycleRequest::machine_id`), so a carried
+        /// `inventory` replaces that machine's entry. `None` as for
+        /// [`ServerToWeb::CliLifecycleInventory`].
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        machine_id: Option<Uuid>,
     },
 
     /// Session started
@@ -1806,6 +2134,23 @@ pub enum ServerToWeb {
         session_id: Uuid,
         reason: SessionAttachmentRejectionReason,
         message: String,
+    },
+
+    /// The session's attached project instances. Always the complete set
+    /// rather than a delta, so an empty list means no instance is attached.
+    ///
+    /// Sent only to connections that advertised
+    /// [`PROJECT_INSTANCES_CAPABILITY`] in `Authenticate.capabilities`. Older
+    /// native builds reject an unknown frame and reconnect, and a replay on
+    /// every attach would keep them reconnecting. For an attached connection
+    /// that advertised it, the server sends the set right after
+    /// `SessionAttached`, and again whenever the set changes: an instance
+    /// attaches or detaches, or the primary hands over. A client without the
+    /// capability uses `SessionInfo::instances` from the session list and the
+    /// pane tags in `PaneList`, which older schemas accept.
+    SessionInstances {
+        session_id: Uuid,
+        instances: Vec<SessionInstanceInfo>,
     },
 
     /// Output from Claude
@@ -1928,6 +2273,33 @@ pub enum ServerToWeb {
     PaneList {
         session_id: Uuid,
         panes: Vec<PaneConfig>,
+    },
+
+    /// Answer to a [`WebToServer::AddPane`] that carried a `request_id`.
+    /// `Starting` is followed by a final `Routed` or `Failed` for the same
+    /// request; see [`AddPaneStatus`].
+    ///
+    /// Sent only to the connection that sent the request, never to the
+    /// session's other viewers. Only a client that understands this frame
+    /// sends a `request_id`, and older native builds drop their socket on a
+    /// frame their schema does not list. If that connection is gone when a
+    /// later result is ready, the result is dropped, and the client reports
+    /// the launch as unconfirmed.
+    AddPaneResult {
+        session_id: Uuid,
+        request_id: String,
+        status: AddPaneStatus,
+        /// The machine the tab was routed to, or is waiting for.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        machine_id: Option<Uuid>,
+        /// The pane id the server allocated, once there is one. Ids are
+        /// allocated against the whole project, so they are unique across
+        /// machines and concurrent requests.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pane_id: Option<u32>,
+        /// Why no tab was created; set with `Failed`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
     },
 
     /// Usage limits update from a CLI client
@@ -2236,6 +2608,50 @@ pub struct SessionInfo {
     /// pane detail" rather than as a session with no panes.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub panes: Vec<MobilePaneSummary>,
+    /// The project's attached (running) instances, one per machine, so a
+    /// project list can name every host instead of only the primary's
+    /// `hostname`. Omitted by older servers and when nothing is attached; in
+    /// both cases `hostname`/`working_dir` remain the description to show.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub instances: Vec<SessionInstanceInfo>,
+}
+
+/// One attached (running) instance of a session's project on one machine.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct SessionInstanceInfo {
+    /// `None` for an attached CLI that reported no machine: standalone and
+    /// older CLIs omit it, and the server's legacy inference fails closed
+    /// when ambiguous. Such a CLI lacks [`PROJECT_INSTANCES_CAPABILITY`], so
+    /// it is always the session's only instance and therefore its primary.
+    /// Requests that name no machine reach it, and so do controls for
+    /// untagged panes. No machine-addressed request can target it. Listing
+    /// it keeps the set complete: a live session never looks as if nothing
+    /// were attached.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub machine_id: Option<Uuid>,
+    /// Display name of `machine_id`; never used for routing.
+    pub hostname: String,
+    /// The instance's checkout. Instances on a shared filesystem report the
+    /// same path; separate checkouts report their own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub working_dir: Option<String>,
+    /// True for the earliest attached instance. It supplies the session's
+    /// legacy single-valued `hostname`/`working_dir` and receives every
+    /// control that names no machine; when it leaves, the next earliest
+    /// becomes primary.
+    #[serde(default)]
+    pub primary: bool,
+    /// Whether the viewer this was sent to may use this instance's runtime:
+    /// type into its tabs, add tabs on it, reboot it. The server computes it
+    /// per connection, because runtime access is evaluated per machine. On a
+    /// third-party host it needs cluster membership that covers this exact
+    /// machine, so one viewer can use some of a project's instances and not
+    /// others. Clients disable the instance's tabs and its machine choice
+    /// when it is `Some(false)`, and say why. They do not offer controls that
+    /// can only fail with "Access denied". `None` means not evaluated; treat
+    /// the instance as usable and let the server decide.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_access: Option<bool>,
 }
 
 /// One agent pane, as mobile needs to list it.
@@ -2269,6 +2685,15 @@ pub struct MobilePaneSummary {
     /// block separately so shared/mobile snapshots do not turn it into idle.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage_limited: Option<UsageLimited>,
+    /// Machine whose project instance runs this pane; see
+    /// [`PaneConfig::machine_id`]. Absent from older servers and for panes
+    /// written before multi-machine instances, which no machine owns yet and
+    /// whose controls go to the session's primary instance.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub machine_id: Option<Uuid>,
+    /// Display name for the pane's host badge; see [`PaneConfig::hostname`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hostname: Option<String>,
 }
 
 /// Aggregated usage counters for a pane or project over one time window.
@@ -2397,6 +2822,14 @@ pub struct MachineProjectInfo {
     pub memory_kb: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
+    /// Canonical lowercase `host/owner/repo` of the checkout's `origin`,
+    /// normalized exactly like `CliToServer::SessionStart::git_remote`. A
+    /// registered project that has never started has no session to carry its
+    /// remote, so without this the web files it under "(no remote)" instead
+    /// of beside the repository's other projects, and `apas register` cannot
+    /// match it. `None` without an origin and from older daemons.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_remote: Option<String>,
 }
 
 /// A registration cannot simultaneously succeed and carry an error.
@@ -2440,6 +2873,83 @@ pub struct MachineWithProjects {
     pub shared_provisioning_available: bool,
     #[serde(default)]
     pub local_project_registration_available: bool,
+    /// The machine's daemon is connected and advertises
+    /// [`PROJECT_INSTANCES_CAPABILITY`], so a project's tabs can be started on
+    /// it beside instances on other machines. Clients offer a machine choice
+    /// for new tabs only where this is true. False on a connected daemon
+    /// (`daemon_connected`) means an older daemon: reboot it to update. False
+    /// from older servers.
+    #[serde(default)]
+    pub project_instances_available: bool,
+    /// The machine's daemon holds a live connection to this server now.
+    /// `MachineInfo::last_seen` is stamped on connect, heartbeat and
+    /// disconnect alike, so a just-disconnected daemon looks freshly seen.
+    /// It cannot separate "offline" from "connected but too old", which a
+    /// disabled machine choice has to explain differently. False from older
+    /// servers.
+    #[serde(default)]
+    pub daemon_connected: bool,
+}
+
+/// Answer to `GET /projects/by-remote?git_remote=<host/owner/repo>`, with an
+/// optional `&project_id=<uuid>`: the caller's existing projects for one
+/// repository, so `apas register` can offer to join a checkout to one of them
+/// instead of registering an unrelated project for the same repository.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ProjectsByRemoteResponse {
+    /// The canonical remote that was looked up.
+    pub git_remote: String,
+    /// Only projects the caller owns or hosts; empty when none match. The
+    /// checkout's own current identity is listed too when its remote
+    /// matches, so the CLI excludes its own id before offering a join.
+    #[serde(default)]
+    pub projects: Vec<ProjectRemoteMatch>,
+    /// The project named by the `project_id` query parameter (the checkout's
+    /// current local identity), whatever remote its sessions recorded.
+    ///
+    /// A project with history can be missing from `projects`: an older CLI
+    /// never sent its remote, its origin changed, or no daemon has reported
+    /// it yet. Zero panes is also a valid state for such a project. Without
+    /// this field the CLI cannot tell it from a pristine identity, and
+    /// re-identifying it would orphan its history.
+    ///
+    /// `None` when the query named no id, or when the caller neither owns nor
+    /// hosts a project with that id. The CLI re-identifies a checkout only
+    /// when it has no panes and the server holds no session for it: no
+    /// `local`, or a `local` whose `has_session` is false.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local: Option<ProjectRemoteMatch>,
+}
+
+/// One existing project whose sessions or registered checkouts carry the
+/// requested remote.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ProjectRemoteMatch {
+    pub project_id: Uuid,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// The server holds a session, and so history, for this project. A
+    /// registered project that never started has none and still matches.
+    #[serde(default)]
+    pub has_session: bool,
+    /// Where the project is known to be checked out, so the join prompt can
+    /// say which project it means (`on <host>:<path>`).
+    #[serde(default)]
+    pub instances: Vec<ProjectRemoteInstance>,
+}
+
+/// One known checkout of a matching project.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ProjectRemoteInstance {
+    /// `None` when the checkout is known only from a session recorded without
+    /// a daemon machine id, as standalone and older CLIs report.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub machine_id: Option<Uuid>,
+    pub hostname: String,
+    pub path: String,
+    /// An instance of the project is running on this machine now.
+    #[serde(default)]
+    pub running: bool,
 }
 
 /// Pane type for dual-pane mode (legacy - kept for backward compatibility)
@@ -2937,6 +3447,41 @@ pub struct PaneConfig {
     /// the team queue and never a Tech Lead delegation target.
     #[serde(default)]
     pub managed: bool,
+    /// Machine whose project instance runs this pane. A project can run one
+    /// instance per machine under one session, and a pane's process, terminal
+    /// and controls live on exactly one of them for the pane's lifetime. The
+    /// server assigns this from the authenticated instance that reports the
+    /// pane, overriding whatever the pane data says, so no instance can claim
+    /// another machine's panes.
+    ///
+    /// `None` = written before multi-machine instances. No machine owns such
+    /// a pane yet. Its controls go to the session's primary instance as a
+    /// fallback, and the first instance that reports it adopts it. When
+    /// instance M reports its roster, the server:
+    /// - replaces every pane tagged M, so a pane tagged M that M no longer
+    ///   reports is gone;
+    /// - tags M on a reported pane whose roster entry is untagged (adoption
+    ///   from the `.apas`, surfacing on the server);
+    /// - drops and logs a reported pane whose roster entry is tagged for
+    ///   another machine;
+    /// - leaves alone every untagged pane M did not report.
+    ///
+    /// The last rule is why "untagged" does not mean "the primary's". A
+    /// separate checkout can join, and become primary, while the pre-upgrade
+    /// host is stopped. If the primary owned untagged panes, that checkout's
+    /// first, empty roster would erase every tab the host still has, with no
+    /// stopped badge and nothing to forget. A CLI without
+    /// [`PROJECT_INSTANCES_CAPABILITY`] is only ever the session's sole
+    /// instance and still replaces the whole roster, as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub machine_id: Option<Uuid>,
+    /// Hostname of `machine_id`, for display only. Hosts get renamed, so
+    /// routing and ownership always use `machine_id`. On an untagged pane the
+    /// server may keep the host it last recorded the pane under, so the tab is
+    /// not shown under whichever instance happens to be primary. It never
+    /// implies ownership.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hostname: Option<String>,
 }
 
 /// Legacy pane_id constants
@@ -2966,6 +3511,8 @@ impl PaneConfig {
             plan_review_mode: PlanReviewMode::default(),
             manual_mode: false,
             managed: false,
+            machine_id: None,
+            hostname: None,
         }]
     }
 
@@ -4529,6 +5076,7 @@ mod tests {
             session_id,
             request_id,
             operation: Some(CliLifecycleOperation::RebootCli),
+            machine_id: None,
         };
         let json = serde_json::to_string(&reboot).unwrap();
         assert!(json.contains("\"type\":\"cli_lifecycle_request\""));
@@ -4965,5 +5513,1033 @@ mod daemon_reboot_tests {
             serde_json::from_str::<ServerToDaemon>(legacy).unwrap(),
             ServerToDaemon::RefreshProjects
         ));
+    }
+}
+
+#[cfg(test)]
+mod project_instances_tests {
+    use super::*;
+    use crate::mobile::MobileSessionSummary;
+    use serde_json::json;
+    use std::collections::{BTreeSet, HashMap};
+
+    fn pane(pane_id: u32, machine_id: Option<Uuid>) -> PaneConfig {
+        let mut pane = PaneConfig::defaults().remove(0);
+        pane.pane_id = pane_id;
+        pane.machine_id = machine_id;
+        pane
+    }
+
+    fn wire_tag<T: Serialize>(message: &T) -> String {
+        serde_json::to_value(message).unwrap()["type"]
+            .as_str()
+            .expect("internally tagged message")
+            .to_string()
+    }
+
+    /// Every `ServerToCli` wire tag, read from the type's own schema so the
+    /// list cannot drift from the enum.
+    fn every_server_to_cli_tag() -> BTreeSet<String> {
+        let schema = serde_json::to_value(schemars::schema_for!(ServerToCli)).unwrap();
+        schema["oneOf"]
+            .as_array()
+            .expect("ServerToCli schema lists its variants")
+            .iter()
+            .map(|variant| {
+                variant["properties"]["type"]["const"]
+                    .as_str()
+                    .expect("variant tag")
+                    .to_string()
+            })
+            .collect()
+    }
+
+    /// One example of every variant with the scope the server routes it by.
+    /// The table is the reviewed classification; `scope()` must agree with it.
+    fn classification(session_id: Uuid, machine_id: Uuid) -> Vec<(ServerToCli, ServerToCliScope)> {
+        use ServerToCliScope::{Connection, NewPane, Pane, Process, Project, Unscoped};
+        let summary_job: crate::PaneWorkSummaryGenerationJob = serde_json::from_value(json!({
+            "job_id": Uuid::new_v4(),
+            "session_id": session_id,
+            "pane_id": 9,
+            "window_start": "2026-11-11T00:00:00Z",
+            "window_end": "2026-11-11T01:00:00Z",
+            "source_digest": "digest",
+            "content": "conversation",
+        }))
+        .unwrap();
+        let s = session_id;
+        vec![
+            (
+                ServerToCli::Registered {
+                    cli_id: Uuid::new_v4(),
+                },
+                Connection,
+            ),
+            (
+                ServerToCli::RegistrationFailed {
+                    reason: "token".into(),
+                },
+                Connection,
+            ),
+            (
+                ServerToCli::VersionUnsupported {
+                    client_version: "26.01.1".into(),
+                    min_version: "26.11.0".into(),
+                },
+                Connection,
+            ),
+            (
+                ServerToCli::SessionRejected {
+                    session_id: s,
+                    reason: "owner".into(),
+                },
+                Connection,
+            ),
+            (
+                ServerToCli::SessionAssigned {
+                    session_id: s,
+                    working_dir: None,
+                },
+                Connection,
+            ),
+            (ServerToCli::Heartbeat, Connection),
+            (
+                ServerToCli::Input {
+                    session_id: s,
+                    data: "y".into(),
+                    pane_id: Some(7),
+                },
+                Pane(7),
+            ),
+            (
+                ServerToCli::Input {
+                    session_id: s,
+                    data: "y".into(),
+                    pane_id: None,
+                },
+                Unscoped,
+            ),
+            (
+                ServerToCli::AnswerQuestion {
+                    session_id: s,
+                    tool_use_id: "toolu_1".into(),
+                    answers: HashMap::new(),
+                },
+                Unscoped,
+            ),
+            (
+                ServerToCli::PlanReviewAnswer {
+                    session_id: s,
+                    tool_use_id: "toolu_2".into(),
+                    approve: true,
+                },
+                Unscoped,
+            ),
+            (
+                ServerToCli::PausePane {
+                    session_id: s,
+                    pane_id: 3,
+                },
+                Pane(3),
+            ),
+            (
+                ServerToCli::ResumePane {
+                    session_id: s,
+                    pane_id: 3,
+                },
+                Pane(3),
+            ),
+            (
+                ServerToCli::RebootPane {
+                    session_id: s,
+                    pane_id: 3,
+                },
+                Pane(3),
+            ),
+            (
+                ServerToCli::RemovePane {
+                    session_id: s,
+                    pane_id: 3,
+                    cleanup_action: None,
+                },
+                Pane(3),
+            ),
+            (
+                ServerToCli::StartBot {
+                    session_id: s,
+                    pane_id: 3,
+                    prompt: None,
+                    min_iteration_interval_minutes: None,
+                    effort: None,
+                },
+                Pane(3),
+            ),
+            (
+                ServerToCli::StopBot {
+                    session_id: s,
+                    pane_id: 3,
+                },
+                Pane(3),
+            ),
+            (
+                ServerToCli::UpdatePaneEffort {
+                    session_id: s,
+                    pane_id: 3,
+                    effort: None,
+                },
+                Pane(3),
+            ),
+            (
+                ServerToCli::UpdatePaneLabel {
+                    session_id: s,
+                    pane_id: 3,
+                    label: "api".into(),
+                },
+                Pane(3),
+            ),
+            (
+                ServerToCli::UpdatePaneModel {
+                    session_id: s,
+                    pane_id: 3,
+                    provider: None,
+                    model: None,
+                },
+                Pane(3),
+            ),
+            (
+                ServerToCli::InterruptPane {
+                    session_id: s,
+                    pane_id: 3,
+                },
+                Pane(3),
+            ),
+            (
+                ServerToCli::AnswerOmpQuestion {
+                    session_id: s,
+                    pane_id: 3,
+                    tool_use_id: "toolu_3".into(),
+                    dialog_id: Uuid::new_v4(),
+                    request_id: "answer-1".into(),
+                    answers: Vec::new(),
+                    cancel: true,
+                },
+                Pane(3),
+            ),
+            (
+                ServerToCli::RequestPaneDiff {
+                    session_id: s,
+                    pane_id: 3,
+                },
+                Pane(3),
+            ),
+            (
+                ServerToCli::CreatePr {
+                    session_id: s,
+                    pane_id: 3,
+                },
+                Pane(3),
+            ),
+            (
+                ServerToCli::UpdatePaneRole {
+                    session_id: s,
+                    pane_id: 3,
+                    role: None,
+                    goal: None,
+                    backstory: None,
+                },
+                Pane(3),
+            ),
+            (
+                ServerToCli::UpdatePaneReviewMode {
+                    session_id: s,
+                    pane_id: 3,
+                    mode: PlanReviewMode::Always,
+                },
+                Pane(3),
+            ),
+            (
+                ServerToCli::UpdatePaneManualMode {
+                    session_id: s,
+                    pane_id: 3,
+                    manual_mode: true,
+                },
+                Pane(3),
+            ),
+            (
+                ServerToCli::TerminalInput {
+                    session_id: s,
+                    pane_id: 3,
+                    data_b64: "eA==".into(),
+                },
+                Pane(3),
+            ),
+            (
+                ServerToCli::TerminalResize {
+                    session_id: s,
+                    pane_id: 3,
+                    cols: 80,
+                    rows: 24,
+                },
+                Pane(3),
+            ),
+            (
+                ServerToCli::GeneratePaneWorkSummary { job: summary_job },
+                Pane(9),
+            ),
+            (
+                ServerToCli::AddPane {
+                    session_id: s,
+                    pane_config: pane(11, Some(machine_id)),
+                    isolated_worktree: false,
+                    initial_input: None,
+                },
+                NewPane {
+                    machine_id: Some(machine_id),
+                },
+            ),
+            (
+                ServerToCli::AddPane {
+                    session_id: s,
+                    pane_config: pane(12, None),
+                    isolated_worktree: false,
+                    initial_input: Some("start".into()),
+                },
+                NewPane { machine_id: None },
+            ),
+            (ServerToCli::RequestPaneList { session_id: s }, Project),
+            (
+                ServerToCli::UpdateProjectFlags {
+                    session_id: s,
+                    auto_approve_todos: false,
+                    auto_merge_prs: false,
+                    team_enabled: false,
+                    disallowed_tab_types: Vec::new(),
+                },
+                Project,
+            ),
+            (
+                ServerToCli::UpdateProjectOperations {
+                    session_id: s,
+                    auto_approve_todos: true,
+                    auto_merge_prs: false,
+                },
+                Project,
+            ),
+            (
+                ServerToCli::ProjectPolicy {
+                    session_id: s,
+                    policy: EffectiveProjectPolicy::default(),
+                },
+                Project,
+            ),
+            (
+                ServerToCli::ForgetMachinePanes {
+                    session_id: s,
+                    machine_id,
+                },
+                Project,
+            ),
+            (ServerToCli::SessionDisconnected { session_id: s }, Project),
+            (
+                ServerToCli::Signal {
+                    session_id: s,
+                    signal: "SIGINT".into(),
+                },
+                Process,
+            ),
+            (
+                ServerToCli::PauseDeadloop { session_id: s },
+                Pane(PANE_ID_DEADLOOP),
+            ),
+            (
+                ServerToCli::ResumeDeadloop { session_id: s },
+                Pane(PANE_ID_DEADLOOP),
+            ),
+            (ServerToCli::RebootCli { session_id: s }, Process),
+            (
+                ServerToCli::CliLifecycleRequest {
+                    session_id: s,
+                    request_id: Uuid::new_v4(),
+                    operation: CliLifecycleOperation::RebootCli,
+                },
+                Process,
+            ),
+        ]
+    }
+
+    /// `scope()` has no wildcard arm, so a new variant cannot compile
+    /// unclassified. This pins each existing classification and fails until a
+    /// new variant also gets a row here.
+    #[test]
+    fn every_server_to_cli_variant_has_a_pinned_scope() {
+        let table = classification(Uuid::new_v4(), Uuid::new_v4());
+        let covered: BTreeSet<String> =
+            table.iter().map(|(message, _)| wire_tag(message)).collect();
+        assert_eq!(
+            covered,
+            every_server_to_cli_tag(),
+            "every ServerToCli variant needs a row in this table"
+        );
+        for (message, expected) in &table {
+            assert_eq!(message.scope(), *expected, "{}", wire_tag(message));
+        }
+        let classes: BTreeSet<&str> = table
+            .iter()
+            .map(|(_, scope)| match scope {
+                ServerToCliScope::Pane(_) => "pane",
+                ServerToCliScope::NewPane { .. } => "new_pane",
+                ServerToCliScope::Project => "project",
+                ServerToCliScope::Process => "process",
+                ServerToCliScope::Unscoped => "unscoped",
+                ServerToCliScope::Connection => "connection",
+            })
+            .collect();
+        assert_eq!(classes.len(), 6, "every class is exercised: {classes:?}");
+    }
+
+    /// Approve, reject and typed input reach the CLI as `Input`. With a pane
+    /// it must go to that pane's machine; without one the server resolves the
+    /// target itself, and falling back to "the pane named 0" would be wrong.
+    #[test]
+    fn input_is_pane_scoped_only_when_it_names_a_pane() {
+        let session_id = Uuid::new_v4();
+        let to_pane = ServerToCli::Input {
+            session_id,
+            data: "n".into(),
+            pane_id: Some(42),
+        };
+        let unaddressed = ServerToCli::Input {
+            session_id,
+            data: "n".into(),
+            pane_id: None,
+        };
+        assert_eq!(to_pane.scope(), ServerToCliScope::Pane(42));
+        assert_eq!(unaddressed.scope(), ServerToCliScope::Unscoped);
+    }
+
+    /// The legacy deadloop controls name no pane, yet the CLI applies them to
+    /// `PANE_ID_DEADLOOP` alone. Routed as process messages they would reach
+    /// the primary even when another machine owns that pane.
+    #[test]
+    fn legacy_deadloop_controls_follow_the_deadloop_pane() {
+        let session_id = Uuid::new_v4();
+        assert_eq!(
+            ServerToCli::PauseDeadloop { session_id }.scope(),
+            ServerToCliScope::Pane(PANE_ID_DEADLOOP)
+        );
+        assert_eq!(
+            ServerToCli::ResumeDeadloop { session_id }.scope(),
+            ServerToCliScope::Pane(PANE_ID_DEADLOOP)
+        );
+    }
+
+    /// The instance that receives `AddPane` tags, persists and runs the pane,
+    /// so the target comes from the config the server tagged.
+    #[test]
+    fn new_panes_go_to_the_machine_the_server_tagged() {
+        let session_id = Uuid::new_v4();
+        let machine_id = Uuid::new_v4();
+        let add = |pane_config| ServerToCli::AddPane {
+            session_id,
+            pane_config,
+            isolated_worktree: true,
+            initial_input: None,
+        };
+        assert_eq!(
+            add(pane(5, Some(machine_id))).scope(),
+            ServerToCliScope::NewPane {
+                machine_id: Some(machine_id)
+            }
+        );
+        assert_eq!(
+            add(pane(5, None)).scope(),
+            ServerToCliScope::NewPane { machine_id: None }
+        );
+    }
+
+    #[test]
+    fn capability_wire_value_is_stable() {
+        assert_eq!(PROJECT_INSTANCES_CAPABILITY, "project_instances_v1");
+    }
+
+    /// `.apas` and the server's `panes.json` hold `PaneConfig` directly, so an
+    /// untagged pane must neither gain keys on rewrite nor fail to load.
+    #[test]
+    fn pane_machine_tags_are_optional_and_omitted_when_unset() {
+        let legacy: PaneConfig = serde_json::from_value(json!({
+            "pane_id": 3,
+            "provider": "codex",
+            "mode": "interactive",
+            "kind": "terminal",
+            "session_id": Uuid::new_v4(),
+        }))
+        .unwrap();
+        assert_eq!(legacy.machine_id, None);
+        assert_eq!(legacy.hostname, None);
+        let written = serde_json::to_value(&legacy).unwrap();
+        assert!(written.get("machine_id").is_none(), "{written}");
+        assert!(written.get("hostname").is_none(), "{written}");
+
+        let machine_id = Uuid::new_v4();
+        let tagged = PaneConfig {
+            machine_id: Some(machine_id),
+            hostname: Some("zoo-006".into()),
+            ..legacy
+        };
+        let decoded: PaneConfig =
+            serde_json::from_value(serde_json::to_value(&tagged).unwrap()).unwrap();
+        assert_eq!(decoded.machine_id, Some(machine_id));
+        assert_eq!(decoded.hostname.as_deref(), Some("zoo-006"));
+
+        let summary: MobilePaneSummary = serde_json::from_value(json!({
+            "pane_id": 3,
+            "kind": "terminal",
+            "provider": "codex",
+        }))
+        .unwrap();
+        assert_eq!(summary.machine_id, None);
+        assert_eq!(summary.hostname, None);
+        let written = serde_json::to_value(&summary).unwrap();
+        assert!(written.get("machine_id").is_none(), "{written}");
+        assert!(written.get("hostname").is_none(), "{written}");
+    }
+
+    #[test]
+    fn add_pane_targets_a_machine_and_correlates_its_result() {
+        let session_id = Uuid::new_v4();
+        let machine_id = Uuid::new_v4();
+        let legacy: WebToServer = serde_json::from_value(json!({
+            "type": "add_pane",
+            "session_id": session_id,
+            "provider": "claude",
+            "mode": "interactive",
+            "kind": "terminal",
+        }))
+        .unwrap();
+        match legacy {
+            WebToServer::AddPane {
+                machine_id,
+                request_id,
+                ..
+            } => {
+                assert_eq!(machine_id, None, "an older client targets the primary");
+                assert_eq!(request_id, None);
+            }
+            other => panic!("expected AddPane, got {other:?}"),
+        }
+        let targeted: WebToServer = serde_json::from_value(json!({
+            "type": "add_pane",
+            "session_id": session_id,
+            "provider": "claude",
+            "mode": "interactive",
+            "kind": "terminal",
+            "machine_id": machine_id,
+            "request_id": "add-1",
+        }))
+        .unwrap();
+        match targeted {
+            WebToServer::AddPane {
+                machine_id: got,
+                request_id,
+                ..
+            } => {
+                assert_eq!(got, Some(machine_id));
+                assert_eq!(request_id.as_deref(), Some("add-1"));
+            }
+            other => panic!("expected AddPane, got {other:?}"),
+        }
+
+        for (status, wire) in [
+            (AddPaneStatus::Routed, "routed"),
+            (AddPaneStatus::Starting, "starting"),
+            (AddPaneStatus::Failed, "failed"),
+        ] {
+            assert_eq!(serde_json::to_value(status).unwrap(), json!(wire));
+        }
+        let starting = ServerToWeb::AddPaneResult {
+            session_id,
+            request_id: "add-1".into(),
+            status: AddPaneStatus::Starting,
+            machine_id: Some(machine_id),
+            pane_id: None,
+            error: None,
+        };
+        let value = serde_json::to_value(&starting).unwrap();
+        assert_eq!(value["type"], "add_pane_result");
+        assert_eq!(value["status"], "starting");
+        assert!(value.get("pane_id").is_none(), "{value}");
+        assert!(value.get("error").is_none(), "{value}");
+        match serde_json::from_value::<ServerToWeb>(value).unwrap() {
+            ServerToWeb::AddPaneResult {
+                request_id,
+                status,
+                machine_id: got,
+                ..
+            } => {
+                assert_eq!(request_id, "add-1");
+                assert_eq!(status, AddPaneStatus::Starting);
+                assert_eq!(got, Some(machine_id));
+            }
+            other => panic!("expected AddPaneResult, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn session_instances_are_absent_from_older_servers_and_explicit_when_live() {
+        let session_id = Uuid::new_v4();
+        let legacy: SessionInfo = serde_json::from_value(json!({
+            "id": session_id,
+            "cli_client_id": null,
+            "working_dir": "/home/u/project",
+            "hostname": "zoo-005",
+            "status": "active",
+            "created_at": null,
+        }))
+        .unwrap();
+        assert!(legacy.instances.is_empty());
+        assert!(serde_json::to_value(&legacy)
+            .unwrap()
+            .get("instances")
+            .is_none());
+
+        let secondary: SessionInstanceInfo = serde_json::from_value(json!({
+            "machine_id": Uuid::new_v4(),
+            "hostname": "zoo-006",
+        }))
+        .unwrap();
+        assert!(!secondary.primary, "primary is opt-in, never assumed");
+        assert_eq!(secondary.working_dir, None);
+        assert_eq!(
+            secondary.runtime_access, None,
+            "unevaluated access is unknown, not denied"
+        );
+        let primary = SessionInstanceInfo {
+            machine_id: Some(Uuid::new_v4()),
+            hostname: "zoo-005".into(),
+            working_dir: Some("/home/u/project".into()),
+            primary: true,
+            runtime_access: Some(false),
+        };
+
+        // The mobile summary flattens SessionInfo; the new list must survive it.
+        let summary = MobileSessionSummary {
+            session: SessionInfo {
+                instances: vec![primary.clone(), secondary.clone()],
+                ..legacy
+            },
+            project_name: None,
+            latest_update_at: None,
+            last_user_input_at: None,
+            latest_summary: None,
+            attention_count: 0,
+        };
+        let decoded: MobileSessionSummary =
+            serde_json::from_value(serde_json::to_value(&summary).unwrap()).unwrap();
+        assert_eq!(decoded.session.instances, vec![primary, secondary]);
+
+        // The live set is complete, so "nothing attached" is an explicit [].
+        let none_attached = ServerToWeb::SessionInstances {
+            session_id,
+            instances: Vec::new(),
+        };
+        let value = serde_json::to_value(&none_attached).unwrap();
+        assert_eq!(value["type"], "session_instances");
+        assert_eq!(value["instances"], json!([]));
+    }
+
+    /// A CLI that reports no machine is still attached; listing it keeps the
+    /// set complete instead of making a live session look empty.
+    #[test]
+    fn an_attachment_without_a_machine_is_listed_without_one() {
+        let legacy_only = SessionInstanceInfo {
+            machine_id: None,
+            hostname: "laptop".into(),
+            working_dir: Some("/home/u/project".into()),
+            primary: true,
+            runtime_access: None,
+        };
+        let value = serde_json::to_value(&legacy_only).unwrap();
+        assert!(value.get("machine_id").is_none(), "{value}");
+        assert!(value.get("runtime_access").is_none(), "{value}");
+        let decoded: SessionInstanceInfo = serde_json::from_value(value).unwrap();
+        assert_eq!(decoded, legacy_only);
+    }
+
+    #[test]
+    fn lifecycle_reports_name_their_instance_when_known() {
+        let session_id = Uuid::new_v4();
+        let machine_id = Uuid::new_v4();
+        let legacy: ServerToWeb = serde_json::from_value(json!({
+            "type": "cli_lifecycle_inventory",
+            "session_id": session_id,
+            "inventory": { "persistent_terminal_hosting": true, "panes": [] },
+        }))
+        .unwrap();
+        match legacy {
+            ServerToWeb::CliLifecycleInventory { machine_id, .. } => assert_eq!(machine_id, None),
+            other => panic!("expected CliLifecycleInventory, got {other:?}"),
+        }
+        let tagged = ServerToWeb::CliLifecycleStatus {
+            session_id,
+            request_id: Uuid::new_v4(),
+            operation: CliLifecycleOperation::RebootCli,
+            phase: CliLifecyclePhase::Accepted,
+            message: None,
+            inventory: None,
+            machine_id: Some(machine_id),
+        };
+        let value = serde_json::to_value(&tagged).unwrap();
+        assert_eq!(value["machine_id"], json!(machine_id));
+        match serde_json::from_value::<ServerToWeb>(value).unwrap() {
+            ServerToWeb::CliLifecycleStatus {
+                machine_id: got, ..
+            } => {
+                assert_eq!(got, Some(machine_id))
+            }
+            other => panic!("expected CliLifecycleStatus, got {other:?}"),
+        }
+    }
+
+    /// The project view's Start/Close act on every instance; the Machines
+    /// page's per-machine buttons, and every older client, act on one.
+    #[test]
+    fn project_wide_start_and_stop_are_opt_in() {
+        let machine_id = Uuid::new_v4();
+        for kind in ["start_machine_project_cli", "stop_machine_project_cli"] {
+            let legacy: WebToServer = serde_json::from_value(json!({
+                "type": kind,
+                "machine_id": machine_id,
+                "project_id": "p",
+            }))
+            .unwrap();
+            let all = match legacy {
+                WebToServer::StartMachineProjectCli { all_instances, .. }
+                | WebToServer::StopMachineProjectCli { all_instances, .. } => all_instances,
+                other => panic!("expected a machine project control, got {other:?}"),
+            };
+            assert!(!all, "{kind}: an older client means one machine");
+
+            let project_wide: WebToServer = serde_json::from_value(json!({
+                "type": kind,
+                "machine_id": machine_id,
+                "project_id": "p",
+                "all_instances": true,
+            }))
+            .unwrap();
+            let all = match project_wide {
+                WebToServer::StartMachineProjectCli { all_instances, .. }
+                | WebToServer::StopMachineProjectCli { all_instances, .. } => all_instances,
+                other => panic!("expected a machine project control, got {other:?}"),
+            };
+            assert!(all, "{kind}");
+        }
+    }
+
+    /// A start the server waits on is correlated; an uncorrelated one, which
+    /// is every start an older server sends, asks for no report.
+    #[test]
+    fn daemon_starts_can_be_correlated_with_their_outcome() {
+        let legacy: ServerToDaemon = serde_json::from_value(json!({
+            "type": "start_project_cli",
+            "project_id": "p",
+        }))
+        .unwrap();
+        match legacy {
+            ServerToDaemon::StartProjectCli { request_id, .. } => assert_eq!(request_id, None),
+            other => panic!("expected StartProjectCli, got {other:?}"),
+        }
+        let request_id = Uuid::new_v4();
+        let correlated = ServerToDaemon::StartProjectCli {
+            project_id: "p".into(),
+            policy: None,
+            request_id: Some(request_id),
+        };
+        let value = serde_json::to_value(&correlated).unwrap();
+        assert_eq!(value["request_id"], json!(request_id));
+
+        let refused = DaemonToServer::ProjectRuntimeStarted {
+            request_id,
+            project_id: "p".into(),
+            success: false,
+            error: Some("project is running on zoo-005".into()),
+        };
+        let value = serde_json::to_value(&refused).unwrap();
+        assert_eq!(value["type"], "project_runtime_started");
+        match serde_json::from_value::<DaemonToServer>(value).unwrap() {
+            DaemonToServer::ProjectRuntimeStarted {
+                request_id: got,
+                success,
+                error,
+                ..
+            } => {
+                assert_eq!(got, request_id);
+                assert!(!success);
+                assert!(error.is_some());
+            }
+            other => panic!("expected ProjectRuntimeStarted, got {other:?}"),
+        }
+        let started: DaemonToServer = serde_json::from_value(json!({
+            "type": "project_runtime_started",
+            "request_id": request_id,
+            "project_id": "p",
+            "success": true,
+        }))
+        .unwrap();
+        match started {
+            DaemonToServer::ProjectRuntimeStarted { success, error, .. } => {
+                assert!(success);
+                assert_eq!(error, None);
+            }
+            other => panic!("expected ProjectRuntimeStarted, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn machine_entries_report_instance_support_and_canonical_remote() {
+        let machine_id = Uuid::new_v4();
+        let legacy: MachineWithProjects = serde_json::from_value(json!({
+            "machine": {
+                "machine_id": machine_id,
+                "hostname": "zoo-005",
+                "os": "linux",
+                "arch": "x86_64",
+            },
+            "projects": [{ "project_id": "p", "path": "/home/u/p" }],
+        }))
+        .unwrap();
+        assert!(!legacy.project_instances_available);
+        assert!(
+            !legacy.daemon_connected,
+            "an older server reports no connection"
+        );
+        assert_eq!(legacy.projects[0].git_remote, None);
+        let written = serde_json::to_value(&legacy).unwrap();
+        assert!(
+            written["projects"][0].get("git_remote").is_none(),
+            "{written}"
+        );
+        assert_eq!(written["project_instances_available"], json!(false));
+
+        let current: MachineWithProjects = serde_json::from_value(json!({
+            "machine": {
+                "machine_id": machine_id,
+                "hostname": "zoo-005",
+                "os": "linux",
+                "arch": "x86_64",
+            },
+            "projects": [{
+                "project_id": "p",
+                "path": "/home/u/p",
+                "git_remote": "github.com/owner/repo",
+            }],
+            "project_instances_available": true,
+            "daemon_connected": true,
+        }))
+        .unwrap();
+        assert!(current.project_instances_available);
+        assert!(current.daemon_connected);
+        assert_eq!(
+            current.projects[0].git_remote.as_deref(),
+            Some("github.com/owner/repo")
+        );
+    }
+
+    #[test]
+    fn process_controls_without_a_machine_target_the_primary() {
+        let session_id = Uuid::new_v4();
+        let request_id = Uuid::new_v4();
+        let machine_id = Uuid::new_v4();
+        let legacy_reboot = format!(r#"{{"type":"reboot_cli","session_id":"{session_id}"}}"#);
+        match serde_json::from_str::<WebToServer>(&legacy_reboot).unwrap() {
+            WebToServer::RebootCli { machine_id, .. } => assert_eq!(machine_id, None),
+            other => panic!("expected RebootCli, got {other:?}"),
+        }
+        let legacy_lifecycle = format!(
+            r#"{{"type":"cli_lifecycle_request","session_id":"{session_id}","request_id":"{request_id}","operation":"reboot_cli"}}"#
+        );
+        match serde_json::from_str::<WebToServer>(&legacy_lifecycle).unwrap() {
+            WebToServer::CliLifecycleRequest { machine_id, .. } => assert_eq!(machine_id, None),
+            other => panic!("expected CliLifecycleRequest, got {other:?}"),
+        }
+
+        let targeted = WebToServer::CliLifecycleRequest {
+            session_id,
+            request_id,
+            operation: Some(CliLifecycleOperation::RebootCli),
+            machine_id: Some(machine_id),
+        };
+        match serde_json::from_value::<WebToServer>(serde_json::to_value(&targeted).unwrap())
+            .unwrap()
+        {
+            WebToServer::CliLifecycleRequest {
+                machine_id: got, ..
+            } => {
+                assert_eq!(got, Some(machine_id))
+            }
+            other => panic!("expected CliLifecycleRequest, got {other:?}"),
+        }
+        let untargeted = WebToServer::RebootCli {
+            session_id: Some(session_id),
+            machine_id: None,
+        };
+        assert!(!serde_json::to_string(&untargeted)
+            .unwrap()
+            .contains("machine_id"));
+    }
+
+    #[test]
+    fn clone_to_join_is_opt_in_on_both_hops() {
+        let web: WebToServer = serde_json::from_value(json!({
+            "type": "create_project_instance",
+            "machine_id": Uuid::new_v4(),
+            "git_remote": "github.com/owner/repo",
+            "instance_name": "repo",
+            "branch": "apas/new",
+        }))
+        .unwrap();
+        match web {
+            WebToServer::CreateProjectInstance {
+                join_project_id, ..
+            } => {
+                assert_eq!(join_project_id, None)
+            }
+            other => panic!("expected CreateProjectInstance, got {other:?}"),
+        }
+
+        let daemon: ServerToDaemon = serde_json::from_value(json!({
+            "type": "create_project_instance",
+            "git_remote": "github.com/owner/repo",
+            "instance_name": "repo",
+            "branch": "apas/new",
+        }))
+        .unwrap();
+        match daemon {
+            ServerToDaemon::CreateProjectInstance {
+                join_existing,
+                project_id,
+                ..
+            } => {
+                assert!(!join_existing);
+                assert_eq!(project_id, None);
+            }
+            other => panic!("expected CreateProjectInstance, got {other:?}"),
+        }
+
+        let project_id = Uuid::new_v4().to_string();
+        let join = ServerToDaemon::CreateProjectInstance {
+            git_remote: "github.com/owner/repo".into(),
+            instance_name: "repo".into(),
+            branch: String::new(),
+            clone_url: Some("https://github.com/owner/repo.git".into()),
+            base_path: None,
+            request_id: Some("clone-1".into()),
+            project_id: Some(project_id.clone()),
+            provisioning_mode: ProjectProvisioningMode::TrustedOwner,
+            join_existing: true,
+        };
+        match serde_json::from_value::<ServerToDaemon>(serde_json::to_value(&join).unwrap())
+            .unwrap()
+        {
+            ServerToDaemon::CreateProjectInstance {
+                join_existing,
+                project_id: got,
+                ..
+            } => {
+                assert!(join_existing);
+                assert_eq!(got.as_deref(), Some(project_id.as_str()));
+            }
+            other => panic!("expected CreateProjectInstance, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn forget_machine_panes_names_the_session_and_machine_on_both_hops() {
+        let session_id = Uuid::new_v4();
+        let machine_id = Uuid::new_v4();
+        let web = WebToServer::ForgetMachinePanes {
+            session_id,
+            machine_id,
+        };
+        assert_eq!(wire_tag(&web), "forget_machine_panes");
+        match serde_json::from_value::<WebToServer>(serde_json::to_value(&web).unwrap()).unwrap() {
+            WebToServer::ForgetMachinePanes {
+                session_id: s,
+                machine_id: m,
+            } => {
+                assert_eq!((s, m), (session_id, machine_id))
+            }
+            other => panic!("expected ForgetMachinePanes, got {other:?}"),
+        }
+        let cli = ServerToCli::ForgetMachinePanes {
+            session_id,
+            machine_id,
+        };
+        assert_eq!(wire_tag(&cli), "forget_machine_panes");
+        match serde_json::from_value::<ServerToCli>(serde_json::to_value(&cli).unwrap()).unwrap() {
+            ServerToCli::ForgetMachinePanes {
+                session_id: s,
+                machine_id: m,
+            } => {
+                assert_eq!((s, m), (session_id, machine_id))
+            }
+            other => panic!("expected ForgetMachinePanes, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn projects_by_remote_response_defaults_unknown_details() {
+        let project_id = Uuid::new_v4();
+        let response: ProjectsByRemoteResponse = serde_json::from_value(json!({
+            "git_remote": "github.com/owner/repo",
+            "projects": [{
+                "project_id": project_id,
+                "instances": [{ "hostname": "laptop", "path": "/home/u/repo" }],
+            }],
+        }))
+        .unwrap();
+        let found = &response.projects[0];
+        assert_eq!(found.project_id, project_id);
+        assert_eq!(found.name, None);
+        assert!(
+            !found.has_session,
+            "a never-started registration has no session"
+        );
+        assert_eq!(found.instances[0].machine_id, None);
+        assert!(!found.instances[0].running);
+
+        assert!(response.local.is_none(), "no project_id was asked about");
+
+        let none: ProjectsByRemoteResponse =
+            serde_json::from_value(json!({ "git_remote": "github.com/owner/other" })).unwrap();
+        assert!(none.projects.is_empty());
+        let written = serde_json::to_value(&none).unwrap();
+        assert_eq!(
+            written["projects"],
+            json!([]),
+            "an empty match list is explicit"
+        );
+        assert!(written.get("local").is_none(), "{written}");
+    }
+
+    /// A local project whose sessions never recorded the remote matches
+    /// nothing, yet has history; `local` is how the CLI learns that.
+    #[test]
+    fn projects_by_remote_answers_for_the_local_identity_whatever_its_remote() {
+        let local_id = Uuid::new_v4();
+        let response: ProjectsByRemoteResponse = serde_json::from_value(json!({
+            "git_remote": "github.com/owner/repo",
+            "projects": [],
+            "local": {
+                "project_id": local_id,
+                "has_session": true,
+                "instances": [],
+            },
+        }))
+        .unwrap();
+        assert!(response.projects.is_empty());
+        let local = response.local.expect("local identity");
+        assert_eq!(local.project_id, local_id);
+        assert!(local.has_session, "history must block re-identification");
     }
 }
