@@ -129,6 +129,12 @@ enum Commands {
     },
     /// Check for updates and install if available
     Update,
+    /// Register a directory (default: the current one) as a project on this
+    /// machine so it appears in the web UI. Does not start it.
+    Register {
+        /// Project directory (default: current directory)
+        path: Option<PathBuf>,
+    },
     /// Login to the APAS server
     Login,
     /// Logout from the APAS server
@@ -284,7 +290,7 @@ async fn main() -> Result<()> {
     // tear down the live daemon and spawn a replacement, kicking off a
     // thrash loop.
     if cli.command.is_none() && !cli.offline && !cli.headless {
-        if let Err(err) = maybe_auto_start_daemon(&cli) {
+        if let Err(err) = maybe_auto_start_daemon(cli.server.clone()) {
             tracing::warn!("Failed to auto-start daemon: {}", err);
         }
     }
@@ -311,6 +317,33 @@ async fn main() -> Result<()> {
                 config.remote.token = Some(token);
                 config.save()?;
 
+                return Ok(());
+            }
+            Commands::Register { path } => {
+                let config = config::Config::load().unwrap_or_default();
+                if cli.token.is_none() && config.remote.token.is_none() {
+                    eprintln!("\x1b[33m🔐 Not logged in.\x1b[0m");
+                    eprintln!("   Run '\x1b[1mapas login\x1b[0m' to authenticate.");
+                    return Ok(());
+                }
+                let dir = path
+                    .or_else(|| cli.working_dir.clone().map(PathBuf::from))
+                    .map_or_else(std::env::current_dir, Ok)?;
+                match register_directory(&dir, &std::env::current_dir()?) {
+                    Ok(message) => eprintln!("{message}"),
+                    Err(err) => {
+                        eprintln!("\x1b[31mCould not register {}: {err:#}\x1b[0m", dir.display());
+                        return Err(err);
+                    }
+                }
+                // The resident instance is what reports registered projects to
+                // the server, so registering without one shows nothing remotely.
+                if let Err(err) = maybe_auto_start_daemon(cli.server.clone()) {
+                    eprintln!(
+                        "\x1b[33m   This machine's APAS instance could not be started ({err}); \
+                         the project will appear once `apas daemon` is running.\x1b[0m"
+                    );
+                }
                 return Ok(());
             }
             Commands::Logout => {
@@ -607,7 +640,7 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-fn maybe_auto_start_daemon(cli: &Cli) -> Result<()> {
+fn maybe_auto_start_daemon(server_override: Option<String>) -> Result<()> {
     // Auto-start only for logged-in users with persistent config token
     // to avoid leaking one-off CLI tokens in process args.
     let config = config::Config::load().unwrap_or_default();
@@ -615,9 +648,7 @@ fn maybe_auto_start_daemon(cli: &Cli) -> Result<()> {
         return Ok(());
     }
 
-    let server = cli
-        .server
-        .clone()
+    let server = server_override
         .or(config.remote.server.clone())
         .unwrap_or_else(|| DEFAULT_SERVER.to_string());
 
@@ -644,6 +675,35 @@ fn register_and_defer(working_dir: &std::path::Path) -> Result<String> {
         "\x1b[36m✓ {name} is registered on this machine.\x1b[0m\n   \
          Start and manage it at {WEB_UI_URL}\n   \
          This host runs one APAS instance per user; it is already running."
+    ))
+}
+
+/// `apas register [path]`: the explicit form of what a bare launch does.
+///
+/// Unlike a launch it uses the strict registration behind the web's
+/// **Existing folder** flow: the folder must exist, valid metadata keeps its
+/// exact bytes and identity, malformed metadata is rejected rather than
+/// regenerated, an id/path conflict fails instead of retargeting another
+/// project, and a registry write failure is an error rather than a warning —
+/// because registering is the whole of what this command is for.
+fn register_directory(dir: &Path, cwd: &Path) -> Result<String> {
+    let absolute = if dir.is_absolute() {
+        dir.to_path_buf()
+    } else {
+        cwd.join(dir)
+    };
+    let input = absolute
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("Folder path is not valid UTF-8"))?;
+    let (registered, _) = project::register_local_project(input)?;
+    let name = registered.name.as_deref().unwrap_or(&registered.path);
+    Ok(format!(
+        "\x1b[36m✓ {name} is registered on this machine.\x1b[0m\n   \
+         Folder:  {path}\n   \
+         Project: {id}\n   \
+         It is listed as Stopped until you start it from {WEB_UI_URL}",
+        path = registered.path,
+        id = registered.project_id,
     ))
 }
 
@@ -1283,6 +1343,82 @@ mod tests {
             super::register_and_defer(&fresh).expect("register");
 
             assert!(crate::project::read_project_id(&fresh).is_some());
+        });
+    }
+
+    #[test]
+    fn register_subcommand_takes_an_optional_folder() {
+        use clap::Parser;
+        let bare = super::Cli::try_parse_from(["apas", "register"]).expect("parse bare");
+        assert!(matches!(
+            bare.command,
+            Some(super::Commands::Register { path: None })
+        ));
+        let with_path =
+            super::Cli::try_parse_from(["apas", "register", "work"]).expect("parse path");
+        match with_path.command {
+            Some(super::Commands::Register { path: Some(path) }) => {
+                assert_eq!(path, std::path::PathBuf::from("work"))
+            }
+            _ => panic!("expected register with a path"),
+        }
+    }
+
+    #[test]
+    fn register_resolves_a_relative_folder_and_keeps_its_identity() {
+        crate::project::test_support::with_isolated_config(|| {
+            let dir = tempfile::tempdir().expect("temp dir");
+            let project_dir = dir.path().join("work");
+            fs::create_dir_all(&project_dir).expect("project dir");
+
+            let message = super::register_directory(std::path::Path::new("work"), dir.path())
+                .expect("register");
+            let id = crate::project::read_project_id(&project_dir).expect("id");
+            assert!(message.contains(&id.to_string()));
+            assert!(message.contains(super::WEB_UI_URL));
+
+            let canonical = fs::canonicalize(&project_dir).expect("canonical");
+            let registered = crate::project::list_registered_projects().expect("registry");
+            assert_eq!(registered.len(), 1);
+            assert_eq!(registered[0].path, canonical.to_str().expect("utf-8"));
+
+            // Registering again, by absolute path this time, is the same project.
+            super::register_directory(&project_dir, std::path::Path::new("/"))
+                .expect("register again");
+            assert_eq!(crate::project::read_project_id(&project_dir), Some(id));
+            assert_eq!(
+                crate::project::list_registered_projects()
+                    .expect("registry")
+                    .len(),
+                1
+            );
+        });
+    }
+
+    #[test]
+    fn register_rejects_malformed_metadata_instead_of_regenerating_it() {
+        // A bare launch deletes a corrupt `.apas` and mints a new identity;
+        // the explicit command must not, since that silently forks a project.
+        crate::project::test_support::with_isolated_config(|| {
+            let dir = tempfile::tempdir().expect("temp dir");
+            let metadata = dir.path().join(".apas");
+            fs::write(&metadata, b"{not json").expect("write");
+
+            assert!(super::register_directory(dir.path(), dir.path()).is_err());
+            assert_eq!(fs::read(&metadata).expect("read"), b"{not json");
+            assert!(crate::project::list_registered_projects()
+                .expect("registry")
+                .is_empty());
+        });
+    }
+
+    #[test]
+    fn register_rejects_a_missing_folder() {
+        crate::project::test_support::with_isolated_config(|| {
+            let dir = tempfile::tempdir().expect("temp dir");
+            let missing = dir.path().join("missing");
+            assert!(super::register_directory(&missing, dir.path()).is_err());
+            assert!(!missing.exists());
         });
     }
 

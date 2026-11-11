@@ -769,7 +769,7 @@ export function Sidebar({ onClose, onCollapse, width }: SidebarProps) {
               <p className="mt-1 text-xs">
                 {sessions.length
                   ? "Every available agent that reported in is working."
-                  : "Run `apas` in a directory to start"}
+                  : "Run `apas register` in a directory to add it"}
               </p>
             </div>
           )}
@@ -785,7 +785,7 @@ export function Sidebar({ onClose, onCollapse, width }: SidebarProps) {
           <div className="text-center text-gray-400 text-sm py-8">
             <FolderOpen className="w-8 h-8 mx-auto mb-2 opacity-50" />
             <p>No projects yet</p>
-            <p className="text-xs mt-1">Run `apas` in a directory to start</p>
+            <p className="text-xs mt-1">Run `apas register` in a directory to add it</p>
           </div>
         ) : (
           <div className="space-y-2">

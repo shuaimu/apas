@@ -1149,6 +1149,15 @@ Registration is all a launch needs to do: the daemon reads the shared registry
 (`list_registered_projects`) on every heartbeat and reports what it finds, so
 the project appears on the Machines page with no IPC and no start request.
 
+**`apas register [path]` is the explicit form**, defaulting to the current
+directory. It uses the strict `register_local_project` path behind the web's
+**Existing folder** flow rather than a launch's lenient one: the folder must
+exist, valid `.apas` bytes and identity are kept, malformed metadata is
+rejected instead of regenerated, an id/path conflict fails, and a registry
+write failure is an error. It then ensures the resident instance is running,
+since that is what reports the project to the server. It never starts the
+project.
+
 **Creating a project from a local directory is still a thing a launch does.**
 `apas` in a directory that is not yet a project creates and registers it.
 The web's **Existing folder** flow now offers register-only creation to machine
