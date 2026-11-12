@@ -321,6 +321,11 @@ an explicitly empty live roster clears the dots instead of restoring stale
 bootstrap panes. Desktop shared-project attribution stays on its own line so
 the activity label and pane statuses remain visible.
 
+A tab whose machine is not running the project, while another machine runs it,
+keeps a gray dot labeled "Not running on <host>" and is left out of the idle
+and waiting-agent lists: nobody can act on it until that machine runs the
+project again.
+
 ## Project Structure
 
 ```
@@ -331,6 +336,9 @@ apas/
 │   │   │   ├── main.rs        # CLI entry point and config commands
 │   │   │   ├── config.rs      # User/machine config and supported backend settings
 │   │   │   ├── project.rs     # .apas project metadata
+│   │   │   ├── project_instances.rs # One machine's share of a project: pane tags, adoption, locked .apas merge
+│   │   │   ├── project_join.rs # `apas register` joining a checkout by git remote
+│   │   │   ├── daemon_registry.rs # Peer daemons and per-machine project claims on the shared config dir
 │   │   │   ├── pane_identity.rs # A pane's role/goal/backstory as a system prompt
 │   │   │   ├── claude_session_hook.rs # SessionStart hook: which transcript a pane writes
 │   │   │   ├── worktree.rs    # Isolated worktree creation/diff/cleanup
@@ -349,8 +357,10 @@ apas/
 │   │   │   ├── state.rs     # AppState with DB, sessions, storage
 │   │   │   ├── storage.rs   # File-based message storage (JSONL)
 │   │   │   ├── db/          # SQLite database
-│   │   │   ├── session/     # Session manager
+│   │   │   ├── session/     # Session manager (instances.rs: a session's per-machine attachments;
+│   │   │   │                #   pane_launches.rs: pane ids and new panes in flight)
 │   │   │   └── routes/
+│   │   │       ├── project_join.rs # GET /projects/by-remote and clone-to-join
 │   │   │       ├── ws_cli.rs  # CLI WebSocket handler, pane/session replay
 │   │   │       └── ws_web.rs  # Web WebSocket handler, Overview/machine actions
 │   │   └── Cargo.toml
@@ -377,6 +387,9 @@ apas/
 │       │   └── lib/
 │       │       ├── store.ts          # Zustand state, WebSocket message handling
 │       │       ├── terminalBus.ts    # Pty frame fan-out (deliberately NOT zustand)
+│       │       ├── projectInstances.ts # A session's instances, one per machine
+│       │       ├── tabHosts.ts       # Which machine runs each tab, and why a tab cannot be used
+│       │       ├── machineChoice.ts  # The "Run on" step for a new tab
 │       │       └── mobileSelectedPane.ts # Which pane a session screen opens on
 │       └── package.json
 │
@@ -641,6 +654,14 @@ Key message types in `crates/shared/src/messages.rs`:
 The `Terminal*` family is the pty byte channel for `kind: "terminal"` panes and
 is deliberately separate from `Output` / `StreamMessage` — see "Terminal panes"
 under Key Concepts for why.
+
+Running one project on several machines adds `ServerToWeb::SessionInstances`,
+`AddPane { machine_id, request_id }` answered by `ServerToWeb::AddPaneResult`,
+`ForgetMachinePanes`, `CreateProjectInstance { join_project_id }`, the
+`all_instances` flag on project Start/Stop, `DaemonToServer::ProjectRuntimeStarted`,
+and the input `MutationAck`. Every `ServerToCli` variant is classified by
+`ServerToCli::scope()`, which routes it; see "A project's tabs can run on several
+machines".
 
 `WebToServer::UpdateProjectFlags` carries the project policy flags from the web
 to the server. The server **rejects the whole message from anyone who is neither
@@ -1156,7 +1177,9 @@ exist, valid `.apas` bytes and identity are kept, malformed metadata is
 rejected instead of regenerated, an id/path conflict fails, and a registry
 write failure is an error. It then ensures the resident instance is running,
 since that is what reports the project to the server. It never starts the
-project.
+project. A checkout whose git remote matches one of your projects can join that
+project instead of becoming a project of its own (`--project`, `--new`,
+`--yes`); see "A project's tabs can run on several machines".
 
 **Creating a project from a local directory is still a thing a launch does.**
 `apas` in a directory that is not yet a project creates and registers it.
@@ -1248,9 +1271,12 @@ taken in `start_project` — so a restarted or self-upgraded daemon would come
 back owning nothing while its project CLIs kept running. During that gap a peer
 sees the projects unclaimed, and its `is_headless_running_for` only reads its
 *own* `/proc`, so a `StartProjectCli` there would spawn a second CLI against the
-same `.apas` and worktrees. A peer holding the claim for something running here
-is logged, not seized: that means two CLIs are already live for one project,
-which is exactly what the operator needs to see.
+same `.apas` and worktrees. A peer holding the project's guard without the
+instances marker, for something running here, is logged, not seized: that
+means a runtime that cannot share the project is live beside this one, which is
+exactly what the operator needs to see. Another machine's instance of the same
+project is not such a peer: capable daemons each hold a per-machine claim and
+share the marked guard (see "A project's tabs can run on several machines").
 
 Relatedly, `claim_project` adopts the **current pid** when refreshing a claim
 owned by this hostname. A claim written by a previous daemon carries that
@@ -1262,6 +1288,272 @@ running the project.
 **Pane hosts are untouched.** They own the PTYs in their own tmux sessions, so
 nothing about replacing the daemon's process image reaches them, and a
 replacement that lands inside their adoption grace picks the terminals back up.
+
+## A project's tabs can run on several machines
+
+One project can run on several machines at once, and each tab runs on the
+machine chosen when it was created. The project keeps **one session**, one
+history, one sharing and one policy; what multiplies is the **instance**, one
+machine's runtime of the project inside that machine's daemon. (This is not the
+per-host APAS process of "One instance per user per host": a daemon can run one
+instance each of many projects.) Tabs never move between machines. The design
+record is `openspec/changes/run-project-tabs-across-machines/`; the doc comments
+on the contract types in `crates/shared/src/messages.rs` are the binding
+statement of the wire.
+
+**The server keeps every instance as an attachment of the one session**
+(`session/instances.rs`). The **primary** is the earliest still attached. It
+supplies the single-valued fields older code reads (`cli_client_id`, the DB
+row's host and working dir, the summary hostname) and receives controls that
+name no machine. When it leaves, the next-earliest takes over and keeps the
+role after the first returns. Only the last instance to leave marks the session
+inactive; a disconnect otherwise touches only the departing machine's
+terminals, statuses and inventory. Capable viewers get the instance set as
+`SessionInstances` on every attach, detach and handover, with `runtime_access`
+evaluated per machine for that viewer.
+
+**Every pane records its machine** in `PaneConfig.machine_id`/`hostname`. A
+capable instance restores, reports and saves only its own panes, tagged, and
+the server re-tags whatever an instance reports from its authenticated
+attachment, so no CLI can claim another machine's tabs. Rosters merge per
+machine: `Some(list)` replaces that machine's panes, `Some([])` means it has
+none, `None` changes nothing, the same empty-versus-unknown rule as "Zero panes
+is a state". An untagged pane predates instances and belongs to no machine
+until an instance reports it; the server stamps an **attributed host** on it
+for display and routing only, never as ownership.
+
+**Tags are permanent, by the owner's decision.** Starting a project on zoo-006
+after stopping it on zoo-005 used to resume zoo-005's tabs there. Now they stay
+listed as stopped on zoo-005, with their ids, until zoo-005 runs the project
+again. While any instance is attached, controls and closes for such a tab are
+refused with "<host> is not running this project. Start it on <host> first.";
+the web dims the tab and offers **Start on <host>**, and the sidebar's pane dots
+read "Not running on <host>" and leave it out of idle and waiting lists.
+
+**Routing is by message scope, and a new variant does not compile until
+someone classifies it.** `ServerToCli::scope()` matches every variant with no
+wildcard arm, and a test pins each classification against the variants read
+from the type's schema. `route_to_cli` sends a pane's controls only to the
+instance that owns the pane, a new pane to the machine the server assigned it,
+project-wide messages (policy, flags) to every instance, and a reboot or
+lifecycle request to the machine it names, else the primary. A request naming a
+machine that runs no instance is refused, never delivered elsewhere, and names
+that machine's host only to a requester who knows the machine. Inbound
+pane-scoped frames are accepted only from the owning instance, which also
+closes the old hole where a replaced CLI kept writing into a session.
+
+**A shared home shares one `.apas`, so every write is a locked merge.** Writes
+take an exclusive lock on `<config dir>/locks/<project-id>.lock`, re-read the
+file, replace only this machine's panes and keep everything else as read. The
+lock is deliberately not a sidecar in the project directory: repositories
+ignore `.apas` by exact name, so an `.apas.lock` would show in `git status`
+where an agent could commit it. Periodic reads (the 5 s flag rebroadcast, the
+reconnect policy snapshot) use a reader that never deletes or regenerates
+`.apas`. Untagged panes are adopted at start, under the lock, only by the
+earliest live claimant, so two machines starting together tag each pane once.
+
+**Claims are per machine and released on stop.** A capable daemon claims
+`claims/<project>/<machine>.json` and also holds the legacy guard
+`claims/<project>.json`, marked `"instances": true`. Older daemons ignore the
+marker and see a live peer, which keeps them out; capable daemons treat a marked
+guard as compatible and an unmarked live one as a runtime that must run alone.
+Claims are released on every stop path, which fixes the old bug where a project
+stopped on one host stayed claimed and could not start on another. A refused
+start is reported as the project's `last_error`, never skipped silently, and a
+start carrying a `request_id` is answered with exactly one
+`ProjectRuntimeStarted` on every outcome path. The heartbeat refreshes each
+running project's claims in the shape its start took.
+
+**An absent claim is believed only after a second look.** Releasing on stop
+means a host has often just removed a claim when another host writes it again,
+and the NFS client caches that absence for as long as it trusts the directory's
+attributes: 30 s on the shared home. `daemon_registry::read_json` therefore
+opens the nearest existing directory above a missing claim, which makes the
+client revalidate it (close-to-open), and reads again; a listing needs nothing
+extra, because `read_dir` opens the directory. Without it, the 2026-11-12 smoke
+run saw a host that had just released a project's guard write its own over a
+peer's guard written a second earlier. Any new cross-host file whose absence
+decides something needs the same treatment.
+
+**Choosing a machine.** The `+` menu on desktop and the mobile-browser pane
+sheet gain a **Run on** step, hidden only when exactly one eligible machine
+already runs the project: running instances first, then registered machines
+("Starts the project first"), then owned machines without the project
+("Clone here"), then offline or older machines disabled with their reason. The
+request is `AddPane { machine_id, request_id }`, answered by `AddPaneResult`
+(`Starting`, then `Routed` or `Failed`) to the requesting connection only.
+`Routed` is delivery, not creation: the tab appears when its instance reports
+it. A stopped target is started first (`StartProjectCli { request_id }`) and
+the tab is routed once that instance's `SessionStart` has been handled,
+failing at once on a refusal and after 90 s without an attachment. A launch
+that never hears a final result is shown as unconfirmed and **never resent**:
+a replay can create a second tab. Native task launches follow the same rule
+once a capable instance runs the project.
+
+**Project-level Start and Close act on every machine; the Machines page does
+not.** The project view sends `all_instances: true`. Start starts every online,
+capable machine that owns tabs of the project (or only the given machine when
+none does). Close stops the given machine, every attached instance, and every
+connected daemon of the project's own accounts that reports running it while
+its instance is not attached (still starting, or reconnecting). The Machines
+page's per-machine Start and Stop keep `all_instances: false` and must never
+reach other machines.
+
+**Forget is roster-only.** **Forget <host>'s tabs**, for a machine that will not
+come back, removes its tabs from the server roster and tells no instance:
+deleting them from a shared `.apas` would remove exactly the entries that
+machine restores its tabs from. Their ids are remembered in
+`sessions/<id>/forgotten-panes.json` and avoided by new tabs, and the tabs come
+back with their ids if that machine runs the project again. UI copy must say
+so and never promise deletion. The server refuses it while that machine runs an
+instance, or while a CLI without instance support runs on its host.
+
+**A refused send is settled, never resent.** Typed input refused because of its
+tab's machine is answered with `MutationAck { mutation: input, accepted: false }`
+carrying the input's `client_msg_id`, to the sending connection only and only
+when it negotiated `project_instances_v1`, in addition to the `Error`. The
+server records only the ids of input it delivers, so a resend would be judged
+afresh and, once that machine runs the project again, typed into the terminal
+minutes after the user saw it refused. The web drops the send from its pending
+queue in memory and storage and marks its bubble "Not delivered" with the
+reason and the text kept; native retires that message id and keeps the id of a
+send that was merely never acknowledged, so a retry is still recognized.
+
+**A separate checkout joins by git remote.** Daemons report each project's
+canonical `git_remote`, read in the background, so it reaches the server from
+the heartbeat after registration; it also files a registration-only entry under
+its repository in the sidebar instead of "(no remote)". `apas register` asks
+`GET /projects/by-remote` (under the already proxied `/projects/` prefix) for
+the caller's projects with the same remote. One match is offered with a
+prompt; several need `--project <id>`; `--new` skips matching; `--yes` or
+`--project` is required when no one can answer. Only a pristine local identity
+(no tabs, no server session) is ever re-identified, so no history is orphaned,
+and a checkout the shared registry already holds at another path is refused:
+start it there instead. From the web, **Clone here** sends
+`CreateProjectInstance { join_project_id }` to an owned machine whose daemon is
+capable. That daemon clones without a new branch into `~/apas_projects/<repo>`
+(suffixed if taken), writes `.apas` with the project's id and no tabs,
+registers it, reports it in a heartbeat before acknowledging, and does not
+start it; the web then adds the tab, which starts the instance.
+
+**A project only a registration knows can be started from the web.** `apas
+register` and a bare `apas` tell the server nothing, so such a project has no
+record or placement, and every Start used to fail as "Machine not found". A
+Start naming the requester's own machine that lists the project now creates
+the record and placement first, through `authorize_project_registration`.
+Native launch still cannot offer such a project, because its targets come from
+project policy, which needs that record: start it once from the web or the
+Machines page.
+
+### Capability and mixed fleets
+
+`project_instances_v1` is negotiated separately by CLIs, daemons and viewers.
+A host whose `config.daemon.machine_id` is set never advertises it: that id is
+shared through the NFS home and cannot tell machines apart.
+
+- **A CLI without it** can only be a session's sole instance. Its
+  `SessionStart` is refused while another machine's instance is attached, and
+  a capable instance's is refused while it runs. A Start of the project on
+  another machine is refused before any daemon frame with the text that
+  machine's `SessionStart` would get: "This project is running on <host> with
+  an APAS CLI that cannot share it with other machines; stop it there, or
+  reboot <host> from the Machines page to update it, then start it here".
+- **An older daemon** can still start a project on a shared home whenever no
+  capable instance runs it. It restores every tab in `.apas`, other machines'
+  included, and strips the tags when it saves: the old host migration, bounded
+  by the claim guard and repaired when the next capable instance adopts the
+  untagged tabs. Nobody should be surprised when an un-rebooted host picks up
+  another machine's tabs. While an instance runs the project, a Start naming
+  such a daemon's machine is refused before any daemon frame with "<host> runs
+  an older APAS that cannot run this project beside other machines. Reboot
+  <host> to update it.", the reason a tab targeted there gets: the daemon would
+  otherwise skip it without a word on a shared home. The check reads attached
+  instances, so just after a server restart, before the running instance has
+  reattached, such a Start still reaches the older daemon.
+- **A capable daemon relies on instances only while the server echoes
+  `project_instances_v1` in `ServerToDaemon::Registered`**, and decides again at
+  every registration. On a server that does not echo it, the daemon refuses a
+  project another live host runs and runs anything else as the project's only
+  runtime, as an older daemon would: every tab, saved untagged, the capability
+  not advertised, and the unmarked guard alone, so a capable peer stays out even
+  after the server is upgraded. Nothing running is changed by a later
+  registration. The resume manifest records whether the server kept one CLI per
+  session, so a requested reboot resumes such a project alone where no other
+  host runs it and otherwise as an instance; on an upgraded server, that reboot
+  is what turns it back into an instance.
+- **Older viewers** never receive `SessionInstances`, `AddPaneResult` or the
+  input acknowledgement: older native builds drop the socket on a frame their
+  bundled schema rejects. They read the instance list from `SessionInfo`, and
+  receive only the primary's lifecycle inventory.
+
+### Rollout and rollback
+
+Deploy **server → web → native → CLI/daemon**. A new server with only older
+CLIs behaves as before, and existing `.apas` files need no migration: a
+pre-upgrade roster's untagged tabs are shown under the session's recorded host
+and are tagged when a capable instance adopts them. Hosts gain the capability
+when their daemon is rebooted to update from the Machines page, which restarts
+every project on that host; do that only with the machine owner's go-ahead.
+After deploying the server, check the join route through nginx:
+`curl -s -o /dev/null -w '%{http_code}' 'https://apas.mpaxos.com/projects/by-remote?git_remote=github.com/x/y'`
+must answer `401` from `apas-server`, not `200` with the app's HTML.
+
+To roll back, first stop the extra instances (stop the project on its
+non-primary machines), then roll back CLI/daemon, web and server. An older CLI
+ignores tags and an older server treats a multi-machine roster as one list,
+which is safe once only one instance runs. A capable daemon re-registering with
+a rolled-back server starts no further instance beside another live host, but
+never stops one already running. An instance left running under a rolled-back
+server reports only its own tabs, which that server takes as the whole roster;
+the other machines' tabs stay in their `.apas`, and starting the project there
+runs it as its only runtime, which lists them again.
+
+### Verification
+
+**Verified on 2026-11-12; not deployed.** At the final commit the Rust
+workspace (shared 83, server 371 and CLI 562 tests), the protocol
+(54 tests and typecheck), web (883 tests, lint and typecheck) and native
+(113 tests, lint and typecheck) checks pass, as does
+`openspec validate --strict`.
+
+A two-host smoke ran on zoo-005 and zoo-006 with isolated servers and daemons
+on disposable projects, beside the production daemons, which it never touched.
+It covered shared-home and separate checkouts, headless Chromium at desktop and
+phone widths, a server rolled back and forward, and pane-host adoption.
+
+- Tabs on two machines each took input on their own machine.
+- Closing one machine's last tab, freezing one machine's daemon until the server
+  dropped it, and rebooting a secondary instance's daemon all left the other
+  machine untouched.
+- A project stopped on one machine started on the other, with every tab staying
+  with its machine.
+- Forgotten tabs came back when their machine ran the project again.
+- Checkouts joined by remote and by clone.
+- Older daemons and CLIs were kept out.
+
+The smoke found four defects. All four were fixed and re-run on both hosts:
+
+- the stale NFS read of a claim described above. The stale view appeared in all
+  nine re-run trials, with marked and unmarked guards, and the peer's guard held
+  every time;
+- an older daemon silently skipping a Start;
+- `apas register` printing a refusal twice;
+- a stopped machine's tab label and terminal line.
+
+The re-run found two more issues: a phone's tab chip hid its machine's state,
+and a terminal left open across a server restart showed no retained-output
+line. Both were fixed afterwards. They are covered by unit tests and a
+Chromium layout check of the chip at 360–390px, not by another two-host run.
+
+Not exercised:
+
+- the join route through nginx (check it at deploy, as above);
+- the interactive `[Y/n]` join prompt;
+- **Clone here** in a browser (only its protocol frames ran);
+- an older CLI's `SessionStart` rejected beside an instance;
+- the web's handling of a refused send (the UI disables sending to such a tab);
+- the start-then-add failure paths;
+- the native app on a device.
 
 ## Terminal-pane history: read the provider's transcript
 
