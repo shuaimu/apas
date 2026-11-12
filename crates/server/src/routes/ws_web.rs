@@ -227,24 +227,23 @@ async fn resolve_pane_roster(
 ) -> Option<Vec<shared::PaneConfig>> {
     crate::routes::ws_cli::ensure_forgotten_panes_loaded(state, session_id).await;
     let cached = state.sessions.get_session_panes(session_id);
-    if !cached.is_empty() || state.sessions.pane_roster_seeded(session_id) {
+    if state.sessions.pane_roster_seeded(session_id)
+        || (!cached.is_empty() && !state.sessions.pane_roster_unreadable(session_id))
+    {
         return Some(cached);
     }
-    match state.storage.load_pane_roster(session_id).await {
+    match crate::routes::ws_cli::load_persisted_pane_roster(state, session_id).await {
         // Seeds only a roster nothing has set yet: an instance's report may
         // have merged while this read was in flight, and must not be undone.
-        Ok(Some(stored)) => {
-            let roster = state.sessions.hydrate_pane_roster(session_id, stored);
+        crate::routes::ws_cli::PersistedRoster::Loaded(roster) => {
             Some(attribute_unhosted_panes(state, session_id, roster).await)
         }
-        Ok(None) => None,
-        Err(error) => {
-            tracing::warn!(
-                %session_id,
-                %error,
-                "failed to load pane roster metadata; treating it as unknown"
-            );
-            None
+        // What instances reported, if anything, is all that is known. While
+        // the file is unreadable that is shown but not seeded, and an empty
+        // cache leaves the caller to infer panes it will not seed either.
+        crate::routes::ws_cli::PersistedRoster::Absent
+        | crate::routes::ws_cli::PersistedRoster::Unreadable => {
+            (!cached.is_empty()).then_some(cached)
         }
     }
 }
@@ -1472,6 +1471,54 @@ async fn send_policy_error(state: &AppState, connection_id: &Uuid, message: impl
             connection_id,
             ServerToWeb::Error {
                 message: message.into(),
+            },
+        )
+        .await;
+}
+
+/// Refuse typed input for `pane_id` with `message`, for a refusal that
+/// resending the same input cannot fix. Every client is sent the `Error`, as
+/// before. A connection that negotiated project instances and tagged the
+/// input with a `client_msg_id` is also sent a
+/// [`shared::MutationKind::Input`] refusal under that id, after the `Error`:
+/// a client that resends input until it is acknowledged then stops and shows
+/// why, instead of resending and giving up with no reason. Older native
+/// builds would drop their socket on the new kind, hence the gate.
+///
+/// Unlike [`send_mutation_ack`] nothing is retained for replay, no decision
+/// is registered and no mutation metric moves: a resend is judged afresh,
+/// since the tab's machine may run the project by then, and accepted input
+/// is deduplicated by its echoed id, which a refused input never records.
+async fn refuse_input(
+    state: &AppState,
+    connection_id: &Uuid,
+    session_id: Uuid,
+    pane_id: u32,
+    client_msg_id: Option<&str>,
+    message: String,
+) {
+    send_policy_error(state, connection_id, message.clone()).await;
+    let Some(request_id) = client_msg_id else {
+        return;
+    };
+    if !state
+        .sessions
+        .web_supports_capability(connection_id, shared::PROJECT_INSTANCES_CAPABILITY)
+    {
+        return;
+    }
+    state
+        .sessions
+        .send_to_web(
+            connection_id,
+            ServerToWeb::MutationAck {
+                request_id: request_id.to_string(),
+                session_id,
+                pane_id: Some(pane_id),
+                mutation: shared::MutationKind::Input,
+                accepted: false,
+                error: Some(message),
+                question_pending: None,
             },
         )
         .await;
@@ -3697,15 +3744,15 @@ async fn replay_instances_after_attach(state: &AppState, connection_id: &Uuid, s
         .sessions
         .web_supports_capability(connection_id, shared::PROJECT_INSTANCES_CAPABILITY)
     {
-        let latest = match inventories.into_iter().next() {
-            Some((machine_id, inventory)) => Some((machine_id, inventory)),
-            // Nothing attached: the inventory last reported, as before.
-            None => state
-                .sessions
-                .lifecycle_inventory(&session_id)
-                .map(|inventory| (None, inventory)),
-        };
-        inventories = latest.into_iter().collect();
+        // Only the primary's, and none until it has reported one, as the live
+        // relay gives such a viewer: the first instance to report is not
+        // always the primary after a restart. With nothing attached, the one
+        // last reported, as before.
+        inventories = state
+            .sessions
+            .primary_lifecycle_inventory(&session_id)
+            .into_iter()
+            .collect();
     } else {
         let instances = match state.sessions.get_web_user(connection_id) {
             Some(user_id) => viewer_session_instances(state, &session_id, &user_id).await,
@@ -3743,12 +3790,13 @@ async fn replay_instances_after_attach(state: &AppState, connection_id: &Uuid, s
 /// way to clear them. It edits the project's roster for everyone, so it
 /// takes the authority project settings do.
 ///
-/// The server roster loses the machine's tagged tabs and the untagged ones
-/// attributed to its host. Running instances are told too: one sharing this
-/// project's `.apas` removes the entries tagged with that machine, while a
-/// separate checkout's holds none. Either kind can come back, untagged ones
-/// when an instance adopts them and the rest if that machine runs the
-/// project again, because each instance reports its own tabs.
+/// Only the server roster changes: it loses the machine's tagged tabs and the
+/// untagged ones attributed to its host, and their ids are remembered for
+/// that machine rather than freed. No instance is told. One sharing this
+/// project's `.apas` would delete the very entries that machine restores
+/// from, so its tabs could never come back as the confirmation promises.
+/// Left alone, they come back when that machine runs the project again and
+/// reports them, and untagged ones when an instance adopts them.
 async fn forget_machine_panes(
     state: &AppState,
     connection_id: &Uuid,
@@ -3818,18 +3866,6 @@ async fn forget_machine_panes(
                 ServerToWeb::PaneList {
                     session_id,
                     panes: state.sessions.get_session_panes(&session_id),
-                },
-            )
-            .await;
-    }
-    if !state.sessions.session_attachments(&session_id).is_empty() {
-        state
-            .sessions
-            .route_to_cli(
-                &session_id,
-                ServerToCli::ForgetMachinePanes {
-                    session_id,
-                    machine_id,
                 },
             )
             .await;
@@ -4371,7 +4407,15 @@ async fn handle_web_input(
             .unwrap_or(shared::PANE_ID_INTERACTIVE)
     });
     if let Some(refusal) = pane_control_refusal(state, connection_id, &sid, target_pane).await {
-        send_policy_error(state, connection_id, refusal).await;
+        refuse_input(
+            state,
+            connection_id,
+            sid,
+            target_pane,
+            client_msg_id.as_deref(),
+            refusal,
+        )
+        .await;
         return;
     }
 
@@ -4456,14 +4500,24 @@ async fn handle_web_input(
         .await;
     } else {
         tracing::warn!("Failed to route input to CLI for session {}", sid);
-        let message = match outcome {
-            CliRouteOutcome::MachineNotRunning { .. } => undelivered_message(state, &outcome),
-            _ => "CLI client not connected".to_string(),
-        };
-        state
-            .sessions
-            .send_to_web(connection_id, ServerToWeb::Error { message })
-            .await;
+        match outcome {
+            // The tab's machine stopped since the check above: as final as
+            // that refusal.
+            CliRouteOutcome::MachineNotRunning { .. } => {
+                refuse_input(
+                    state,
+                    connection_id,
+                    sid,
+                    target_pane,
+                    client_msg_id.as_deref(),
+                    undelivered_message(state, &outcome),
+                )
+                .await;
+            }
+            // Nothing reached a CLI, and a resend may once one reconnects, so
+            // the send is left unanswered as before.
+            _ => send_policy_error(state, connection_id, "CLI client not connected").await,
+        }
     }
 }
 
@@ -4597,6 +4651,34 @@ async fn handle_reorder_panes(
             },
         )
         .await;
+}
+
+/// Apply a web edit of one tab (its label, effort, model or bot settings),
+/// save the roster and send it to the session's viewers. Returns false, and
+/// changes nothing, when the roster does not list the tab.
+///
+/// The tab is edited in place and the roster saved as it is at the moment of
+/// writing, as a reorder is: editing a copy and putting the copy back would
+/// replace the whole roster, dropping a tab another machine's instance
+/// reported in between from memory and from `panes.json`.
+async fn edit_roster_pane(
+    state: &AppState,
+    session_id: Uuid,
+    pane_id: u32,
+    edit: impl FnOnce(&mut shared::PaneConfig),
+) -> bool {
+    let Some(panes) = state
+        .sessions
+        .update_session_pane(&session_id, pane_id, edit)
+    else {
+        return false;
+    };
+    crate::routes::ws_cli::persist_pane_roster(state, &session_id).await;
+    state
+        .sessions
+        .route_to_web(&session_id, ServerToWeb::PaneList { session_id, panes })
+        .await;
+    true
 }
 
 /// Deliver the answer to a pending decision (a question or a plan review),
@@ -4811,7 +4893,15 @@ async fn handle_terminal_conversation_input(
     }
 
     if let Some(refusal) = pane_control_refusal(state, connection_id, &sid, pane_id).await {
-        send_policy_error(state, connection_id, refusal).await;
+        refuse_input(
+            state,
+            connection_id,
+            sid,
+            pane_id,
+            client_msg_id.as_deref(),
+            refusal,
+        )
+        .await;
         return;
     }
 
@@ -4829,6 +4919,8 @@ async fn handle_terminal_conversation_input(
         )
         .await;
     if !input_sent {
+        // Nothing reached the terminal, and a resend may once a CLI
+        // reconnects, so the send is left unanswered as before.
         state
             .sessions
             .send_to_web(
@@ -4869,16 +4961,19 @@ async fn handle_terminal_conversation_input(
         state
             .sessions
             .cancel_terminal_transcript_echo(&sid, pane_id, &text);
-        state
-            .sessions
-            .send_to_web(
-                connection_id,
-                ServerToWeb::Error {
-                    message: "The text reached the terminal, but Enter could not be sent"
-                        .to_string(),
-                },
-            )
-            .await;
+        // The text is already in the terminal and its id is not recorded, so
+        // an unanswered send would be resent and typed there again by a
+        // client that resends until acknowledged. The refusal stops that and
+        // says where the text is.
+        refuse_input(
+            state,
+            connection_id,
+            sid,
+            pane_id,
+            client_msg_id.as_deref(),
+            "The text reached the terminal, but Enter could not be sent".to_string(),
+        )
+        .await;
         return;
     }
 
@@ -6818,22 +6913,11 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             continue;
                         };
                         tracing::info!("Updating pane {} label in session {}", pane_id, sid);
-                        let mut panes = state.sessions.get_session_panes(&sid);
-                        if let Some(pane) = panes.iter_mut().find(|p| p.pane_id == pane_id) {
-                            pane.label = Some(label.clone());
-                            state.sessions.set_session_panes(&sid, panes.clone());
-                            let _ = state.storage.save_pane_list(&sid, &panes).await;
-                            state
-                                .sessions
-                                .route_to_web(
-                                    &sid,
-                                    ServerToWeb::PaneList {
-                                        session_id: sid,
-                                        panes,
-                                    },
-                                )
-                                .await;
-                        }
+                        let new_label = label.clone();
+                        edit_roster_pane(&state, sid, pane_id, |pane| {
+                            pane.label = Some(new_label);
+                        })
+                        .await;
                         // Also forward to CLI so it updates meta.label and
                         // persists to .apas — without this, the rename is
                         // cache-only and gets clobbered on next CLI restart
@@ -7464,21 +7548,12 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             sid,
                             normalized
                         );
-                        let mut panes = state.sessions.get_session_panes(&sid);
-                        if let Some(pane) = panes.iter_mut().find(|p| p.pane_id == pane_id) {
-                            pane.effort = normalized.clone();
-                            state.sessions.set_session_panes(&sid, panes.clone());
-                            let _ = state.storage.save_pane_list(&sid, &panes).await;
-                            state
-                                .sessions
-                                .route_to_web(
-                                    &sid,
-                                    ServerToWeb::PaneList {
-                                        session_id: sid,
-                                        panes,
-                                    },
-                                )
-                                .await;
+                        let new_effort = normalized.clone();
+                        if edit_roster_pane(&state, sid, pane_id, |pane| {
+                            pane.effort = new_effort;
+                        })
+                        .await
+                        {
                             // Forward to CLI so it persists to the .apas file.
                             state
                                 .sessions
@@ -7558,25 +7633,14 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             provider,
                             trimmed
                         );
-                        let mut panes = state.sessions.get_session_panes(&sid);
-                        if let Some(pane) = panes.iter_mut().find(|p| p.pane_id == pane_id) {
+                        let new_model = trimmed.clone();
+                        edit_roster_pane(&state, sid, pane_id, |pane| {
                             if let Some(p) = provider {
                                 pane.provider = p;
                             }
-                            pane.model = trimmed.clone();
-                            state.sessions.set_session_panes(&sid, panes.clone());
-                            let _ = state.storage.save_pane_list(&sid, &panes).await;
-                            state
-                                .sessions
-                                .route_to_web(
-                                    &sid,
-                                    ServerToWeb::PaneList {
-                                        session_id: sid,
-                                        panes,
-                                    },
-                                )
-                                .await;
-                        }
+                            pane.model = new_model;
+                        })
+                        .await;
                         state
                             .sessions
                             .route_to_cli(
@@ -7636,8 +7700,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
 
                         // Optimistically update cached pane state so web
                         // reflects the change even if the CLI PaneList is lost.
-                        let mut panes = state.sessions.get_session_panes(&sid);
-                        if let Some(pane) = panes.iter_mut().find(|p| p.pane_id == pane_id) {
+                        edit_roster_pane(&state, sid, pane_id, |pane| {
                             pane.mode = shared::PaneMode::Deadloop;
                             pane.prompt = prompt;
                             pane.min_iteration_interval_minutes = min_iteration_interval_minutes
@@ -7646,19 +7709,8 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                 pane.effort = normalize_start_bot_effort(requested_effort);
                             }
                             pane.stop_requested = false;
-                            state.sessions.set_session_panes(&sid, panes.clone());
-                            let _ = state.storage.save_pane_list(&sid, &panes).await;
-                            state
-                                .sessions
-                                .route_to_web(
-                                    &sid,
-                                    ServerToWeb::PaneList {
-                                        session_id: sid,
-                                        panes,
-                                    },
-                                )
-                                .await;
-                        }
+                        })
+                        .await;
                     }
                 }
                 Ok(WebToServer::StopBot {
@@ -7689,22 +7741,10 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
 
                         // Optimistically set stop_requested so web shows
                         // "Force Stop" without waiting for CLI PaneList.
-                        let mut panes = state.sessions.get_session_panes(&sid);
-                        if let Some(pane) = panes.iter_mut().find(|p| p.pane_id == pane_id) {
+                        edit_roster_pane(&state, sid, pane_id, |pane| {
                             pane.stop_requested = true;
-                            state.sessions.set_session_panes(&sid, panes.clone());
-                            let _ = state.storage.save_pane_list(&sid, &panes).await;
-                            state
-                                .sessions
-                                .route_to_web(
-                                    &sid,
-                                    ServerToWeb::PaneList {
-                                        session_id: sid,
-                                        panes,
-                                    },
-                                )
-                                .await;
-                        }
+                        })
+                        .await;
                     }
                 }
                 Ok(WebToServer::ResumeSession { session_id: sid }) => {
@@ -7915,7 +7955,9 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                 None => {
                                     let inferred = infer_panes_from_messages(sid, &messages);
                                     if !inferred.is_empty() {
-                                        state.sessions.set_session_panes(&sid, inferred.clone());
+                                        state
+                                            .sessions
+                                            .seed_inferred_pane_roster(&sid, inferred.clone());
                                     }
                                     (inferred, false)
                                 }
@@ -8268,9 +8310,10 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                             let inferred =
                                                 infer_panes_from_messages(sid, &messages);
                                             if !inferred.is_empty() {
-                                                state
-                                                    .sessions
-                                                    .set_session_panes(&sid, inferred.clone());
+                                                state.sessions.seed_inferred_pane_roster(
+                                                    &sid,
+                                                    inferred.clone(),
+                                                );
                                             }
                                             (inferred, false)
                                         }
@@ -9116,6 +9159,171 @@ mod project_instance_tests {
         assert!(errors(&web.drain()).is_empty());
     }
 
+    /// `viewer` types into the project, naming `pane_id` and tagging the send
+    /// with `id`.
+    async fn typed(p: &Project, viewer: &Uuid, pane_id: Option<u32>, id: Option<&str>) {
+        handle_web_input(
+            &p.state,
+            viewer,
+            None,
+            Some(p.session),
+            "keep going".to_string(),
+            None,
+            pane_id,
+            id.map(str::to_string),
+        )
+        .await;
+    }
+
+    /// The refusals a sender is told about under its input's id: request id,
+    /// pane and reason of each `Input` mutation acknowledgement.
+    fn input_refusals(messages: &[ServerToWeb]) -> Vec<(String, Option<u32>, Option<String>)> {
+        messages
+            .iter()
+            .filter_map(|message| match message {
+                ServerToWeb::MutationAck {
+                    request_id,
+                    pane_id,
+                    mutation: shared::MutationKind::Input,
+                    accepted,
+                    error,
+                    question_pending,
+                    ..
+                } => {
+                    assert!(!accepted, "an input acknowledgement is only a refusal");
+                    assert!(question_pending.is_none());
+                    Some((request_id.clone(), *pane_id, error.clone()))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Typed input for a stopped machine's tab is refused by name, and a
+    /// viewer that negotiated project instances is also told under the
+    /// input's id, after the error: resending cannot change the answer, and a
+    /// client that resends until acknowledged would otherwise give up with no
+    /// reason to show. Input naming no pane is reported for the legacy pane
+    /// it means. A viewer without the capability, and a send without an id,
+    /// get the error alone, as before, and nothing reaches an instance.
+    #[tokio::test]
+    async fn refused_input_is_acknowledged_to_a_viewer_that_tracks_its_sends() {
+        let p = project().await;
+        let mut a = p.instance(p.m5, HOST_A);
+        p.roster(vec![
+            pane(shared::PANE_ID_INTERACTIVE, Some(p.m6), Some(HOST_B)),
+            pane(3, Some(p.m5), Some(HOST_A)),
+            pane(4, Some(p.m6), Some(HOST_B)),
+        ]);
+        let mut capable = p.viewer(p.owner, &[PROJECT_INSTANCES_CAPABILITY]);
+        let mut older = p.viewer(p.owner, &[]);
+        capable.drain();
+        older.drain();
+        let refusal = not_running(HOST_B);
+
+        typed(&p, &capable.id, Some(4), Some("send-4")).await;
+        let seen = capable.drain();
+        assert!(
+            matches!(seen.first(), Some(ServerToWeb::Error { message }) if *message == refusal),
+            "the error comes first: {seen:?}"
+        );
+        assert_eq!(
+            input_refusals(&seen),
+            vec![("send-4".to_string(), Some(4), Some(refusal.clone()))]
+        );
+        assert_eq!(seen.len(), 2, "{seen:?}");
+
+        typed(&p, &capable.id, None, Some("send-legacy")).await;
+        let seen = capable.drain();
+        assert_eq!(errors(&seen), vec![refusal.clone()]);
+        assert_eq!(
+            input_refusals(&seen),
+            vec![(
+                "send-legacy".to_string(),
+                Some(shared::PANE_ID_INTERACTIVE),
+                Some(refusal.clone())
+            )]
+        );
+
+        handle_terminal_conversation_input(
+            &p.state,
+            &capable.id,
+            None,
+            p.session,
+            4,
+            "keep going".to_string(),
+            Some("conversation-4".to_string()),
+        )
+        .await;
+        let seen = capable.drain();
+        assert_eq!(errors(&seen), vec![refusal.clone()]);
+        assert_eq!(
+            input_refusals(&seen),
+            vec![("conversation-4".to_string(), Some(4), Some(refusal.clone()))]
+        );
+
+        typed(&p, &capable.id, Some(4), None).await;
+        let seen = capable.drain();
+        assert_eq!(errors(&seen), vec![refusal.clone()]);
+        assert!(input_refusals(&seen).is_empty(), "no id, nothing to settle");
+
+        typed(&p, &older.id, Some(4), Some("older-4")).await;
+        let seen = older.drain();
+        assert_eq!(errors(&seen), vec![refusal.clone()]);
+        assert!(input_refusals(&seen).is_empty(), "an older viewer gets the error alone");
+
+        assert!(a.drain().is_empty(), "nothing reaches the running instance");
+    }
+
+    /// When the text reached the terminal but its Enter could not follow, the
+    /// send is refused under its id: resending it would type the text into
+    /// the terminal again, and the reason says where it is.
+    #[tokio::test]
+    async fn input_typed_without_its_enter_is_acknowledged_as_refused() {
+        let p = project().await;
+        let mut a = p.instance(p.m5, HOST_A);
+        p.roster(vec![pane(3, Some(p.m5), Some(HOST_A))]);
+        let mut web = p.viewer(p.owner, &[PROJECT_INSTANCES_CAPABILITY]);
+        web.drain();
+        let (state, connection, session) = (p.state.clone(), web.id, p.session);
+        let send = tokio::spawn(async move {
+            handle_terminal_conversation_input(
+                &state,
+                &connection,
+                None,
+                session,
+                3,
+                "run the tests".to_string(),
+                Some("conversation-3".to_string()),
+            )
+            .await;
+        });
+        let typed = a.rx.recv().await.expect("the text reaches the terminal");
+        assert!(matches!(typed, ServerToCli::TerminalInput { pane_id: 3, .. }));
+        // The instance's connection closes before Enter is sent.
+        drop(a);
+        send.await.unwrap();
+
+        let reason = "The text reached the terminal, but Enter could not be sent".to_string();
+        let seen = web.drain();
+        assert_eq!(errors(&seen), vec![reason.clone()]);
+        assert_eq!(
+            input_refusals(&seen),
+            vec![("conversation-3".to_string(), Some(3), Some(reason))]
+        );
+        assert!(
+            !seen
+                .iter()
+                .any(|message| matches!(message, ServerToWeb::UserInput { .. })),
+            "{seen:?}"
+        );
+        assert!(p
+            .state
+            .sessions
+            .seen_input_id(&p.session, "conversation-3")
+            .is_none());
+    }
+
     /// Typed input, approvals, answers and pane controls for a tab on the
     /// secondary machine reach that machine's instance and no other; input
     /// naming no pane goes to whichever instance runs the interactive pane.
@@ -9561,11 +9769,12 @@ mod project_instance_tests {
     }
 
     /// Forgetting a stopped machine drops its tagged tabs and the untagged
-    /// ones attributed to its host from the roster, persists that, tells
-    /// viewers, and tells every running instance so a shared `.apas` drops
-    /// the machine's entries too.
+    /// ones attributed to its host from the roster, persists that and tells
+    /// viewers. It tells no instance: one sharing the `.apas` would delete the
+    /// entries that machine restores its tabs from when it runs the project
+    /// again.
     #[tokio::test]
-    async fn forgetting_a_stopped_machine_drops_its_tabs_everywhere() {
+    async fn forgetting_a_stopped_machine_drops_its_tabs_from_the_roster_only() {
         let p = project().await;
         let mut a = p.instance(p.m5, HOST_A);
         let _d6 = p.daemon(p.m6, HOST_B, CAPABLE_DAEMON);
@@ -9610,10 +9819,11 @@ mod project_instance_tests {
             ServerToWeb::PaneList { panes, .. }
                 if panes.iter().map(|pane| pane.pane_id).collect::<Vec<_>>() == vec![3, 6]
         )));
-        assert!(matches!(
-            a.drain().as_slice(),
-            [ServerToCli::ForgetMachinePanes { machine_id, .. }] if *machine_id == p.m6
-        ));
+        let to_running_instance = a.drain();
+        assert!(
+            to_running_instance.is_empty(),
+            "the running instance is not told: {to_running_instance:?}"
+        );
         assert!(p.state.sessions.terminal_snapshot(&p.session, 4).is_none());
         assert!(p
             .state
@@ -9700,10 +9910,8 @@ mod project_instance_tests {
         forget_machine_panes(&p.state, &owner_web.id, p.session, p.m6).await;
         assert!(errors(&owner_web.drain()).is_empty());
         assert_eq!(p.pane_ids(), vec![3]);
-        assert!(matches!(
-            renamed.drain().as_slice(),
-            [ServerToCli::ForgetMachinePanes { machine_id, .. }] if *machine_id == p.m6
-        ));
+        // Forgetting changes the roster alone; no instance is told.
+        assert!(renamed.drain().is_empty());
     }
 
     /// After a server restart a stopped machine's tabs are known only from
@@ -10020,6 +10228,125 @@ mod project_instance_tests {
             .await
             .unwrap()
             .is_empty());
+    }
+
+    /// A web edit of one tab changes that tab in place, then saves and shows
+    /// the roster as it stands, another machine's tab reported meanwhile
+    /// included. An edit of a tab the roster does not list changes nothing.
+    #[tokio::test]
+    async fn a_web_edit_of_one_tab_keeps_every_other_tab() {
+        let p = project().await;
+        let a = p.instance(p.m5, HOST_A);
+        let b = p.instance(p.m6, HOST_B);
+        let mut web = p.viewer(p.owner, &[]);
+        p.state
+            .sessions
+            .merge_instance_roster(&p.session, &a.id, vec![pane(3, None, None)])
+            .unwrap();
+        // zoo-006 reports a new tab after the rename was asked for.
+        p.state
+            .sessions
+            .merge_instance_roster(&p.session, &b.id, vec![pane(9, None, None)])
+            .unwrap();
+
+        assert!(
+            edit_roster_pane(&p.state, p.session, 3, |pane| {
+                pane.label = Some("renamed".to_string());
+            })
+            .await
+        );
+        let summary = |panes: &[PaneConfig]| {
+            panes
+                .iter()
+                .map(|pane| (pane.pane_id, pane.machine_id, pane.label.clone()))
+                .collect::<Vec<_>>()
+        };
+        let expected = vec![
+            (3, Some(p.m5), Some("renamed".to_string())),
+            (9, Some(p.m6), None),
+        ];
+        assert_eq!(summary(&p.state.sessions.get_session_panes(&p.session)), expected);
+        let persisted = p
+            .state
+            .storage
+            .load_pane_roster(&p.session)
+            .await
+            .unwrap()
+            .expect("the roster is saved");
+        assert_eq!(summary(&persisted), expected);
+        let lists: Vec<Vec<PaneConfig>> = web
+            .drain()
+            .into_iter()
+            .filter_map(|message| match message {
+                ServerToWeb::PaneList { panes, .. } => Some(panes),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(lists.len(), 1);
+        assert_eq!(summary(&lists[0]), expected);
+
+        assert!(!edit_roster_pane(&p.state, p.session, 7, |pane| pane.label = None).await);
+        assert!(web.drain().is_empty());
+        assert_eq!(summary(&p.state.sessions.get_session_panes(&p.session)), expected);
+    }
+
+    /// A viewer arriving while `panes.json` cannot be read neither treats the
+    /// roster as known nor lets panes inferred from history become it, and a
+    /// report merged meanwhile is shown but not saved: either would be saved
+    /// over the tabs the file holds. Once the file reads, its tabs and the
+    /// report are the roster, and every instance is asked to report again.
+    #[tokio::test]
+    async fn a_roster_that_cannot_be_read_is_not_seeded_from_a_viewer() {
+        let p = project().await;
+        let file = p
+            .dir
+            .join("sessions")
+            .join(p.session.to_string())
+            .join("panes.json");
+        // A directory in its place makes every read of the file fail.
+        std::fs::create_dir_all(&file).unwrap();
+        let _web = p.viewer(p.owner, &[]);
+        let ids = |roster: Option<Vec<PaneConfig>>| {
+            roster.map(|panes| panes.iter().map(|pane| pane.pane_id).collect::<Vec<_>>())
+        };
+
+        assert_eq!(ids(resolve_pane_roster(&p.state, &p.session).await), None);
+        assert!(p.state.sessions.pane_roster_unreadable(&p.session));
+        assert!(!p
+            .state
+            .sessions
+            .seed_inferred_pane_roster(&p.session, vec![pane(2, None, None)]));
+        assert!(p.pane_ids().is_empty(), "no inferred pane became the roster");
+
+        let mut a = p.instance(p.m5, HOST_A);
+        p.state
+            .sessions
+            .merge_instance_roster(&p.session, &a.id, vec![pane(3, None, None)])
+            .unwrap();
+        crate::routes::ws_cli::persist_pane_roster(&p.state, &p.session).await;
+        assert!(file.is_dir(), "nothing was saved over the file");
+        assert_eq!(
+            ids(resolve_pane_roster(&p.state, &p.session).await),
+            Some(vec![3]),
+            "viewers see the report meanwhile"
+        );
+        assert!(!p.state.sessions.pane_roster_seeded(&p.session));
+
+        std::fs::remove_dir(&file).unwrap();
+        p.state
+            .storage
+            .save_pane_list(&p.session, &[pane(4, Some(p.m6), Some(HOST_B))])
+            .await
+            .unwrap();
+        assert_eq!(
+            ids(resolve_pane_roster(&p.state, &p.session).await),
+            Some(vec![4, 3])
+        );
+        assert!(p.state.sessions.pane_roster_seeded(&p.session));
+        assert!(a
+            .drain()
+            .iter()
+            .any(|message| matches!(message, ServerToCli::RequestPaneList { .. })));
     }
 
     /// The project view's Start starts each online, capable machine that owns
@@ -10436,6 +10763,48 @@ mod project_instance_tests {
             .iter()
             .any(|message| matches!(message, ServerToWeb::SessionInstances { .. })));
         assert_eq!(inventories(&older), vec![Some(p.m5)]);
+    }
+
+    /// After a restart the primary can attach first and report its inventory
+    /// after a secondary has. A viewer keeping one inventory per session is
+    /// replayed nothing until the primary's arrives, never the secondary's:
+    /// its reboot would restart the primary while counting the secondary's
+    /// tabs.
+    #[tokio::test]
+    async fn an_older_viewer_is_never_replayed_a_secondarys_inventory() {
+        let p = project().await;
+        let _a = p.instance(p.m5, HOST_A);
+        let _b = p.instance(p.m6, HOST_B);
+        p.state.sessions.set_lifecycle_inventory(
+            p.session,
+            Some(p.m6),
+            shared::CliLifecycleInventory::default(),
+        );
+        let inventories = |messages: &[ServerToWeb]| {
+            messages
+                .iter()
+                .filter_map(|message| match message {
+                    ServerToWeb::CliLifecycleInventory { machine_id, .. } => Some(*machine_id),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        let mut capable = p.viewer(p.owner, &[PROJECT_INSTANCES_CAPABILITY]);
+        let mut older = p.viewer(p.owner, &[]);
+
+        replay_instances_after_attach(&p.state, &capable.id, p.session).await;
+        replay_instances_after_attach(&p.state, &older.id, p.session).await;
+        assert_eq!(inventories(&capable.drain()), vec![Some(p.m6)]);
+        assert!(inventories(&older.drain()).is_empty());
+        assert!(p.state.sessions.lifecycle_inventory(&p.session).is_none());
+
+        p.state.sessions.set_lifecycle_inventory(
+            p.session,
+            Some(p.m5),
+            shared::CliLifecycleInventory::default(),
+        );
+        replay_instances_after_attach(&p.state, &older.id, p.session).await;
+        assert_eq!(inventories(&older.drain()), vec![Some(p.m5)]);
     }
 
     /// Pane summaries name each tab's machine, show an untagged tab under

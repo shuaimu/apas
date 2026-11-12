@@ -7,7 +7,7 @@ type StoreState = ReturnType<typeof useStore.getState>;
 
 const initialStore = useStore.getInitialState();
 
-function renderApprovalPrompt() {
+function renderApprovalPrompt(disabledReason?: string) {
   const approve = vi.fn();
   const reject = vi.fn();
 
@@ -23,6 +23,7 @@ function renderApprovalPrompt() {
       toolCallId="toolu_permission_123"
       tool="Bash"
       description="Run `npm test` in the web package"
+      disabledReason={disabledReason}
     />,
   );
 
@@ -65,5 +66,20 @@ describe("ApprovalPrompt", () => {
     expect(reject).toHaveBeenCalledTimes(1);
     expect(reject).toHaveBeenCalledWith("toolu_permission_123");
     expect(approve).not.toHaveBeenCalled();
+  });
+
+  it("disables both answers with the reason when the pane cannot take them", () => {
+    const reason = "Access denied: you cannot use zoo-006, which runs this project instance";
+    const { approve, reject } = renderApprovalPrompt(reason);
+
+    expect(screen.getByRole("status").textContent).toBe(reason);
+    for (const name of [/Approve/, /Reject/]) {
+      const button = screen.getByRole("button", { name }) as HTMLButtonElement;
+      expect(button.disabled).toBe(true);
+      expect(button.title).toBe(reason);
+      fireEvent.click(button);
+    }
+    expect(approve).not.toHaveBeenCalled();
+    expect(reject).not.toHaveBeenCalled();
   });
 });

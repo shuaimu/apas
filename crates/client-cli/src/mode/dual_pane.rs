@@ -4437,13 +4437,6 @@ impl ProjectStore {
             crate::project_instances::update_project_settings(&self.dir, self.project_id, update)
         })
     }
-
-    /// Remove the entries tagged with `machine_id`, returning their ids.
-    fn forget_machine(&self, machine_id: Uuid) -> Result<Vec<u32>> {
-        off_runtime(|| {
-            crate::project_instances::forget_machine_panes(&self.dir, self.project_id, machine_id)
-        })
-    }
 }
 
 /// Persist this runtime's pane configs (including dynamic tabs) to `.apas`.
@@ -11103,56 +11096,53 @@ mod tests {
         assert!(capabilities.contains(&shared::PERSISTENT_TERMINAL_HOST_CAPABILITY.to_string()));
     }
 
+    /// Forgetting a stopped machine's tabs changes only the server's roster;
+    /// no CLI removes them from `.apas`. On a shared home their entries stay
+    /// in the file while another machine's instance keeps saving its own, so
+    /// when the forgotten machine runs the project again it restores the same
+    /// tabs with the same conversations, as the confirmation promised.
     #[test]
-    fn forgetting_a_machine_removes_only_the_entries_tagged_with_it() {
-        let _config = crate::config::test_config::isolated_config_dir();
-        use shared::PaneKind::Terminal;
-        let (zoo5, zoo6, laptop) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
-        let dir = tempfile::tempdir().unwrap();
-        write_project(
-            dir.path(),
-            vec![
-                recorded_pane(3, Terminal, Some((zoo5, "zoo-005"))),
+    fn a_stopped_machines_tabs_survive_a_shared_home_and_come_back_with_it() {
+        crate::project::test_support::with_isolated_config(|| {
+            use shared::PaneKind::Terminal;
+            let (zoo5, zoo6) = (Uuid::new_v4(), Uuid::new_v4());
+            let dir = tempfile::tempdir().unwrap();
+            let stopped = vec![
                 recorded_pane(4, Terminal, Some((zoo6, "zoo-006"))),
                 recorded_pane(5, Terminal, Some((zoo6, "zoo-006"))),
-                // The CLI keys on the tag: an untagged pane last run on
-                // zoo-006 stays, and comes back if an instance adopts it.
-                recorded_pane(6, Terminal, None),
-                recorded_pane(7, Terminal, Some((laptop, "laptop"))),
-            ],
-        );
-        let instance = super::InstanceIdentity {
-            machine_id: zoo5,
-            hostname: Some("zoo-005".to_string()),
-            capable: true,
-        };
-        let store = existing_project_store(dir.path(), instance.owner());
+            ];
+            let mut panes = vec![recorded_pane(3, Terminal, Some((zoo5, "zoo-005")))];
+            panes.extend(stopped.iter().cloned());
+            write_project(dir.path(), panes);
 
-        assert_eq!(
-            super::forget_machine_panes_here(&store, &instance, zoo6),
-            vec![4, 5]
-        );
-        assert_eq!(ids_of(&on_disk(dir.path()).panes), vec![3, 6, 7]);
-        assert_eq!(
-            ids_of(&store.cached().metadata.panes),
-            vec![3, 6, 7],
-            "what this runtime reads next no longer lists them"
-        );
+            // zoo-005 runs on alone, closing its tab and opening another.
+            let running = super::open_runtime(dir.path(), &machine(zoo5, "zoo-005")).unwrap();
+            let running_ids: Vec<u32> =
+                running.tabs.iter().map(|(pane_id, ..)| *pane_id).collect();
+            assert_eq!(running_ids, vec![3]);
+            let store = existing_project_store(dir.path(), machine(zoo5, "zoo-005"));
+            store
+                .save_panes(&[recorded_pane(7, Terminal, Some((zoo5, "zoo-005")))])
+                .unwrap();
+            let mut on_file = ids_of(&on_disk(dir.path()).panes);
+            on_file.sort();
+            assert_eq!(on_file, vec![4, 5, 7]);
 
-        // This machine runs the project; its panes are its own to keep.
-        assert!(super::forget_machine_panes_here(&store, &instance, zoo5).is_empty());
-        assert_eq!(ids_of(&on_disk(dir.path()).panes), vec![3, 6, 7]);
-
-        // A runtime without the capability owns every pane in the file, so it
-        // leaves even another machine's entries where they are.
-        let sole = super::InstanceIdentity {
-            machine_id: zoo6,
-            hostname: Some("zoo-006".to_string()),
-            capable: false,
-        };
-        let sole_store = existing_project_store(dir.path(), sole.owner());
-        assert!(super::forget_machine_panes_here(&sole_store, &sole, laptop).is_empty());
-        assert_eq!(ids_of(&on_disk(dir.path()).panes), vec![3, 6, 7]);
+            // zoo-006 runs the project again and gets its tabs back as they were.
+            let back = super::open_runtime(dir.path(), &machine(zoo6, "zoo-006")).unwrap();
+            let restored: Vec<(u32, Uuid)> = back
+                .tabs
+                .iter()
+                .map(|(pane_id, session_id, ..)| (*pane_id, *session_id))
+                .collect();
+            assert_eq!(
+                restored,
+                stopped
+                    .iter()
+                    .map(|pane| (pane.pane_id, pane.session_id))
+                    .collect::<Vec<_>>()
+            );
+        });
     }
 
     #[test]
@@ -14590,44 +14580,6 @@ fn session_start_message(
     }
 }
 
-/// `ForgetMachinePanes`: drop `machine_id`'s panes from `.apas`, so no
-/// instance sharing the file restores them, and refresh the copy this
-/// runtime reads. Returns the pane ids removed.
-///
-/// Only an instance acts on it. A runtime without the capability owns every
-/// pane in the file, including any a machine had tagged before it restored
-/// them, and saves them back untagged; removing the tagged entries would only
-/// drop panes it runs until its next save. A forget naming this machine is
-/// ignored too: the server refuses one for a machine that runs the project,
-/// and this machine's panes are its own to keep. This runtime's own panes
-/// never change, so there is nothing to report back.
-fn forget_machine_panes_here(
-    store: &ProjectStore,
-    instance: &InstanceIdentity,
-    machine_id: Uuid,
-) -> Vec<u32> {
-    if !instance.capable {
-        tracing::info!(%machine_id, "ignoring a forget: this runtime owns every pane in .apas");
-        return Vec::new();
-    }
-    if machine_id == instance.machine_id {
-        tracing::warn!(%machine_id, "ignoring a forget for this machine, which runs the project");
-        return Vec::new();
-    }
-    match store.forget_machine(machine_id) {
-        Ok(forgotten) => {
-            tracing::info!(%machine_id, ?forgotten, "forgot another machine's panes in .apas");
-            // The copy this runtime reads still lists them.
-            store.read();
-            forgotten
-        }
-        Err(error) => {
-            tracing::warn!(%machine_id, %error, "could not forget another machine's panes in .apas");
-            Vec::new()
-        }
-    }
-}
-
 /// Run server connection, reconnecting automatically with bounded backoff.
 async fn run_server_connection(
     server_url: &str,
@@ -15936,11 +15888,6 @@ async fn run_server_connection(
                                                         });
                                                     }
                                                 });
-                                            }
-                                            ServerToCli::ForgetMachinePanes { session_id: forget_session, machine_id } => {
-                                                if forget_session == session_id {
-                                                    forget_machine_panes_here(&store, &instance, machine_id);
-                                                }
                                             }
                                             ServerToCli::RemovePane { session_id: _, pane_id: remove_id, cleanup_action } => {
                                                 invalidate_omp_reboot_generation(&pane_metas, remove_id);

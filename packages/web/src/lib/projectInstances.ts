@@ -181,6 +181,24 @@ export function resolvePaneInstance(
 }
 
 /**
+ * Whether a pane is known not to be running: its project has attached
+ * instances, but none of them receives the pane's controls, because the
+ * pane's machine is stopped, offline or reconnecting. Such a pane is not an
+ * idle agent waiting for someone, even though the server reports it as not
+ * working. With no instance list (an older server, or nothing attached)
+ * nothing is known per pane and this is false, so callers keep judging by
+ * the session alone.
+ */
+export function paneNotRunning(
+  pane: PaneMachineFields,
+  instances: SessionInstance[] | undefined,
+  machines?: MachineWithProjects[],
+): boolean {
+  if (!instances || instances.length === 0) return false;
+  return resolvePaneInstance(pane, instances, machines) === null;
+}
+
+/**
  * Machine ids by hostname and hostnames by machine id, gathered from every
  * source that pairs them. A hostname claimed by two different machines is
  * ambiguous and maps to neither.

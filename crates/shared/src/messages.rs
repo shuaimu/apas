@@ -78,11 +78,12 @@ pub const LOCAL_PROJECT_REGISTRATION_CAPABILITY: &str = "local_project_registrat
 /// session.
 ///
 /// Web and mobile clients advertise it too, in `Authenticate.capabilities`,
-/// to receive [`ServerToWeb::SessionInstances`]; a server that implements
+/// to receive [`ServerToWeb::SessionInstances`] and the input refusals
+/// acknowledged as [`MutationKind::Input`]; a server that implements
 /// instances echoes it in `Authenticated.negotiated_capabilities`, so a client
-/// can tell whether that frame will come. The gate is what keeps older native
+/// can tell whether those will come. The gate is what keeps older native
 /// builds connected: they validate every frame against their bundled schema
-/// and drop the socket on a variant it does not list.
+/// and drop the socket on a variant or value it does not list.
 pub const PROJECT_INSTANCES_CAPABILITY: &str = "project_instances_v1";
 /// Canonical non-working pane status used while an agent is blocked on a
 /// question only the human can answer. Keep the wire value stable: older web
@@ -671,15 +672,6 @@ pub enum ServerToCli {
         cleanup_action: Option<PaneCleanupAction>,
     },
 
-    /// Forget every pane owned by `machine_id`, a machine with no running
-    /// instance that the owner confirmed will not come back. Sent to every
-    /// attached instance: one sharing the same `.apas` removes that machine's
-    /// entries from it under the project lock, so they are neither restored
-    /// nor shown again. A separate checkout's `.apas` holds none of them and
-    /// is left alone; if that machine ever returns, its instance reports its
-    /// own tabs again, because each instance is authoritative for its panes.
-    ForgetMachinePanes { session_id: Uuid, machine_id: Uuid },
-
     /// Start bot (deadloop) on a pane
     StartBot {
         session_id: Uuid,
@@ -924,8 +916,8 @@ pub enum ServerToCliScope {
     /// one that tags, persists and runs it.
     NewPane { machine_id: Option<Uuid> },
     /// Project-wide state that every instance must hold (policy, flags and
-    /// operations updates, roster requests, forgotten machines): fan it out to
-    /// every attached instance.
+    /// operations updates, roster requests): fan it out to every attached
+    /// instance.
     Project,
     /// Addressed to one instance process rather than to a pane (reboot,
     /// lifecycle, signals): deliver it to the machine the originating request
@@ -1011,7 +1003,6 @@ impl ServerToCli {
             | Self::UpdateProjectFlags { .. }
             | Self::UpdateProjectOperations { .. }
             | Self::ProjectPolicy { .. }
-            | Self::ForgetMachinePanes { .. }
             | Self::SessionDisconnected { .. } => Project,
 
             Self::Signal { .. } | Self::RebootCli { .. } | Self::CliLifecycleRequest { .. } => {
@@ -1349,7 +1340,9 @@ pub enum WebToServer {
         // Client-generated id for this send. The web client retransmits
         // inputs it hasn't seen acked (3s retry + reconnect replay); the
         // server uses this id to drop retransmits of an input it already
-        // stored instead of double-storing them.
+        // stored instead of double-storing them. A refusal can also be
+        // answered with a `MutationKind::Input` acknowledgement carrying it;
+        // see there.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         client_msg_id: Option<String>,
     },
@@ -1363,6 +1356,8 @@ pub enum WebToServer {
         session_id: Uuid,
         pane_id: u32,
         text: String,
+        // As on `Input`: echoed by `UserInput`, and carried by a
+        // `MutationKind::Input` acknowledgement of a refusal.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         client_msg_id: Option<String>,
     },
@@ -1546,8 +1541,26 @@ pub enum WebToServer {
     /// tabs cannot be closed one by one (their state lives on that machine),
     /// so this is the only way to clear them. Refused while `machine_id` has a
     /// running instance, which is authoritative for its own panes and would
-    /// report them again. Running instances receive
-    /// [`ServerToCli::ForgetMachinePanes`].
+    /// report them again, and while a CLI without
+    /// [`PROJECT_INSTANCES_CAPABILITY`] runs on its host, which may be that
+    /// machine under an older CLI.
+    ///
+    /// Only the server's roster changes. The panes tagged `machine_id` leave
+    /// it, and so do the untagged panes attributed to that machine's host.
+    /// Nothing is sent to any instance, and no CLI removes another machine's
+    /// entries from a `.apas`: on a shared home they stay in the file every
+    /// instance reads, as a separate checkout's stay in its own. The removed
+    /// ids are remembered for that machine rather than freed, across server
+    /// restarts too, so the server gives new tabs other ids while any other
+    /// is free. When that machine runs the project again it restores and
+    /// reports its tabs, and they come back with their ids; an untagged one
+    /// comes back with whichever instance reports it. That is what the
+    /// confirmation promises ("they come back if <host> runs this project
+    /// again"), on a shared home and on a separate checkout alike.
+    ///
+    /// Instances are deliberately not told. One sharing the `.apas` would
+    /// delete exactly the entries that machine restores from, and its tabs
+    /// could never come back.
     ForgetMachinePanes {
         session_id: Uuid,
         machine_id: Uuid,
@@ -1994,6 +2007,9 @@ pub enum ProjectAccessChange {
     Deleted,
 }
 
+/// What a [`ServerToWeb::MutationAck`] answers. Its `request_id` is the id the
+/// request carried: `request_id` on approvals, answers and interrupts, and
+/// `client_msg_id` on typed input.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum MutationKind {
@@ -2001,6 +2017,34 @@ pub enum MutationKind {
     Question,
     PlanReview,
     Interrupt,
+    /// The server refused a [`WebToServer::Input`] or
+    /// [`WebToServer::TerminalConversationInput`] that carried a
+    /// `client_msg_id`. The acknowledgement's `request_id` is that id, and its
+    /// `pane_id` the tab the input was for: the one it named, else the legacy
+    /// pane the server resolved it to. It is only ever a refusal: `accepted`
+    /// is false, `error` gives the reason and `question_pending` is absent.
+    /// Accepted input is acknowledged as before, by the
+    /// [`ServerToWeb::UserInput`] echo carrying the same `client_msg_id`, so a
+    /// client never waits for an accepted one.
+    ///
+    /// The server sends it when it refuses the input because of the tab's
+    /// machine: that machine is not running the project ("<host> is not
+    /// running this project. Start it on <host> first."), or the sender may
+    /// not use it. Resending changes neither answer, and a client that settles
+    /// sends by id would otherwise resend until it gave up with no reason to
+    /// show. The server may send one for any other refusal of such an input
+    /// too, so a client settles the send with `error` whatever the reason. A
+    /// refusal reported only as an `Error`, and every refusal from an older
+    /// server, leaves the send unanswered, as before.
+    ///
+    /// It goes only to the connection that sent the input, and only when that
+    /// connection negotiated [`PROJECT_INSTANCES_CAPABILITY`]. It comes in
+    /// addition to the [`ServerToWeb::Error`] carrying the same text, never
+    /// instead of it, so a client that shows that error, as the web does,
+    /// ignores this. The gate is what keeps older native builds connected:
+    /// their bundled schema lists only the four kinds above, and they drop
+    /// the socket on a frame it rejects.
+    Input,
 }
 
 /// Why a requested session attachment was rejected. The session id carried
@@ -2090,6 +2134,7 @@ pub enum ServerToWeb {
     /// Correlated acceptance or rejection for a time-sensitive coding
     /// mutation. `accepted` means the current authorized CLI accepted the
     /// operation for processing; clients never infer success from send().
+    /// A [`MutationKind::Input`] acknowledgement is only ever a rejection.
     MutationAck {
         request_id: String,
         session_id: Uuid,
@@ -5888,13 +5933,6 @@ mod project_instances_tests {
                 },
                 Project,
             ),
-            (
-                ServerToCli::ForgetMachinePanes {
-                    session_id: s,
-                    machine_id,
-                },
-                Project,
-            ),
             (ServerToCli::SessionDisconnected { session_id: s }, Project),
             (
                 ServerToCli::Signal {
@@ -6431,6 +6469,72 @@ mod project_instances_tests {
         }
     }
 
+    /// A refused input comes back as a rejection carrying the input's
+    /// `client_msg_id`, so a client that settles sends by id can show the
+    /// reason instead of resending. A client built before the kind existed
+    /// cannot read the frame at all, which is why only a connection that
+    /// negotiated instances receives it.
+    #[test]
+    fn a_refused_input_is_acknowledged_by_its_client_msg_id() {
+        let session_id = Uuid::new_v4();
+        let refusal = "zoo-005 is not running this project. Start it on zoo-005 first.";
+        let frame = serde_json::to_value(ServerToWeb::MutationAck {
+            request_id: "msg-1".into(),
+            session_id,
+            pane_id: Some(4),
+            mutation: MutationKind::Input,
+            accepted: false,
+            error: Some(refusal.into()),
+            question_pending: None,
+        })
+        .unwrap();
+        assert_eq!(frame["type"], "mutation_ack");
+        assert_eq!(frame["mutation"], "input");
+        assert!(frame.get("question_pending").is_none(), "{frame}");
+        match serde_json::from_value::<ServerToWeb>(frame.clone()).unwrap() {
+            ServerToWeb::MutationAck {
+                request_id,
+                session_id: got,
+                pane_id,
+                mutation,
+                accepted,
+                error,
+                question_pending,
+            } => {
+                assert_eq!(request_id, "msg-1");
+                assert_eq!(got, session_id);
+                assert_eq!(pane_id, Some(4));
+                assert_eq!(mutation, MutationKind::Input);
+                assert!(!accepted);
+                assert_eq!(error.as_deref(), Some(refusal));
+                assert_eq!(question_pending, None);
+            }
+            other => panic!("expected MutationAck, got {other:?}"),
+        }
+
+        // The kinds as clients predating this one declare them.
+        #[derive(Debug, Deserialize)]
+        #[serde(rename_all = "snake_case")]
+        enum OlderMutationKind {
+            Approval,
+            Question,
+            PlanReview,
+            Interrupt,
+        }
+        #[derive(Debug, Deserialize)]
+        struct OlderAck {
+            mutation: OlderMutationKind,
+        }
+        let older = |frame: serde_json::Value| {
+            serde_json::from_value::<OlderAck>(frame).map(|ack| ack.mutation)
+        };
+        assert!(older(frame).is_err());
+        assert!(matches!(
+            older(json!({ "mutation": "plan_review" })),
+            Ok(OlderMutationKind::PlanReview)
+        ));
+    }
+
     #[test]
     fn machine_entries_report_instance_support_and_canonical_remote() {
         let machine_id = Uuid::new_v4();
@@ -6589,8 +6693,12 @@ mod project_instances_tests {
         }
     }
 
+    /// Forgetting a machine's tabs is a request to the server's roster and
+    /// nothing else. There is no CLI-bound forget: an instance sharing the
+    /// `.apas` would delete exactly the entries the forgotten machine restores
+    /// from, and the tabs the confirmation promises back could never return.
     #[test]
-    fn forget_machine_panes_names_the_session_and_machine_on_both_hops() {
+    fn forget_machine_panes_is_a_roster_request_that_never_reaches_a_cli() {
         let session_id = Uuid::new_v4();
         let machine_id = Uuid::new_v4();
         let web = WebToServer::ForgetMachinePanes {
@@ -6598,7 +6706,8 @@ mod project_instances_tests {
             machine_id,
         };
         assert_eq!(wire_tag(&web), "forget_machine_panes");
-        match serde_json::from_value::<WebToServer>(serde_json::to_value(&web).unwrap()).unwrap() {
+        let frame = serde_json::to_value(&web).unwrap();
+        match serde_json::from_value::<WebToServer>(frame.clone()).unwrap() {
             WebToServer::ForgetMachinePanes {
                 session_id: s,
                 machine_id: m,
@@ -6607,20 +6716,14 @@ mod project_instances_tests {
             }
             other => panic!("expected ForgetMachinePanes, got {other:?}"),
         }
-        let cli = ServerToCli::ForgetMachinePanes {
-            session_id,
-            machine_id,
-        };
-        assert_eq!(wire_tag(&cli), "forget_machine_panes");
-        match serde_json::from_value::<ServerToCli>(serde_json::to_value(&cli).unwrap()).unwrap() {
-            ServerToCli::ForgetMachinePanes {
-                session_id: s,
-                machine_id: m,
-            } => {
-                assert_eq!((s, m), (session_id, machine_id))
-            }
-            other => panic!("expected ForgetMachinePanes, got {other:?}"),
-        }
+        assert!(
+            !every_server_to_cli_tag().contains("forget_machine_panes"),
+            "no ServerToCli message tells an instance to forget a machine"
+        );
+        assert!(
+            serde_json::from_value::<ServerToCli>(frame).is_err(),
+            "a CLI cannot read a forget as anything it acts on"
+        );
     }
 
     #[test]

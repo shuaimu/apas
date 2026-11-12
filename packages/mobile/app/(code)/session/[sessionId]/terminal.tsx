@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Alert, Keyboard, Linking, Pressable, ScrollView, StyleSheet, Text, View } from "react-native";
 import { useLocalSearchParams } from "expo-router";
 import * as Clipboard from "expo-clipboard";
@@ -15,7 +15,8 @@ import {
 import { ErrorNotice, Screen, StatusBadge } from "@/components/ui";
 import { connectionSupervisor } from "@/connection/runtime";
 import { useTheme } from "@/design/tokens";
-import { mutationsAllowed, useMobileStore } from "@/state/store";
+import { instancesForSession, tabUnavailableReason } from "@/state/projectInstances";
+import { mutationsAllowed, PROJECT_INSTANCES_CAPABILITY, useMobileStore } from "@/state/store";
 import { subscribeTerminalMessages } from "@/terminal/events";
 import { encodeTerminalInput } from "@/terminal/input";
 
@@ -32,6 +33,24 @@ export default function TerminalScreen() {
   const connection = useMobileStore((state) => state.connection);
   const terminalEnabled = useMobileStore((state) => Boolean(state.features.terminal));
   const sessionAccessible = useMobileStore((state) => state.sessions.some((session) => session.id === sessionId));
+  const session = useMobileStore((state) => state.sessions.find((item) => item.id === sessionId));
+  // Undefined until a live roster arrives; the bootstrap's pane detail stands
+  // in until then, as on the activity screen.
+  const livePanes = useMobileStore((state) => state.panesBySession[sessionId]);
+  const liveInstances = useMobileStore((state) => state.instancesBySession[sessionId]);
+  const instancesSupported = useMobileStore((state) => state.negotiatedCapabilities.includes(PROJECT_INSTANCES_CAPABILITY));
+  // Whether this tab's machine runs the project and this viewer may use it,
+  // judged as the activity screen judges it. The retained screen still
+  // attaches and reads, but keys and sizes would each come back refused, and
+  // an error frame shows nothing here.
+  const unavailableReason = useMemo(() => {
+    const pane = (livePanes ?? session?.panes)?.find((candidate) => candidate.pane_id === paneId);
+    return tabUnavailableReason(pane, instancesForSession(session, liveInstances), instancesSupported && Boolean(session?.is_active));
+  }, [instancesSupported, liveInstances, livePanes, paneId, session]);
+  // The size the terminal last asked for, and whether it was held back while
+  // the tab could not take it: then it is sent once the tab can.
+  const lastSize = useRef<{ cols: number; rows: number } | null>(null);
+  const sizeHeld = useRef(false);
   const [ready, setReady] = useState(false);
   const [lifecycle, setLifecycle] = useState<TerminalReconciliationState["lifecycle"]>("unknown");
   const [status, setStatus] = useState<string | null>(null);
@@ -91,8 +110,26 @@ export default function TerminalScreen() {
     if (resizeTimer.current) clearTimeout(resizeTimer.current);
   }, []);
 
+  useEffect(() => {
+    // A size still waiting to go out when the tab stops taking input is held
+    // with the rest, not sent.
+    if (unavailableReason) {
+      if (resizeTimer.current) {
+        clearTimeout(resizeTimer.current);
+        resizeTimer.current = null;
+        sizeHeld.current = true;
+      }
+      return;
+    }
+    // Usable again: the pty never heard the size held back meanwhile.
+    const size = lastSize.current;
+    if (!sizeHeld.current || !size || !ready || lifecycle !== "running" || !mutationsAllowed() || !validPane || !sessionAccessible) return;
+    sizeHeld.current = false;
+    connectionSupervisor()?.send({ type: "terminal_resize", session_id: sessionId, pane_id: paneId, cols: size.cols, rows: size.rows });
+  }, [lifecycle, paneId, ready, sessionAccessible, sessionId, unavailableReason, validPane]);
+
   const sendInput = (value: string) => {
-    if (!ready || lifecycle !== "running" || !mutationsAllowed() || !validPane) return;
+    if (!ready || lifecycle !== "running" || !mutationsAllowed() || !validPane || unavailableReason) return;
     connectionSupervisor()?.send({ type: "terminal_input", session_id: sessionId, pane_id: paneId, data_b64: encodeTerminalInput(value) });
   };
 
@@ -136,6 +173,11 @@ export default function TerminalScreen() {
       attach();
     } else if (message.type === "input") sendInput(message.data);
     else if (message.type === "resize") {
+      lastSize.current = { cols: message.cols, rows: message.rows };
+      if (unavailableReason) {
+        sizeHeld.current = true;
+        return;
+      }
       if (!ready || lifecycle !== "running" || !mutationsAllowed() || !sessionAccessible) return;
       if (resizeTimer.current) clearTimeout(resizeTimer.current);
       resizeTimer.current = setTimeout(() => {
@@ -149,11 +191,12 @@ export default function TerminalScreen() {
   if (!validPane) return <Screen><ErrorNotice message="Choose an exact terminal pane from the activity screen before attaching." /></Screen>;
   const visibleLifecycle = sessionAccessible ? lifecycle : "unknown";
   const visibleStatus = sessionAccessible ? status : null;
-  const inputReady = ready && visibleLifecycle === "running" && mutationsAllowed() && sessionAccessible;
+  const inputReady = ready && visibleLifecycle === "running" && mutationsAllowed() && sessionAccessible && !unavailableReason;
   return (
     <Screen>
       <View style={[styles.statusBar, { backgroundColor: theme.terminal }]}><Text style={styles.title}>Pane {paneId}</Text><StatusBadge label={visibleLifecycle} tone={visibleLifecycle === "running" ? "success" : visibleLifecycle === "exited" ? "danger" : "warning"} />{visibleStatus ? <Text numberOfLines={1} style={styles.status}>{visibleStatus}</Text> : null}</View>
       {!terminalEnabled ? <ErrorNotice message="Mobile terminal access is disabled by the cluster administrator." /> : null}
+      {unavailableReason ? <ErrorNotice message={unavailableReason} /> : null}
       <WebView
         ref={webView}
         source={{ html: terminalHtml, baseUrl: "about:blank" }}

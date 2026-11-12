@@ -399,6 +399,11 @@ impl FileStorage {
     /// Persist pane configurations for a session so inactive sessions can
     /// restore tabs after restart. Each pane keeps its machine tag and
     /// attributed host, so a stopped instance's tabs come back with their host.
+    ///
+    /// Only tests write a given roster. The server saves through
+    /// [`Self::save_pane_roster_latest`]: a roster copied before the write
+    /// can predate another machine's report and would replace it.
+    #[cfg(test)]
     pub async fn save_pane_list(
         &self,
         session_id: &Uuid,
@@ -414,7 +419,8 @@ impl FileStorage {
     /// concurrently the last write holds the latest roster rather than
     /// whichever report's copy happened to finish last. `None` writes nothing
     /// and returns false: the session is gone, and writing would recreate its
-    /// directory.
+    /// directory, or its roster is not loaded, and writing would replace the
+    /// file with part of it.
     pub async fn save_pane_roster_latest<F>(&self, session_id: &Uuid, snapshot: F) -> Result<bool>
     where
         F: FnOnce() -> Option<Vec<shared::PaneConfig>>,
@@ -426,6 +432,23 @@ impl FileStorage {
         };
         self.write_pane_roster(session_id, &panes).await?;
         Ok(true)
+    }
+
+    /// Move a `panes.json` that does not parse out of the way, keeping its
+    /// bytes beside it for an operator, and return where it went. Such a file
+    /// never becomes readable, and while it is there the roster is never
+    /// saved. Taken under the roster lock, like every write of the file.
+    pub async fn set_aside_pane_roster(&self, session_id: &Uuid) -> Result<PathBuf> {
+        let lock = self.roster_lock(session_id);
+        let _guard = lock.lock().await;
+        let file_path = self.panes_file(session_id);
+        let millis = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_millis())
+            .unwrap_or_default();
+        let aside = file_path.with_file_name(format!("panes.json.unreadable-{millis}"));
+        fs::rename(&file_path, &aside).await?;
+        Ok(aside)
     }
 
     /// Persist the forgotten pane ids `snapshot` returns, taken under the

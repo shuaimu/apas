@@ -16,6 +16,9 @@ const PROJECT_INSTANCE_FRAMES = [
   "server-cli-lifecycle-status-instance.json",
   "server-add-pane-starting.json",
   "server-add-pane-failed.json",
+  // Sent only to a connection that negotiated project instances; an older
+  // bundled schema, without the "input" kind, would drop the socket.
+  "server-mutation-ack-input.json",
 ];
 
 function fixture(name: string): ServerToWeb {
@@ -233,6 +236,40 @@ describe("ConnectionSupervisor", () => {
       error: "already resolved",
     });
     await expect(acknowledged).rejects.toThrow("already resolved");
+  });
+
+  it("settles typed input the server refused with the server's reason, not a retry", async () => {
+    const socket = new FakeSocket();
+    const supervisor = new ConnectionSupervisor({
+      createSocket: () => socket,
+      accessToken: async () => "access",
+      bootstrap: async () => emptyBootstrap,
+      persistBootstrap: async () => undefined,
+      setPhase: jest.fn(),
+      setMutationsAllowed: jest.fn(),
+      applyBootstrap: jest.fn(),
+    });
+    supervisor.start();
+    socket.open();
+    await Promise.resolve();
+    const refusal = fixture("server-mutation-ack-input.json");
+    if (refusal.type !== "mutation_ack") throw new Error("unexpected fixture");
+    // Accepted input is acknowledged by its user_input echo; a refusal by a
+    // mutation_ack carrying the input's client_msg_id.
+    const acknowledged = supervisor.sendAcknowledged({
+      type: "input",
+      session_id: refusal.session_id,
+      pane_id: refusal.pane_id,
+      text: "Run the suite.",
+      client_msg_id: refusal.request_id,
+    }, refusal.request_id);
+    const sends = socket.sent.length;
+    socket.receive(refusal);
+    await expect(acknowledged).rejects.toThrow(refusal.error!);
+    // Settled: the timer that would resend it is gone with it.
+    jest.advanceTimersByTime(10_000);
+    expect(socket.sent).toHaveLength(sends);
+    expect(socket.closed).toBe(false);
   });
 
   it("drops a silent socket after the heartbeat response deadline", async () => {

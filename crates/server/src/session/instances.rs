@@ -12,7 +12,7 @@ use super::{
     SessionState, PENDING_PANE_REBOOT_TTL,
 };
 use shared::{
-    PaneConfig, ServerToCli, ServerToCliScope, ServerToWeb, SessionInstanceInfo,
+    PaneConfig, PaneType, ServerToCli, ServerToCliScope, ServerToWeb, SessionInstanceInfo,
     PANE_ID_INTERACTIVE, PROJECT_INSTANCES_CAPABILITY,
 };
 use std::collections::{HashMap, HashSet};
@@ -315,6 +315,9 @@ struct LockedDetach {
     was_primary: bool,
     primary: Option<InstanceAttachment>,
     departing: DepartingPanes,
+    /// The panes whose cached status the detach dropped, which viewers are
+    /// told are no longer busy.
+    cleared_statuses: Vec<(u32, PaneType)>,
 }
 
 impl SessionState {
@@ -343,14 +346,21 @@ impl SessionState {
         // A status for a pane the roster does not list has no owner left to
         // clear it, so it goes too.
         let listed: HashSet<u32> = self.panes.iter().map(|pane| pane.pane_id).collect();
-        self.pane_statuses
-            .retain(|pane_id, _| listed.contains(pane_id) && !departing.touches(*pane_id));
+        let mut cleared_statuses = Vec::new();
+        self.pane_statuses.retain(|pane_id, (pane_type, _)| {
+            let keep = listed.contains(pane_id) && !departing.touches(*pane_id);
+            if !keep {
+                cleared_statuses.push((*pane_id, *pane_type));
+            }
+            keep
+        });
         self.sync_primary();
         LockedDetach {
             instance,
             was_primary: index == 0,
             primary: self.instances.first().cloned(),
             departing,
+            cleared_statuses,
         }
     }
 }
@@ -643,6 +653,7 @@ impl SessionManager {
             was_primary,
             primary,
             departing,
+            cleared_statuses,
         } = locked;
         if let Some(mut tracked) = self.cli_sessions.get_mut(&instance.cli_id) {
             tracked.retain(|tracked_session| tracked_session != session_id);
@@ -673,6 +684,21 @@ impl SessionManager {
                     lifecycle: terminal.lifecycle,
                     status: terminal.status,
                     runtime: terminal.runtime,
+                },
+            );
+        }
+        // Viewers keep each pane's last status until told otherwise. While
+        // another machine keeps the session active nothing else clears the
+        // departing machine's: a native client, which never re-reads
+        // statuses, would show its tabs Working or Pending answer for good.
+        for (pane_id, pane_type) in cleared_statuses {
+            self.route_to_web_now(
+                session_id,
+                ServerToWeb::PaneStatus {
+                    session_id: *session_id,
+                    pane_type,
+                    pane_id: Some(pane_id),
+                    status: None,
                 },
             );
         }
@@ -957,7 +983,8 @@ impl SessionManager {
     /// an older CLI no machine and its hostname as the attributed host. See
     /// [`PaneConfig::machine_id`]. Existing panes keep their places and
     /// web-set labels, new ones are appended, and only the reporter's removed
-    /// panes lose their status.
+    /// panes lose their status. The result seeds the roster unless
+    /// `panes.json` could not be read; see [`SessionState::roster_unreadable`].
     pub fn merge_instance_roster(
         &self,
         session_id: &Uuid,
@@ -1087,7 +1114,12 @@ impl SessionManager {
                 }
             }
             session.panes = merged.clone();
-            session.roster_seeded = true;
+            // Merged into nothing because `panes.json` could not be read, the
+            // roster lacks whatever the file holds: shown, but not seeded, so
+            // it is not saved over the file and the next load reads it again.
+            if !session.roster_unreadable {
+                session.roster_seeded = true;
+            }
             (merged, finished_reboots, foreign)
         };
 
@@ -1165,7 +1197,8 @@ impl SessionManager {
     }
 
     /// Whether the in-memory roster holds the project's roster yet: seeded
-    /// from `panes.json`, reported by an instance, or set by a web change.
+    /// from `panes.json`, reported by an instance, or set by a web change. A
+    /// report merged while `panes.json` could not be read does not seed it.
     pub fn pane_roster_seeded(&self, session_id: &Uuid) -> bool {
         self.sessions
             .get(session_id)
@@ -1177,6 +1210,13 @@ impl SessionManager {
     /// instance's report must merge into the persisted roster rather than an
     /// empty one, or every stopped machine's tabs would vanish; and a late
     /// seed must not overwrite a report that merged first.
+    ///
+    /// Reports merged while `panes.json` could not be read are cached but
+    /// never seeded the roster. They are the latest word on the panes they
+    /// list, so those replace the stored entries with their ids and the rest
+    /// are appended; stored entries they do not list, a stopped machine's
+    /// among them, stay. A pane such a report had dropped is back until its
+    /// instance reports again, which the caller asks every instance to do.
     pub fn hydrate_pane_roster(
         &self,
         session_id: &Uuid,
@@ -1186,9 +1226,63 @@ impl SessionManager {
             return stored;
         };
         if !session.roster_seeded {
-            session.replace_roster(stored);
+            let mut roster = stored;
+            for reported in std::mem::take(&mut session.panes) {
+                match roster
+                    .iter_mut()
+                    .find(|pane| pane.pane_id == reported.pane_id)
+                {
+                    Some(pane) => *pane = reported,
+                    None => roster.push(reported),
+                }
+            }
+            session.replace_roster(roster);
         }
         session.panes.clone()
+    }
+
+    /// Whether the last read of the session's `panes.json` failed, with none
+    /// succeeding since; see [`SessionState::roster_unreadable`].
+    pub fn pane_roster_unreadable(&self, session_id: &Uuid) -> bool {
+        self.sessions
+            .get(session_id)
+            .is_some_and(|session| session.roster_unreadable)
+    }
+
+    /// Record that `panes.json` could not be read, so reports merge without
+    /// seeding the roster and nothing saves over the file. A roster seeded
+    /// meanwhile, by a read that succeeded, no longer depends on the file and
+    /// is left alone.
+    pub fn mark_pane_roster_unreadable(&self, session_id: &Uuid) {
+        if let Some(mut session) = self.sessions.get_mut(session_id) {
+            if !session.roster_seeded {
+                session.roster_unreadable = true;
+            }
+        }
+    }
+
+    /// `panes.json` is gone, or was moved aside: nothing is left to protect,
+    /// and the next report seeds the roster.
+    pub fn clear_pane_roster_unreadable(&self, session_id: &Uuid) {
+        if let Some(mut session) = self.sessions.get_mut(session_id) {
+            session.roster_unreadable = false;
+        }
+    }
+
+    /// Seed the roster with panes inferred from message history, for a session
+    /// that never saved one, and only while nothing else has set it: a report
+    /// merged since the roster was found missing is the truth, and while
+    /// `panes.json` is unreadable a guess must not become the roster saved
+    /// over it. Returns whether it seeded.
+    pub fn seed_inferred_pane_roster(&self, session_id: &Uuid, inferred: Vec<PaneConfig>) -> bool {
+        let Some(mut session) = self.sessions.get_mut(session_id) else {
+            return false;
+        };
+        if session.roster_seeded || session.roster_unreadable || !session.panes.is_empty() {
+            return false;
+        }
+        session.replace_roster(inferred);
+        true
     }
 
     /// Attribute every untagged pane that has no host to `host`, the session's
@@ -1452,6 +1546,52 @@ mod tests {
         assert!(instances.iter().all(|instance| instance.runtime_access.is_none()));
     }
 
+    /// After a restart a project's session is not in memory, and its first
+    /// instance and its first viewer can arrive at the same moment. Whichever
+    /// creates the session, the other joins it: the viewer never replaces the
+    /// session the instance attached to, which nothing would attach again.
+    /// Both run on their own threads from a shared barrier, many times over,
+    /// since the two only collide when they interleave.
+    #[test]
+    fn a_viewer_attaching_alongside_the_first_instance_keeps_it_attached() {
+        let manager = SessionManager::new();
+        let user = Uuid::new_v4();
+        let a = cli(&manager, user, true);
+        let cli_id = a.id;
+        let machine = Uuid::new_v4();
+        let web = Uuid::new_v4();
+        let sessions: Vec<Uuid> = (0..10_000).map(|_| Uuid::new_v4()).collect();
+        let barrier = std::sync::Barrier::new(2);
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                for session in &sessions {
+                    barrier.wait();
+                    attached(manager.attach_cli_instance(
+                        *session,
+                        cli_id,
+                        Some(machine),
+                        Some(format!("/work/{HOST_A}")),
+                        Some(HOST_A.to_string()),
+                    ));
+                }
+            });
+            scope.spawn(|| {
+                for session in &sessions {
+                    barrier.wait();
+                    assert!(manager.attach_web_to_session(session, web, None));
+                }
+            });
+        });
+        let lost: Vec<&Uuid> = sessions
+            .iter()
+            .filter(|session| manager.instance_for_cli(session, &a.id).is_none())
+            .collect();
+        assert!(lost.is_empty(), "{} sessions lost their instance", lost.len());
+        assert!(sessions
+            .iter()
+            .all(|session| manager.is_web_attached_to_session(session, &web)));
+    }
+
     /// A reconnect replaces only its own machine's attachment, in place, so
     /// a primary that reconnects stays primary, and the replaced socket's
     /// late disconnect detaches nothing.
@@ -1653,8 +1793,9 @@ mod tests {
     }
 
     /// One machine's instance leaving disconnects only its own terminals and
-    /// clears only its own statuses; the session stays active under the next
-    /// primary, and only the last instance leaving makes it inactive.
+    /// clears only its own statuses, telling viewers so; the session stays
+    /// active under the next primary, and only the last instance leaving
+    /// makes it inactive.
     #[test]
     fn a_departing_instance_touches_only_its_own_tabs_and_hands_over_the_primary() {
         let manager = SessionManager::new();
@@ -1708,6 +1849,19 @@ mod tests {
             )),
             "{seen:?}"
         );
+        // The session stays active, so nothing else would clear the departed
+        // machine's Working indicator in a viewer that keeps statuses.
+        let status_updates = |seen: &[ServerToWeb]| {
+            seen.iter()
+                .filter_map(|message| match message {
+                    ServerToWeb::PaneStatus { pane_id, status, .. } => {
+                        Some((*pane_id, status.clone()))
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(status_updates(&seen), vec![(Some(3), None)]);
 
         let detached = manager.detach_cli_instance(&session, &b.id).unwrap();
         assert!(detached.was_primary);
@@ -1719,10 +1873,12 @@ mod tests {
         let state = manager.get_session(&session).unwrap();
         assert_eq!(state.cli_client_id, None);
         assert_eq!(state.hostname.as_deref(), Some(HOST_B), "the last host stays described");
-        assert!(drain(&mut web_rx).iter().any(|message| matches!(
+        let seen = drain(&mut web_rx);
+        assert!(seen.iter().any(|message| matches!(
             message,
             ServerToWeb::SessionAttached { has_active_cli: false, .. }
         )));
+        assert_eq!(status_updates(&seen), vec![(Some(4), None)]);
     }
 
     /// The same machine can reconnect between a departing instance leaving

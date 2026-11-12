@@ -79,4 +79,25 @@ describe("MobileCodeHome across machines", () => {
     expect(screen.getByText("zoo-005")).toBeTruthy();
     expect(screen.queryByText(/\+\d/)).toBeNull();
   });
+
+  it("does not list a stopped machine's agents as idle while another machine runs the project", () => {
+    // zoo-006 stopped; zoo-005 keeps the project active, and the server still
+    // reports zoo-006's panes as not working.
+    const session: SessionInfo = {
+      ...live,
+      instances: [live.instances![0]],
+      panes: [
+        { pane_id: 1, label: "Claude 1", kind: "terminal", provider: "claude", is_working: false, machine_id: ZOO5, hostname: "zoo-005" },
+        { pane_id: 3, label: "Claude 3", kind: "terminal", provider: "claude", is_working: false, machine_id: ZOO6, hostname: "zoo-006" },
+      ],
+    };
+    render(<MobileCodeHome {...props({ legacySessions: [session], selectedView: "idle" })} />);
+    expect(screen.getByRole("button", { name: "Open Claude 1 in alpha" })).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Open Claude 3 in alpha" })).toBeNull();
+
+    cleanup();
+    render(<MobileCodeHome {...props({ legacySessions: [session] })} />);
+    expect(screen.getByRole("img", { name: "Claude 1: Idle" })).toBeTruthy();
+    expect(screen.getByRole("img", { name: "Claude 3: Not running on zoo-006" })).toBeTruthy();
+  });
 });

@@ -1,3 +1,5 @@
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
 import { describe, expect, it } from "vitest";
 import type { AddPaneRequest, CliLifecycleInventory, MachineWithProjects, PaneConfig } from "./store";
 import { LEGACY_MACHINE_KEY, type SessionInstance } from "./projectInstances";
@@ -129,6 +131,107 @@ describe("describeTabHosts", () => {
     const foreign = hosts({ ...base, machines: [machine(ZOO5, "zoo-005")] });
     expect(foreign.tabs.get(2)?.refusal).toBe(stoppedOnHostReason("zoo-006"));
     expect(foreign.tabs.get(2)?.stopped).toMatchObject({ canStart: false, canForget: true });
+  });
+
+  it("offers no Start beside an attached CLI without multi-machine support, as the new-tab picker", () => {
+    // zoo-005's daemon is connected but older, so its instance owns the whole
+    // project: the server would refuse zoo-006's instance beside it.
+    const panes = [pane(1, ZOO5, "zoo-005"), pane(2, ZOO6, "zoo-006")];
+    const machines = [machine(ZOO5, "zoo-005", { projectInstancesAvailable: false }), machine(ZOO6, "zoo-006")];
+    const instances = [instance(ZOO5, "zoo-005", { primary: true })];
+    const result = hosts({ panes, instances, machines });
+    expect(result.tabs.get(2)).toMatchObject({ state: "stopped", refusal: stoppedOnHostReason("zoo-006") });
+    expect(result.tabs.get(2)?.stopped).toMatchObject({
+      canStart: true,
+      projectId: PROJECT,
+      startDisabledReason: "Reboot zoo-005 to update",
+    });
+    // The same machine in the new-tab picker, for the same reason.
+    const picker = buildMachineChoices({
+      projectId: PROJECT,
+      instances,
+      machines,
+      instancesSupported: true,
+      canClone: false,
+    });
+    expect(picker.choices.find((choice) => choice.machineId === ZOO6)?.disabledReason)
+      .toBe(result.tabs.get(2)?.stopped?.startDisabledReason);
+
+    // A sole CLI that reported no machine is older by definition.
+    const machineless = hosts({
+      panes,
+      instances: [instance(undefined, "zoo-005", { primary: true })],
+      machines: [machine(ZOO5, "zoo-005"), machine(ZOO6, "zoo-006")],
+    });
+    expect(machineless.tabs.get(2)?.stopped?.startDisabledReason).toBe("Reboot zoo-005 to update");
+  });
+
+  it("calls a machine that still runs the project disconnected, with nothing to start", () => {
+    // zoo-006's instance lost its socket; its daemon is connected and still
+    // reports the project running, so the tabs come back by themselves.
+    const panes = [pane(1, ZOO5, "zoo-005"), pane(2, ZOO6, "zoo-006"), pane(3, null, "zoo-006")];
+    const instances = [instance(ZOO5, "zoo-005", { primary: true })];
+    const running = (machineId: string, hostname: string) => machine(machineId, hostname, {
+      projects: [{ projectId: PROJECT, path: "/work/project", isRunning: true }],
+    });
+    const result = hosts({ panes, instances, machines: [running(ZOO5, "zoo-005"), running(ZOO6, "zoo-006")] });
+    for (const id of [2, 3]) {
+      const tab = result.tabs.get(id);
+      expect(tab).toMatchObject({
+        hostname: "zoo-006",
+        machineId: ZOO6,
+        state: "disconnected",
+        badge: true,
+        refusal: "zoo-006 is reconnecting to this project. Its tabs work again once it reconnects.",
+      });
+      // A running project has nothing to start. Its tabs can still be
+      // forgotten: a daemon that dropped silently reads this way for hours.
+      expect(tab?.stopped).toEqual({
+        machineId: ZOO6,
+        hostname: "zoo-006",
+        projectId: undefined,
+        startDisabledReason: undefined,
+        canStart: false,
+        canForget: true,
+      });
+    }
+    expect(result.tabs.get(1)?.state).toBe("running");
+
+    // Once the daemon reports it stopped, it is stopped, with Start.
+    const stopped = hosts({ panes, instances, machines: [running(ZOO5, "zoo-005"), machine(ZOO6, "zoo-006")] });
+    expect(stopped.tabs.get(2)?.state).toBe("stopped");
+    expect(stopped.tabs.get(2)?.stopped?.canStart).toBe(true);
+
+    // A running entry under another project's id says nothing about this one.
+    const otherProject = hosts({
+      panes,
+      instances,
+      machines: [running(ZOO5, "zoo-005"), machine(ZOO6, "zoo-006", {
+        projects: [{ projectId: "30000000-0000-4000-8000-000000000999", path: "/work/other", isRunning: true }],
+      })],
+    });
+    expect(otherProject.tabs.get(2)?.state).toBe("stopped");
+
+    // A daemon that is gone is offline whatever it last reported.
+    const offline = hosts({
+      panes,
+      instances,
+      machines: [running(ZOO5, "zoo-005"), machine(ZOO6, "zoo-006", {
+        daemonConnected: false,
+        projects: [{ projectId: PROJECT, path: "/work/project", isRunning: true }],
+      })],
+    });
+    expect(offline.tabs.get(2)?.state).toBe("offline");
+  });
+
+  it("refuses a stopped machine's tab in the words of the protocol's own refusal", () => {
+    // The golden frame for typed input refused because its tab's machine is
+    // not running the project: the disabled control and that refusal agree.
+    const refusal = JSON.parse(readFileSync(
+      resolve(__dirname, "../../../protocol/fixtures/server-mutation-ack-input.json"),
+      "utf8",
+    )) as { error: string };
+    expect(stoppedOnHostReason("zoo-005")).toBe(refusal.error);
   });
 
   it("lets only the owner forget a machine's tabs", () => {

@@ -23,6 +23,7 @@ import {
 } from "@/lib/projectList";
 import { useProjectOrder } from "@/lib/useProjectOrder";
 import { projectHostLabel } from "@/lib/tabHosts";
+import { paneNotRunning } from "@/lib/projectInstances";
 
 // Truncate path in the middle to preserve the folder name at the end
 // e.g., "/home/shuai/workspace/long-project" -> "/home/.../long-project"
@@ -165,7 +166,9 @@ export function Sidebar({ onClose, onCollapse, width }: SidebarProps) {
       .filter((session) => session.isActive)
       .flatMap((session) =>
         (session.panes ?? [])
-          .filter((pane) => !pane.is_working)
+          // Nor are a stopped machine's, while another machine keeps the
+          // project active.
+          .filter((pane) => !pane.is_working && !paneNotRunning(pane, session.instances, machines))
           .map((pane) => ({
             session,
             pane,
@@ -173,7 +176,7 @@ export function Sidebar({ onClose, onCollapse, width }: SidebarProps) {
             usageLimit: paneUsageLimit(session, pane, usageLimits, availabilityNow),
           })),
       ),
-    [availabilityNow, sessions, usageLimits],
+    [availabilityNow, machines, sessions, usageLimits],
   );
   const pendingAgents = useMemo(
     () => waitingAgents.filter((agent) => agent.awaitingAnswer),
@@ -932,7 +935,7 @@ export function Sidebar({ onClose, onCollapse, width }: SidebarProps) {
                             ? new Date(project.createdAt).toLocaleDateString()
                             : ""}
                       </span>
-                      {project.sessionId !== null && <PaneStatusDots panes={project.panes} isActive={project.isActive} />}
+                      {project.sessionId !== null && <PaneStatusDots panes={project.panes} isActive={project.isActive} instances={project.instances} machines={machines} />}
                     </div>
                     {project.sessionId === null && (
                       <Link

@@ -1,6 +1,6 @@
 use shared::{
-    AddPaneStatus, CodeEvent, JobApiError, JobEventsResponse, JobMutationReceipt, ServerToWeb,
-    WebToServer,
+    AddPaneStatus, CodeEvent, JobApiError, JobEventsResponse, JobMutationReceipt, MutationKind,
+    ServerToWeb, WebToServer,
 };
 use std::path::PathBuf;
 
@@ -192,6 +192,23 @@ fn multi_machine_fixtures_populate_the_new_fields() {
             assert!(machines[0].project_instances_available);
             assert!(machines[0].daemon_connected);
             assert!(machines[0].projects[0].git_remote.is_some());
+        }
+        other => panic!("unexpected {other:?}"),
+    }
+    match server("server-mutation-ack-input.json") {
+        ServerToWeb::MutationAck {
+            request_id,
+            mutation,
+            accepted,
+            error,
+            question_pending,
+            ..
+        } => {
+            assert_eq!(mutation, MutationKind::Input);
+            assert_eq!(request_id, "msg-1");
+            assert!(!accepted);
+            assert!(error.is_some());
+            assert_eq!(question_pending, None);
         }
         other => panic!("unexpected {other:?}"),
     }

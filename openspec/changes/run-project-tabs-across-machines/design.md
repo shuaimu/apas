@@ -158,7 +158,23 @@ capable instance M reports its roster:
   stopped instances' tabs survive a server restart and render with their host.
 
 A CLI without the capability is only ever the session's sole instance
-(Decision 5), so its report still replaces the whole roster, as today.
+(Decision 5), and nothing it reports is tagged. Its report:
+
+- takes each pane it reports in place of that id's entry, untagged and
+  attributed to its host, whatever the entry's tag: on a shared home such a
+  CLI restores and runs every pane in the `.apas`, as before instances;
+- removes the untagged panes it did not report, and the panes tagged with its
+  own machine (the one its `SessionStart` named, if any) that it did not
+  report;
+- keeps every pane tagged for another machine that it did not report, listed
+  as stopped on that machine with its id still allocated.
+
+The last rule is for a separate checkout, whose tabs such a CLI cannot see.
+An earlier draft let this report replace the whole roster, as before
+instances. That erased a stopped checkout's tabs, leaving nothing to start or
+forget until that machine ran the project again, and freed their ids for
+another pane. The binding statement is the `PaneConfig::machine_id` doc
+comment.
 
 **Untagged panes.** A pane with `machine_id` None was written before
 multi-machine instances. Ownership is only ever established by an instance
@@ -178,24 +194,50 @@ instance reports.
 
 A pane-scoped control or close for an untagged pane is routed:
 
-1. to the attached instance whose hostname equals the attributed host, if any;
-2. else to the sole attached instance if it is a CLI without the capability
-   (it owns the whole roster);
+1. to the attached instance whose hostname equals the attributed host, if any
+   (the earliest attached, should two share that name);
+2. else to the sole attached instance if it is a CLI without the capability,
+   which runs every untagged pane, as before instances;
 3. else, if the pane has no attributed host, to the primary as a fallback;
 4. otherwise it is refused as stopped on the attributed host: "<host> is not
    running this project. Start it on <host> first."
 
-The "primary as a fallback" in the `PaneConfig::machine_id` and
-`ServerToCliScope::Pane` doc comments is step 3: it applies to a pane with no
-attributed host, and to a pane the roster does not list.
+A tagged pane is never routed this way. Its controls go only to the instance
+on its machine, even while a CLI without the capability is the sole instance:
+that CLI reports every pane it runs untagged, so a tab still tagged for
+another machine is one it does not run, such as a separate checkout's. With no
+instance on that machine they are refused as stopped there. The "primary as a
+fallback" in the `ServerToCliScope::Pane` doc comment covers a pane with no
+attributed host (step 3) and a pane the roster does not list. With no instance
+attached at all, nothing is refused as stopped: a control fails as it always
+has.
 
 Forget: `ForgetMachinePanes { X }` removes panes tagged X and untagged panes
-whose attributed host equals X's hostname, from the server roster only.
-Instances sharing the `.apas` remove only entries tagged X (the CLI keys on the
-tag). Untagged entries left in a `.apas` can come back when an instance adopts
-them, and a forgotten machine's tabs come back if that machine runs the
-project again, so UI copy must say the tabs "come back if <host> runs this
-project again", never promise permanent deletion.
+whose attributed host equals X's hostname, from the server roster only. No
+instance is told and no `.apas` changes: an instance sharing the file would
+delete exactly the entries X restores its tabs from, so they could never come
+back. The removed ids are remembered for X rather than freed, across server
+restarts, in `sessions/<id>/forgotten-panes.json` beside `panes.json` (whose
+shape older servers read, so it does not change). New tabs get other ids while
+any other is free, because a newer tab holding one of those ids would make X's
+returning tab look like another machine's pane, and the merge would drop it.
+When X runs the project again it restores and reports its tabs, which come
+back with their ids; an untagged one comes back with whichever instance
+reports it. Either way the id stops being remembered. So UI copy must say the
+tabs "come back if <host> runs this project again", never promise permanent
+deletion.
+
+**Closing an untagged pane.** A capable instance reports every pane it runs
+tagged, so an untagged entry routed to it, by attributed host or to the
+primary as a fallback, is one it does not have: a stale entry persisted before
+instances, a pane inferred from history, or one closed before the instance's
+first report. Its report leaves untagged entries alone, as it must for other
+hosts' tabs, so nothing would ever remove such a tab. Once a close for it is
+delivered to a capable instance, the server therefore drops the entry with its
+status, retained terminal, in-flight reboot and pending decisions, and
+remembers its id as it does a forgotten one: an untagged entry left in some
+`.apas` comes back when an instance adopts it. If the instance did run the
+pane after all, the close it received ends it there too.
 
 For display an untagged pane is shown under its attributed host, with no host
 badge when it has none. For an `all_instances` Start (Decision 9), an untagged
@@ -224,15 +266,18 @@ against the variants read from the type's schema. `route_to_cli` routes by it:
   `PauseDeadloop`/`ResumeDeadloop` name no pane, but the CLI applies them only
   to `PANE_ID_DEADLOOP`, so they are `Pane(PANE_ID_DEADLOOP)`; sent to the
   primary they would act on a pane another machine may own. A pane tagged for
-  a machine with no attachment is refused as stopped (Decision 9). An untagged
-  pane, or one the roster does not list, follows the routing in Decision 2.
+  a machine with no attachment is refused as stopped (Decision 9), even while
+  a CLI without the capability is the sole instance. An untagged pane, or one
+  the roster does not list, follows the routing in Decision 2.
 - **`NewPane { machine_id }`**: `AddPane` goes to the instance on the
   `machine_id` the server assigned to the new pane's config, or to the primary
   when that is `None` (Decision 9). It carries the machine because the
   instance that receives the pane is the one that tags, persists and runs it.
 - **`Project`**: every attached instance. `ProjectPolicy`,
-  `UpdateProjectFlags`, `UpdateProjectOperations`, `RequestPaneList`,
-  `ForgetMachinePanes`, and `SessionDisconnected`, which is never sent today.
+  `UpdateProjectFlags`, `UpdateProjectOperations`, `RequestPaneList`, and
+  `SessionDisconnected`, which is never sent today. There is no CLI-bound
+  forget: forgetting a machine's tabs changes only the server roster
+  (Decision 2).
 - **`Process`**: one instance process. `RebootCli`, `CliLifecycleRequest` and
   `Signal` go to the machine the originating web request names in its optional
   `machine_id` (Decision 4), else the primary. The CLI-bound message carries no
@@ -266,10 +311,15 @@ The same per-machine evaluation is reported to each viewer as
 
 ### 4. Inbound ownership and disconnect scoping
 
-A pane-scoped message from a CLI is accepted only if that CLI is the attachment
-for the pane's machine; otherwise it is dropped with a warning. A CLI without
-the capability is the sole instance and owns the whole roster. This closes the
-existing hole where a replaced CLI keeps writing into a session.
+A pane-scoped message from a CLI is accepted only from an attached instance,
+and for a pane tagged with a machine only from that machine's instance, even
+when the sender is a sole CLI without the capability, which reports every pane
+it runs untagged. Anything else is dropped with a warning. An untagged pane
+belongs to no machine until an instance reports it, so any attached instance
+may report for it. A pane the roster does not list yet is accepted, because a
+new tab's first frames can arrive before the roster report that lists it,
+unless its id is reserved for a new pane on another machine (Decision 9). This
+closes the existing hole where a replaced CLI keeps writing into a session.
 
 On disconnect of machine M's instance: remove M's attachment, move only M's
 running terminals to `disconnected`, clear only M's pane statuses, and keep
@@ -293,6 +343,14 @@ instance. A status that carries an inventory replaces that machine's entry.
 that machine's instance, else the primary. Projects run inside their machine's
 daemon, so rebooting one instance replaces that host's daemon and every
 project in it, and leaves the other machines' instances running.
+
+A viewer without `project_instances_v1` keeps one inventory per session, and
+its `RebootCli` names no machine, so it reaches the primary. Relaying every
+machine's inventory to it would flip its inventory to whichever machine
+reported last and make its reboot confirmation count another machine's panes.
+It therefore receives only the primary's inventory: another machine's
+`CliLifecycleStatus` reaches it without its inventory, and after a primary
+handover it is sent the new primary's once that instance has reported one.
 
 ### 5. Mixed fleets degrade to one machine
 
@@ -324,8 +382,21 @@ and `CreateProjectInstance.join_existing` are sent only to daemons advertising
 the capability: an older daemon ignores the first and reports nothing beyond
 its heartbeat, and ignores the second and, on the owner path, would branch,
 mint an unrelated project and start it. On the viewer side, web and native
-clients advertise the capability to receive the frames older native builds
-would reject (Decision 9).
+clients advertise the capability to receive the frames, and the
+acknowledgement kind, that older native builds would reject (Decision 9).
+
+A capable daemon also needs to know whether the server runs instances. A
+server that implements them echoes `project_instances_v1` to a daemon that
+advertised it, in `ServerToDaemon::Registered.negotiated_capabilities`; older
+servers send no list. A daemon that does not find the capability there has
+reached a server that keeps one CLI per session, where a second machine's
+`SessionStart` replaces the first machine's instance and that instance's tabs
+can no longer be controlled. For as long as that connection lasts it handles
+every `StartProjectCli` as daemons did before instances, refusing a project
+another live host runs rather than starting an instance beside it. It decides
+again at every registration, because the server can be upgraded or rolled
+back while the daemon runs, and it never stops an instance already running
+because of this. The binding statement is the `Registered` doc comment.
 
 A host whose `config.daemon.machine_id` is set does not advertise the
 capability. That id is shared through the NFS home, so it cannot distinguish
@@ -351,13 +422,26 @@ A separate checkout has its own `.apas` and needs no shared lock.
   project-level fields as read from disk.
 - **Project-level writes** (`update_project_operations`, the legacy `is_paused`
   writes, worktree assignment) change only their field under the same lock.
-- **Adoption.** At instance start, under the lock, untagged panes are tagged
-  with this machine *only if* no other machine holds a live instance claim for
-  the project; the claims module answers that from the per-machine claims
-  (Decision 7). A new instance on a second machine therefore starts with no
-  panes. With one machine this tags the existing panes in place, the only
-  on-disk change to existing projects. The server sees the adoption when the
-  instance reports those panes (Decision 2).
+- **Adoption.** At instance start, under the lock and on a fresh read,
+  untagged panes are tagged with this machine *only if* it is the earliest
+  live claimant: no other machine's live instance claim is older than its
+  own, compared by claim time and then by machine id, so two machines
+  claiming in the same second get one answer between them. A host that runs
+  the project alone (a live legacy claim without the instances marker) always
+  rules adoption out, because it runs every untagged pane itself. A run with
+  no claim of its own, such as a standalone `--headless`, has no start to
+  order, so any other live instance rules it out. The claims module answers
+  all of this from the per-machine claims (Decision 7). A new instance on a
+  second machine while the first runs therefore starts with no panes. Order
+  rather than presence decides because each daemon writes its claim before
+  its instance reaches this check: two machines starting together each see
+  the other's claim, and if presence alone ruled adoption out, neither would
+  adopt, leaving the untagged tabs on no machine, listed under a host that
+  does not run them, until every instance stopped. Adopting beside a later
+  claimant takes nothing it runs, since a capable instance never runs an
+  untagged pane. With one machine this tags the existing panes in place, the
+  only on-disk change to existing projects. The server sees the adoption when
+  the instance reports those panes (Decision 2).
 - **Tags are permanent** (owner decision). An instance never restores or adopts
   a pane tagged for another machine, even when that machine is stopped. This
   is a deliberate change from today's shared-home behaviour, where starting
@@ -370,15 +454,16 @@ A separate checkout has its own `.apas` and needs no shared lock.
   never sees another machine's panes as its own. The instance reports exactly
   those panes, tagged, in `SessionStart.panes` and `PaneList`, and `Some([])`
   when it has none.
-- **Forget.** `ForgetMachinePanes { X }` removes only the entries tagged X,
-  under the lock. The CLI keys on the tag, so untagged entries stay and come
-  back if an instance adopts them; the server forgets those from its roster by
-  attributed host instead (Decision 2).
+- **Forget** writes nothing. No instance is told (Decision 2), so X's entries
+  stay in the shared `.apas`, and the other instances' pane saves keep them as
+  they keep any other machine's panes. When X runs the project again it
+  restores them, and its tabs come back.
 - **Periodic reads** (5 s flags, reconnect policy snapshot) use a
   non-destructive reader that never deletes or regenerates `.apas`; a parse
   failure is logged and the last good copy kept.
 - **Pane ids** are allocated by the server against the merged roster and its
-  in-flight reservations (Decision 9), so ids are unique across machines.
+  in-flight reservations (Decision 9), so ids are unique across machines, and
+  they avoid the remembered ids of forgotten tabs (Decision 2).
   `--attach`'s local add checks every pane in `.apas`, not just its own.
 
 Older binaries drop unknown fields on rewrite and would strip tags. That is
@@ -405,8 +490,10 @@ names; the current `.tmp.<pid>` name can collide across hosts.
 `start_project` no longer skips a claimed project silently. A refusal is
 reported as the project's `last_error`, and a start that carried a
 `request_id` is answered with `ProjectRuntimeStarted { success: false, error }`
-(Decision 9). The claims module also answers whether another machine holds a
-live instance claim for a project, which adoption needs (Decision 6).
+(Decision 9). The claims module also reports a project's live claims: the
+other machines with a live instance claim and when each claimed the project,
+another host holding the legacy claim without the marker, and this machine's
+own claim. Adoption orders by them (Decision 6).
 
 ### 8. Transcript discovery across machines
 
@@ -446,12 +533,15 @@ For a request naming machine M:
 
 - **Instance attached on M:** check runtime access on M, allocate an id
   against the merged roster *plus in-flight reservations*, tag the config with
-  M, and route it as `NewPane`. An instance without the capability can only be
-  the primary; its new pane stays untagged (Decision 2) and goes to it as
-  `NewPane { machine_id: None }`. Reservations expire when the id appears in
-  M's roster or after 60 s, and they also count native task launches, whose
-  ids come from a separate range. This also fixes today's race between two
-  quick adds.
+  M, and route it as `NewPane`. The allocation also avoids the remembered ids
+  of forgotten tabs, and hands one out only when no other id is free
+  (Decision 2). An instance without the capability can only be the primary;
+  its new pane stays untagged (Decision 2) and goes to it as `NewPane {
+  machine_id: None }`. Reservations expire when the id appears in M's roster
+  or after 60 s, and they also count native task launches, whose ids come from
+  a separate range. While an id is reserved for M and not yet listed, frames
+  for it are accepted only from M's instance (Decision 4). This also fixes
+  today's race between two quick adds.
 - **P registered on M, not running, M's daemon online and capable:** send
   `StartProjectCli { request_id }` to M (existing policy checks), keep a
   pending add keyed by (session, M) and reply `Starting`. The daemon answers
@@ -464,8 +554,12 @@ For a request naming machine M:
   cannot say whether a failure belongs to this attempt, and several refusals
   set no error at all. `success: true` only means the runtime started, or
   already ran; the server routes the pending add when M's `SessionStart`
-  attaches. `success: false` fails the pending add with `error`. M's daemon
-  going offline, or 90 s without M's attachment, also fails it. Pending adds
+  attaches. `success: false` fails the pending add with `error`. So does the
+  server refusing M's `SessionStart` (its registration is refused, it runs
+  under another account, or it cannot attach beside the instances already
+  there), at once and with that refusal's reason rather than after the
+  timeout. M's daemon going offline, or 90 s without M's attachment, also
+  fails it. Pending adds
   live in memory; a server restart drops them without a reply, the web shows
   the launch as unconfirmed, and nothing replays automatically.
 - **Not registered on M, M owned by the requester:** the web offers clone to
@@ -478,7 +572,15 @@ owned machines where it is registered, then owned online machines without it,
 then offline or older machines disabled with the reason (Decision 5). An
 instance whose `runtime_access` is `Some(false)` for this viewer is disabled
 with the reason too. The picker defaults to the machine of the selected tab.
-With a single eligible machine the menu is unchanged.
+
+The machine step is hidden only when exactly one machine is eligible and it
+already runs the project; the menu is then unchanged. A sole eligible
+registered machine, typically a stopped single-machine project, is still
+shown, preselected, under "Starts the project first": choosing a tab type
+starts the project there, relaunching its saved tabs and unpaused bots, before
+the tab is added, and the menu says so before the click, as the project's Open
+asks before the same start. A clone is never preselected, so a sole clone
+choice must be picked, and the clone confirmed, before a tab can be requested.
 
 **Instances for viewers.** `ServerToWeb::SessionInstances { session_id,
 instances }` carries the complete set of attached instances, so an empty list
@@ -513,8 +615,13 @@ the preferred registration machine, instead of returning `null` on ambiguity.
 permanent, Start then starts an instance on every online, capable machine that
 owns tabs of the project, counting an untagged pane for the machine its
 attributed host names (Decision 2), and starts on the given `machine_id` only
-when no machine qualifies. Stop stops every attached instance. Each machine is
-authorized as a single-machine request would be. `false`, which every older
+when no machine qualifies. Stop stops every attached instance. Only a
+requester with access to the project's content may ask for every instance:
+the fan-out reads the project's roster and its refusals name hosts, so anyone
+else gets the bare "Machine not found" a per-machine request would, and no
+daemon is sent anything. Each machine is then authorized as a single-machine
+request would be. A Start first places a project that only its owner's
+machine has registered (Decision 10). `false`, which every older
 client sends, keeps today's single-machine meaning for the Machines page's
 per-machine Start and Stop, which must not start or stop other machines; an
 older server ignores the flag and acts on `machine_id` alone. Stop-runtime,
@@ -522,20 +629,38 @@ suspension and deletion act on every attachment, each rejected on its own
 connection, and deletion waits for every machine's purge acknowledgement.
 
 **Tabs of a machine that is not running.** Their controls are disabled with
-"Start on <host>". The server refuses controls and closes for them with
-"<host> is not running this project. Start it on <host> first.", because the
-owning instance holds the tab's state. For a machine that will not come back,
-**Forget <host>'s tabs** asks for confirmation, and its copy says the tabs come
-back if <host> runs this project again. The server refuses
+"Start on <host>". While any instance of the project is attached, the server
+refuses controls and closes for them with "<host> is not running this
+project. Start it on <host> first.", because the owning instance holds the
+tab's state; with none attached they fail as they always have. For a machine
+that will not come back, **Forget <host>'s tabs** asks for confirmation, and
+its copy says the tabs come back if <host> runs this project again. The
+server refuses
 `ForgetMachinePanes` while that machine has a running instance, which is
-authoritative for its own panes and would report them again. Otherwise it
-removes the panes tagged with that machine, and the untagged panes attributed
-to its hostname, from the server roster (Decision 2), and sends
-`ForgetMachinePanes { machine_id }` to every attached instance. An instance
-sharing the same `.apas` removes the entries tagged with that machine under the
-lock. A separate checkout's `.apas` holds none of them and is untouched; if
-that machine returns, its instance reports its tabs again, because each
+authoritative for its own panes and would report them again, and while a CLI
+without the capability runs on its host, which may be that machine under an
+older CLI. Otherwise it removes the panes tagged with that machine, and the
+untagged panes attributed to its hostname, from the server roster, remembers
+their ids, and tells no instance (Decision 2). Whether that machine shares the
+`.apas` or has a separate checkout, its entries are untouched, so if it
+returns, its instance restores and reports its tabs again, because each
 instance is authoritative for its own panes.
+
+Typed input refused this way, or because the sender may not use the tab's
+machine, is also answered with `MutationAck { mutation: input, accepted:
+false, error }`, whose `request_id` is the input's `client_msg_id` and whose
+`pane_id` is the tab it was for. It goes only to the sending connection, only
+when that connection negotiated `project_instances_v1` and the input carried a
+`client_msg_id`, and always in addition to the `Error` with the same text. It
+is only ever a refusal and is never registered as a pending decision: accepted
+input is still confirmed by the `UserInput` echo. Resending cannot change
+either answer, and a client that settles sends by id, as native does, would
+otherwise resend until it gave up with no reason to show; the web shows the
+`Error` and ignores the acknowledgement. The server may answer other refusals
+of such input the same way. Older native builds' schemas list only the four
+earlier kinds, and they drop the socket on a frame that does not validate,
+hence the gate. The binding statement is the `MutationKind::Input` doc
+comment.
 
 **Native task launch.** `MobileTaskLaunchRequest.machine_id`, the machine of
 the chosen `MobileLaunchTarget`, keeps its original meaning until an instance
@@ -547,6 +672,8 @@ running on that machine receives the task, a registered but stopped machine
 whose daemon advertises the capability is started first, and a machine that
 cannot run an instance beside the attached ones fails the launch with the
 reason. A launch picked by machine never lands silently on another machine.
+Like a Start, a launch first places a project that only its owner's machine
+has registered (Decision 10).
 
 ### 10. Joining a checkout by git remote
 
@@ -567,7 +694,12 @@ form.
 
 - `projects` lists the projects the caller owns or hosts whose sessions, or
   whose owned-machine inventory, carry that remote, so a registered but
-  never-started project also matches. Each `ProjectRemoteMatch` has its id,
+  never-started project also matches. It leaves out a project being deleted,
+  and a project whose session runs under another account, such as one the
+  caller owns that was provisioned on a cluster owner's machine: every
+  instance runs under its session's account and a `SessionStart` from any
+  other is refused, so a checkout joined to it could never start. Each
+  `ProjectRemoteMatch` has its id,
   name, `has_session` (the server holds a session, and so history, for it),
   and its known checkouts, each with `machine_id`, `hostname`, `path` and
   `running`. The checkout's own current identity is listed too when its remote
@@ -605,11 +737,32 @@ refused when the shared registry already has the project at another path,
 because a shared-home machine already sees that checkout: start it there
 instead of cloning a second copy into the same home.
 
+**Starting a project only a registration knows.** `apas register`, and a
+bare `apas` in a new directory, register a project on the machine without
+telling the server. Until something starts it there is no project record and
+no cluster placement, so the runtime-access check refused every web Start of
+it as "Machine not found", and a project registered that way could never be
+started from the web. `StartMachineProjectCli`, for the machine it names, and
+a native task launch therefore first place such a project when the requester
+owns that machine, the machine lists the project, and the project has no
+placement in the requester's cluster. Under the project-operation guard they
+call `authorize_project_registration`, exactly as the instance's
+`SessionStart` would a moment later. It creates a missing project record
+owned by the requester, with the direct placement, and refuses a suspended or
+deleting project or one the requester has no access to; a refusal leaves
+everything as it was, and the Start is refused as before. A cluster member
+still needs a project role first.
+
 ### 11. Clone to join
 
 `WebToServer::CreateProjectInstance` gains optional `join_project_id`. It is
 allowed only on the owner path: the requester must host the project and own
-the target machine, whose daemon must advertise the capability. The server
+the target machine, whose daemon must advertise the capability. It is refused
+for a project whose session runs under another account, for the reason
+`/projects/by-remote` leaves such a project out (Decision 10), and for a
+machine that already lists the project ("<host> already has this project. Add
+the tab there instead."), since a second checkout there would be a second
+instance on one machine. The server
 then forwards `ServerToDaemon::CreateProjectInstance { project_id: Some(P),
 join_existing: true, .. }`. `join_existing` is a separate flag because a
 present `project_id` already means a fresh identity reserved for two-phase
@@ -644,10 +797,12 @@ machines, plus a running/disconnected state per machine. An untagged pane is
 shown under its attributed host, with no host badge when it has none
 (Decision 2). Tabs of a stopped machine, and of an instance whose
 `runtime_access` is `Some(false)` for this viewer, show why their controls are
-disabled (Decision 9). The sidebar keeps one row per project, shows the
-primary host plus "+N" when several instances are attached, and pane dots
-cover every machine. Mobile web and native show the badge from the pane tags
-in `PaneList` and `MobilePaneSummary`.
+disabled (Decision 9). On the web such a terminal tab keeps showing its
+retained screen but sends no keystrokes or resizes, so a hidden view does not
+provoke a refusal on every window resize. The sidebar keeps one row per
+project, shows the primary host plus "+N" when several instances are attached,
+and pane dots cover every machine. Mobile web and native show the badge from
+the pane tags in `PaneList` and `MobilePaneSummary`.
 
 ## Risks / Trade-offs
 
@@ -655,8 +810,14 @@ in `PaneList` and `MobilePaneSummary`.
   per-project lock under `<config dir>/locks/` uses the same mechanism. If
   locking fails, the save fails rather than writing unlocked.
 - **Untagged-pane adoption race.** Two capable instances starting at the same
-  moment are serialized by the lock and the per-machine claim. The second sees
-  the first's live claim and does not adopt.
+  moment each see the other's claim, which both wrote before reaching
+  adoption. The earlier claim, then the lower machine id, adopts, and the
+  lock with a fresh read tags each pane once (Decision 6).
+- **Remembered ids can be reused.** A forgotten tab's id is handed out again
+  only when no other id in the allocation range is free, and a native task
+  launch derives its id from its request rather than the allocator. A
+  forgotten tab whose id was taken either way is dropped as another machine's
+  pane when its machine returns.
 - **Stripping by an older binary** is bounded by the claim guard (Decision 7)
   and repaired by adoption.
 - **Primary handover** changes the session summary hostname when the earliest
@@ -681,9 +842,12 @@ Deploy shared protocol → server → web → mobile → CLI/daemon, the order t
 runbook uses for every protocol change. The shared contract is already
 committed (task group 1). All new fields are optional, and a new server with
 only old CLIs behaves exactly as today. The new frames, `SessionInstances`
-and `AddPaneResult`, reach only clients that asked for them, so older web and
-native builds keep working against a new server. Hosts gain the capability
-when their daemon is rebooted to update from the Machines page. Existing
+and `AddPaneResult`, and `MutationKind::Input` acknowledgements reach only
+clients that asked for them, so older web and native builds keep working
+against a new server. Hosts gain the capability
+when their daemon is rebooted to update from the Machines page, and use it
+only while the server echoes it at registration (Decision 5), so a daemon
+updated before the server keeps running each project on one machine. Existing
 `.apas` files need no migration. The server shows a pre-upgrade roster's
 untagged panes under the session's recorded host, and they are tagged when a
 capable instance adopts and reports them.
@@ -695,9 +859,14 @@ today's host-migration behaviour, and the claim guard bounds it. Nobody should
 be surprised when an un-rebooted zoo-006 daemon picks up zoo-005's tabs. Its
 CLI reports them untagged, so the server stamps them with zoo-006 as their
 attributed host and leaves them adoptable by the next capable instance
-(Decision 2).
+(Decision 2). Tabs tagged for a machine whose entries that `.apas` does not
+hold, such as a separate checkout's, stay listed as stopped on their machine,
+with their ids.
 
 **Rollback.** Stop extra instances first, by stopping the project on
 non-primary machines, then roll back CLI/daemon, web and server. An older CLI
 ignores tags, and an older server treats a multi-machine roster as one list,
-which is safe once only one instance runs.
+which is safe once only one instance runs. A capable daemon that re-registers
+with a rolled-back server starts no further instance beside another live host
+(Decision 5), but it never stops one already running, so stopping the extra
+instances remains the first step.

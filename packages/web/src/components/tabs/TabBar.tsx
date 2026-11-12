@@ -144,6 +144,12 @@ const HOST_BADGE_TONES: Record<TabHostState, { badge: string; dot: string }> = {
     badge: "bg-amber-100 text-amber-800 dark:bg-amber-950/60 dark:text-amber-200",
     dot: "bg-amber-500",
   },
+  // Still running there, briefly unreachable: amber like a problem that
+  // clears by itself, not grey like a machine someone has to start.
+  disconnected: {
+    badge: "bg-gray-100 text-gray-500 dark:bg-gray-800 dark:text-gray-400",
+    dot: "bg-amber-400",
+  },
   stopped: {
     badge: "bg-gray-100 text-gray-500 dark:bg-gray-800 dark:text-gray-400",
     dot: "bg-gray-400",

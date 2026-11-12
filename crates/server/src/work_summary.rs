@@ -590,8 +590,12 @@ impl PaneWorkSummaryService {
 
     /// Whether summaries can be generated for one pane. That depends on the
     /// CLI of the instance that runs the pane, since each machine's instance
-    /// can be a different version; a pane whose machine is not running has
-    /// none, as a session without a CLI never had.
+    /// can be a different version. A session with no CLI at all reads as
+    /// needing an update, as it always has. A tab whose own machine is
+    /// stopped while another machine runs the project is `Unknown`: whether
+    /// that machine's CLI can summarize is not known until it runs again,
+    /// and "needs an update" would send the user to update a CLI that may be
+    /// current when starting that machine is what helps.
     fn availability_for(&self, session_id: Uuid, pane_id: u32) -> PaneWorkSummaryAvailability {
         if !self.config.enabled {
             return PaneWorkSummaryAvailability::SummarizerDisabled;
@@ -604,7 +608,8 @@ impl PaneWorkSummaryService {
             {
                 owner
             }
-            PaneOwner::Instance(_) | PaneOwner::NotRunning { .. } | PaneOwner::NoInstance => {
+            PaneOwner::NotRunning { .. } => return PaneWorkSummaryAvailability::Unknown,
+            PaneOwner::Instance(_) | PaneOwner::NoInstance => {
                 return PaneWorkSummaryAvailability::CliUpdateRequired
             }
         };
@@ -2366,6 +2371,61 @@ mod service_tests {
             primary_rx.try_recv().is_err(),
             "the primary runs none of pane 7"
         );
+    }
+
+    /// A tab whose machine is stopped while another machine runs the project
+    /// does not claim its CLI needs an update: nothing is known about that
+    /// CLI until it runs again. The running machine's tabs are unaffected.
+    #[tokio::test]
+    async fn a_stopped_machines_tab_does_not_ask_for_a_cli_update() {
+        let (service, db, _storage, sessions) = test_service().await;
+        let owner = Uuid::new_v4();
+        let session_id = Uuid::new_v4();
+        add_user_and_session(&db, owner, session_id).await;
+        let cli_id = Uuid::new_v4();
+        let (cli_tx, _cli_rx) = mpsc::channel(8);
+        sessions.register_cli(cli_id, owner, cli_tx, Some("test".to_string()));
+        sessions.set_cli_capabilities(
+            cli_id,
+            vec![
+                shared::PROJECT_INSTANCES_CAPABILITY.to_string(),
+                PANE_WORK_SUMMARY_CAPABILITY.to_string(),
+            ],
+        );
+        let (m5, m6) = (Uuid::new_v4(), Uuid::new_v4());
+        assert!(matches!(
+            sessions.attach_cli_instance(
+                session_id,
+                cli_id,
+                Some(m5),
+                Some("/work/zoo-005".to_string()),
+                Some("zoo-005".to_string()),
+            ),
+            crate::session::AttachOutcome::Attached { .. }
+        ));
+        let pane = |pane_id: u32, machine_id: Option<Uuid>, host: &str| {
+            let mut pane = shared::PaneConfig::defaults().remove(0);
+            pane.pane_id = pane_id;
+            pane.machine_id = machine_id;
+            pane.hostname = Some(host.to_string());
+            pane
+        };
+        // zoo-006 is stopped: one tab tagged for it, one only attributed.
+        sessions.set_session_panes(
+            &session_id,
+            vec![
+                pane(3, Some(m5), "zoo-005"),
+                pane(7, Some(m6), "zoo-006"),
+                pane(8, None, "zoo-006"),
+            ],
+        );
+
+        let (_, running) = service.list_for_pane(session_id, 3).await.unwrap();
+        let (_, tagged) = service.list_for_pane(session_id, 7).await.unwrap();
+        let (_, attributed) = service.list_for_pane(session_id, 8).await.unwrap();
+        assert_eq!(running, PaneWorkSummaryAvailability::Available);
+        assert_eq!(tagged, PaneWorkSummaryAvailability::Unknown);
+        assert_eq!(attributed, PaneWorkSummaryAvailability::Unknown);
     }
 
     /// One machine's summarizer reporting itself unavailable says nothing

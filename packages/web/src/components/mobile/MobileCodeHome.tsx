@@ -20,7 +20,7 @@ import type {
 import { writeSelectedPane } from "@/lib/mobileSelectedPane";
 import { compareRecentlyIdle } from "@/lib/idlePaneOrdering";
 import { buildProjectList } from "@/lib/projectList";
-import { parseSessionInstances, type SessionInstance } from "@/lib/projectInstances";
+import { paneNotRunning, parseSessionInstances, type SessionInstance } from "@/lib/projectInstances";
 import { projectHostLabel } from "@/lib/tabHosts";
 import {
   paneUsageLimit,
@@ -90,6 +90,11 @@ interface MobileMachineSummary {
   cluster_access?: "owner" | "member";
   shared_provisioning_available?: boolean;
   local_project_registration_available?: boolean;
+  /** Whether the daemon is connected now, and connected with multi-machine
+   *  support: what tells a sole instance without it, which runs every
+   *  untagged pane, from one that does not. */
+  daemon_connected?: boolean;
+  project_instances_available?: boolean;
 }
 
 interface MobileBootstrapResponse {
@@ -132,6 +137,8 @@ function adaptMachine(entry: MachineWithProjects): MobileMachineSummary {
     cluster_access: entry.clusterAccess,
     shared_provisioning_available: entry.sharedProvisioningAvailable,
     local_project_registration_available: entry.localProjectRegistrationAvailable ?? false,
+    daemon_connected: entry.daemonConnected,
+    project_instances_available: entry.projectInstancesAvailable,
   };
 }
 
@@ -341,6 +348,8 @@ export function MobileCodeHome({
       clusterAccess: entry.cluster_access,
       sharedProvisioningAvailable: entry.shared_provisioning_available,
       localProjectRegistrationAvailable: entry.local_project_registration_available,
+      daemonConnected: entry.daemon_connected,
+      projectInstancesAvailable: entry.project_instances_available,
     })),
     [machines],
   );
@@ -447,7 +456,9 @@ export function MobileCodeHome({
       .filter((session) => session.is_active)
       .flatMap((session) =>
         (session.panes ?? [])
-          .filter((pane) => !pane.is_working)
+          // Nor are a stopped machine's, while another machine keeps the
+          // project active.
+          .filter((pane) => !pane.is_working && !paneNotRunning(pane, session.instances, registeredInventory))
           .map((pane) => ({
             session,
             pane,
@@ -460,7 +471,7 @@ export function MobileCodeHome({
             ),
           })),
       ),
-    [availabilityNow, sessions, usageLimits],
+    [availabilityNow, registeredInventory, sessions, usageLimits],
   );
   const pendingPanes = useMemo(
     () => waitingPanes.filter((entry) => entry.awaitingAnswer),
@@ -816,7 +827,7 @@ export function MobileCodeHome({
                   </div>
                   <div className="mt-2 flex flex-wrap items-center gap-x-2 gap-y-1">
                     <span className="min-w-0 truncate text-sm text-[#686873] dark:text-[#aaaab6]">{sessionTarget(session)}</span>
-                    <PaneStatusDots panes={session.panes} isActive={session.is_active === true} />
+                    <PaneStatusDots panes={session.panes} isActive={session.is_active === true} instances={session.instances} machines={registeredInventory} />
                   </div>
                   {session.latest_summary && <p className="mt-2 line-clamp-2 text-sm leading-5">{session.latest_summary}</p>}
                   <div className="mt-2.5 flex items-center justify-between gap-2.5">

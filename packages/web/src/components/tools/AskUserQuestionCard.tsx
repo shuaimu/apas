@@ -31,6 +31,11 @@ interface AskUserQuestionCardProps {
   input: unknown;
   sessionId?: string;
   paneId?: number;
+  /** Why the question cannot be answered from here now: the pane's machine
+   *  is not running the project, or this viewer may not use it. The server
+   *  would refuse the answer and keep the question pending, so the card is
+   *  locked with the reason rather than marked answered. */
+  disabledReason?: string;
 }
 
 // Sentinel index used to represent the "Other / free text" choice in the
@@ -50,6 +55,7 @@ export const AskUserQuestionCard = memo(function AskUserQuestionCard({
   input,
   sessionId,
   paneId,
+  disabledReason,
 }: AskUserQuestionCardProps) {
   const answeredQuestions = useStore((s) => s.answeredQuestions);
   const answerQuestion = useStore((s) => s.answerQuestion);
@@ -70,7 +76,11 @@ export const AskUserQuestionCard = memo(function AskUserQuestionCard({
     !!ompState && ompState.dialogId === dialogId;
   const nativeResult = isOmp ? ompState?.result : undefined;
   const unsupportedProvider = !!data.provider && data.provider !== "omp" && data.provider !== "claude";
-  const locked = unsupportedProvider || isOmp && (!canAnswerOmp || !!ompState && ompState.phase !== "pending");
+  // A refused pane locks the card before anything is selected or sent:
+  // answering would show success, record the question as answered and queue
+  // the answer for replay, while the server refuses it and keeps it pending.
+  const locked = unsupportedProvider || !!disabledReason
+    || isOmp && (!canAnswerOmp || !!ompState && ompState.phase !== "pending");
 
   // OMP keys are native IDs (question text and ordering are not identities).
   const [selections, setSelections] = useState<Map<string | number, Set<number>>>(
@@ -330,9 +340,10 @@ export const AskUserQuestionCard = memo(function AskUserQuestionCard({
                       to claude (per Anthropic's docs), not the word "Other". */}
                   {!isOmp && <button
                     type="button"
+                    disabled={locked}
                     aria-pressed={otherSelected}
                     onClick={() => toggleOption(qIdx, OTHER_INDEX, multi)}
-                    className={`w-full flex items-start gap-3 text-left px-3 py-2 rounded border transition-colors ${
+                    className={`w-full flex items-start gap-3 text-left px-3 py-2 rounded border transition-colors disabled:opacity-60 ${
                       otherSelected
                         ? "border-blue-400 dark:border-blue-500 bg-blue-50 dark:bg-blue-900/40"
                         : "border-dashed border-gray-300 dark:border-gray-600 hover:bg-gray-50 dark:hover:bg-gray-800"
@@ -387,10 +398,16 @@ export const AskUserQuestionCard = memo(function AskUserQuestionCard({
           );
         })}
 
+        {!isSubmitted && disabledReason && (
+          <p role="status" className="rounded border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-900 dark:border-amber-900 dark:bg-amber-950/30 dark:text-amber-200">
+            {disabledReason}
+          </p>
+        )}
         {!isSubmitted && (
           <div className="flex flex-wrap justify-end gap-2 pt-1">
             {isOmp && <button
               type="button"
+              title={disabledReason}
               disabled={locked || !toolUseId}
               className="min-h-11 px-4 py-2 rounded-lg border border-gray-300 dark:border-gray-700 text-sm disabled:opacity-50"
               onClick={() => {
@@ -401,6 +418,7 @@ export const AskUserQuestionCard = memo(function AskUserQuestionCard({
             >Cancel question</button>}
             <button
               type="button"
+              title={disabledReason}
               onClick={handleSubmit}
               disabled={locked || !toolUseId || !allAnswered}
               className={`min-h-11 flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-medium transition-colors ${

@@ -115,14 +115,14 @@ function paneOwner(
 
 /**
  * Why a tab cannot take input here, or null when it can. A stopped machine is
- * described the way the server refuses its tabs' controls.
+ * described the way the server refuses its tabs' controls, word for word.
  */
 export function paneUnavailableReason(reachability: PaneReachability, host: string | null): string | null {
   switch (reachability) {
     case "stopped":
       return host
         ? `${host} is not running this project. Start it on ${host} first.`
-        : "This tab's machine is not running this project. Start the project there first.";
+        : "This tab's machine is not running this project.";
     case "no_access":
       return host
         ? `Your access does not cover ${host}, so this tab is read-only here.`
@@ -130,4 +130,18 @@ export function paneUnavailableReason(reachability: PaneReachability, host: stri
     default:
       return null;
   }
+}
+
+/**
+ * Why one tab cannot take input here, or null when it can or when nothing
+ * says otherwise: a tab missing from the roster is left to the server.
+ * `live` as for `paneReachability`.
+ */
+export function tabUnavailableReason(
+  pane: PaneMachineFields | undefined,
+  instances: SessionInstanceInfo[],
+  live: boolean,
+): string | null {
+  if (!pane) return null;
+  return paneUnavailableReason(paneReachability(pane, instances, live), paneHostname(pane, instances));
 }

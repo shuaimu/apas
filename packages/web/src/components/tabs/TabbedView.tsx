@@ -85,7 +85,8 @@ function TerminalPaneWithViews({
   isLoading: boolean;
   hasMore: boolean;
   /** Why the pane cannot take input now, e.g. its machine is not running
-   *  the project. Disables both views' input. */
+   *  the project. Disables both views' input, and the conversation's
+   *  questions and approvals. */
   disabledReason?: string;
 }) {
   return (
@@ -115,6 +116,7 @@ function TerminalPaneWithViews({
             isLoading={isLoading}
             hasMore={hasMore}
             isActive={isActive}
+            disabledReason={disabledReason}
           />
           {/* Writes go into the pty, not through MCP — a tool server can only
               answer calls, never push a turn into a live conversation. */}
@@ -1666,6 +1668,7 @@ export function TabbedView({
                     hasMore={paneHasMore[paneKey(tab.pane_id)] || false}
                     isActive={isActive}
                     role={tab.role}
+                    disabledReason={tabHosts.tabs.get(tab.pane_id)?.refusal}
                   />
                 </>
               )}
@@ -1793,7 +1796,12 @@ export function TabbedView({
       {!workspace.active && planReviewPending.length > 0 && (
         <div className="fixed inset-x-0 bottom-0 z-40 flex justify-center p-3 pointer-events-none">
           <div className="pointer-events-auto flex w-full max-w-3xl flex-col gap-2">
-            {planReviewPending.map((item) => (
+            {planReviewPending.map((item) => {
+              // A held tool on a machine that is not running the project (or
+              // that this viewer may not use) can only be refused; the
+              // optimistic answer would also drop the review from view.
+              const reviewRefusal = tabHosts.tabs.get(item.paneId)?.refusal;
+              return (
               <div
                 key={item.toolUseId}
                 className="rounded-lg border border-orange-700 bg-orange-950/90 p-3 text-zinc-100 shadow-xl"
@@ -1813,24 +1821,32 @@ export function TabbedView({
                     }
                   })()}
                 </pre>
+                {reviewRefusal && (
+                  <p role="status" className="mb-2 text-xs text-orange-200">{reviewRefusal}</p>
+                )}
                 <div className="flex justify-end gap-2">
                   <button
                     type="button"
+                    disabled={Boolean(reviewRefusal)}
+                    title={reviewRefusal}
                     onClick={() => answerPlanReview(item.toolUseId, false)}
-                    className="rounded border border-red-700 bg-red-900/40 px-3 py-1 text-xs text-red-200 hover:bg-red-900/60"
+                    className="rounded border border-red-700 bg-red-900/40 px-3 py-1 text-xs text-red-200 hover:bg-red-900/60 disabled:cursor-not-allowed disabled:opacity-50"
                   >
                     Deny
                   </button>
                   <button
                     type="button"
+                    disabled={Boolean(reviewRefusal)}
+                    title={reviewRefusal}
                     onClick={() => answerPlanReview(item.toolUseId, true)}
-                    className="rounded border border-emerald-700 bg-emerald-700 px-3 py-1 text-xs text-emerald-50 hover:bg-emerald-600"
+                    className="rounded border border-emerald-700 bg-emerald-700 px-3 py-1 text-xs text-emerald-50 hover:bg-emerald-600 disabled:cursor-not-allowed disabled:opacity-50"
                   >
                     Approve
                   </button>
                 </div>
               </div>
-            ))}
+              );
+            })}
           </div>
         </div>
       )}
@@ -2383,6 +2399,10 @@ export interface MessagePaneProps {
    * Manager pane gets a chat-first prompt; everyone else falls back to
    * the generic placeholder. */
   role?: string;
+  /** Why the pane cannot take answers now: its machine is not running the
+   *  project, or this viewer may not use it. Locks its questions and
+   *  approvals with the reason; the history still reads. */
+  disabledReason?: string;
 }
 
 // Initial number of messages mounted per pane. The full backlog stays in
@@ -2453,7 +2473,7 @@ function HistoryLoadingPlaceholder({ paneId }: { paneId: number }) {
   );
 }
 
-export function MessagePane({ paneId, messages, onLoadMore, isLoading, hasMore, isActive, role }: MessagePaneProps) {
+export function MessagePane({ paneId, messages, onLoadMore, isLoading, hasMore, isActive, role, disabledReason }: MessagePaneProps) {
   const sessionId = useStore((s) => s.sessionId);
   // How many newest messages to mount. Grows when the user reveals older
   // ones. `expanded` latches once they page all the way back so server-
@@ -2771,7 +2791,7 @@ export function MessagePane({ paneId, messages, onLoadMore, isLoading, hasMore, 
         item.kind === "tool-group" ? (
           <ToolGroupCard key={item.id} items={item.items} />
         ) : (
-          <MessageComponent key={item.message.id} message={item.message} />
+          <MessageComponent key={item.message.id} message={item.message} disabledReason={disabledReason} />
         ),
       )}
       <div ref={messagesEndRef} />
@@ -2781,12 +2801,18 @@ export function MessagePane({ paneId, messages, onLoadMore, isLoading, hasMore, 
 
 // --- MessageComponent ---
 
-const MessageComponent = memo(function MessageComponent({ message }: { message: Message }) {
+const MessageComponent = memo(function MessageComponent({
+  message,
+  disabledReason,
+}: {
+  message: Message;
+  disabledReason?: string;
+}) {
   switch (message.role) {
     case "user":
       return <UserMessage message={message} />;
     case "assistant":
-      return <AssistantMessage message={message} />;
+      return <AssistantMessage message={message} disabledReason={disabledReason} />;
     case "system":
       return (
         <div className="text-center text-xs text-gray-500 py-1">

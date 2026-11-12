@@ -218,6 +218,61 @@ describe("where mobile panes run", () => {
       expect(button.title).toBe(STOPPED);
     }
   });
+
+  it("will not answer a stopped pane's questions, approvals or plan reviews", () => {
+    // The server refuses each and keeps it pending; the plan review used to
+    // vanish on an optimistic answer and the question to read as answered.
+    seed(11);
+    const at = new Date();
+    act(() => useStore.setState({
+      paneMessages: {
+        "11": [
+          {
+            id: "approval-11",
+            role: "assistant",
+            content: "",
+            timestamp: at,
+            sessionId: SID,
+            paneId: 11,
+            outputType: { type: "approval_request", toolCallId: "tool-approval-11", tool: "Bash", description: "rm -rf build" },
+          },
+          {
+            id: "question-11",
+            role: "assistant",
+            content: "",
+            timestamp: at,
+            sessionId: SID,
+            paneId: 11,
+            outputType: {
+              type: "tool_use",
+              tool: "AskUserQuestion",
+              toolUseId: "toolu-question-11",
+              input: { questions: [{ question: "Ship it?", options: [{ label: "Yes" }, { label: "No" }] }] },
+            },
+          },
+        ],
+      },
+      planReviewPending: [{ paneId: 11, toolUseId: "toolu-plan-11", toolName: "Bash", input: { command: "ls" }, arrivedAt: Date.now() }],
+    }));
+    renderScreen();
+
+    for (const name of ["Approve", "Reject", "Deny", "Yes", "Submit"]) {
+      for (const button of screen.getAllByRole("button", { name }) as HTMLButtonElement[]) {
+        expect(button.disabled).toBe(true);
+        fireEvent.click(button);
+      }
+    }
+    // The plan review, the approval and the question each say why.
+    expect(screen.getAllByRole("status").filter((element) => element.textContent === STOPPED).length)
+      .toBeGreaterThanOrEqual(3);
+    expect(sent("approve")).toEqual([]);
+    expect(sent("reject")).toEqual([]);
+    expect(sent("answer_question")).toEqual([]);
+    expect(sent("plan_review_answer")).toEqual([]);
+    const state = useStore.getState();
+    expect(state.planReviewPending).toHaveLength(1);
+    expect(state.answeredQuestions.has("toolu-question-11")).toBe(false);
+  });
 });
 
 describe("opening a stopped project", () => {

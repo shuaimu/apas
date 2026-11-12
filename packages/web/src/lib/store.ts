@@ -757,7 +757,8 @@ interface AppState {
    *  not contain yet. Read through `selectSessionInstances`. */
   sessionInstances: Record<string, SessionInstance[]>;
   /** Correlated new-tab launches by `AddPaneRequest.requestId`, for every
-   *  session. In memory only, and never resent. */
+   *  session. Never resent. Kept in this tab's session storage so a reload
+   *  reports the ones it cut off as unconfirmed (`restoreAddPaneRequests`). */
   addPaneRequests: Record<string, AddPaneRequest>;
 
   // Messages (single pane mode / fallback)
@@ -1444,6 +1445,88 @@ function failAddPaneRequest(set: StoreSet, get: () => AppState, requestId: strin
   get().showToast(error, "error");
 }
 
+/** Where this browser tab keeps its launches across a reload. Per tab, like
+ *  the connection that is the only one ever told a launch's outcome. */
+const ADD_PANE_REQUESTS_KEY = "apas_add_pane_requests";
+const ADD_PANE_REQUEST_STATUSES = new Set<AddPaneRequestStatus>([
+  "cloning", "pending", "starting", "routed", "failed", "unconfirmed",
+]);
+
+function storedAddPaneRequest(value: unknown): AddPaneRequest | null {
+  if (!value || typeof value !== "object") return null;
+  const record = value as Record<string, unknown>;
+  const text = (key: string): string | undefined =>
+    typeof record[key] === "string" && record[key] ? record[key] as string : undefined;
+  const { requestId, sessionId, provider, kind, status, startedAt, updatedAt, paneId } = record;
+  if (typeof requestId !== "string" || !requestId || typeof sessionId !== "string" || !sessionId
+    || typeof provider !== "string" || (kind !== "agent" && kind !== "terminal")
+    || typeof status !== "string" || !ADD_PANE_REQUEST_STATUSES.has(status as AddPaneRequestStatus)
+    || typeof startedAt !== "number" || !Number.isFinite(startedAt)
+    || typeof updatedAt !== "number" || !Number.isFinite(updatedAt)
+    || (paneId !== undefined && !Number.isInteger(paneId))) {
+    return null;
+  }
+  return {
+    requestId,
+    sessionId,
+    machineId: text("machineId"),
+    hostname: text("hostname"),
+    status: status as AddPaneRequestStatus,
+    addRequestId: text("addRequestId"),
+    cloneRequestId: text("cloneRequestId"),
+    provider,
+    kind,
+    label: text("label"),
+    paneId: paneId as number | undefined,
+    error: text("error"),
+    startedAt,
+    updatedAt,
+  };
+}
+
+/**
+ * The launches a reloaded tab had before it reloaded. Their answers went
+ * only to the connection the reload ended, so one still in flight can no
+ * longer be confirmed: it comes back unconfirmed, as after a dropped
+ * connection, and is never resent. A clone's acknowledgement goes to every
+ * connection of its owner, so a late one still turns the warning into "the
+ * clone finished; add a tab there" (`applyCloneAndAddCreated`). A routed
+ * launch was delivered: its tab appears, or its instance reports its own
+ * refusal. Failed and unconfirmed ones stay until dismissed.
+ */
+export function restoreAddPaneRequests(stored: unknown): Record<string, AddPaneRequest> {
+  if (!Array.isArray(stored)) return {};
+  const restored: Record<string, AddPaneRequest> = {};
+  for (const value of stored) {
+    const request = storedAddPaneRequest(value);
+    if (!request || request.status === "routed") continue;
+    restored[request.requestId] = IN_FLIGHT_ADD_PANE_STATUSES.has(request.status)
+      ? { ...request, status: "unconfirmed", error: unconfirmedAddPaneMessage(request, "connection") }
+      : request;
+  }
+  return restored;
+}
+
+function loadAddPaneRequests(): Record<string, AddPaneRequest> {
+  if (typeof sessionStorage === "undefined") return {};
+  try {
+    return restoreAddPaneRequests(JSON.parse(sessionStorage.getItem(ADD_PANE_REQUESTS_KEY) || "[]"));
+  } catch {
+    return {};
+  }
+}
+
+function saveAddPaneRequests(requests: Record<string, AddPaneRequest>): void {
+  if (typeof sessionStorage === "undefined") return;
+  try {
+    const kept = Object.values(requests).filter((request) => request.status !== "routed");
+    if (kept.length) sessionStorage.setItem(ADD_PANE_REQUESTS_KEY, JSON.stringify(kept));
+    else sessionStorage.removeItem(ADD_PANE_REQUESTS_KEY);
+  } catch {
+    // The launch list still works in memory if browser storage is unavailable.
+  }
+}
+
 function machineHostname(state: AppState, sessionId: string, machineId: string | undefined): string | undefined {
   if (!machineId) return primaryInstance(selectSessionInstances(state, sessionId))?.hostname;
   return selectSessionInstances(state, sessionId).find((instance) => instance.machineId === machineId)?.hostname
@@ -1728,7 +1811,7 @@ export const useStore = create<AppState>((set, get) => ({
   cliLifecycleLatestBySession: {},
   sessions: [],
   sessionInstances: {},
-  addPaneRequests: {},
+  addPaneRequests: loadAddPaneRequests(),
   messages: [],
   hasMoreMessages: false,
   isLoadingMore: false,
@@ -3825,6 +3908,13 @@ export const useStore = create<AppState>((set, get) => ({
   },
 
 }));
+
+// Every change to the launch list reaches this tab's session storage, from
+// whichever of the many places sets it, so a reload can report what it cut
+// off instead of forgetting it.
+useStore.subscribe((state, previous) => {
+  if (state.addPaneRequests !== previous.addPaneRequests) saveAddPaneRequests(state.addPaneRequests);
+});
 
 // Hydrate the per-session message snapshots from IndexedDB on app boot.
 // Runs once at module load; until it resolves, the in-memory cache is

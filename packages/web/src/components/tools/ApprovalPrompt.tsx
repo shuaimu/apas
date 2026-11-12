@@ -7,10 +7,15 @@ interface ApprovalPromptProps {
   toolCallId: string;
   tool: string;
   description: string;
+  /** Why the request cannot be answered from here now: the pane's machine is
+   *  not running the project, or this viewer may not use it. The server would
+   *  only refuse the answer, so the buttons are disabled with the reason. */
+  disabledReason?: string;
 }
 
-export function ApprovalPrompt({ toolCallId, tool, description }: ApprovalPromptProps) {
+export function ApprovalPrompt({ toolCallId, tool, description, disabledReason }: ApprovalPromptProps) {
   const { approve, reject } = useStore();
+  const disabled = Boolean(disabledReason);
 
   return (
     <div className="border-2 border-yellow-400 dark:border-yellow-600 rounded-lg overflow-hidden my-2">
@@ -29,17 +34,31 @@ export function ApprovalPrompt({ toolCallId, tool, description }: ApprovalPrompt
           {description}
         </p>
 
+        {disabledReason && (
+          <p role="status" className="text-sm text-amber-800 dark:text-amber-200 mb-3">
+            {disabledReason}
+          </p>
+        )}
+
         <div className="flex gap-2">
           <button
-            onClick={() => approve(toolCallId)}
-            className="flex-1 flex items-center justify-center gap-2 px-4 py-2 bg-green-500 text-white rounded-lg hover:bg-green-600 transition-colors"
+            disabled={disabled}
+            title={disabledReason}
+            onClick={() => {
+              if (!disabled) approve(toolCallId);
+            }}
+            className="flex-1 flex items-center justify-center gap-2 px-4 py-2 bg-green-500 text-white rounded-lg hover:bg-green-600 transition-colors disabled:cursor-not-allowed disabled:opacity-50 disabled:hover:bg-green-500"
           >
             <Check className="w-4 h-4" />
             Approve
           </button>
           <button
-            onClick={() => reject(toolCallId)}
-            className="flex-1 flex items-center justify-center gap-2 px-4 py-2 bg-red-500 text-white rounded-lg hover:bg-red-600 transition-colors"
+            disabled={disabled}
+            title={disabledReason}
+            onClick={() => {
+              if (!disabled) reject(toolCallId);
+            }}
+            className="flex-1 flex items-center justify-center gap-2 px-4 py-2 bg-red-500 text-white rounded-lg hover:bg-red-600 transition-colors disabled:cursor-not-allowed disabled:opacity-50 disabled:hover:bg-red-500"
           >
             <X className="w-4 h-4" />
             Reject

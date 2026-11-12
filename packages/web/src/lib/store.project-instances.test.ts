@@ -3,6 +3,7 @@ import { resolve } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi, type Mock } from "vitest";
 import { validateClientMessage } from "@apas/protocol";
 import {
+  restoreAddPaneRequests,
   selectCliLifecycleInventory,
   useStore,
   type EffectiveProjectPolicy,
@@ -15,6 +16,7 @@ import {
   selectSessionInstances,
   type SessionInstance,
 } from "./projectInstances";
+import { ompQuestionKey } from "./ompQuestions";
 
 /**
  * One project, several machines. These drive the real socket handler with the
@@ -33,6 +35,9 @@ type MockWs = {
   onmessage?: (event: MessageEvent) => void;
   onclose?: (event: CloseEvent) => void;
 };
+
+/** Where a browser tab keeps its launches across a reload. */
+const ADD_PANE_REQUESTS_KEY = "apas_add_pane_requests";
 
 function fixture(name: string): Record<string, unknown> {
   return JSON.parse(readFileSync(resolve(__dirname, "../../../protocol/fixtures", name), "utf8"));
@@ -154,6 +159,32 @@ describe("negotiating instances", () => {
     const [authenticate] = sentFrames(ws, "authenticate");
     expect(authenticate.capabilities).toContain(PROJECT_INSTANCES_CAPABILITY);
     expectValidFrame(authenticate);
+  });
+
+  it("leaves a refused input's acknowledgement to the error it accompanies", async () => {
+    // A negotiated viewer gets a mutation_ack for typed input the server
+    // refused, beside the Error toast the web already shows. Its request id is
+    // the input's client_msg_id, so it must not settle anything else, even an
+    // OMP answer that happens to share the id.
+    const refusal = fixture("server-mutation-ack-input.json");
+    const omp = {
+      sessionId: refusal.session_id as string,
+      paneId: refusal.pane_id as number,
+      toolUseId: "toolu-omp-4",
+      dialogId: "dialog-4",
+      requestId: refusal.request_id as string,
+      phase: "submitting" as const,
+    };
+    useStore.setState({ ompQuestions: new Map([[ompQuestionKey(omp.sessionId, omp.paneId, omp.toolUseId), omp]]) });
+    const ws = await openSocket();
+    negotiate();
+    const before = useStore.getState();
+    deliver(ws, refusal);
+    const after = useStore.getState();
+    expect(after.ompQuestions).toBe(before.ompQuestions);
+    expect(after.addPaneRequests).toBe(before.addPaneRequests);
+    expect(after.pendingSends).toBe(before.pendingSends);
+    expect(showToast).not.toHaveBeenCalled();
   });
 });
 
@@ -556,6 +587,91 @@ describe("clone and add", () => {
     expect(attempt()).toMatch(/already has this project/);
     expect(sentFrames(ws, "create_project_instance")).toHaveLength(0);
     expect(useStore.getState().addPaneRequests).toEqual({});
+  });
+
+  it("keeps its launches across a reload of the tab, reporting the cut-off ones unconfirmed", async () => {
+    const ws = await openSocket();
+    negotiate();
+    const clone = useStore.getState().cloneAndAddPane(target, tab);
+    const pending = addTerminal();
+    const failed = addTerminal();
+    deliver(ws, { type: "add_pane_result", session_id: SID, request_id: failed.requestId, status: "failed", error: "zoo-005 refused the tab" });
+    const routed = addTerminal();
+    deliver(ws, { type: "add_pane_result", session_id: SID, request_id: routed.requestId, status: "routed", pane_id: 41 });
+
+    // Per tab: the reloaded page is the same tab, and no other tab's launches
+    // are its to report.
+    const stored = JSON.parse(sessionStorage.getItem(ADD_PANE_REQUESTS_KEY) ?? "[]") as { requestId: string; status: string }[];
+    expect(Object.fromEntries(stored.map((request) => [request.requestId, request.status]))).toEqual({
+      [clone.requestId!]: "cloning",
+      [pending.requestId!]: "pending",
+      [failed.requestId!]: "failed",
+    });
+
+    // The reload: a fresh store, from this tab's storage alone.
+    vi.resetModules();
+    const reloaded = (await import("./store")).useStore;
+    const restored = reloaded.getState().addPaneRequests;
+    // Their answers went only to the connection the reload ended.
+    expect(restored[clone.requestId!]).toMatchObject({
+      status: "unconfirmed",
+      machineId: LAPTOP,
+      hostname: "laptop",
+      cloneRequestId: clone.requestId,
+      error: expect.stringMatching(/checkout may exist there without a tab\. Nothing was resent/),
+    });
+    expect(restored[pending.requestId!]).toMatchObject({ status: "unconfirmed", error: expect.stringMatching(/It was not resent/) });
+    expect(restored[failed.requestId!]).toMatchObject({ status: "failed", error: "zoo-005 refused the tab" });
+    expect(restored[routed.requestId!]).toBeUndefined();
+
+    // The clone's acknowledgement reaches every connection of its owner, the
+    // reloaded page's included: it says where the checkout went, and still
+    // nothing is added or sent again.
+    reloaded.setState({ showToast: vi.fn(), listMachines: vi.fn(), negotiatedCapabilities: new Set([PROJECT_INSTANCES_CAPABILITY]) });
+    reloaded.getState().connect();
+    await new Promise((done) => setTimeout(done, 10));
+    const next = reloaded.getState().ws as unknown as MockWs;
+    deliver(next, { type: "project_instance_created", machine_id: LAPTOP, request_id: clone.requestId, project_id: PROJECT });
+    expect(reloaded.getState().addPaneRequests[clone.requestId!]).toMatchObject({
+      status: "unconfirmed",
+      error: expect.stringMatching(/finished, but no tab was added/),
+    });
+    expect(sentFrames(next, "add_pane")).toHaveLength(0);
+    expect(sentFrames(next, "create_project_instance")).toHaveLength(0);
+
+    // Dismissed is gone for good, reloads included.
+    reloaded.getState().dismissAddPaneRequest(failed.requestId!);
+    expect((JSON.parse(sessionStorage.getItem(ADD_PANE_REQUESTS_KEY) ?? "[]") as { requestId: string }[])
+      .map((request) => request.requestId)).not.toContain(failed.requestId);
+    reloaded.getState().disconnect();
+    expect(sessionStorage.getItem(ADD_PANE_REQUESTS_KEY)).toBeNull();
+  });
+
+  it("restores only well-formed launches from storage", () => {
+    const base = { requestId: "a", sessionId: SID, provider: "claude", kind: "terminal", startedAt: 1, updatedAt: 2 };
+    expect(restoreAddPaneRequests(null)).toEqual({});
+    expect(restoreAddPaneRequests({ a: base })).toEqual({});
+    expect(restoreAddPaneRequests([
+      { ...base, status: "starting", hostname: "zoo-006" },
+      { ...base, requestId: "b", status: "teleporting" },
+      { ...base, requestId: "c", status: "failed", kind: "spaceship" },
+      { ...base, requestId: "d", status: "failed", paneId: 1.5 },
+      { ...base, requestId: "", status: "failed" },
+      "junk",
+    ])).toEqual({
+      a: {
+        ...base,
+        kind: "terminal",
+        status: "unconfirmed",
+        hostname: "zoo-006",
+        machineId: undefined,
+        addRequestId: undefined,
+        cloneRequestId: undefined,
+        label: undefined,
+        paneId: undefined,
+        error: "Connection lost before the server confirmed this tab. It was not resent; check the tab bar before trying again.",
+      },
+    });
   });
 });
 

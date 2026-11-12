@@ -207,7 +207,7 @@
       ]
     },
     {
-      "description": "Correlated acceptance or rejection for a time-sensitive coding\nmutation. `accepted` means the current authorized CLI accepted the\noperation for processing; clients never infer success from send().",
+      "description": "Correlated acceptance or rejection for a time-sensitive coding\nmutation. `accepted` means the current authorized CLI accepted the\noperation for processing; clients never infer success from send().\nA [`MutationKind::Input`] acknowledgement is only ever a rejection.",
       "type": "object",
       "properties": {
         "accepted": {
@@ -2974,12 +2974,22 @@
       ]
     },
     "MutationKind": {
-      "type": "string",
-      "enum": [
-        "approval",
-        "question",
-        "plan_review",
-        "interrupt"
+      "description": "What a [`ServerToWeb::MutationAck`] answers. Its `request_id` is the id the\nrequest carried: `request_id` on approvals, answers and interrupts, and\n`client_msg_id` on typed input.",
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "approval",
+            "question",
+            "plan_review",
+            "interrupt"
+          ]
+        },
+        {
+          "description": "The server refused a [`WebToServer::Input`] or\n[`WebToServer::TerminalConversationInput`] that carried a\n`client_msg_id`. The acknowledgement's `request_id` is that id, and its\n`pane_id` the tab the input was for: the one it named, else the legacy\npane the server resolved it to. It is only ever a refusal: `accepted`\nis false, `error` gives the reason and `question_pending` is absent.\nAccepted input is acknowledged as before, by the\n[`ServerToWeb::UserInput`] echo carrying the same `client_msg_id`, so a\nclient never waits for an accepted one.\n\nThe server sends it when it refuses the input because of the tab's\nmachine: that machine is not running the project (\"<host> is not\nrunning this project. Start it on <host> first.\"), or the sender may\nnot use it. Resending changes neither answer, and a client that settles\nsends by id would otherwise resend until it gave up with no reason to\nshow. The server may send one for any other refusal of such an input\ntoo, so a client settles the send with `error` whatever the reason. A\nrefusal reported only as an `Error`, and every refusal from an older\nserver, leaves the send unanswered, as before.\n\nIt goes only to the connection that sent the input, and only when that\nconnection negotiated [`PROJECT_INSTANCES_CAPABILITY`]. It comes in\naddition to the [`ServerToWeb::Error`] carrying the same text, never\ninstead of it, so a client that shows that error, as the web does,\nignores this. The gate is what keeps older native builds connected:\ntheir bundled schema lists only the four kinds above, and they drop\nthe socket on a frame it rejects.",
+          "type": "string",
+          "const": "input"
+        }
       ]
     },
     "OutputType": {

@@ -18,8 +18,12 @@
 //! * [`start_instance`] adopts untagged panes unless another machine claimed
 //!   the project first or runs it alone, and returns the panes this instance
 //!   restores ([`open_instance`] first creates a missing file, as a runtime
-//!   starting in a folder must);
-//! * [`forget_machine_panes`] drops one machine's entries.
+//!   starting in a folder must).
+//!
+//! No write removes another machine's panes, not even when the owner forgets
+//! that machine's tabs: forgetting changes only the server's roster, and on a
+//! shared home this file is what that machine restores its tabs from if it
+//! runs the project again.
 //!
 //! [`read_project_metadata`] is the reader for periodic and background reads.
 //! Unlike `get_or_create_project` it never creates, deletes, regenerates or
@@ -410,24 +414,6 @@ pub fn update_pane<R>(
     Ok(result)
 }
 
-/// Drop every pane tagged with `machine_id`, for `ForgetMachinePanes`: the
-/// owner confirmed that machine will not come back. Untagged panes stay even
-/// when that machine last ran them; the server forgets those from its roster
-/// by host instead, and they can return when an instance adopts them.
-///
-/// The server refuses to forget a machine that runs an instance, so an
-/// instance never receives this for its own machine. Returns the ids dropped.
-pub fn forget_machine_panes(dir: &Path, project_id: Uuid, machine_id: Uuid) -> Result<Vec<u32>> {
-    let (forgotten, _) = transact(
-        dir,
-        project_id,
-        LOCK_WAIT,
-        WhenMissing::Create,
-        |document| Ok(document.forget(machine_id)),
-    )?;
-    Ok(forgotten)
-}
-
 /// Whether another machine's claim on the project rules out this one adopting
 /// its untagged panes: a host runs it alone, or another machine claimed it
 /// before this one did ([`crate::daemon_registry::LiveInstances::blocks_adoption`]).
@@ -814,8 +800,10 @@ impl Document {
             return Vec::new();
         }
         // Only a pane whose id no other entry shares. Two entries with one id
-        // means one was left behind by a forget beside a pane that is in use,
-        // and adopting it would give this instance two panes with one id.
+        // means an untagged one outlived its tab, which the server forgot or
+        // closed in its roster alone (or never knew of), and its id went to a
+        // pane that is in use. Adopting it would give this instance two panes
+        // with one id.
         let untagged = self
             .panes
             .iter()
@@ -930,19 +918,6 @@ impl Document {
         } else if !self.panes.iter().any(|pane| is_deadloop(&pane)) {
             self.settings.is_paused = false;
         }
-    }
-
-    fn forget(&mut self, machine_id: Uuid) -> Vec<u32> {
-        let mut forgotten = Vec::new();
-        self.panes.retain(|pane| {
-            if pane.config.machine_id == Some(machine_id) {
-                forgotten.push(pane.config.pane_id);
-                false
-            } else {
-                true
-            }
-        });
-        forgotten
     }
 
     /// The file as the operation leaves it. Only what changed differs from
@@ -1272,7 +1247,6 @@ mod tests {
                 .is_err()
         );
         assert!(update_pane(dir.path(), project, 3, |pane| pane.label = None).is_err());
-        assert!(forget_machine_panes(dir.path(), project, Uuid::new_v4()).is_err());
         assert_eq!(
             std::fs::read(&path).unwrap(),
             corrupt,
@@ -1583,7 +1557,6 @@ mod tests {
 
         save_instance_panes(dir.path(), project, &instance(me, "zoo-005"), &panes).unwrap();
         start_instance(dir.path(), project, &instance(me, "zoo-005")).unwrap();
-        forget_machine_panes(dir.path(), project, Uuid::new_v4()).unwrap();
         update_project_settings(dir.path(), project, |_| ()).unwrap();
         assert_eq!(update_pane(dir.path(), project, 9, |_| ()).unwrap(), None);
 
@@ -1983,35 +1956,6 @@ mod tests {
     }
 
     #[test]
-    fn forgetting_a_machine_removes_only_its_entries() {
-        let _config = isolated_config_dir();
-        let (me, gone) = (Uuid::new_v4(), Uuid::new_v4());
-        let (dir, project) = project_with(vec![
-            tagged(pane(1, Uuid::new_v4()), me, "zoo-005"),
-            tagged(pane(2, Uuid::new_v4()), gone, "laptop"),
-            tagged(pane(3, Uuid::new_v4()), gone, "laptop"),
-            pane(4, Uuid::new_v4()),
-        ]);
-
-        assert_eq!(
-            forget_machine_panes(dir.path(), project, gone).unwrap(),
-            vec![2, 3]
-        );
-
-        let disk = on_disk(dir.path());
-        assert_eq!(
-            pane_ids(&disk.panes),
-            vec![1, 4],
-            "untagged panes are not forgotten"
-        );
-        let after = bytes(dir.path());
-        assert!(forget_machine_panes(dir.path(), project, gone)
-            .unwrap()
-            .is_empty());
-        assert_eq!(bytes(dir.path()), after);
-    }
-
-    #[test]
     fn a_settings_write_changes_only_its_fields() {
         let _config = isolated_config_dir();
         let other = Uuid::new_v4();
@@ -2096,7 +2040,6 @@ mod tests {
         let (project, me) = (Uuid::new_v4(), Uuid::new_v4());
 
         assert!(start_instance(&dir, project, &instance(me, "zoo-005")).is_err());
-        assert!(forget_machine_panes(&dir, project, me).unwrap().is_empty());
         assert_eq!(update_pane(&dir, project, 1, |_| ()).unwrap(), None);
         assert!(
             !get_apas_path(&dir).exists(),

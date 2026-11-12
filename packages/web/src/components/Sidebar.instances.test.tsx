@@ -97,4 +97,64 @@ describe("project rows across machines", () => {
     fireEvent.click(screen.getByRole("button", { name: "Idle sessions" }));
     expect(screen.getByRole("button", { name: "Open Claude 3 in chiral-network" }).textContent).toContain("zoo-006");
   });
+
+  it("lists a stopped machine's agents as not running, not as idle", () => {
+    // zoo-006 stopped; zoo-005 keeps the project active. The server reports
+    // zoo-006's panes as not working, with an idle time.
+    seed([project({
+      instances: [{ machineId: ZOO5, hostname: "zoo-005", primary: true }],
+      panes: [
+        { pane_id: 1, label: "Claude 1", kind: "terminal", provider: "claude", is_working: false, machine_id: ZOO5, hostname: "zoo-005" },
+        { pane_id: 3, label: "Claude 3", kind: "terminal", provider: "claude", is_working: false, machine_id: ZOO6, hostname: "zoo-006", idle_since: "2026-11-12T00:00:00Z" },
+        // Written before instances and attributed to zoo-006.
+        { pane_id: 4, label: "Claude 4", kind: "terminal", provider: "claude", is_working: false, awaiting_answer: true, hostname: "zoo-006" },
+      ],
+    })]);
+    render(<Sidebar />);
+    expect(screen.getByRole("img", { name: "Claude 1: Idle" })).toBeTruthy();
+    expect(screen.getByRole("img", { name: "Claude 3: Not running on zoo-006" })).toBeTruthy();
+    expect(screen.getByRole("img", { name: "Claude 4: Not running on zoo-006" })).toBeTruthy();
+
+    fireEvent.click(screen.getByRole("button", { name: "Idle sessions" }));
+    expect(screen.getByRole("button", { name: "Open Claude 1 in chiral-network" })).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Open Claude 3 in chiral-network" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Open Claude 4 in chiral-network" })).toBeNull();
+  });
+
+  it("still lists idle agents when the server reports no instances", () => {
+    // An older server: nothing says which machines run the project, so the
+    // session's own state is all there is to go on.
+    seed([project({
+      instances: undefined,
+      panes: [
+        { pane_id: 3, label: "Claude 3", kind: "terminal", provider: "claude", is_working: false, machine_id: ZOO6, hostname: "zoo-006" },
+      ],
+    })]);
+    render(<Sidebar />);
+    expect(screen.getByRole("img", { name: "Claude 3: Idle" })).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Idle sessions" }));
+    expect(screen.getByRole("button", { name: "Open Claude 3 in chiral-network" })).toBeTruthy();
+  });
+
+  it("keeps a sole older CLI's untagged agents idle: that CLI runs them all", () => {
+    // zoo-005's daemon is connected but older, so its instance owns every
+    // untagged pane, including ones last recorded on another host.
+    seed([project({
+      instances: [{ machineId: ZOO5, hostname: "zoo-005", primary: true }],
+      panes: [
+        { pane_id: 4, label: "Claude 4", kind: "terminal", provider: "claude", is_working: false, hostname: "zoo-006" },
+      ],
+    })]);
+    act(() => useStore.setState({
+      machines: [{
+        machine: { machineId: ZOO5, hostname: "zoo-005", os: "linux", arch: "x86_64" },
+        projects: [{ projectId: "project-a", path: "/work/chiral-network", isRunning: true }],
+        clusterAccess: "owner",
+        daemonConnected: true,
+        projectInstancesAvailable: false,
+      }],
+    }));
+    render(<Sidebar />);
+    expect(screen.getByRole("img", { name: "Claude 4: Idle" })).toBeTruthy();
+  });
 });

@@ -536,7 +536,12 @@ export type ServerToWeb =
       type: "heartbeat";
       [k: string]: unknown;
     };
-export type MutationKind = "approval" | "question" | "plan_review" | "interrupt";
+/**
+ * What a [`ServerToWeb::MutationAck`] answers. Its `request_id` is the id the
+ * request carried: `request_id` on approvals, answers and interrupts, and
+ * `client_msg_id` on typed input.
+ */
+export type MutationKind = ("approval" | "question" | "plan_review" | "interrupt") | "input";
 /**
  * Whether one configured pane can retain its exact live process during a
  * full CLI replacement.

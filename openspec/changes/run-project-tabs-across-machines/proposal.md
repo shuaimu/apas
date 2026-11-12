@@ -53,7 +53,9 @@ Two concrete cases motivate this:
   `--project <id>` joins explicitly and `--new` keeps it separate.
 - Older CLIs, daemons, web and mobile builds keep today's one-machine
   behaviour; nothing changes for a project until a capable instance runs it.
-  Older web and native builds never receive the new frames.
+  Older web and native builds never receive the new frames, and a capable
+  daemon runs an instance beside another machine's only on a server that
+  confirms support.
 
 ## Capabilities
 
@@ -77,29 +79,36 @@ requirements continue to apply to each instance.
   id on `AddPane` with the correlated `AddPaneResult`; `SessionInstanceInfo`
   in session summaries and the capability-gated `SessionInstances` frame; a
   target machine on reboot and lifecycle requests and on lifecycle reports;
-  `all_instances` on project Start/Stop; `ForgetMachinePanes`;
-  `StartProjectCli.request_id` with `ProjectRuntimeStarted`;
-  `daemon_connected`, `project_instances_available` and a canonical
-  `git_remote` on machine entries; the join id on clone requests; the
-  `ProjectsByRemoteResponse` types; and the instance meaning of a native
-  launch's machine. Regenerated web/mobile schemas, protocol TypeScript and
-  fixtures.
+  `all_instances` on project Start/Stop; the web's roster-only
+  `ForgetMachinePanes` (no CLI-bound forget); `StartProjectCli.request_id`
+  with `ProjectRuntimeStarted`; the capability echoed to daemons in
+  `ServerToDaemon::Registered`; `daemon_connected`,
+  `project_instances_available` and a canonical `git_remote` on machine
+  entries; the join id on clone requests; the `ProjectsByRemoteResponse`
+  types; `MutationKind::Input` refusals of typed input for viewers that
+  negotiated the capability; and the instance meaning of a native launch's
+  machine. Regenerated web/mobile schemas, protocol TypeScript and fixtures.
 - **Server:** per-machine attachments on a session; roster merge with adoption
   of untagged panes and attributed hosts; routing by scope, capability and
   runtime-access checks per pane machine; disconnect scoping; inbound
   pane-ownership validation; per-machine lifecycle inventories; the instance
-  set for capable viewers; in-flight pane-id reservations; start-then-add
-  correlated with the daemon's start outcome; project-wide start/stop, and
-  stop/delete across all instances; a `/projects/by-remote` lookup.
+  set for capable viewers; in-flight pane-id reservations; remembered ids of
+  forgotten tabs; correlated refusals of input for a stopped or inaccessible
+  machine's tab; start-then-add correlated with the daemon's start outcome;
+  project-wide start/stop, and stop/delete across all instances; placing a
+  project only a registration knows when its owner starts it; a
+  `/projects/by-remote` lookup.
 - **CLI/daemon:** machine id threaded into the project runtime; pane tagging,
   adoption and locked merge-save in `.apas`; restore of own panes only;
   cross-machine transcript exclusion; per-machine claims with release on stop;
-  a correlated report of every start outcome; each project's `git_remote` in
-  the inventory; `apas register` join flow; clone-to-join provisioning.
+  instances only on a server that echoes the capability; a correlated report
+  of every start outcome; each project's `git_remote` in the inventory;
+  `apas register` join flow; clone-to-join provisioning.
 - **Web/mobile:** host badges, machine picker, pending/failed/unconfirmed tab
   launches, project-wide Start/Close, forgetting a stopped machine's tabs, and
   machine resolution for multi-machine projects; native mobile shows host
-  badges and targets launches at the chosen machine.
+  badges, targets launches at the chosen machine, and shows why a send was
+  refused.
 - **Rollout:** shared → server → web → mobile → CLI/daemon. No migration of
   existing `.apas` files is required; untagged panes are adopted when a
   capable instance reports them.

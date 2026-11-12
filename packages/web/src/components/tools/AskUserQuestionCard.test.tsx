@@ -151,4 +151,36 @@ describe("AskUserQuestionCard", () => {
     expect(screen.queryByRole("button", { name: /submit/i })).toBeNull();
     expect(screen.queryByRole("button", { name: /first option/i })).toBeNull();
   });
+
+  it("locks a question its pane cannot take now, says why, and sends nothing", () => {
+    const { answerQuestion } = seedQuestionStore();
+    const reason = "zoo-006 is not running this project. Start it on zoo-006 first.";
+
+    render(
+      <AskUserQuestionCard
+        toolUseId="tool-refused"
+        input={{
+          questions: [
+            {
+              question: "Which rollout path should we take?",
+              options: [{ label: "Safe path" }, { label: "Fast path" }],
+            },
+          ],
+        }}
+        disabledReason={reason}
+      />,
+    );
+
+    expect(screen.getByRole("status").textContent).toBe(reason);
+    const option = screen.getByRole("button", { name: /fast path/i }) as HTMLButtonElement;
+    const other = screen.getByRole("button", { name: /other/i }) as HTMLButtonElement;
+    const submit = screen.getByRole("button", { name: /submit/i }) as HTMLButtonElement;
+    expect([option.disabled, other.disabled, submit.disabled]).toEqual([true, true, true]);
+    expect(submit.title).toBe(reason);
+    fireEvent.click(option);
+    fireEvent.click(submit);
+    expect(option.getAttribute("aria-pressed")).toBe("false");
+    expect(answerQuestion).not.toHaveBeenCalled();
+    expect(screen.queryByText("Answer Submitted")).toBeNull();
+  });
 });

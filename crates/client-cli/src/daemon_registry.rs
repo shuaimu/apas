@@ -234,6 +234,10 @@ pub enum ClaimRefusal {
     /// This daemon runs projects alone ([`ClaimMode::Exclusive`]), and another
     /// host runs this one.
     RunningElsewhere(InstanceHolder),
+    /// This daemon could run the project beside another machine's instance,
+    /// but the server it is connected to keeps one CLI per session, and
+    /// another host runs it ([`claim_project_alone`]).
+    SingleMachineServer(InstanceHolder),
 }
 
 impl ClaimRefusal {
@@ -248,6 +252,12 @@ impl ClaimRefusal {
             Self::RunningElsewhere(holder) => format!(
                 "{host} is running this project, and this host cannot run it beside another \
                  machine because config.toml sets daemon.machine_id",
+                host = holder.hostname
+            ),
+            Self::SingleMachineServer(holder) => format!(
+                "{host} is running this project, and the APAS server this host is connected \
+                 to cannot run a project on more than one machine at a time; stop it on {host} \
+                 first",
                 host = holder.hostname
             ),
         }
@@ -665,6 +675,67 @@ fn claim_project_at(
     }
 }
 
+/// [`claim_project`] for a start that must not run beside another machine's
+/// instance although `mode` would allow it: the server this daemon is
+/// connected to keeps one CLI per session, so a second machine's runtime
+/// would replace the first's there and leave its tabs beyond reach.
+///
+/// In [`ClaimMode::Instances`] it refuses, as every daemon did before
+/// instances, while any other host has a live claim on the project: an
+/// instance claim, or the guard, marked or not. Otherwise it claims exactly as
+/// [`claim_project`] does. The claims keep `mode`'s shape, marker included:
+/// what starts is the same capable runtime, the heartbeat refreshes them in
+/// that shape, and only the server stands in the way of a further instance.
+/// [`ClaimMode::Exclusive`] refuses any other live host already.
+pub fn claim_project_alone(
+    config_dir: &Path,
+    project_id: &str,
+    project_path: &str,
+    machine_id: Uuid,
+    mode: ClaimMode,
+) -> Result<ClaimOutcome> {
+    claim_project_alone_at(
+        config_dir,
+        project_id,
+        project_path,
+        machine_id,
+        mode,
+        &Actor::current(),
+        now_secs(),
+    )
+}
+
+fn claim_project_alone_at(
+    config_dir: &Path,
+    project_id: &str,
+    project_path: &str,
+    machine_id: Uuid,
+    mode: ClaimMode,
+    actor: &Actor,
+    now: u64,
+) -> Result<ClaimOutcome> {
+    if mode == ClaimMode::Instances {
+        let others = live_instance_machines_at(config_dir, project_id, machine_id, actor, now);
+        if let Some(holder) = others
+            .exclusive_legacy
+            .or_else(|| others.machines.into_iter().next())
+        {
+            return Ok(ClaimOutcome::HeldBy(ClaimRefusal::SingleMachineServer(
+                holder,
+            )));
+        }
+    }
+    claim_project_at(
+        config_dir,
+        project_id,
+        project_path,
+        machine_id,
+        mode,
+        actor,
+        now,
+    )
+}
+
 fn write_instance_claim(
     path: &Path,
     previous: Option<&ProjectClaim>,
@@ -1009,9 +1080,9 @@ mod tests {
 
     fn refusing_host(refusal: &ClaimRefusal) -> &str {
         match refusal {
-            ClaimRefusal::ExclusiveHolder(holder) | ClaimRefusal::RunningElsewhere(holder) => {
-                &holder.hostname
-            }
+            ClaimRefusal::ExclusiveHolder(holder)
+            | ClaimRefusal::RunningElsewhere(holder)
+            | ClaimRefusal::SingleMachineServer(holder) => &holder.hostname,
         }
     }
 
@@ -1321,6 +1392,127 @@ mod tests {
             "one answer between them"
         );
         assert_eq!(seen_by_5.blocks_adoption(), m6 < m5);
+    }
+
+    /// Facing a server that keeps one CLI per session, a capable daemon starts
+    /// a project only where no other host runs it, as daemons did before
+    /// instances, whatever the other host's claim says. Alone, it claims in
+    /// its own shape, marker included.
+    #[test]
+    fn a_start_that_must_run_alone_refuses_beside_any_other_live_host() {
+        let now = now_secs();
+        let (m5, m6) = (Uuid::new_v4(), Uuid::new_v4());
+        let (zoo5, zoo6) = (host("zoo-005", 11), host("zoo-006", 12));
+        let alone = |dir: &Path, at: u64| {
+            claim_project_alone_at(dir, "p1", "/proj", m6, ClaimMode::Instances, &zoo6, at).unwrap()
+        };
+        let capable_instance = |dir: &Path, at: u64| {
+            claim_project_at(dir, "p1", "/proj", m5, ClaimMode::Instances, &zoo5, at).unwrap();
+        };
+
+        // Every way another host shows that it runs the project: its instance
+        // claim beside the marked guard, its instance claim alone (its guard
+        // released while another instance has not retaken it yet), and the
+        // unmarked guard of a host that runs the project alone.
+        let marked = TempDir::new().unwrap();
+        capable_instance(marked.path(), now);
+        let instance_only = TempDir::new().unwrap();
+        capable_instance(instance_only.path(), now);
+        std::fs::remove_file(claim_path(instance_only.path(), "p1")).unwrap();
+        let unmarked = TempDir::new().unwrap();
+        write_atomic(
+            &claim_path(unmarked.path(), "p1"),
+            &other_host_claim("p1", "older-peer.invalid", now),
+            &host("older-peer.invalid", 1),
+        )
+        .unwrap();
+        for (dir, holder) in [
+            (&marked, "zoo-005"),
+            (&instance_only, "zoo-005"),
+            (&unmarked, "older-peer.invalid"),
+        ] {
+            let guard_before = std::fs::read(claim_path(dir.path(), "p1")).ok();
+            match alone(dir.path(), now) {
+                ClaimOutcome::HeldBy(refusal) => {
+                    assert!(
+                        matches!(refusal, ClaimRefusal::SingleMachineServer(_)),
+                        "{holder}: {refusal:?}"
+                    );
+                    assert_eq!(refusing_host(&refusal), holder);
+                    let reason = refusal.reason();
+                    assert!(
+                        reason.contains("cannot run a project on more than one machine"),
+                        "{reason}"
+                    );
+                    assert!(
+                        reason.contains(&format!("stop it on {holder} first")),
+                        "{reason}"
+                    );
+                }
+                other => panic!("{holder} runs the project; expected a refusal, got {other:?}"),
+            }
+            assert!(
+                !instance_claim_path(dir.path(), "p1", m6).exists(),
+                "{holder}: a refused start claims nothing"
+            );
+            assert_eq!(
+                std::fs::read(claim_path(dir.path(), "p1")).ok(),
+                guard_before,
+                "{holder}: the guard is left as it was"
+            );
+        }
+
+        // A host that stopped refreshing no longer runs it.
+        let lapsed = TempDir::new().unwrap();
+        capable_instance(lapsed.path(), now - STALE_AFTER_SECS - 10);
+        assert_eq!(alone(lapsed.path(), now), ClaimOutcome::Acquired);
+
+        // Alone, the claims are a capable daemon's: its instance claim and the
+        // guard marked, so the start is no different once the server runs
+        // instances again.
+        let unclaimed = TempDir::new().unwrap();
+        assert_eq!(alone(unclaimed.path(), now), ClaimOutcome::Acquired);
+        for dir in [&lapsed, &unclaimed] {
+            let own = read_claim(&instance_claim_path(dir.path(), "p1", m6)).unwrap();
+            assert_eq!(own.hostname, "zoo-006");
+            let guard = read_claim(&claim_path(dir.path(), "p1")).unwrap();
+            assert_eq!(
+                (guard.hostname.as_str(), guard.instances),
+                ("zoo-006", true)
+            );
+        }
+
+        // This host's own claims, a previous daemon's say, are no other host.
+        let earlier = TempDir::new().unwrap();
+        claim_project_at(
+            earlier.path(),
+            "p1",
+            "/proj",
+            m6,
+            ClaimMode::Instances,
+            &host("zoo-006", 99),
+            now - 30,
+        )
+        .unwrap();
+        assert_eq!(alone(earlier.path(), now), ClaimOutcome::AlreadyOurs);
+
+        // A daemon that runs projects alone anyway refuses as it always did.
+        match claim_project_alone_at(
+            marked.path(),
+            "p1",
+            "/proj",
+            m6,
+            ClaimMode::Exclusive,
+            &zoo6,
+            now,
+        )
+        .unwrap()
+        {
+            ClaimOutcome::HeldBy(ClaimRefusal::RunningElsewhere(holder)) => {
+                assert_eq!(holder.hostname, "zoo-005")
+            }
+            other => panic!("expected the configured-machine-id refusal, got {other:?}"),
+        }
     }
 
     /// The bug this prevents: shared projects.json + a /proc-only guard let

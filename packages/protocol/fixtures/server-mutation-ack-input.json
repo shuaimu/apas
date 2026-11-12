@@ -1,0 +1,9 @@
+{
+  "type": "mutation_ack",
+  "request_id": "msg-1",
+  "session_id": "20000000-0000-4000-8000-000000000001",
+  "pane_id": 4,
+  "mutation": "input",
+  "accepted": false,
+  "error": "zoo-005 is not running this project. Start it on zoo-005 first."
+}

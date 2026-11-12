@@ -10,6 +10,7 @@ import {
   paneUnavailableReason,
   rosterSpansHosts,
   sessionHostSummary,
+  tabUnavailableReason,
 } from "./projectInstances";
 import { useMobileStore } from "./store";
 
@@ -130,8 +131,26 @@ describe("tab reachability", () => {
   it("says why a tab cannot take input, naming where to start it", () => {
     expect(paneUnavailableReason("stopped", "zoo-006")).toBe("zoo-006 is not running this project. Start it on zoo-006 first.");
     expect(paneUnavailableReason("no_access", "zoo-006")).toBe("Your access does not cover zoo-006, so this tab is read-only here.");
-    expect(paneUnavailableReason("stopped", null)).toMatch(/not running this project/);
+    expect(paneUnavailableReason("stopped", null)).toBe("This tab's machine is not running this project.");
     expect(paneUnavailableReason("usable", "zoo-006")).toBeNull();
+  });
+
+  it("describes a stopped machine in the words of the protocol's own refusal", () => {
+    // The golden refusal of typed input for a tab on a stopped machine.
+    const refusal = fixture("server-mutation-ack-input.json");
+    expect(refusal.type).toBe("mutation_ack");
+    expect(paneUnavailableReason("stopped", "zoo-005")).toBe(refusal.type === "mutation_ack" ? refusal.error : undefined);
+  });
+
+  it("judges one tab for screens that show only that tab", () => {
+    expect(tabUnavailableReason({ machine_id: ZOO_006, hostname: "zoo-006" }, [zoo005], true))
+      .toBe("zoo-006 is not running this project. Start it on zoo-006 first.");
+    expect(tabUnavailableReason({ machine_id: ZOO_006, hostname: "zoo-006" }, [zoo005, { ...zoo006, runtime_access: false }], true))
+      .toBe("Your access does not cover zoo-006, so this tab is read-only here.");
+    expect(tabUnavailableReason({ machine_id: ZOO_006, hostname: "zoo-006" }, [zoo005, zoo006], true)).toBeNull();
+    // Without a live set, or for a tab the roster does not list, the server decides.
+    expect(tabUnavailableReason({ machine_id: ZOO_006, hostname: "zoo-006" }, [zoo005], false)).toBeNull();
+    expect(tabUnavailableReason(undefined, [zoo005], true)).toBeNull();
   });
 });
 

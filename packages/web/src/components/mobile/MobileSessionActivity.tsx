@@ -250,11 +250,16 @@ function MobileEventCard({
   answeredQuestions,
   onApprove,
   onReject,
+  disabledReason,
 }: {
   item: ActivityItem;
   answeredQuestions: Map<string, Record<string, string>>;
   onApprove: (toolCallId: string) => void;
   onReject: (toolCallId: string) => void;
+  /** Why the card's pane cannot take answers now: its machine is not running
+   *  the project, or this viewer may not use it. The server would only
+   *  refuse an answer, so its decisions are disabled with the reason. */
+  disabledReason?: string;
 }) {
   const [expanded, setExpanded] = useState(false);
   const { message } = item;
@@ -299,14 +304,15 @@ function MobileEventCard({
       {output?.type === "approval_request" && (
         <div className="mt-3 border-t border-amber-200 pt-3 dark:border-amber-900">
           <p className="mb-3 text-sm text-[#686873] dark:text-[#aaaab6]">{output.description}</p>
+          {disabledReason && <p role="status" className="mb-3 text-sm text-amber-800 dark:text-amber-200">{disabledReason}</p>}
           <div className="flex gap-2">
-            <button type="button" onClick={() => onReject(output.toolCallId)} className="flex-1 rounded-xl border border-red-300 px-3 py-2 text-sm font-bold text-red-600 dark:border-red-900 dark:text-red-300">Reject</button>
-            <button type="button" onClick={() => onApprove(output.toolCallId)} className="flex-1 rounded-xl bg-emerald-600 px-3 py-2 text-sm font-bold text-white">Approve</button>
+            <button type="button" disabled={Boolean(disabledReason)} title={disabledReason} onClick={() => onReject(output.toolCallId)} className="flex-1 rounded-xl border border-red-300 px-3 py-2 text-sm font-bold text-red-600 disabled:opacity-40 dark:border-red-900 dark:text-red-300">Reject</button>
+            <button type="button" disabled={Boolean(disabledReason)} title={disabledReason} onClick={() => onApprove(output.toolCallId)} className="flex-1 rounded-xl bg-emerald-600 px-3 py-2 text-sm font-bold text-white disabled:opacity-40">Approve</button>
           </div>
         </div>
       )}
       {output?.type === "tool_use" && output.tool === "AskUserQuestion" && (
-        <AskUserQuestionCard key={JSON.stringify([message.sessionId, message.paneId, output.toolUseId])} toolUseId={output.toolUseId} input={output.input} sessionId={message.sessionId} paneId={message.paneId} />
+        <AskUserQuestionCard key={JSON.stringify([message.sessionId, message.paneId, output.toolUseId])} toolUseId={output.toolUseId} input={output.input} sessionId={message.sessionId} paneId={message.paneId} disabledReason={disabledReason} />
       )}
     </article>
   );
@@ -916,13 +922,19 @@ export function MobileSessionActivity({ connected, onBack, onReconnect }: Mobile
       <div ref={activityScrollRef} role="log" aria-label="Conversation activity" onScroll={handleActivityScroll} className="min-h-0 flex-1 overflow-y-auto px-4 pb-4">
         {selectedPlanReviews.length > 0 && (
           <div className="mb-3 space-y-2">
-            {selectedPlanReviews.map((plan) => (
-              <div key={plan.toolUseId} className="rounded-2xl border border-amber-400 bg-white p-3.5 dark:border-amber-700 dark:bg-[#1b1b21]">
-                <span className="rounded-full bg-amber-100 px-2.5 py-1 text-[0.68rem] font-extrabold uppercase text-amber-800 dark:bg-amber-950/60 dark:text-amber-200">plan review</span>
-                <p className="mt-2 text-sm font-semibold">Pane {plan.paneId} wants to use {plan.toolName}.</p>
-                <div className="mt-3 flex gap-2"><button type="button" onClick={() => answerPlanReview(plan.toolUseId, false)} className="flex-1 rounded-xl border border-red-300 py-2 text-sm font-bold text-red-600 dark:border-red-900 dark:text-red-300">Deny</button><button type="button" onClick={() => answerPlanReview(plan.toolUseId, true)} className="flex-1 rounded-xl bg-emerald-600 py-2 text-sm font-bold text-white">Approve</button></div>
-              </div>
-            ))}
+            {selectedPlanReviews.map((plan) => {
+              // Answering optimistically drops the review, while the server
+              // refuses it for a machine that is not running the project.
+              const planRefusal = tabHosts.tabs.get(plan.paneId)?.refusal;
+              return (
+                <div key={plan.toolUseId} className="rounded-2xl border border-amber-400 bg-white p-3.5 dark:border-amber-700 dark:bg-[#1b1b21]">
+                  <span className="rounded-full bg-amber-100 px-2.5 py-1 text-[0.68rem] font-extrabold uppercase text-amber-800 dark:bg-amber-950/60 dark:text-amber-200">plan review</span>
+                  <p className="mt-2 text-sm font-semibold">Pane {plan.paneId} wants to use {plan.toolName}.</p>
+                  {planRefusal && <p role="status" className="mt-2 text-sm text-amber-800 dark:text-amber-200">{planRefusal}</p>}
+                  <div className="mt-3 flex gap-2"><button type="button" disabled={Boolean(planRefusal)} title={planRefusal} onClick={() => answerPlanReview(plan.toolUseId, false)} className="flex-1 rounded-xl border border-red-300 py-2 text-sm font-bold text-red-600 disabled:opacity-40 dark:border-red-900 dark:text-red-300">Deny</button><button type="button" disabled={Boolean(planRefusal)} title={planRefusal} onClick={() => answerPlanReview(plan.toolUseId, true)} className="flex-1 rounded-xl bg-emerald-600 py-2 text-sm font-bold text-white disabled:opacity-40">Approve</button></div>
+                </div>
+              );
+            })}
           </div>
         )}
 
@@ -939,7 +951,7 @@ export function MobileSessionActivity({ connected, onBack, onReconnect }: Mobile
 
         {visibleActivity.length > 0 ? (
           <div className="space-y-2.5">
-            {visibleActivity.map((item) => <MobileEventCard key={item.key} item={item} answeredQuestions={answeredQuestions} onApprove={approve} onReject={reject} />)}
+            {visibleActivity.map((item) => <MobileEventCard key={item.key} item={item} answeredQuestions={answeredQuestions} onApprove={approve} onReject={reject} disabledReason={tabHosts.tabs.get(item.paneId)?.refusal} />)}
           </div>
         ) : (
           <div className="flex min-h-60 flex-col items-center justify-center px-5 text-center">

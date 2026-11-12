@@ -793,6 +793,42 @@ describe("mobile code screens", () => {
     expect(view.getByText("Claude 3 · zoo-005")).toBeTruthy();
   });
 
+  it("shows the server's own reason when it refuses typed input for a tab's machine", async () => {
+    // A sole instance that reported a machine may or may not own a tab another
+    // host recorded, so the screen lets the server decide. The server refuses
+    // the input with a mutation_ack carrying its client_msg_id, which settles
+    // the send with that reason instead of retrying it into a timeout.
+    const refusal = "zoo-005 is not running this project. Start it on zoo-005 first.";
+    mockParams = { sessionId: session.id };
+    mockReadCachedSnapshot.mockReturnValue(new Promise(() => undefined));
+    mockSendAcknowledged.mockRejectedValueOnce(new Error(refusal));
+    useMobileStore.setState({
+      sessions: [session],
+      features: { terminal: true, coding_mutations: true },
+      negotiatedCapabilities: ["project_instances_v1"],
+      instancesBySession: { [session.id]: [{ ...zoo006, primary: true }] },
+      panesBySession: { [session.id]: [{ ...terminalPane, pane_id: 5, label: "Legacy 5", hostname: "zoo-005" }] },
+    });
+    const view = render(<SessionActivityScreen />);
+
+    await waitFor(() => expect(view.getByText("✓ Legacy 5")).toBeTruthy());
+    expect(view.queryByTestId("pane-unavailable")).toBeNull();
+    fireEvent.changeText(view.getByPlaceholderText("Message this terminal conversation"), "Run the suite.");
+    fireEvent.press(view.getByText("Send message"));
+
+    await waitFor(() => expect(view.getByText(refusal)).toBeTruthy());
+    expect(view.queryByText("The terminal conversation message was not acknowledged.")).toBeNull();
+    expect(mockSendAcknowledged).toHaveBeenCalledTimes(1);
+    expect(mockSendAcknowledged).toHaveBeenCalledWith(expect.objectContaining({
+      type: "terminal_conversation_input",
+      pane_id: 5,
+      client_msg_id: expect.any(String),
+    }), expect.any(String));
+    // The draft stays, and sending it again (once the machine runs) carries
+    // the same id: a refused input was never recorded, so it is not a duplicate.
+    expect(view.getByText("Retry message safely")).toBeTruthy();
+  });
+
   it("calls no machine stopped when the server did not negotiate instances", async () => {
     mockParams = { sessionId: session.id, paneId: "4" };
     mockReadCachedSnapshot.mockReturnValue(new Promise(() => undefined));

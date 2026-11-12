@@ -12,6 +12,10 @@ import { AskUserQuestionCard } from "@/components/tools/AskUserQuestionCard";
 
 interface AssistantMessageProps {
   message: Message;
+  /** Why the message's pane cannot take answers now (its machine is not
+   *  running the project, or this viewer may not use it). Locks the
+   *  questions and approvals it shows, with the reason. */
+  disabledReason?: string;
 }
 
 interface FoldableItemEventPreview {
@@ -151,7 +155,7 @@ function truncateValue(value: string, max = 140): string {
   return `${value.slice(0, max)}...`;
 }
 
-export const AssistantMessage = memo(function AssistantMessage({ message }: AssistantMessageProps) {
+export const AssistantMessage = memo(function AssistantMessage({ message, disabledReason }: AssistantMessageProps) {
   const outputType = message.outputType;
 
   return (
@@ -160,7 +164,7 @@ export const AssistantMessage = memo(function AssistantMessage({ message }: Assi
         <Bot className="w-4 h-4 sm:w-5 sm:h-5 text-purple-500" />
       </div>
       <div className="flex-1 min-w-0 overflow-hidden">
-        {renderContent(message, outputType)}
+        {renderContent(message, outputType, disabledReason)}
         <div className="text-xs text-gray-400 mt-1">
           {formatTimestamp(message.timestamp)}
         </div>
@@ -169,7 +173,7 @@ export const AssistantMessage = memo(function AssistantMessage({ message }: Assi
   );
 });
 
-function renderContent(message: Message, outputType: Message["outputType"]) {
+function renderContent(message: Message, outputType: Message["outputType"], disabledReason?: string) {
   if (!outputType) {
     return <TextContent content={message.content} />;
   }
@@ -190,6 +194,7 @@ function renderContent(message: Message, outputType: Message["outputType"]) {
             input={outputType.input}
             sessionId={message.sessionId}
             paneId={message.paneId}
+            disabledReason={disabledReason}
           />
         );
       }
@@ -239,6 +244,7 @@ function renderContent(message: Message, outputType: Message["outputType"]) {
           toolCallId={outputType.toolCallId}
           tool={outputType.tool}
           description={outputType.description}
+          disabledReason={disabledReason}
         />
       );
 

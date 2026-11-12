@@ -1,6 +1,6 @@
 import { Alert } from "react-native";
 import { act, cleanup, render } from "@testing-library/react-native";
-import type { MobileSessionSummary } from "@apas/protocol";
+import type { MobileSessionSummary, PaneConfig, SessionInstanceInfo } from "@apas/protocol";
 
 import TerminalScreen from "@/../app/(code)/session/[sessionId]/terminal";
 import { useMobileStore } from "@/state/store";
@@ -47,6 +47,22 @@ const session: MobileSessionSummary = {
   is_active: true,
 };
 
+const ZOO_005 = "50000000-0000-4000-8000-000000000001";
+const ZOO_006 = "50000000-0000-4000-8000-000000000002";
+const zoo005: SessionInstanceInfo = { machine_id: ZOO_005, hostname: "zoo-005", primary: true, runtime_access: true };
+const zoo006: SessionInstanceInfo = { machine_id: ZOO_006, hostname: "zoo-006", primary: false, runtime_access: true };
+// The tab this screen shows, pane 3, runs on zoo-006.
+const zoo006Pane: PaneConfig = {
+  pane_id: 3,
+  provider: "codex",
+  mode: "interactive",
+  kind: "terminal",
+  session_id: "terminal-pane-session",
+  is_paused: false,
+  machine_id: ZOO_006,
+  hostname: "zoo-006",
+};
+
 function bridge(message: unknown): void {
   act(() => {
     mockWebViewProps.onMessage?.({ nativeEvent: { data: JSON.stringify(message) } });
@@ -82,6 +98,9 @@ describe("native terminal containment and input", () => {
       serverMutationsAllowed: true,
       sessions: [session],
       features: { terminal: true, coding_mutations: true },
+      negotiatedCapabilities: [],
+      instancesBySession: {},
+      panesBySession: {},
     });
   });
 
@@ -156,5 +175,48 @@ describe("native terminal containment and input", () => {
     expect(mockSend).not.toHaveBeenCalled();
     expect(mockInjectJavaScript).toHaveBeenCalledWith(expect.stringContaining('"type":"reset","reason":"access_lost"'));
     expect(mockWebViewProps.onShouldStartLoadWithRequest?.({ url: "https://evil.example" })).toBe(false);
+  });
+
+  it("shows a tab on a machine this viewer cannot use, but sends it no keys or sizes", () => {
+    // The project's other instance admits this viewer, so the retained screen
+    // attaches as running; zoo-006's would refuse every key, and an error
+    // frame shows nothing on this screen.
+    useMobileStore.setState({
+      negotiatedCapabilities: ["project_instances_v1"],
+      instancesBySession: { [sessionId]: [zoo005, { ...zoo006, runtime_access: false }] },
+      panesBySession: { [sessionId]: [zoo006Pane] },
+    });
+    const view = render(<TerminalScreen />);
+    makeRunning();
+    expect(mockSend).toHaveBeenCalledWith({ type: "terminal_attach", session_id: sessionId, pane_id: 3 });
+    mockSend.mockClear();
+
+    bridge({ type: "input", data: "ls\r" });
+    bridge({ type: "resize", cols: 100, rows: 30 });
+    act(() => jest.advanceTimersByTime(200));
+    expect(mockSend).not.toHaveBeenCalled();
+    expect(view.getByText("Your access does not cover zoo-006, so this tab is read-only here.")).toBeTruthy();
+    expect(view.getByRole("button", { name: "Esc" })).toBeDisabled();
+
+    // Access arrives: the size held back reaches the pty, and keys work.
+    act(() => useMobileStore.getState().setSessionInstances(sessionId, [zoo005, zoo006]));
+    expect(mockSend).toHaveBeenCalledWith({ type: "terminal_resize", session_id: sessionId, pane_id: 3, cols: 100, rows: 30 });
+    expect(view.queryByText(/Your access does not cover/)).toBeNull();
+    bridge({ type: "input", data: "ls" });
+    expect(mockSend).toHaveBeenLastCalledWith(expect.objectContaining({ type: "terminal_input", pane_id: 3 }));
+  });
+
+  it("says when the tab's machine is not running the project", () => {
+    useMobileStore.setState({
+      negotiatedCapabilities: ["project_instances_v1"],
+      instancesBySession: { [sessionId]: [zoo005] },
+      panesBySession: { [sessionId]: [zoo006Pane] },
+    });
+    const view = render(<TerminalScreen />);
+    makeRunning();
+    mockSend.mockClear();
+    bridge({ type: "input", data: "ls" });
+    expect(mockSend).not.toHaveBeenCalled();
+    expect(view.getByText("zoo-006 is not running this project. Start it on zoo-006 first.")).toBeTruthy();
   });
 });

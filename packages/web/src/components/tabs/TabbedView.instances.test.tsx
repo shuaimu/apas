@@ -238,6 +238,100 @@ describe("a tab whose machine is not running the project", () => {
     fireEvent.change(input, { target: { value: "hello" } });
     expect((screen.getByRole("button", { name: "Send" }) as HTMLButtonElement).disabled).toBe(true);
   });
+
+  it("will not answer the stopped machine's questions or plan reviews, and says why", async () => {
+    // The server refuses the answer and keeps the question pending; answering
+    // here used to toast success, mark the card answered and queue the
+    // answer for replay on every reconnect.
+    seed(11);
+    const question = {
+      id: "question-11",
+      role: "assistant" as const,
+      content: "",
+      timestamp: new Date(),
+      sessionId: SID,
+      paneId: 11,
+      outputType: {
+        type: "tool_use" as const,
+        tool: "AskUserQuestion",
+        toolUseId: "toolu-question-11",
+        input: { questions: [{ question: "Ship it?", options: [{ label: "Yes" }, { label: "No" }] }] },
+      },
+    };
+    act(() => useStore.setState({
+      paneMessages: { ...useStore.getState().paneMessages, [paneKey(11)]: [question] },
+      planReviewPending: [{ paneId: 11, toolUseId: "toolu-plan-11", toolName: "Bash", input: { command: "ls" }, arrivedAt: Date.now() }],
+    }));
+    render(<TabbedView />);
+    await screen.findByTestId("terminal-pane-11");
+    fireEvent.click(screen.getByRole("button", { name: /Conversation/ }));
+
+    const yes = await screen.findByRole("button", { name: "Yes" }) as HTMLButtonElement;
+    expect(yes.disabled).toBe(true);
+    fireEvent.click(yes);
+    const submit = screen.getByRole("button", { name: "Submit" }) as HTMLButtonElement;
+    expect(submit.disabled).toBe(true);
+    expect(submit.title).toBe(STOPPED);
+    fireEvent.click(submit);
+    const reasons = screen.getAllByRole("status").filter((element) => element.textContent === STOPPED);
+    // The question card and the plan review each say why, beside the banner.
+    expect(reasons.length).toBeGreaterThanOrEqual(2);
+
+    const approve = screen.getByRole("button", { name: "Approve" }) as HTMLButtonElement;
+    expect(approve.disabled).toBe(true);
+    fireEvent.click(approve);
+
+    expect(sent("answer_question")).toEqual([]);
+    expect(sent("plan_review_answer")).toEqual([]);
+    const state = useStore.getState();
+    expect(state.answeredQuestions.has("toolu-question-11")).toBe(false);
+    expect(state.pendingAnswers).toEqual([]);
+    expect(state.planReviewPending).toHaveLength(1);
+    expect(state.showToast).not.toHaveBeenCalledWith("Answer sent to Claude", "success");
+  });
+
+  it("offers no Start beside a CLI without multi-machine support, and says which to reboot", async () => {
+    // zoo-005's daemon is connected but older: its instance owns the project,
+    // so the server would refuse zoo-006's instance beside it.
+    seed(11);
+    act(() => useStore.setState({
+      machines: [
+        { ...machine(ZOO5, "zoo-005", true), projectInstancesAvailable: false },
+        machine(ZOO6, "zoo-006", true),
+        machine(LAPTOP, "laptop", false),
+      ],
+    }));
+    render(<TabbedView />);
+    await screen.findByTestId("terminal-pane-11");
+    const start = screen.getByRole("button", { name: "Start on zoo-006" }) as HTMLButtonElement;
+    expect(start.disabled).toBe(true);
+    expect(start.title).toBe("Reboot zoo-005 to update");
+    fireEvent.click(start);
+    expect(sent("start_machine_project_cli")).toEqual([]);
+  });
+
+  it("calls a machine whose instance is reconnecting disconnected, with nothing to start", async () => {
+    // zoo-006's daemon still runs the project; only its instance's socket is
+    // gone, and it comes back by itself.
+    seed(11);
+    act(() => useStore.setState({
+      machines: [
+        machine(ZOO5, "zoo-005", true),
+        { ...machine(ZOO6, "zoo-006", true), projects: [{ projectId: SID, path: "/work/project", isRunning: true }] },
+        machine(LAPTOP, "laptop", false),
+      ],
+    }));
+    const { container } = render(<TabbedView />);
+    const pane = await screen.findByTestId("terminal-pane-11");
+    const reconnecting = "zoo-006 is reconnecting to this project. Its tabs work again once it reconnects.";
+    expect(screen.getAllByRole("status").some((element) => element.textContent?.includes(reconnecting))).toBe(true);
+    expect(pane.getAttribute("data-input-disabled")).toBe(reconnecting);
+    expect(container.querySelector('[data-tab-id="11"]')?.textContent).toContain("disconnected");
+    expect(screen.queryByRole("button", { name: "Start on zoo-006" })).toBeNull();
+    // A sleeping laptop's daemon reads as connected and running for hours, so
+    // its tabs can still be forgotten from here.
+    expect(screen.getByRole("button", { name: "Forget zoo-006's tabs" })).toBeTruthy();
+  });
 });
 
 describe("choosing a machine for a new tab", () => {

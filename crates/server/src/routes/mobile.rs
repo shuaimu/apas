@@ -483,8 +483,12 @@ pub async fn launch_task(
             )
         })?;
     let _launch_guard = state.mobile_task_launch_guard(request.request_id).await;
-    // A launch starts the project when nothing runs it, so a project its
-    // owner's machine only registered is placed first, as a web Start does.
+    // A launch starts the project when nothing runs it, so a project the
+    // requester's own machine lists but that has no placement in the
+    // requester's cluster yet is placed first, as a web Start does. This
+    // needs a project record: one that `apas register` created and that has
+    // never run has none, so it has no policy, `launch_targets` never offers
+    // it, and it is refused above. A web Start of it creates the record.
     super::ws_web::place_registered_project(
         &state,
         &user_id,

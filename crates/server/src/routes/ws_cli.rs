@@ -207,24 +207,107 @@ fn admit_inbound(
 /// Load `panes.json` into the session's roster before an instance's report
 /// merges into it. After a server restart the cached roster is empty, and a
 /// capable instance's report merged into nothing would drop every stopped
-/// machine's tabs. A failed read leaves the roster as it is.
+/// machine's tabs. A failed read is tried again at the next report; see
+/// [`load_persisted_pane_roster`].
 async fn ensure_pane_roster_loaded(state: &AppState, session_id: &Uuid) {
     ensure_forgotten_panes_loaded(state, session_id).await;
     if state.sessions.pane_roster_seeded(session_id) {
         return;
     }
+    load_persisted_pane_roster(state, session_id).await;
+}
+
+/// What reading a session's `panes.json` found.
+pub(crate) enum PersistedRoster {
+    /// The saved roster seeded the session's, unless something seeded it
+    /// first; the roster now held.
+    Loaded(Vec<PaneConfig>),
+    /// Nothing is saved: nothing ever was, or a file that does not parse was
+    /// moved aside.
+    Absent,
+    /// The file is there but could not be read. Until a read succeeds the
+    /// roster is not seeded, so nothing saves over the file.
+    Unreadable,
+}
+
+/// Read `panes.json` into the session's unseeded roster.
+///
+/// A file that cannot be read now, for example while descriptors run out,
+/// may hold tabs nothing else knows, such as a stopped machine's. Reports
+/// still merge for viewers to see, but the roster stays unseeded and unsaved
+/// until a later load reads the file; merging into nothing and saving that
+/// would have erased those tabs for good. When a read then succeeds, the
+/// reports merged meanwhile are laid over the saved roster and every instance
+/// is asked to report again, so what they dropped meanwhile goes too. A file
+/// that does not parse never will, and would leave the roster unsaved for
+/// good, so it is moved aside for an operator and treated as never saved.
+pub(crate) async fn load_persisted_pane_roster(
+    state: &AppState,
+    session_id: &Uuid,
+) -> PersistedRoster {
     match state.storage.load_pane_roster(session_id).await {
         Ok(Some(stored)) => {
-            state.sessions.hydrate_pane_roster(session_id, stored);
+            let recovering = state.sessions.pane_roster_unreadable(session_id);
+            let roster = state.sessions.hydrate_pane_roster(session_id, stored);
+            if recovering {
+                tracing::info!(
+                    %session_id,
+                    "read the persisted pane roster after a failed read; asking every instance to report again"
+                );
+                state
+                    .sessions
+                    .route_to_cli(
+                        session_id,
+                        ServerToCli::RequestPaneList {
+                            session_id: *session_id,
+                        },
+                    )
+                    .await;
+            }
+            PersistedRoster::Loaded(roster)
         }
         // Never saved: there are no stopped tabs to keep, and the roster
         // stays unknown until an instance reports one.
-        Ok(None) => {}
-        Err(error) => tracing::warn!(
-            %session_id,
-            %error,
-            "failed to load the persisted pane roster; merging into the cached one"
-        ),
+        Ok(None) => {
+            state.sessions.clear_pane_roster_unreadable(session_id);
+            PersistedRoster::Absent
+        }
+        Err(error) if error.downcast_ref::<serde_json::Error>().is_some() => {
+            match state.storage.set_aside_pane_roster(session_id).await {
+                Ok(aside) => tracing::error!(
+                    %session_id,
+                    %error,
+                    aside = %aside.display(),
+                    "the persisted pane roster does not parse; moved it aside and treating the roster as never saved"
+                ),
+                // Another load moved it first.
+                Err(set_aside)
+                    if set_aside
+                        .downcast_ref::<std::io::Error>()
+                        .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound) => {}
+                Err(set_aside) => {
+                    tracing::error!(
+                        %session_id,
+                        %error,
+                        %set_aside,
+                        "the persisted pane roster does not parse and could not be moved aside; it will not be saved over"
+                    );
+                    state.sessions.mark_pane_roster_unreadable(session_id);
+                    return PersistedRoster::Unreadable;
+                }
+            }
+            state.sessions.clear_pane_roster_unreadable(session_id);
+            PersistedRoster::Absent
+        }
+        Err(error) => {
+            tracing::warn!(
+                %session_id,
+                %error,
+                "failed to read the persisted pane roster; it will not be saved over until a read succeeds"
+            );
+            state.sessions.mark_pane_roster_unreadable(session_id);
+            PersistedRoster::Unreadable
+        }
     }
 }
 
@@ -3476,5 +3559,122 @@ mod instance_tests {
         })
         .await;
         eventually_row(&harness, session, "the session ends", |row| row.status == "ended").await;
+    }
+
+    fn tagged(pane_id: u32, machine_id: Uuid, host: &str) -> PaneConfig {
+        let mut pane = pane(pane_id);
+        pane.machine_id = Some(machine_id);
+        pane.hostname = Some(host.to_string());
+        pane
+    }
+
+    fn tags(panes: &[PaneConfig]) -> Vec<(u32, Option<Uuid>)> {
+        panes
+            .iter()
+            .map(|pane| (pane.pane_id, pane.machine_id))
+            .collect()
+    }
+
+    fn panes_file(harness: &Harness, session_id: Uuid) -> std::path::PathBuf {
+        harness
+            .dir
+            .join("sessions")
+            .join(session_id.to_string())
+            .join("panes.json")
+    }
+
+    /// After a restart the saved roster holds a stopped machine's tab. While
+    /// `panes.json` cannot be read, an instance's report is shown but never
+    /// saved over the file, which would erase that tab for good. Once the
+    /// file reads again the tab is back beside the report, every instance
+    /// is asked to report again, and the whole roster is saved.
+    #[tokio::test]
+    async fn a_roster_that_cannot_be_read_is_never_saved_over() {
+        let harness = harness().await;
+        let session = Uuid::new_v4();
+        let (m5, m6) = (Uuid::new_v4(), Uuid::new_v4());
+        harness
+            .state
+            .storage
+            .save_pane_list(&session, &[tagged(3, m5, HOST_A), tagged(4, m6, HOST_B)])
+            .await
+            .unwrap();
+        // A directory in its place makes every read of the file fail.
+        let file = panes_file(&harness, session);
+        let saved = file.with_file_name("panes.json.saved");
+        std::fs::rename(&file, &saved).unwrap();
+        std::fs::create_dir(&file).unwrap();
+
+        let (mut a, _) = connect_cli(&harness, true).await;
+        start(&mut a, session_start(session, m5, HOST_A, Some(vec![pane(3)]))).await;
+        let sessions = &harness.state.sessions;
+        assert_eq!(tags(&sessions.get_session_panes(&session)), vec![(3, Some(m5))]);
+        assert!(sessions.pane_roster_unreadable(&session));
+        assert!(!sessions.pane_roster_seeded(&session));
+        assert!(sessions.pane_roster_snapshot(&session).is_none());
+        assert!(file.is_dir(), "nothing was saved over the unreadable roster");
+
+        // The file reads again; the instance's next report loads it first.
+        std::fs::remove_dir(&file).unwrap();
+        std::fs::rename(&saved, &file).unwrap();
+        send(&mut a, CliToServer::PaneList {
+            session_id: session,
+            panes: vec![pane(3), pane(5)],
+        })
+        .await;
+        receive(&mut a, |message| matches!(message, ServerToCli::RequestPaneList { .. })).await;
+        let expected = vec![(3, Some(m5)), (4, Some(m6)), (5, Some(m5))];
+        eventually("the report merges into the saved roster", || {
+            tags(&sessions.get_session_panes(&session)) == expected
+        })
+        .await;
+        assert!(sessions.pane_roster_seeded(&session));
+        assert!(!sessions.pane_roster_unreadable(&session));
+        let persisted = harness
+            .state
+            .storage
+            .load_pane_roster(&session)
+            .await
+            .unwrap()
+            .expect("the roster is saved again");
+        assert_eq!(tags(&persisted), expected);
+    }
+
+    /// A `panes.json` that does not parse never will. It is moved aside with
+    /// its bytes for an operator, and the project goes on as if no roster
+    /// had been saved, rather than never saving one again.
+    #[tokio::test]
+    async fn a_roster_that_does_not_parse_is_moved_aside() {
+        let harness = harness().await;
+        let session = Uuid::new_v4();
+        let m5 = Uuid::new_v4();
+        let file = panes_file(&harness, session);
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, b"[{\"pane_id\": 3,").unwrap();
+
+        let (mut a, _) = connect_cli(&harness, true).await;
+        start(&mut a, session_start(session, m5, HOST_A, Some(vec![pane(3)]))).await;
+        let sessions = &harness.state.sessions;
+        assert!(sessions.pane_roster_seeded(&session));
+        assert!(!sessions.pane_roster_unreadable(&session));
+        let persisted = harness
+            .state
+            .storage
+            .load_pane_roster(&session)
+            .await
+            .unwrap()
+            .expect("the reported roster is saved");
+        assert_eq!(tags(&persisted), vec![(3, Some(m5))]);
+        let aside: Vec<std::path::PathBuf> = std::fs::read_dir(file.parent().unwrap())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("panes.json.unreadable-"))
+            })
+            .collect();
+        assert_eq!(aside.len(), 1, "{aside:?}");
+        assert_eq!(std::fs::read(&aside[0]).unwrap(), b"[{\"pane_id\": 3,");
     }
 }

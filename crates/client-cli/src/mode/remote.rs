@@ -542,7 +542,6 @@ async fn run_connection(
                     | Ok(ServerToCli::RebootPane { .. })
                     | Ok(ServerToCli::AddPane { .. })
                     | Ok(ServerToCli::RemovePane { .. })
-                    | Ok(ServerToCli::ForgetMachinePanes { .. })
                     | Ok(ServerToCli::StartBot { .. })
                     | Ok(ServerToCli::StopBot { .. })
                     | Ok(ServerToCli::RequestPaneList { .. })

@@ -386,8 +386,15 @@ pub struct SessionState {
     /// `panes` holds the project's roster: seeded from `panes.json`, reported
     /// by an instance, or set by a web change. Until then an empty `panes`
     /// only means "not loaded", and merging one instance's report into it
-    /// would drop every other machine's tabs.
+    /// would drop every other machine's tabs. An unseeded roster is never
+    /// saved.
     pub roster_seeded: bool,
+    /// The last read of `panes.json` failed, and none has succeeded since.
+    /// The file may hold tabs nothing else knows, such as a stopped
+    /// machine's, so reports still merge into `panes` for viewers to see but
+    /// do not seed it: nothing saves over the file, and the next load reads
+    /// it again.
+    pub roster_unreadable: bool,
     /// Ids handed to new panes that their instance has not reported yet. New
     /// ids are allocated against these as well as `panes`, under this
     /// session's lock, so concurrent adds never draw the same id.
@@ -419,6 +426,7 @@ impl SessionState {
             machine_id: None,
             instances: Vec::new(),
             roster_seeded: false,
+            roster_unreadable: false,
             pane_reservations: HashMap::new(),
             forgotten_panes: HashMap::new(),
             forgotten_panes_loaded: false,
@@ -426,7 +434,8 @@ impl SessionState {
     }
 
     /// Replace the whole roster, dropping the statuses of panes that are gone
-    /// and starting new idle panes' idle time now.
+    /// and starting new idle panes' idle time now. The roster is then the
+    /// project's, seeded and no longer waiting on an unreadable `panes.json`.
     fn replace_roster(&mut self, panes: Vec<PaneConfig>) {
         let observed_at = chrono::Utc::now().to_rfc3339();
         let pane_ids = panes
@@ -450,6 +459,7 @@ impl SessionState {
         }
         self.panes = panes;
         self.roster_seeded = true;
+        self.roster_unreadable = false;
     }
 }
 
@@ -1195,19 +1205,34 @@ impl SessionManager {
             .collect()
     }
 
-    /// The single inventory older readers expect: the first attached
-    /// instance's that has reported, which is the primary's once it has, and
-    /// with no instance attached the latest one reported, as a session with
-    /// one instance always had.
+    /// The single inventory older readers expect, with the machine it is
+    /// sent under: the primary's, and nothing while the primary has not
+    /// reported one. Their reboot and lifecycle requests name no machine and
+    /// so reach the primary; another machine's inventory, even one reported
+    /// first, would have their confirmation count tabs the request does not
+    /// restart. With no instance attached it is the latest one reported,
+    /// under no machine, as a session with one instance always had.
+    pub fn primary_lifecycle_inventory(
+        &self,
+        session_id: &Uuid,
+    ) -> Option<(Option<Uuid>, shared::CliLifecycleInventory)> {
+        let primary = self.primary_instance(session_id);
+        let inventories = self.lifecycle_inventories.get(session_id)?;
+        match primary {
+            Some(primary) => inventories
+                .iter()
+                .find(|(machine, _)| *machine == primary.machine_id)
+                .cloned(),
+            None => inventories
+                .last()
+                .map(|(_, inventory)| (None, inventory.clone())),
+        }
+    }
+
+    /// [`Self::primary_lifecycle_inventory`] without its machine.
     pub fn lifecycle_inventory(&self, session_id: &Uuid) -> Option<shared::CliLifecycleInventory> {
-        self.attached_lifecycle_inventories(session_id)
-            .into_iter()
-            .next()
+        self.primary_lifecycle_inventory(session_id)
             .map(|(_, inventory)| inventory)
-            .or_else(|| {
-                let inventories = self.lifecycle_inventories.get(session_id)?;
-                inventories.last().map(|(_, inventory)| inventory.clone())
-            })
     }
 
     pub fn claim_lifecycle_request(
@@ -2493,29 +2518,35 @@ impl SessionManager {
         // the cleanup wholesale, so we don't leak attachments across page
         // reloads.
 
-        if let Some(mut session) = self.sessions.get_mut(session_id) {
-            // Add this web client if not already attached
-            if !session.web_connection_ids.contains(&web_connection_id) {
-                session.web_connection_ids.push(web_connection_id);
-            }
-            tracing::info!(
-                "Web client {} attached to session {} (total viewers: {})",
-                web_connection_id,
-                session_id,
-                session.web_connection_ids.len()
-            );
-            return true;
+        // Find or create the session in one step. A separate miss-then-insert
+        // let an instance's `SessionStart` attach in between, and the insert
+        // then replaced its session with an empty one: the instance's frames
+        // were dropped as coming from no instance until its connection
+        // closed, since nothing attaches it again. A session not in memory
+        // only means the server restarted or nothing has touched it since.
+        let mut created = false;
+        let mut session = self.sessions.entry(*session_id).or_insert_with(|| {
+            created = true;
+            SessionState::empty(*session_id, Uuid::nil())
+        });
+        if !session.web_connection_ids.contains(&web_connection_id) {
+            session.web_connection_ids.push(web_connection_id);
         }
-
-        // Session not in memory - create it (happens after server restart or reconnection)
+        let viewers = session.web_connection_ids.len();
+        drop(session);
+        if created {
+            tracing::info!(
+                "Created session {} in memory for web attach (recorded cli: {:?})",
+                session_id,
+                cli_client_id
+            );
+        }
         tracing::info!(
-            "Creating session {} in memory for web attach (recorded cli: {:?})",
+            "Web client {} attached to session {} (total viewers: {})",
+            web_connection_id,
             session_id,
-            cli_client_id
+            viewers
         );
-        let mut state = SessionState::empty(*session_id, Uuid::nil());
-        state.web_connection_ids.push(web_connection_id);
-        self.sessions.insert(*session_id, state);
         true
     }
 
@@ -2562,6 +2593,7 @@ impl SessionManager {
             machine_id: s.machine_id,
             instances: s.instances.clone(),
             roster_seeded: s.roster_seeded,
+            roster_unreadable: s.roster_unreadable,
             pane_reservations: s.pane_reservations.clone(),
             forgotten_panes: s.forgotten_panes.clone(),
             forgotten_panes_loaded: s.forgotten_panes_loaded,
@@ -2604,10 +2636,15 @@ impl SessionManager {
         self.sessions.contains_key(session_id)
     }
 
-    /// Replace the whole cached roster, as a web edit of labels or order
-    /// does with the roster it read. An instance's own roster report goes
-    /// through [`Self::merge_instance_roster`] instead, which replaces only
-    /// that instance's panes.
+    /// Replace the whole cached roster with `panes`, which tests set up
+    /// rosters with. The server never does: a roster copied before the
+    /// replacement can predate another machine's report and would undo it.
+    /// An instance's report goes through [`Self::merge_instance_roster`], a
+    /// web edit through [`Self::update_session_pane`] or
+    /// [`Self::reorder_session_panes`], a saved roster through
+    /// [`Self::hydrate_pane_roster`], and an inferred one through
+    /// [`Self::seed_inferred_pane_roster`].
+    #[cfg(test)]
     pub fn set_session_panes(&self, session_id: &Uuid, panes: Vec<PaneConfig>) {
         if let Some(mut session) = self.sessions.get_mut(session_id) {
             session.replace_roster(panes);
@@ -2644,11 +2681,36 @@ impl SessionManager {
         Some(session.panes.clone())
     }
 
-    /// The cached roster, or `None` when the session is not in memory, so a
-    /// save never recreates a deleted session's directory with an empty one.
+    /// Apply `edit` to the pane `pane_id` and return the roster, or `None`
+    /// when the roster does not list that pane. Done in place under the
+    /// session's lock, as [`Self::reorder_session_panes`] is: a web edit that
+    /// read a copy and replaced the roster with it undid any roster report
+    /// merged in between, such as another machine's new tab.
+    pub fn update_session_pane(
+        &self,
+        session_id: &Uuid,
+        pane_id: u32,
+        edit: impl FnOnce(&mut PaneConfig),
+    ) -> Option<Vec<PaneConfig>> {
+        let mut session = self.sessions.get_mut(session_id)?;
+        let pane = session
+            .panes
+            .iter_mut()
+            .find(|pane| pane.pane_id == pane_id)?;
+        edit(pane);
+        Some(session.panes.clone())
+    }
+
+    /// The cached roster to save, or `None` to save nothing: when the session
+    /// is not in memory, so a save never recreates a deleted session's
+    /// directory with an empty one, and while the roster is not seeded. An
+    /// unseeded roster is at most what instances reported since `panes.json`
+    /// failed to read, and saving it would replace every stopped machine's
+    /// tabs the file holds.
     pub fn pane_roster_snapshot(&self, session_id: &Uuid) -> Option<Vec<PaneConfig>> {
         self.sessions
             .get(session_id)
+            .filter(|session| session.roster_seeded)
             .map(|session| session.panes.clone())
     }
 

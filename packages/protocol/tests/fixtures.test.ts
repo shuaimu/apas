@@ -36,6 +36,12 @@ describe("Rust protocol golden fixtures", () => {
     expect(validateClientMessage({ type: "invented_mutation" }).valid).toBe(false);
   });
 
+  it("accepts an input refusal acknowledgement but not an invented mutation kind", () => {
+    const refusal = JSON.parse(readFileSync(`${fixturesDirectory}/server-mutation-ack-input.json`, "utf8"));
+    expect(validateServerMessage({ ...refusal, mutation: "approval" }).valid).toBe(true);
+    expect(validateServerMessage({ ...refusal, mutation: "invented" }).valid).toBe(false);
+  });
+
   it("rejects a job mutation with an unsafe sequence number", () => {
     expect(validateJobContract("mutation_request", {
       request_id: "7c6d2400-7b4b-455d-b732-7f066dab7a24",
