@@ -218,14 +218,13 @@ fn resolve_pane_owner(session: &SessionState, pane_id: u32) -> PaneOwner {
     let Some(primary) = session.instances.first() else {
         return PaneOwner::NoInstance;
     };
-    // A CLI without the capability is only ever the sole instance, and it
-    // owns the whole roster.
-    if !primary.capable {
-        return PaneOwner::Instance(primary.clone());
-    }
     let Some(pane) = session.panes.iter().find(|pane| pane.pane_id == pane_id) else {
         return PaneOwner::Instance(primary.clone());
     };
+    // A tagged pane is its machine's, whichever instance is primary, and
+    // even while a CLI without the capability is the sole instance: such a
+    // CLI reports every pane it runs untagged, so a tab still tagged for
+    // another machine is one it does not run, such as a separate checkout's.
     if let Some(machine_id) = pane.machine_id {
         return match session
             .instances
@@ -239,55 +238,73 @@ fn resolve_pane_owner(session: &SessionState, pane_id: u32) -> PaneOwner {
             },
         };
     }
-    // An untagged pane goes to the instance on its attributed host. With no
-    // attributed host there is nothing to refuse in the name of, so the
-    // primary takes it.
-    let Some(host) = pane
+    // An untagged pane goes to the instance on its attributed host, else to a
+    // sole CLI without the capability, which runs every untagged pane as
+    // before instances. With no attributed host there is nothing to refuse
+    // in the name of, so the primary takes it.
+    let host = pane
         .hostname
         .as_deref()
         .map(normalize_machine_hostname)
-        .filter(|host| !host.is_empty())
-    else {
-        return PaneOwner::Instance(primary.clone());
-    };
-    session
-        .instances
-        .iter()
-        .find(|instance| {
+        .filter(|host| !host.is_empty());
+    if let Some(host) = &host {
+        if let Some(owner) = session.instances.iter().find(|instance| {
             instance
                 .hostname
                 .as_deref()
-                .is_some_and(|candidate| normalize_machine_hostname(candidate) == host)
-        })
-        .map(|owner| PaneOwner::Instance(owner.clone()))
-        .unwrap_or_else(|| PaneOwner::NotRunning {
+                .is_some_and(|candidate| normalize_machine_hostname(candidate) == *host)
+        }) {
+            return PaneOwner::Instance(owner.clone());
+        }
+    }
+    if session.instances.len() == 1 && !primary.capable {
+        return PaneOwner::Instance(primary.clone());
+    }
+    match host {
+        None => PaneOwner::Instance(primary.clone()),
+        Some(_) => PaneOwner::NotRunning {
             machine_id: None,
             hostname: pane.hostname.clone(),
-        })
+        },
+    }
 }
 
 /// The panes a departing instance's disconnect touches.
 enum DepartingPanes {
-    /// A CLI without the capability was the only instance and owned the
-    /// whole roster.
-    All,
+    /// A CLI without the capability was the only instance and ran every pane
+    /// but these, which are tagged for other machines: a tab still tagged
+    /// for another machine is one such a CLI does not run, since it reports
+    /// every pane it runs untagged.
+    AllBut(HashSet<u32>),
     /// A capable instance owns the panes tagged with its machine.
     Tagged(HashSet<u32>),
 }
 
 impl DepartingPanes {
     fn of(session: &SessionState, instance: &InstanceAttachment) -> Self {
-        if !instance.capable {
-            return Self::All;
-        }
-        Self::Tagged(
+        let tagged = |mine: bool| -> HashSet<u32> {
             session
                 .panes
                 .iter()
-                .filter(|pane| pane.machine_id.is_some() && pane.machine_id == instance.machine_id)
+                .filter(|pane| {
+                    pane.machine_id
+                        .is_some_and(|owner| (Some(owner) == instance.machine_id) == mine)
+                })
                 .map(|pane| pane.pane_id)
-                .collect(),
-        )
+                .collect()
+        };
+        if instance.capable {
+            Self::Tagged(tagged(true))
+        } else {
+            Self::AllBut(tagged(false))
+        }
+    }
+
+    fn touches(&self, pane_id: u32) -> bool {
+        match self {
+            Self::AllBut(others) => !others.contains(&pane_id),
+            Self::Tagged(owned) => owned.contains(&pane_id),
+        }
     }
 }
 
@@ -323,16 +340,11 @@ impl SessionState {
     fn detach_at(&mut self, index: usize) -> LockedDetach {
         let instance = self.instances.remove(index);
         let departing = DepartingPanes::of(self, &instance);
-        match &departing {
-            DepartingPanes::All => self.pane_statuses.clear(),
-            DepartingPanes::Tagged(owned) => {
-                // A status for a pane the roster does not list has no owner
-                // left to clear it, so it goes too.
-                let listed: HashSet<u32> = self.panes.iter().map(|pane| pane.pane_id).collect();
-                self.pane_statuses
-                    .retain(|pane_id, _| listed.contains(pane_id) && !owned.contains(pane_id));
-            }
-        }
+        // A status for a pane the roster does not list has no owner left to
+        // clear it, so it goes too.
+        let listed: HashSet<u32> = self.panes.iter().map(|pane| pane.pane_id).collect();
+        self.pane_statuses
+            .retain(|pane_id, _| listed.contains(pane_id) && !departing.touches(*pane_id));
         self.sync_primary();
         LockedDetach {
             instance,
@@ -386,15 +398,34 @@ fn merge_capable_report(
     (merged, removed, foreign)
 }
 
-/// A sole older CLI's report replacing the whole roster, in the existing
-/// order with new panes appended.
-fn replace_with_report(existing: &[PaneConfig], reported: Vec<PaneConfig>) -> Vec<PaneConfig> {
+/// A report from a CLI without the capability, the session's sole instance,
+/// merged into `existing`; `machine_id` is the machine its `SessionStart`
+/// named, if any. Each pane it reports takes that id's place, whatever the
+/// entry's tag: on a shared home such a CLI restores and runs every pane in
+/// the `.apas`, as before instances. Untagged panes it did not report go,
+/// and so do panes tagged with its own machine. A pane tagged for another
+/// machine that it did not report stays, stopped there with its id still
+/// allocated: a separate checkout's tabs are not ones it can see, and
+/// dropping them would leave nothing to start or forget until that machine
+/// ran the project again. Existing panes keep their places and new ones are
+/// appended. See [`PaneConfig::machine_id`].
+fn merge_sole_report(
+    existing: &[PaneConfig],
+    reported: Vec<PaneConfig>,
+    machine_id: Option<Uuid>,
+) -> Vec<PaneConfig> {
     let order: Vec<u32> = reported.iter().map(|pane| pane.pane_id).collect();
     let mut incoming: HashMap<u32, PaneConfig> =
         reported.into_iter().map(|pane| (pane.pane_id, pane)).collect();
     let mut merged: Vec<PaneConfig> = existing
         .iter()
-        .filter_map(|pane| incoming.remove(&pane.pane_id))
+        .filter_map(|pane| match incoming.remove(&pane.pane_id) {
+            Some(update) => Some(update),
+            None => pane
+                .machine_id
+                .filter(|owner| Some(*owner) != machine_id)
+                .map(|_| pane.clone()),
+        })
         .collect();
     merged.extend(order.into_iter().filter_map(|pane_id| incoming.remove(&pane_id)));
     merged
@@ -630,12 +661,7 @@ impl SessionManager {
             if reporter.is_some_and(|reporter| attached.contains(&reporter)) {
                 return false;
             }
-            match &departing {
-                DepartingPanes::All => true,
-                DepartingPanes::Tagged(owned) => {
-                    owned.contains(&pane_id) || reporter == Some(instance.cli_id)
-                }
-            }
+            departing.touches(pane_id) || reporter == Some(instance.cli_id)
         });
         for (pane_id, terminal) in terminals {
             self.route_to_web_now(
@@ -716,10 +742,11 @@ impl SessionManager {
     }
 
     /// Which instance owns `pane_id`. A tagged pane belongs to its machine's
-    /// instance. An untagged pane goes to the instance on its attributed host,
-    /// else to a sole CLI without the capability, which owns the whole
-    /// roster, else to the primary when it has no attributed host. A pane
-    /// the roster does not list also goes to the primary. Anything else is
+    /// instance, whether or not that one has the capability. An untagged pane
+    /// goes to the instance on its attributed host, else to a sole CLI
+    /// without the capability, which runs every untagged pane, else to the
+    /// primary when it has no attributed host. A pane the roster does not
+    /// list also goes to the primary. Anything else is
     /// [`PaneOwner::NotRunning`] on the pane's machine.
     pub fn pane_owner(&self, session_id: &Uuid, pane_id: u32) -> PaneOwner {
         match self.sessions.get(session_id) {
@@ -729,11 +756,12 @@ impl SessionManager {
     }
 
     /// Whether `cli_id` may report output, state or status for `pane_id`.
-    /// Only the instance owning a tagged pane may. A sole CLI without the
-    /// capability owns every pane; an untagged pane belongs to no machine
-    /// until an instance reports it, so any capable instance may; and a pane
-    /// the roster does not list yet is accepted, because a new tab's first
-    /// frames can arrive before the roster report that lists it.
+    /// Only the instance on a tagged pane's machine may, whether or not it
+    /// has the capability. An untagged pane belongs to no machine until an
+    /// instance reports it, so any attached instance may; and a pane the
+    /// roster does not list yet is accepted, because a new tab's first frames
+    /// can arrive before the roster report that lists it, unless its id is
+    /// reserved for a new pane on another machine.
     pub fn inbound_pane_verdict(
         &self,
         session_id: &Uuid,
@@ -750,16 +778,27 @@ impl SessionManager {
         else {
             return InboundPaneVerdict::NotAttached;
         };
-        if !reporter.capable {
-            return InboundPaneVerdict::Accept;
-        }
+        // A pane tagged for another machine is never the reporter's, even a
+        // sole CLI without the capability's: that CLI reports every pane it
+        // runs untagged.
         match session.panes.iter().find(|pane| pane.pane_id == pane_id) {
             Some(pane) if pane.machine_id.is_some() && pane.machine_id != reporter.machine_id => {
                 InboundPaneVerdict::Foreign {
                     owner_hostname: pane.hostname.clone(),
                 }
             }
-            _ => InboundPaneVerdict::Accept,
+            Some(_) => InboundPaneVerdict::Accept,
+            // Not listed yet. While its id is reserved for a new pane sent to
+            // another machine, that machine is the only one whose instance
+            // can be running it.
+            None => match self.live_pane_reservation(&session, pane_id) {
+                Some(Some(machine_id)) if Some(machine_id) != reporter.machine_id => {
+                    InboundPaneVerdict::Foreign {
+                        owner_hostname: self.machine_hostname(&machine_id),
+                    }
+                }
+                _ => InboundPaneVerdict::Accept,
+            },
         }
     }
 
@@ -855,23 +894,27 @@ impl SessionManager {
             ServerToCliScope::Process | ServerToCliScope::Connection => {
                 self.route_to_cli_on_machine(session_id, None, msg).await
             }
-            ServerToCliScope::Unscoped => {
-                let pane_id = match &msg {
-                    // A CLI applies input that names no pane to the legacy
-                    // interactive pane, so it goes to that pane's owner.
-                    ServerToCli::Input { .. } => Some(PANE_ID_INTERACTIVE),
-                    ServerToCli::AnswerQuestion { tool_use_id, .. }
-                    | ServerToCli::PlanReviewAnswer { tool_use_id, .. } => self
-                        .pending_decisions
-                        .get(&(*session_id, tool_use_id.clone()))
-                        .and_then(|decision| decision.pane_id),
-                    _ => None,
-                };
-                match pane_id {
-                    Some(pane_id) => self.route_to_cli_for_pane(session_id, pane_id, msg).await,
-                    None => self.route_to_cli_on_machine(session_id, None, msg).await,
-                }
-            }
+            ServerToCliScope::Unscoped => match self.unscoped_target_pane(session_id, &msg) {
+                Some(pane_id) => self.route_to_cli_for_pane(session_id, pane_id, msg).await,
+                None => self.route_to_cli_on_machine(session_id, None, msg).await,
+            },
+        }
+    }
+
+    /// The pane an [`ServerToCliScope::Unscoped`] message concerns, whose
+    /// owner receives it; `None` sends it to the primary. Input naming no
+    /// pane is applied by a CLI to the legacy interactive pane. An answer
+    /// goes with the decision it answers while the server holds that
+    /// decision, and to the primary when it does not.
+    pub fn unscoped_target_pane(&self, session_id: &Uuid, msg: &ServerToCli) -> Option<u32> {
+        match msg {
+            ServerToCli::Input { .. } => Some(PANE_ID_INTERACTIVE),
+            ServerToCli::AnswerQuestion { tool_use_id, .. }
+            | ServerToCli::PlanReviewAnswer { tool_use_id, .. } => self
+                .pending_decisions
+                .get(&(*session_id, tool_use_id.clone()))
+                .and_then(|decision| decision.pane_id),
+            _ => None,
         }
     }
 
@@ -906,7 +949,9 @@ impl SessionManager {
     /// A capable instance M's report replaces every pane tagged M, adopts the
     /// untagged entries it reports, and leaves every other pane alone; a
     /// reported pane the roster lists for another machine is dropped and
-    /// logged. A sole CLI without the capability replaces the whole roster.
+    /// logged. A sole CLI without the capability replaces every pane but
+    /// those tagged for another machine that it did not report; see
+    /// [`merge_sole_report`].
     /// The server tags what it accepts from the reporting instance, whatever
     /// the pane data says: a capable instance's machine and hostname, or for
     /// an older CLI no machine and its hostname as the attributed host. See
@@ -990,6 +1035,7 @@ impl SessionManager {
                 }
             }
 
+            let reported_ids: Vec<u32> = reported.iter().map(|pane| pane.pane_id).collect();
             let (merged, foreign) = if reporter.capable {
                 let (merged, removed, foreign) =
                     merge_capable_report(&session.panes, reported, reporter.machine_id);
@@ -999,7 +1045,7 @@ impl SessionManager {
                 }
                 (merged, foreign)
             } else {
-                let merged = replace_with_report(&session.panes, reported);
+                let merged = merge_sole_report(&session.panes, reported, reporter.machine_id);
                 let listed: HashSet<u32> = merged.iter().map(|pane| pane.pane_id).collect();
                 session
                     .pane_statuses
@@ -1016,6 +1062,28 @@ impl SessionManager {
                         .pane_idle_since
                         .entry(pane.pane_id)
                         .or_insert_with(|| observed_at.clone());
+                }
+            }
+            // A forgotten tab that its machine reports again is back in the
+            // roster, and its id is in use rather than remembered. An untagged
+            // one comes back with whichever instance reports it. Another
+            // machine reporting a forgotten id is kept, since dropping a
+            // running tab would hide it, but the id stays remembered for the
+            // machine it was forgotten for.
+            for pane_id in reported_ids.iter().filter(|pane_id| !foreign.contains(pane_id)) {
+                let Some(forgotten_for) = session.forgotten_panes.get(pane_id).copied() else {
+                    continue;
+                };
+                if forgotten_for.is_none() || forgotten_for == reporter.machine_id {
+                    session.forgotten_panes.remove(pane_id);
+                } else {
+                    tracing::warn!(
+                        %session_id,
+                        %cli_id,
+                        pane_id,
+                        ?forgotten_for,
+                        "an instance reported a pane id forgotten for another machine"
+                    );
                 }
             }
             session.panes = merged.clone();
@@ -1035,6 +1103,65 @@ impl SessionManager {
             );
         }
         Some(merged)
+    }
+
+    /// After a close of `pane_id` was delivered to `cli_id`, drop the pane
+    /// from the roster if no instance runs it: the roster lists it untagged
+    /// and `cli_id`'s instance, which received the close, can share the
+    /// project. Returns whether it was dropped.
+    ///
+    /// Such an instance reports every pane it runs, and its report tags each
+    /// one, so an untagged entry routed to it is one it does not have: a
+    /// stale entry persisted before instances, panes inferred from history,
+    /// or a pane closed before the instance's first report. Its report leaves
+    /// untagged entries alone, as it must for other hosts' tabs, and the close
+    /// changes nothing on its side, so without this the tab could never be
+    /// closed. If the instance did run it after all, the close it received
+    /// ends it there too. The id is remembered, not freed: an untagged entry
+    /// left in some `.apas` comes back when an instance adopts it.
+    pub fn drop_closed_untagged_pane(
+        &self,
+        session_id: &Uuid,
+        pane_id: u32,
+        cli_id: &Uuid,
+    ) -> bool {
+        {
+            let Some(mut entry) = self.sessions.get_mut(session_id) else {
+                return false;
+            };
+            let session = &mut *entry;
+            let received_by_capable = session
+                .instances
+                .iter()
+                .any(|instance| instance.cli_id == *cli_id && instance.capable);
+            let Some(index) = session
+                .panes
+                .iter()
+                .position(|pane| pane.pane_id == pane_id && pane.machine_id.is_none())
+            else {
+                return false;
+            };
+            if !received_by_capable {
+                return false;
+            }
+            session.panes.remove(index);
+            session.pane_statuses.remove(&pane_id);
+            session.pane_idle_since.remove(&pane_id);
+            session.forgotten_panes.insert(pane_id, None);
+        }
+        self.terminal_states.remove(&(*session_id, pane_id));
+        self.pending_pane_reboots.remove(&(*session_id, pane_id));
+        self.pending_decisions
+            .retain(|(decision_session, _), decision| {
+                decision_session != session_id || decision.pane_id != Some(pane_id)
+            });
+        tracing::info!(
+            %session_id,
+            pane_id,
+            %cli_id,
+            "dropped a closed tab that no instance runs"
+        );
+        true
     }
 
     /// Whether the in-memory roster holds the project's roster yet: seeded
@@ -1484,16 +1611,45 @@ mod tests {
             manager.inbound_pane_verdict(&session, &stranger.id, 99),
             InboundPaneVerdict::NotAttached
         );
+        // While its id is reserved for a new tab on zoo-006, an unlisted pane
+        // is zoo-006's alone.
+        let reserved = manager.allocate_pane_id(&session, Some(m6)).unwrap();
+        assert_eq!(
+            manager.inbound_pane_verdict(&session, &b.id, reserved),
+            InboundPaneVerdict::Accept
+        );
+        assert_eq!(
+            manager.inbound_pane_verdict(&session, &a.id, reserved),
+            InboundPaneVerdict::Foreign {
+                owner_hostname: None
+            }
+        );
 
-        // A sole older CLI owns every pane, whatever the roster's tags say.
+        // A sole older CLI reports every pane it runs untagged: one still
+        // tagged for another machine is not one it runs.
         let legacy_session = Uuid::new_v4();
         let older = cli(&manager, user, false);
         attached(attach(&manager, legacy_session, &older, Some(m6), Some(HOST_B)));
-        manager.set_session_panes(&legacy_session, vec![pane(3, Some(m5), Some(HOST_A))]);
+        manager.set_session_panes(
+            &legacy_session,
+            vec![
+                pane(3, Some(m5), Some(HOST_A)),
+                pane(4, Some(m6), Some(HOST_B)),
+                pane(5, None, Some(HOST_A)),
+            ],
+        );
         assert_eq!(
             manager.inbound_pane_verdict(&legacy_session, &older.id, 3),
-            InboundPaneVerdict::Accept
+            InboundPaneVerdict::Foreign {
+                owner_hostname: Some(HOST_A.to_string())
+            }
         );
+        for pane_id in [4, 5] {
+            assert_eq!(
+                manager.inbound_pane_verdict(&legacy_session, &older.id, pane_id),
+                InboundPaneVerdict::Accept
+            );
+        }
     }
 
     /// One machine's instance leaving disconnects only its own terminals and
@@ -1732,7 +1888,8 @@ mod tests {
 
     /// An untagged pane goes to the instance on its attributed host, else to
     /// a sole older CLI, else to the primary only when it has no attributed
-    /// host; otherwise it is stopped on that host.
+    /// host; otherwise it is stopped on that host. A tagged pane is always
+    /// its machine's.
     #[tokio::test]
     async fn untagged_panes_follow_their_attributed_host() {
         let manager = SessionManager::new();
@@ -1781,7 +1938,8 @@ mod tests {
             }
         );
 
-        // A sole older CLI owns the whole roster, tags and hosts included.
+        // A sole older CLI runs every untagged pane, whatever its attributed
+        // host, but a tagged pane stays its machine's, stopped there.
         let legacy_session = Uuid::new_v4();
         let older = cli(&manager, user, false);
         attached(attach(&manager, legacy_session, &older, None, Some(HOST_A)));
@@ -1789,12 +1947,16 @@ mod tests {
             &legacy_session,
             vec![pane(9, None, Some("zoo-009")), pane(10, Some(m9), Some("zoo-009"))],
         );
-        for pane_id in [9, 10, 11] {
+        for pane_id in [9, 11] {
             assert!(matches!(
                 manager.pane_owner(&legacy_session, pane_id),
                 PaneOwner::Instance(instance) if instance.cli_id == older.id
             ));
         }
+        assert!(matches!(
+            manager.pane_owner(&legacy_session, 10),
+            PaneOwner::NotRunning { machine_id: Some(machine), .. } if machine == m9
+        ));
     }
 
     /// A new pane goes to the machine it was tagged for; input that names no
@@ -1971,26 +2133,61 @@ mod tests {
         assert_eq!(ids(&merged), vec![4], "once adopted, the pane is the reporter's to remove");
     }
 
-    /// A CLI without the capability is the only instance: its report replaces
-    /// the whole roster, untagged, under its own host.
+    /// A CLI without the capability is the only instance, and nothing it
+    /// reports is tagged. Each pane it reports takes its id's place under its
+    /// own host, whatever the entry's tag, as a shared home's older CLI runs
+    /// every pane in the `.apas`. Untagged panes and its own machine's that it
+    /// did not report go. Another machine's tagged tab that it did not report,
+    /// such as a separate checkout's, stays, stopped there, so it can still be
+    /// started or forgotten and its id is not handed out again.
     #[test]
-    fn an_older_cli_replaces_the_whole_roster_untagged() {
+    fn an_older_clis_report_keeps_only_other_machines_unreported_tabs() {
         let manager = SessionManager::new();
         let user = Uuid::new_v4();
         let session = Uuid::new_v4();
         let (m5, m6) = (Uuid::new_v4(), Uuid::new_v4());
         let older = cli(&manager, user, false);
         attached(attach(&manager, session, &older, Some(m5), Some(HOST_A)));
-        manager.set_session_panes(&session, vec![pane(3, Some(m6), Some(HOST_B))]);
-        manager.set_pane_status(&session, PaneType::Interactive, 3, Some("Working...".into()));
+        manager.set_session_panes(
+            &session,
+            vec![
+                pane(3, Some(m6), Some(HOST_B)),
+                pane(5, Some(m6), Some(HOST_B)),
+                pane(6, Some(m5), Some(HOST_A)),
+                pane(7, None, Some("elsewhere")),
+            ],
+        );
+        manager.set_pane_status(&session, PaneType::Interactive, 6, Some("Working...".into()));
+        manager.set_pane_status(&session, PaneType::Interactive, 7, Some("Working...".into()));
 
         let merged = manager
-            .merge_instance_roster(&session, &older.id, vec![pane(4, Some(m6), Some("elsewhere"))])
+            .merge_instance_roster(
+                &session,
+                &older.id,
+                vec![pane(5, Some(m6), Some("elsewhere")), pane(4, Some(m6), Some("elsewhere"))],
+            )
             .unwrap();
-        assert_eq!(ids(&merged), vec![4]);
-        assert_eq!(merged[0].machine_id, None, "an older CLI's panes are never tagged");
-        assert_eq!(merged[0].hostname.as_deref(), Some(HOST_A));
+        assert_eq!(ids(&merged), vec![3, 5, 4]);
+        assert_eq!(
+            (merged[0].machine_id, merged[0].hostname.as_deref()),
+            (Some(m6), Some(HOST_B)),
+            "zoo-006's unreported tab stays, stopped there"
+        );
+        for reported in &merged[1..] {
+            assert_eq!(reported.machine_id, None, "an older CLI's panes are never tagged");
+            assert_eq!(reported.hostname.as_deref(), Some(HOST_A));
+        }
         assert!(manager.get_pane_statuses(&session).is_empty());
+        assert!(matches!(
+            manager.pane_owner(&session, 3),
+            PaneOwner::NotRunning { machine_id: Some(machine), .. } if machine == m6
+        ));
+        for pane_id in [4, 5] {
+            assert!(matches!(
+                manager.pane_owner(&session, pane_id),
+                PaneOwner::Instance(instance) if instance.cli_id == older.id
+            ));
+        }
     }
 
     /// The server owns the order: existing panes keep their places and

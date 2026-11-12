@@ -145,10 +145,40 @@ describe("buildMachineChoices", () => {
     expect(summary(model({ canClone: false, machines: [machine("laptop")] }))).toEqual([]);
   });
 
-  it("starts a stopped project on its only registered machine without asking", () => {
+  // Before, a stopped project's only registered machine was a hidden default:
+  // `+` started the project, relaunching its saved tabs and bots, with nothing
+  // in the menu saying so. The step is now shown, preselected, so the start is
+  // disclosed before the click.
+  it("shows the step when the only eligible machine would start the project", () => {
     const result = model({ machines: [machine("zoo-005", { registered: true })], canClone: false });
-    expect(result.showChoice).toBe(false);
+    expect(result.showChoice).toBe(true);
     expect(result.defaultChoice).toMatchObject({ machineId: "zoo-005", kind: "registered" });
+    expect(summary(result)).toEqual([["zoo-005", "registered", null]]);
+
+    // The same when another instance runs the project but this viewer may
+    // not use it: the viewer's own machine would be started.
+    const elsewhere = model({
+      instances: [instance("zoo-006", "zoo-006", { primary: true, runtimeAccess: false })],
+      machines: [machine("zoo-005", { registered: true })],
+      canClone: false,
+    });
+    expect(elsewhere.showChoice).toBe(true);
+    expect(elsewhere.defaultChoice).toMatchObject({ machineId: "zoo-005", kind: "registered" });
+  });
+
+  it("keeps the step hidden when the only eligible machine already runs the project", () => {
+    // Also with a registered machine that cannot take the tab: only eligible
+    // choices count.
+    const result = model({
+      instances: [instance("zoo-005", "zoo-005", { primary: true })],
+      machines: [
+        machine("zoo-005", { registered: true }),
+        machine("zoo-006", { registered: true, daemonConnected: false, projectInstancesAvailable: false }),
+      ],
+      canClone: false,
+    });
+    expect(result.showChoice).toBe(false);
+    expect(result.defaultChoice).toMatchObject({ machineId: "zoo-005", kind: "instance" });
   });
 
   it("uses the fallback machine when neither a tab nor a primary decides", () => {

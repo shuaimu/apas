@@ -14,9 +14,13 @@ const TERMINAL_KEYS = [
 export function MobileTerminalKeyBar({
   paneId,
   connected,
+  disabledReason,
 }: {
   paneId: number;
   connected: boolean;
+  /** Why the pane cannot take input, e.g. its machine is not running the
+   *  project. The server would refuse every key, each as an error toast. */
+  disabledReason?: string;
 }) {
   const sendTerminalInput = useStore((state) => state.sendTerminalInput);
 
@@ -31,7 +35,8 @@ export function MobileTerminalKeyBar({
           key={key.ariaLabel}
           type="button"
           aria-label={key.ariaLabel}
-          disabled={!connected}
+          disabled={!connected || Boolean(disabledReason)}
+          title={disabledReason}
           // Keep xterm focused so tapping an accessory key does not dismiss a
           // phone's software keyboard while the user filters a provider menu.
           onPointerDown={(event) => event.preventDefault()}

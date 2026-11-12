@@ -41,8 +41,10 @@ import {
   describeTabHosts,
   forgetMachineTabsCopy,
   groupMachineChoices,
+  hostList,
   machineChoiceDetail,
   projectHostLabel,
+  projectStartHosts,
   sessionIsOwned,
   tabHostStateLabel,
   type ConfirmationCopy,
@@ -624,8 +626,9 @@ export function MobileSessionActivity({ connected, onBack, onReconnect }: Mobile
 
   const createPane = (option: LaunchOption) => {
     // The machine step's pick, else the default (the selected pane's
-    // machine). The default is sent even when the step is hidden: it may be a
-    // registered machine that the server starts before adding the pane.
+    // machine). A hidden step's default is a running instance, and is still
+    // sent so the pane cannot land elsewhere; a default that would start the
+    // project is never hidden (`buildMachineChoices`).
     const target = selectedMachine ?? machineChoices.defaultChoice;
     if (target?.kind === "clone") {
       // Cloning onto a machine is confirmed on its own sheet first.
@@ -761,6 +764,16 @@ export function MobileSessionActivity({ connected, onBack, onReconnect }: Mobile
     && paneConfigs.some((pane) => pane.pane_id === mountedTerminal.paneId && pane.kind === "terminal")
     ? mountedTerminal : null;
   const terminalIsOpen = terminalPaneId !== null && retainedTerminal?.paneId === terminalPaneId;
+  // The retained terminal's own pane, which need not be the selected one.
+  // Its screen still reads, but keys and sizes would only be refused.
+  const retainedRefusal = retainedTerminal
+    ? tabHosts.tabs.get(retainedTerminal.paneId)?.refusal
+    : undefined;
+  // The machines the Open sheet's request starts; empty means only the one it
+  // names, which is all an older server ever starts.
+  const openProjectStartHosts = openProjectTarget && instancesSupported
+    ? projectStartHosts({ panes: paneConfigs, machines, projectId: openProjectTarget.projectId })
+    : [];
 
   return (
     <ProjectJobsWorkspace key={`${accountId}:${projectId ?? sessionId}`} project={projectContext} paneSelectionRequested={false}>
@@ -887,8 +900,15 @@ export function MobileSessionActivity({ connected, onBack, onReconnect }: Mobile
             <button type="button" onClick={() => setTerminalPaneId(null)} className="flex min-h-11 items-center gap-2 rounded-lg px-2 py-2 text-sm font-bold hover:bg-neutral-800"><ArrowLeft className="h-5 w-5" /> Conversation</button>
             <span className="truncate px-2 text-xs text-neutral-400">{selectedPane ? paneLabel(selectedPane) : `Pane ${retainedTerminal.paneId}`}</span>
           </div>
-          <div className="flex min-h-0 flex-1 flex-col"><TerminalPane key={`${sessionId}:${retainedTerminal.paneId}`} paneId={retainedTerminal.paneId} visible={terminalIsOpen && !workspace.active} /></div>
-          <MobileTerminalKeyBar paneId={retainedTerminal.paneId} connected={connected} />
+          {/* The session's refusal banner is hidden while the terminal is
+              open, so the terminal says why it takes no input. */}
+          {retainedRefusal && (
+            <p role="status" className="flex shrink-0 items-start gap-2 border-b border-neutral-800 px-3 py-2 text-xs text-amber-300">
+              <AlertTriangle aria-hidden="true" className="mt-px h-4 w-4 shrink-0" /> {retainedRefusal}
+            </p>
+          )}
+          <div className="flex min-h-0 flex-1 flex-col"><TerminalPane key={`${sessionId}:${retainedTerminal.paneId}`} paneId={retainedTerminal.paneId} visible={terminalIsOpen && !workspace.active} inputDisabledReason={retainedRefusal} /></div>
+          <MobileTerminalKeyBar paneId={retainedTerminal.paneId} connected={connected} disabledReason={retainedRefusal} />
         </section>
       )}
       <div hidden={workspace.active || terminalIsOpen} className={workspace.active || terminalIsOpen ? "hidden" : "flex min-h-0 flex-1 flex-col"}>
@@ -1159,11 +1179,12 @@ export function MobileSessionActivity({ connected, onBack, onReconnect }: Mobile
           <div role="dialog" aria-modal="true" aria-label={`Open ${projectName}`} onClick={(event) => event.stopPropagation()} className="w-full rounded-t-[1.4rem] border-t border-[#dedee7] bg-[#f7f7fa] p-4 pb-[max(1rem,env(safe-area-inset-bottom))] shadow-2xl dark:border-[#383842] dark:bg-[#111115]">
             <h2 className="text-lg font-extrabold">Open {projectName}?</h2>
             <p className="mt-1.5 text-sm leading-5 text-[#686873] dark:text-[#aaaab6]">
-              {/* Opening the project starts every machine that has its tabs,
-                  not only the one this screen names. */}
-              {tabHosts.spansMachines
-                ? "Its APAS process starts on each online machine that has its tabs, and their saved panes become available again."
-                : `Its APAS process starts on ${session.hostname || "the selected host"}, and its saved panes become available again.`}
+              {/* Name the machines the server will start: every online one
+                  that has the project's tabs, else the one the request names.
+                  Not the session's recorded host, which may be a machine with
+                  no tabs that was the last to stop. An older server starts
+                  only the named machine. */}
+              {`Its APAS process starts on ${hostList(openProjectStartHosts) || openProjectTarget.hostname || session.hostname || "the selected host"}, and its saved panes become available again.`}
             </p>
             <div className="mt-4 flex gap-2.5">
               <button type="button" onClick={() => setOpenProjectTarget(null)} className="flex-1 rounded-xl border border-[#dedee7] px-4 py-2.5 text-sm font-bold dark:border-[#383842]">Cancel</button>

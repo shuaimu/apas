@@ -85,7 +85,7 @@ function TerminalPaneWithViews({
   isLoading: boolean;
   hasMore: boolean;
   /** Why the pane cannot take input now, e.g. its machine is not running
-   *  the project. */
+   *  the project. Disables both views' input. */
   disabledReason?: string;
 }) {
   return (
@@ -100,6 +100,9 @@ function TerminalPaneWithViews({
           key={`terminal-${sessionId}-${paneId}`}
           paneId={paneId}
           visible={isActive && mode === "terminal"}
+          // Still shows the retained screen, but sends no keys or sizes the
+          // server could only refuse; the banner above says why.
+          inputDisabledReason={disabledReason}
         />
       </div>
       {mode === "conversation" && (
@@ -878,9 +881,9 @@ export function TabbedView({
               : "Claude";
     const label = `${basePrefix} ${effectiveTabs.length + 1}`;
     // The machine step's pick, else the default (the selected tab's machine).
-    // The default is sent even when the step is hidden: it may be a
-    // registered machine whose instance the server starts before adding the
-    // tab, and naming it keeps the tab off any other machine.
+    // A hidden step's default is a running instance, and is still sent:
+    // naming it keeps the tab off any other machine. A default that would
+    // start the project is never hidden (`buildMachineChoices`).
     const target = machine ?? machineChoices.defaultChoice;
     let result: { success: boolean; error?: string };
     if (target?.kind === "clone") {

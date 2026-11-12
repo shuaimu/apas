@@ -13,7 +13,9 @@ import { MobileSessionActivity } from "./MobileSessionActivity";
  */
 
 vi.mock("@/components/tabs/TerminalPane", () => ({
-  TerminalPane: ({ paneId }: { paneId: number }) => <div>Raw terminal pane {paneId}</div>,
+  TerminalPane: ({ paneId, inputDisabledReason }: { paneId: number; inputDisabledReason?: string }) => (
+    <div data-input-disabled={inputDisabledReason}>Raw terminal pane {paneId}</div>
+  ),
 }));
 
 const SID = "20000000-0000-4000-8000-000000000001";
@@ -173,6 +175,39 @@ describe("where mobile panes run", () => {
     expectValid(forget);
   });
 
+  it("opens a stopped pane's raw terminal to read, not to type into", async () => {
+    seed(11);
+    renderScreen();
+    fireEvent.click(screen.getByRole("button", { name: "More actions" }));
+    fireEvent.click(screen.getByRole("button", { name: "Open raw terminal" }));
+
+    const terminal = screen.getByRole("region", { name: "Mobile terminal" });
+    // The session's banner is hidden behind the terminal, so it says why.
+    expect(within(terminal).getByRole("status").textContent).toContain(STOPPED);
+    expect((await within(terminal).findByText("Raw terminal pane 11")).getAttribute("data-input-disabled")).toBe(STOPPED);
+    for (const key of within(terminal).getByRole("toolbar", { name: "Terminal keys" }).querySelectorAll("button")) {
+      expect(key.hasAttribute("disabled")).toBe(true);
+      expect(key.getAttribute("title")).toBe(STOPPED);
+      fireEvent.click(key);
+    }
+    expect(sent("terminal_input")).toEqual([]);
+  });
+
+  it("opens a running pane's raw terminal for typing", async () => {
+    seed(10);
+    renderScreen();
+    fireEvent.click(screen.getByRole("button", { name: "More actions" }));
+    fireEvent.click(screen.getByRole("button", { name: "Open raw terminal" }));
+
+    const terminal = screen.getByRole("region", { name: "Mobile terminal" });
+    expect(within(terminal).queryByRole("status")).toBeNull();
+    expect((await within(terminal).findByText("Raw terminal pane 10")).hasAttribute("data-input-disabled")).toBe(false);
+    fireEvent.click(within(terminal).getByRole("button", { name: "Send Escape" }));
+    const [input] = sent("terminal_input");
+    expect(input).toMatchObject({ type: "terminal_input", session_id: SID, pane_id: 10 });
+    expectValid(input);
+  });
+
   it("disables a stopped pane's actions with the reason", () => {
     seed(11);
     renderScreen();
@@ -182,6 +217,46 @@ describe("where mobile panes run", () => {
       expect(button.disabled).toBe(true);
       expect(button.title).toBe(STOPPED);
     }
+  });
+});
+
+describe("opening a stopped project", () => {
+  function stoppedOn(zoo5: Partial<MachineWithProjects>) {
+    // Every tab is zoo-005's. The laptop joined with no tabs and was the
+    // last to stop, so it is the session's recorded host and the machine
+    // the screen addresses.
+    seed(10, []);
+    const registration = (machineId: string, hostname: string): MachineWithProjects => ({
+      ...machine(machineId, hostname, true),
+      projects: [{ projectId: SID, path: "/work/project", isRunning: false }],
+    });
+    act(() => useStore.setState({
+      isAttached: false,
+      machines: [{ ...registration(ZOO5, "zoo-005"), ...zoo5 }, registration(LAPTOP, "laptop")],
+      paneConfigs: [terminal(10, "Claude 1", ZOO5, "zoo-005"), terminal(11, "Claude 2", ZOO5, "zoo-005")],
+      sessions: [{ ...useStore.getState().sessions[0], isActive: false, status: "offline", hostname: "laptop" }],
+    }));
+    renderScreen();
+    fireEvent.click(screen.getByRole("button", { name: "More actions" }));
+    fireEvent.click(screen.getByRole("button", { name: "Open project" }));
+    // The project is named after its repository, "project".
+    return screen.getByRole("dialog", { name: "Open project" });
+  }
+
+  it("names the machine with the tabs, which is the one the server starts", () => {
+    const sheet = stoppedOn({});
+    expect(sheet.textContent).toContain("Its APAS process starts on zoo-005, and its saved panes become available again.");
+    expect(sheet.textContent).not.toContain("laptop");
+
+    fireEvent.click(within(sheet).getByRole("button", { name: "Open project" }));
+    const [start] = sent("start_machine_project_cli");
+    expect(start).toEqual({ type: "start_machine_project_cli", machine_id: LAPTOP, project_id: SID, all_instances: true });
+    expectValid(start);
+  });
+
+  it("names the machine the request names when no machine with tabs can start", () => {
+    const sheet = stoppedOn({ daemonConnected: false, projectInstancesAvailable: false });
+    expect(sheet.textContent).toContain("Its APAS process starts on laptop, and its saved panes become available again.");
   });
 });
 
@@ -224,6 +299,27 @@ describe("choosing a machine for a new mobile agent", () => {
     expect(clone).toMatchObject({ machine_id: LAPTOP, join_project_id: SID, instance_name: "project" });
     expectValid(clone);
     expect(screen.getByRole("status", { name: "New tab launches" }).textContent).toContain("Cloning the repository onto laptop…");
+  });
+
+  it("says a stopped project starts first, even when its machine is the only choice", () => {
+    // A stopped single-machine project: adding an agent starts it there,
+    // relaunching its saved panes, so the sheet says so before the tap.
+    seed(10, []);
+    act(() => useStore.setState({
+      isAttached: false,
+      machines: [machine(ZOO5, "zoo-005", true)],
+      paneConfigs: [terminal(10, "Claude 1", ZOO5, "zoo-005")],
+      sessions: [{ ...useStore.getState().sessions[0], isActive: false, gitRemote: undefined }],
+    }));
+    renderScreen();
+    const sheet = openInteractiveSheet();
+    const starts = within(within(sheet).getByRole("group", { name: "Run on" }))
+      .getByRole("group", { name: "Starts the project first" });
+    expect((within(starts).getByRole("radio", { name: /^zoo-005/ }) as HTMLInputElement).checked).toBe(true);
+    fireEvent.click(within(sheet).getByRole("button", { name: /^Claude terminal/ }));
+    const [add] = sent("add_pane");
+    expect(add).toMatchObject({ session_id: SID, machine_id: ZOO5, kind: "terminal" });
+    expectValid(add);
   });
 
   it("leaves the sheet unchanged with a single eligible machine", () => {

@@ -158,6 +158,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
         tx,
         machine_info.clone(),
         initial_projects,
+        &daemon_capabilities,
     );
     state
         .sessions
@@ -297,6 +298,19 @@ fn validate_daemon_registration(
     })
 }
 
+/// The advertised daemon capabilities this server echoes in `Registered`:
+/// only those a daemon reads the echo of. A daemon that advertised
+/// `project_instances_v1` and does not see it echoed runs each project on one
+/// machine, as a server predating instances requires, so this server, which
+/// runs instances, must echo it.
+fn negotiated_daemon_capabilities(advertised: &[String]) -> Vec<String> {
+    [shared::PROJECT_INSTANCES_CAPABILITY]
+        .into_iter()
+        .filter(|negotiable| advertised.iter().any(|capability| capability == negotiable))
+        .map(str::to_string)
+        .collect()
+}
+
 fn register_daemon_session(
     sessions: &SessionManager,
     machine_id: Uuid,
@@ -304,9 +318,14 @@ fn register_daemon_session(
     sender: mpsc::Sender<ServerToDaemon>,
     machine: MachineInfo,
     projects: Vec<MachineProjectInfo>,
+    capabilities: &[String],
 ) -> ServerToDaemon {
     sessions.register_daemon(machine_id, user_id, sender, machine, projects);
-    ServerToDaemon::Registered { machine_id, cluster_owner_user_id: Some(user_id) }
+    ServerToDaemon::Registered {
+        machine_id,
+        cluster_owner_user_id: Some(user_id),
+        negotiated_capabilities: negotiated_daemon_capabilities(capabilities),
+    }
 }
 
 async fn apply_registered_daemon_message(
@@ -673,12 +692,18 @@ mod tests {
             tx,
             registration.machine,
             registration.projects,
+            &[],
         );
 
         match response {
-            ServerToDaemon::Registered { machine_id, cluster_owner_user_id } => {
+            ServerToDaemon::Registered {
+                machine_id,
+                cluster_owner_user_id,
+                negotiated_capabilities,
+            } => {
                 assert_eq!(cluster_owner_user_id, Some(registration.user_id));
                 assert_eq!(machine_id, registration.machine_id);
+                assert!(negotiated_capabilities.is_empty());
             }
             other => panic!("unexpected registration response: {other:?}"),
         }
@@ -687,6 +712,86 @@ mod tests {
         assert_eq!(machine.machine.hostname, "daemon-host");
         assert_eq!(machine.projects.len(), 1);
         assert_eq!(machine.projects[0].project_id, "alpha");
+    }
+
+    /// A daemon learns from `Registered` whether this server runs project
+    /// instances, and is told so only when it advertised them. Without the
+    /// echo, a capable daemon keeps each project on one machine.
+    #[tokio::test]
+    async fn ws_daemon_registration_echoes_instance_support_only_when_advertised() {
+        use tokio_tungstenite::{connect_async, tungstenite::Message as ClientMessage};
+
+        let state = test_state().await;
+        let user_id = Uuid::new_v4();
+        add_active_user(&state, user_id, "echo@example.com").await;
+        let token = test_token(user_id, &state.config.auth.jwt_secret);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let router = crate::routes::create_router(state.clone());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+
+        let mut echoes = Vec::new();
+        for capabilities in [
+            vec![
+                shared::PROJECT_POLICY_CAPABILITY.to_string(),
+                shared::PROJECT_INSTANCES_CAPABILITY.to_string(),
+            ],
+            vec![shared::PROJECT_POLICY_CAPABILITY.to_string()],
+        ] {
+            let machine_id = Uuid::new_v4();
+            let (mut daemon, _) = connect_async(format!("ws://{address}/ws/daemon"))
+                .await
+                .unwrap();
+            let register = DaemonToServer::Register {
+                token: token.clone(),
+                machine: test_machine(machine_id, "echo-host"),
+                projects: Vec::new(),
+                capabilities,
+            };
+            daemon
+                .send(ClientMessage::Text(
+                    serde_json::to_string(&register).unwrap().into(),
+                ))
+                .await
+                .unwrap();
+            let reply = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                loop {
+                    match daemon.next().await.unwrap().unwrap() {
+                        ClientMessage::Text(text) => {
+                            return serde_json::from_str::<ServerToDaemon>(&text).unwrap()
+                        }
+                        ClientMessage::Ping(data) => {
+                            daemon.send(ClientMessage::Pong(data)).await.unwrap()
+                        }
+                        other => panic!("unexpected websocket frame: {other:?}"),
+                    }
+                }
+            })
+            .await
+            .expect("timed out waiting for the registration reply");
+            match reply {
+                ServerToDaemon::Registered {
+                    machine_id: registered,
+                    negotiated_capabilities,
+                    ..
+                } => {
+                    assert_eq!(registered, machine_id);
+                    echoes.push(negotiated_capabilities);
+                }
+                other => panic!("unexpected registration reply: {other:?}"),
+            }
+        }
+        server.abort();
+
+        assert_eq!(
+            echoes,
+            vec![
+                vec![shared::PROJECT_INSTANCES_CAPABILITY.to_string()],
+                Vec::<String>::new(),
+            ]
+        );
     }
 
     #[test]
@@ -724,6 +829,7 @@ mod tests {
             tx,
             test_machine(machine_id, "initial-host"),
             vec![test_project("old", "/work/old", true)],
+            &[],
         );
 
         apply_registered_daemon_message(
@@ -770,6 +876,7 @@ mod tests {
                 test_project("running-a", "/work/a", true),
                 test_project("running-b", "/work/b", true),
             ],
+            &[],
         );
 
         assert!(
@@ -811,6 +918,7 @@ mod tests {
             daemon_tx,
             test_machine(machine_id, "owner-host"),
             Vec::new(),
+            &[],
         );
         let owner_web_id = Uuid::new_v4();
         let (owner_tx, mut owner_rx) = mpsc::channel(4);
@@ -880,6 +988,7 @@ mod tests {
             daemon_tx,
             test_machine(machine_id, "shared-host"),
             Vec::new(),
+            &[],
         );
         state.sessions.set_daemon_capabilities(
             machine_id,
@@ -1006,6 +1115,7 @@ mod tests {
             daemon_tx,
             test_machine(machine_id, "shared-host"),
             Vec::new(),
+            &[],
         );
         let request_id = Uuid::new_v4().to_string();
         let project_id = Uuid::new_v4().to_string();

@@ -54,13 +54,14 @@ export interface MachineChoiceModel {
   /** Attached instances, then machines where the project is registered, then
    *  owned machines to clone onto; disabled choices last, with reasons. */
   choices: MachineChoice[];
-  /** Where a new tab goes without asking. Never a clone, which always needs
-   *  the user to pick it and confirm. */
+  /** The preselected choice. Never a clone, which always needs the user to
+   *  pick it and confirm. */
   defaultChoice?: MachineChoice;
   /** Whether to show the machine step. False means the new-tab flow is
-   *  unchanged, but `defaultChoice`'s machine must still be passed to
-   *  `addPane`: it may be a registered machine whose instance the server
-   *  starts before adding the tab. */
+   *  unchanged: `defaultChoice` is then a running instance (or absent), and
+   *  its machine is still passed to `addPane` so the tab cannot land on
+   *  another machine. A default that would start the project somewhere is
+   *  never hidden; see `buildMachineChoices`. */
   showChoice: boolean;
 }
 
@@ -154,6 +155,12 @@ export function buildMachineChoices(input: MachineChoiceInput): MachineChoiceMod
   return {
     choices,
     defaultChoice,
-    showChoice: eligible.length > 1 || (eligible.length === 1 && !defaultChoice),
+    // One eligible machine leaves the flow unchanged only when it already
+    // runs the project. A registered machine as the only choice (typically a
+    // stopped single-machine project) would be started first, relaunching
+    // its saved tabs and unpaused bots: the step is shown so the menu says
+    // "Starts the project first" before the click, as Open asks before the
+    // same start. A clone is never a default, so it is always picked here.
+    showChoice: eligible.length > 1 || (eligible.length === 1 && defaultChoice?.kind !== "instance"),
   };
 }

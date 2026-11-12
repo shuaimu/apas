@@ -139,6 +139,21 @@ pub struct StoredMessage {
     pub pane_type: Option<String>,
 }
 
+/// A pane id that left the project roster while a machine may still hold its
+/// tab: a forgotten machine's tab, which comes back if that machine runs the
+/// project again, or an untagged tab closed while no instance ran it, which
+/// comes back if an instance adopts it. New panes are never given these ids,
+/// or the returning tab would collide with a newer one on another machine and
+/// be dropped as that machine's. Kept in `forgotten-panes.json` beside
+/// `panes.json`, whose shape older servers read and so must not change.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ForgottenPane {
+    pub pane_id: u32,
+    /// The machine the tab was tagged for; `None` for an untagged tab.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub machine_id: Option<Uuid>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PaneWorkSummaryDocument {
     #[serde(default = "pane_work_summary_sidecar_version")]
@@ -234,6 +249,11 @@ impl FileStorage {
     fn pane_work_summaries_file(&self, session_id: &Uuid) -> PathBuf {
         self.session_dir(session_id)
             .join("pane-work-summaries.json")
+    }
+
+    /// The pane ids forgotten from the roster; see [`ForgottenPane`].
+    fn forgotten_panes_file(&self, session_id: &Uuid) -> PathBuf {
+        self.session_dir(session_id).join("forgotten-panes.json")
     }
 
     /// Ensure the session directory exists
@@ -406,6 +426,58 @@ impl FileStorage {
         };
         self.write_pane_roster(session_id, &panes).await?;
         Ok(true)
+    }
+
+    /// Persist the forgotten pane ids `snapshot` returns, taken under the
+    /// roster lock as [`Self::save_pane_roster_latest`] takes the roster, so
+    /// the last write holds the latest set. `None` writes nothing and returns
+    /// false: the session is gone, or its set was never loaded and writing
+    /// would drop the ids it holds. An empty set removes the file.
+    pub async fn save_forgotten_panes_latest<F>(
+        &self,
+        session_id: &Uuid,
+        snapshot: F,
+    ) -> Result<bool>
+    where
+        F: FnOnce() -> Option<Vec<ForgottenPane>>,
+    {
+        let lock = self.roster_lock(session_id);
+        let _guard = lock.lock().await;
+        let Some(forgotten) = snapshot() else {
+            return Ok(false);
+        };
+        let file_path = self.forgotten_panes_file(session_id);
+        if forgotten.is_empty() {
+            return match fs::remove_file(&file_path).await {
+                Ok(()) => Ok(true),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(true),
+                Err(error) => Err(error.into()),
+            };
+        }
+        self.ensure_session_dir(session_id).await?;
+        let tmp_path = session_gc_temp_path(&file_path);
+        let json = serde_json::to_vec(&forgotten)?;
+        if let Err(error) = fs::write(&tmp_path, json).await {
+            let _ = fs::remove_file(&tmp_path).await;
+            return Err(error.into());
+        }
+        if let Err(error) = fs::rename(&tmp_path, &file_path).await {
+            let _ = fs::remove_file(&tmp_path).await;
+            return Err(error.into());
+        }
+        Ok(true)
+    }
+
+    /// The pane ids forgotten from the session's roster, empty when none
+    /// were. A malformed file is an error, so the caller does not overwrite
+    /// ids it could not read.
+    pub async fn load_forgotten_panes(&self, session_id: &Uuid) -> Result<Vec<ForgottenPane>> {
+        let file_path = self.forgotten_panes_file(session_id);
+        if !file_path.exists() {
+            return Ok(Vec::new());
+        }
+        let data = fs::read(file_path).await?;
+        Ok(serde_json::from_slice(&data)?)
     }
 
     /// Load persisted pane configurations for a session

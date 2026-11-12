@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useCallback, useEffect, useRef, useState } from "react";
+import React, { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { Terminal } from "@xterm/xterm";
 import { ClipboardAddon } from "@xterm/addon-clipboard";
 import { FitAddon } from "@xterm/addon-fit";
@@ -181,6 +181,7 @@ function currentTerminalTheme() {
 export function TerminalPane({
   paneId,
   visible = true,
+  inputDisabledReason,
 }: {
   paneId: number;
   /**
@@ -190,6 +191,15 @@ export function TerminalPane({
    * comes back. Defaults to true for callers that mount and unmount instead.
    */
   visible?: boolean;
+  /**
+   * Why this pane cannot take input now: its machine is not running the
+   * project, or this viewer may not use that machine (`describeTabHosts`).
+   * The terminal still attaches and shows the retained screen, but sends no
+   * keystrokes and no sizes while this is set. The server can only refuse
+   * them, and each refusal comes back as an error toast: one per keystroke,
+   * and two just for opening the tab.
+   */
+  inputDisabledReason?: string;
 }) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const termRef = useRef<Terminal | null>(null);
@@ -203,6 +213,12 @@ export function TerminalPane({
   // Snapshot/live reconciliation state lives in a ref so reconnects do not
   // tear down the terminal (which would drop focus and scroll position).
   const lastSizeRef = useRef<{ cols: number; rows: number }>({ cols: 0, rows: 0 });
+
+  // Read by `applyFit` and the input handler instead of being captured:
+  // adding it to their dependencies would recreate the terminal, and drop its
+  // scrollback, whenever the pane's machine stops or starts.
+  const inputDisabledRef = useRef(Boolean(inputDisabledReason));
+  const wasInputDisabledRef = useRef(Boolean(inputDisabledReason));
 
   const attachTerminal = useStore((s) => s.attachTerminal);
   const sendTerminalInput = useStore((s) => s.sendTerminalInput);
@@ -245,12 +261,30 @@ export function TerminalPane({
     } catch {
       return;
     }
+    // Fitted locally, but not reported: the server would refuse the size.
+    // It goes out once the pane can take input again (below).
+    if (inputDisabledRef.current) return;
     const { cols, rows } = term;
     if (cols !== lastSizeRef.current.cols || rows !== lastSizeRef.current.rows) {
       lastSizeRef.current = { cols, rows };
       sendTerminalResize(paneId, cols, rows);
     }
   }, [paneId, sendTerminalResize]);
+
+  // A layout effect, so the flag changes before any ResizeObserver callback
+  // can see it: the refusal banner that arrives with it resizes the terminal
+  // in the same frame, and that size must not go out.
+  useLayoutEffect(() => {
+    const disabled = Boolean(inputDisabledReason);
+    inputDisabledRef.current = disabled;
+    const wasDisabled = wasInputDisabledRef.current;
+    wasInputDisabledRef.current = disabled;
+    if (disabled || !wasDisabled) return;
+    // Usable again: the size was withheld meanwhile, and the instance that
+    // just started may have a default-size pty, as after a reconnect below.
+    lastSizeRef.current = { cols: 0, rows: 0 };
+    applyFit();
+  }, [inputDisabledReason, applyFit]);
 
   // Terminal lifetime: created once per pane, torn down on unmount.
   useEffect(() => {
@@ -310,7 +344,11 @@ export function TerminalPane({
       }
     });
 
-    const onData = term.onData((data) => sendTerminalInput(paneId, data));
+    // Keystrokes for a pane that cannot take input are dropped here; the
+    // reason is shown beside the terminal.
+    const onData = term.onData((data) => {
+      if (!inputDisabledRef.current) sendTerminalInput(paneId, data);
+    });
     term.attachCustomKeyEventHandler((event) =>
       handleTerminalClipboardKey(event, term.hasSelection()),
     );
@@ -379,7 +417,8 @@ export function TerminalPane({
           {lifecycleBanner}
         </div>
       )}
-      <div ref={containerRef} className="min-h-0 flex-1 overflow-hidden p-1" />
+      {/* The title explains, where the typing happens, why keys do nothing. */}
+      <div ref={containerRef} title={inputDisabledReason} className="min-h-0 flex-1 overflow-hidden p-1" />
     </div>
   );
 }

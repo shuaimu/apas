@@ -202,10 +202,31 @@ impl SessionManager {
         self.pane_launch_timing().start_timeout
     }
 
+    /// The machine a new pane's id is reserved for while its instance has
+    /// not reported it, if that reservation is still live. Read with the
+    /// session already borrowed.
+    pub(super) fn live_pane_reservation(
+        &self,
+        session: &SessionState,
+        pane_id: u32,
+    ) -> Option<Option<Uuid>> {
+        let ttl = self.pane_launch_timing().reservation_ttl;
+        session
+            .pane_reservations
+            .get(&pane_id)
+            .filter(|reservation| reservation.reserved_at.elapsed() < ttl)
+            .map(|reservation| reservation.machine_id)
+    }
+
     /// Allocate a pane id for a new pane on `machine_id` (`None` for an
     /// untagged pane), against the project's whole roster and the ids still
     /// in flight, and reserve it. `None` when every id is taken or the session
     /// is not loaded.
+    ///
+    /// Forgotten ids are avoided too: the machine that held one may run the
+    /// project again and report its tab, which a newer tab with that id would
+    /// have dropped as another machine's. Only a range with no other id left
+    /// hands one out, and that id stops being remembered.
     pub fn allocate_pane_id(&self, session_id: &Uuid, machine_id: Option<Uuid>) -> Option<u32> {
         let ttl = self.pane_launch_timing().reservation_ttl;
         let now = Instant::now();
@@ -217,7 +238,25 @@ impl SessionManager {
             .map(|pane| pane.pane_id)
             .chain(session.pane_reservations.keys().copied())
             .collect();
-        let pane_id = pick_pane_id(&used)?;
+        let avoided: HashSet<u32> = used
+            .iter()
+            .copied()
+            .chain(session.forgotten_panes.keys().copied())
+            .collect();
+        let pane_id = match pick_pane_id(&avoided) {
+            Some(pane_id) => pane_id,
+            None => {
+                let pane_id = pick_pane_id(&used)?;
+                let forgotten_for = session.forgotten_panes.remove(&pane_id);
+                tracing::warn!(
+                    %session_id,
+                    pane_id,
+                    ?forgotten_for,
+                    "every pane id is in use; reusing a forgotten tab's id"
+                );
+                pane_id
+            }
+        };
         session.pane_reservations.insert(
             pane_id,
             PaneIdReservation {
@@ -250,6 +289,59 @@ impl SessionManager {
         if let Some(mut session) = self.sessions.get_mut(session_id) {
             session.pane_reservations.remove(&pane_id);
         }
+    }
+
+    /// Whether the session's forgotten pane ids have been read from disk.
+    /// True for a session not in memory, which has nothing to read them into.
+    pub fn forgotten_panes_loaded(&self, session_id: &Uuid) -> bool {
+        self.sessions
+            .get(session_id)
+            .is_none_or(|session| session.forgotten_panes_loaded)
+    }
+
+    /// Add the forgotten pane ids read from disk to the ones held, and mark
+    /// them loaded. Ids forgotten in memory before the read are kept.
+    pub fn hydrate_forgotten_panes(
+        &self,
+        session_id: &Uuid,
+        stored: Vec<crate::storage::ForgottenPane>,
+    ) {
+        let Some(mut session) = self.sessions.get_mut(session_id) else {
+            return;
+        };
+        if session.forgotten_panes_loaded {
+            return;
+        }
+        for forgotten in stored {
+            session
+                .forgotten_panes
+                .entry(forgotten.pane_id)
+                .or_insert(forgotten.machine_id);
+        }
+        session.forgotten_panes_loaded = true;
+    }
+
+    /// The forgotten pane ids to save, or `None` when there is nothing that
+    /// may be saved: the session is not in memory, or its ids on disk were
+    /// never read and saving would drop them.
+    pub fn forgotten_panes_snapshot(
+        &self,
+        session_id: &Uuid,
+    ) -> Option<Vec<crate::storage::ForgottenPane>> {
+        let session = self.sessions.get(session_id)?;
+        if !session.forgotten_panes_loaded {
+            return None;
+        }
+        let mut forgotten: Vec<crate::storage::ForgottenPane> = session
+            .forgotten_panes
+            .iter()
+            .map(|(pane_id, machine_id)| crate::storage::ForgottenPane {
+                pane_id: *pane_id,
+                machine_id: *machine_id,
+            })
+            .collect();
+        forgotten.sort_by_key(|pane| pane.pane_id);
+        Some(forgotten)
     }
 
     /// `cli_id` reported its roster: the ids reserved for its machine that it
@@ -442,6 +534,32 @@ impl SessionManager {
         true
     }
 
+    /// The server refused the `SessionStart` of `machine_id`'s instance of
+    /// `session_id`, for `reason`. The panes waiting on a start of it that
+    /// the server sent fail now, with that reason. Its daemon answered that
+    /// the runtime started, so nothing else ends their wait before its time
+    /// limit, whose "did not start" would hide the reason the server has.
+    /// A start the server is only finishing for an instance already attached
+    /// is left alone: that instance was not the one refused.
+    pub fn refuse_instance_start(&self, session_id: Uuid, machine_id: Uuid, reason: &str) {
+        let key = (session_id, machine_id);
+        let mut starts = self.instance_starts.lock().expect("instance starts poisoned");
+        if !starts
+            .pending
+            .get(&key)
+            .is_some_and(|pending| pending.request_id.is_some())
+        {
+            return;
+        }
+        let failed = starts.finish(key, InstanceStartOutcome::Refused(reason.to_string()));
+        tracing::info!(
+            %session_id,
+            %machine_id,
+            failed,
+            "the instance new panes waited for was refused"
+        );
+    }
+
     /// The start `request_id` could not be sent to `machine_id`'s daemon.
     pub fn fail_instance_start(&self, session_id: Uuid, machine_id: Uuid, request_id: Uuid) {
         let key = (session_id, machine_id);
@@ -586,6 +704,44 @@ mod tests {
             Some(first),
             "a released id is free"
         );
+    }
+
+    /// A forgotten machine's tab ids are not handed to new panes while any
+    /// other id is free: that machine keeps its tabs and reports them again
+    /// if it runs the project again. Only a range with nothing else free
+    /// hands one out, and that id is then no longer remembered.
+    #[test]
+    fn forgotten_ids_go_to_new_panes_only_when_nothing_else_is_free() {
+        let manager = SessionManager::new();
+        let laptop = Uuid::new_v4();
+        let forgotten: Vec<u32> = (40..50).collect();
+        let fresh: Vec<u32> = (50..60).collect();
+        let free: Vec<u32> = forgotten.iter().chain(&fresh).copied().collect();
+        let session_id = crowded_session(&manager, &free);
+        let mut roster = manager.get_session_panes(&session_id);
+        roster.extend(forgotten.iter().map(|pane_id| {
+            let mut pane = pane(*pane_id);
+            pane.machine_id = Some(laptop);
+            pane
+        }));
+        manager.set_session_panes(&session_id, roster);
+        let mut removed = manager
+            .forget_machine_panes(&session_id, laptop, None)
+            .unwrap();
+        removed.sort();
+        assert_eq!(removed, forgotten);
+
+        let mut allocated: Vec<u32> = (0..fresh.len())
+            .map(|_| manager.allocate_pane_id(&session_id, None).unwrap())
+            .collect();
+        allocated.sort();
+        assert_eq!(allocated, fresh, "never a forgotten id while others are free");
+
+        let reused = manager.allocate_pane_id(&session_id, None).unwrap();
+        assert!(forgotten.contains(&reused), "{reused}");
+        let session = manager.get_session(&session_id).unwrap();
+        assert!(!session.forgotten_panes.contains_key(&reused));
+        assert_eq!(session.forgotten_panes.len(), forgotten.len() - 1);
     }
 
     /// A reservation whose pane never appears expires.

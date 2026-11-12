@@ -225,6 +225,7 @@ async fn resolve_pane_roster(
     state: &AppState,
     session_id: &Uuid,
 ) -> Option<Vec<shared::PaneConfig>> {
+    crate::routes::ws_cli::ensure_forgotten_panes_loaded(state, session_id).await;
     let cached = state.sessions.get_session_panes(session_id);
     if !cached.is_empty() || state.sessions.pane_roster_seeded(session_id) {
         return Some(cached);
@@ -585,6 +586,65 @@ pub(crate) async fn has_machine_project_runtime_access(
             .is_some()
 }
 
+/// Before an explicit Start on `machine_id`, place a project registered
+/// there in its owner's cluster if nothing has yet, exactly as the
+/// instance's `SessionStart` would a moment later.
+///
+/// `apas register`, and a bare `apas` in a new directory, register a project
+/// on the machine without telling the server. Until something starts it
+/// there is no project record and no placement, and
+/// [`has_machine_project_runtime_access`] refuses every Start of it as
+/// "Machine not found", so a project registered that way could never be
+/// started from the web. This applies only to `user_id`'s own machine that
+/// lists the project, never to a cluster member, who needs a project role
+/// first. `authorize_project_registration` creates a missing record owned by
+/// `user_id`, refuses a suspended or deleting project or one `user_id` has no
+/// access to, and adds the direct placement; a refusal leaves everything as
+/// it was, so the access check refuses the Start as before.
+pub(crate) async fn place_registered_project(
+    state: &AppState,
+    user_id: &Uuid,
+    machine_id: &Uuid,
+    project_id: &str,
+) {
+    if state.sessions.daemon_owner(machine_id) != Some(*user_id)
+        || !state
+            .sessions
+            .machines_listing_project(project_id)
+            .contains(machine_id)
+    {
+        return;
+    }
+    if state
+        .db
+        .project_is_placed_in_cluster(project_id, &user_id.to_string())
+        .await
+        .unwrap_or(true)
+    {
+        return;
+    }
+    let _project_guard = state.project_operation_guard(project_id).await;
+    match state
+        .db
+        .authorize_project_registration(project_id, &user_id.to_string())
+        .await
+    {
+        Ok(_) => tracing::info!(
+            %user_id,
+            %machine_id,
+            %project_id,
+            "placed a registered project in its owner's cluster for a Start"
+        ),
+        Err(error) => tracing::info!(
+            %user_id,
+            %machine_id,
+            %project_id,
+            %error,
+            "a registered project cannot be placed for a Start"
+        ),
+    }
+}
+
 /// Every known pane of a project, across the sessions that belong to it:
 /// the roster in memory where one is loaded, else the persisted one.
 async fn project_roster(state: &AppState, project_id: &str) -> Vec<shared::PaneConfig> {
@@ -651,6 +711,22 @@ fn project_stop_machines(state: &AppState, project_id: &str, machine_id: Uuid) -
     machines
 }
 
+/// Whether `user_id` may ask for a project-wide Start or Close of
+/// `project_id`, which looks at every machine that runs the project or owns
+/// its tabs and names the one it refuses. Only someone who can see the
+/// project's content, and with it the hosts of its instances and tabs, may:
+/// anyone else is answered as a per-machine request is, with a bare
+/// "Machine not found", and learns nothing of where the project runs. Runtime
+/// access on any machine implies this access, so no permitted Start or Close
+/// is lost.
+async fn may_act_on_every_instance(state: &AppState, user_id: &Uuid, project_id: &str) -> bool {
+    state
+        .db
+        .has_project_content_access(project_id, &user_id.to_string())
+        .await
+        .unwrap_or(false)
+}
+
 /// A refusal for one machine of a request that may cover several, naming
 /// that machine's host when it does.
 fn machine_refusal(state: &AppState, machine_id: Uuid, several: bool, reason: &str) -> String {
@@ -703,6 +779,15 @@ async fn start_machine_project(
     project_id: &str,
     all_instances: bool,
 ) {
+    // A project only registered on the requester's machine is placed first,
+    // or no Start of it would ever pass the access checks below.
+    place_registered_project(state, user_id, &machine_id, project_id).await;
+    // Checked before the fan-out is even computed: it reads the project's
+    // roster, and its refusals name the hosts it found.
+    if all_instances && !may_act_on_every_instance(state, user_id, project_id).await {
+        send_policy_error(state, connection_id, "Machine not found").await;
+        return;
+    }
     let fanned_out = if all_instances {
         project_start_machines(state, project_id).await
     } else {
@@ -802,6 +887,11 @@ async fn stop_machine_project(
     project_id: &str,
     all_instances: bool,
 ) {
+    // As for a project-wide Start: its refusals name the hosts it found.
+    if all_instances && !may_act_on_every_instance(state, user_id, project_id).await {
+        send_policy_error(state, connection_id, "Machine not found").await;
+        return;
+    }
     let targets = if all_instances {
         project_stop_machines(state, project_id, machine_id)
     } else {
@@ -2223,7 +2313,7 @@ async fn handle_add_pane(
 /// Check a new pane against `instance`, which `target` names for the CLI
 /// capability checks, allocate its id, and send it there. The pane is tagged
 /// with the instance's machine when its CLI can share the project; an older
-/// CLI owns the whole roster, and its panes stay untagged. Returns the
+/// CLI reports its panes untagged, and they stay untagged. Returns the
 /// machine and pane id it was delivered with.
 async fn launch_new_pane(
     state: &AppState,
@@ -3718,15 +3808,9 @@ async fn forget_machine_panes(
             }
         };
     if !removed.is_empty() {
-        if let Err(error) = state
-            .storage
-            .save_pane_roster_latest(&session_id, || {
-                state.sessions.pane_roster_snapshot(&session_id)
-            })
-            .await
-        {
-            tracing::warn!(%session_id, %error, "failed to persist the roster after forgetting a machine");
-        }
+        // The forgotten ids are saved with the roster: they stay unavailable
+        // to new panes, across restarts too, until the machine reports them.
+        crate::routes::ws_cli::persist_pane_roster(state, &session_id).await;
         state
             .sessions
             .route_to_web(
@@ -4222,25 +4306,12 @@ async fn handle_cli_lifecycle_request(
     }
 }
 
+/// Relay a request's status as an instance's own reports are relayed: a
+/// viewer that keeps one inventory per session is not handed the inventory
+/// of a request bound to another machine than the primary.
 async fn broadcast_lifecycle_status(state: &AppState, session_id: Uuid, message: ServerToWeb) {
-    let web_ids = state
-        .sessions
-        .get_session(&session_id)
-        .map(|session| session.web_connection_ids)
-        .unwrap_or_default();
-    for web_id in web_ids {
-        let authorized = match state.sessions.get_web_user(&web_id) {
-            Some(user_id) => state
-                .db
-                .check_session_access(&session_id.to_string(), &user_id.to_string())
-                .await
-                .unwrap_or(false),
-            None => false,
-        };
-        if authorized {
-            state.sessions.send_to_web(&web_id, message.clone()).await;
-        }
-    }
+    crate::routes::ws_cli::route_lifecycle_to_authorized_web(state, session_id, message, false)
+        .await;
 }
 
 async fn handle_web_input(
@@ -4396,13 +4467,146 @@ async fn handle_web_input(
     }
 }
 
+/// `RemovePane`: close a tab on the instance that owns it.
+async fn handle_remove_pane(
+    state: &AppState,
+    connection_id: &Uuid,
+    msg_session_id: Option<Uuid>,
+    fallback_session_id: Option<Uuid>,
+    pane_id: u32,
+    cleanup_action: Option<shared::PaneCleanupAction>,
+) {
+    let Some(sid) = resolve_pane_session(
+        state,
+        connection_id,
+        msg_session_id,
+        fallback_session_id,
+        pane_id,
+    )
+    .await
+    else {
+        return;
+    };
+    let Ok((_project_id, _project_guard)) = state.active_session_operation(&sid.to_string()).await
+    else {
+        return;
+    };
+    tracing::info!(
+        "Removing pane {} from session {} (cleanup_action={:?})",
+        pane_id,
+        sid,
+        cleanup_action,
+    );
+    state.sessions.cancel_pane_reboot(&sid, pane_id);
+    // The instance the close goes to, read before routing it there.
+    let receiver = match state.sessions.pane_owner(&sid, pane_id) {
+        PaneOwner::Instance(owner) => Some(owner.cli_id),
+        PaneOwner::NotRunning { .. } | PaneOwner::NoInstance => None,
+    };
+    let outcome = state
+        .sessions
+        .route_to_cli_for_pane(
+            &sid,
+            pane_id,
+            ServerToCli::RemovePane {
+                session_id: sid,
+                pane_id,
+                cleanup_action,
+            },
+        )
+        .await;
+    match outcome {
+        // Drop any terminal scrollback for this pane so a
+        // later pane that reuses the id doesn't inherit the
+        // dead pane's frames on attach.
+        CliRouteOutcome::Delivered(_) => {
+            state.sessions.clear_terminal_scrollback(&sid, pane_id);
+            // An untagged tab that the instance it went to does not run
+            // would otherwise stay: only that instance's report could remove
+            // it, and its report leaves untagged tabs alone.
+            if receiver.is_some_and(|cli_id| {
+                state
+                    .sessions
+                    .drop_closed_untagged_pane(&sid, pane_id, &cli_id)
+            }) {
+                crate::routes::ws_cli::persist_pane_roster(state, &sid).await;
+                state
+                    .sessions
+                    .route_to_web(
+                        &sid,
+                        ServerToWeb::PaneList {
+                            session_id: sid,
+                            panes: state.sessions.get_session_panes(&sid),
+                        },
+                    )
+                    .await;
+            }
+        }
+        // Its machine stopped meanwhile: the tab stays,
+        // stopped there, and so does what it last showed.
+        CliRouteOutcome::MachineNotRunning { .. } => {
+            send_policy_error(state, connection_id, undelivered_message(state, &outcome)).await
+        }
+        CliRouteOutcome::NoInstance | CliRouteOutcome::Undelivered => {
+            state.sessions.clear_terminal_scrollback(&sid, pane_id)
+        }
+    }
+}
+
+/// `ReorderPanes`: the project-wide tab order, which only the server keeps.
+///
+/// The roster is loaded first. A connection attached on its own behalf, as
+/// `resolve_target_session` attaches one after a reconnect, has not loaded
+/// it, and after a server restart the cache is then empty until something
+/// reads `panes.json`. Reordering that empty cache saved an empty roster over
+/// the persisted one and marked it loaded, so every stopped machine's tabs
+/// vanished, and their ids came free, until those machines ran again.
+async fn handle_reorder_panes(
+    state: &AppState,
+    connection_id: &Uuid,
+    msg_session_id: Option<Uuid>,
+    fallback_session_id: Option<Uuid>,
+    pane_ids: Vec<u32>,
+) {
+    let Some(sid) =
+        resolve_target_session(state, connection_id, msg_session_id, fallback_session_id).await
+    else {
+        return;
+    };
+    let Ok((_project_id, _project_guard)) = state.active_session_operation(&sid.to_string()).await
+    else {
+        return;
+    };
+    tracing::info!("Reordering panes in session {}", sid);
+    // No roster known at all (a legacy session that never saved one) leaves
+    // nothing to order.
+    if resolve_pane_roster(state, &sid).await.is_none() {
+        return;
+    }
+    let Some(panes) = state.sessions.reorder_session_panes(&sid, &pane_ids) else {
+        return;
+    };
+    crate::routes::ws_cli::persist_pane_roster(state, &sid).await;
+    state
+        .sessions
+        .route_to_web(
+            &sid,
+            ServerToWeb::PaneList {
+                session_id: sid,
+                panes,
+            },
+        )
+        .await;
+}
+
 /// Deliver the answer to a pending decision (a question or a plan review),
 /// which names no pane on the wire. A claimed decision is no longer there
 /// for routing to look up, so the caller passes its pane, or the pane the
 /// client named, and the answer goes to the instance that owns it. With
-/// neither, routing resolves a decision still pending, else it goes to the
+/// neither, a decision still pending names the pane, else it goes to the
 /// primary, as an answer whose decision cannot be resolved always has.
-/// Returns the error to acknowledge with.
+/// Whichever instance it reaches, the viewer must be allowed to use that
+/// instance's machine. Returns the error to acknowledge with.
 async fn route_decision_answer(
     state: &AppState,
     connection_id: &Uuid,
@@ -4410,6 +4614,7 @@ async fn route_decision_answer(
     pane_id: Option<u32>,
     message: ServerToCli,
 ) -> Result<(), String> {
+    let pane_id = pane_id.or_else(|| state.sessions.unscoped_target_pane(session_id, &message));
     let outcome = match pane_id {
         Some(pane_id) => {
             if let Some(refusal) =
@@ -4423,9 +4628,20 @@ async fn route_decision_answer(
                 .await
         }
         None => {
+            // Passing the session's check only shows that some instance
+            // admits the viewer. An answer whose decision the server no
+            // longer holds, as after a restart, goes to the primary, which
+            // may be an instance the viewer may not use.
+            if let Some(primary) = state.sessions.primary_instance(session_id) {
+                if let Some(refusal) =
+                    instance_access_refusal(state, connection_id, session_id, &primary).await
+                {
+                    return Err(refusal);
+                }
+            }
             state
                 .sessions
-                .route_to_cli_by_scope(session_id, message)
+                .route_to_cli_on_machine(session_id, None, message)
                 .await
         }
     };
@@ -6577,56 +6793,15 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     pane_id,
                     cleanup_action,
                 }) => {
-                    if let Some(sid) =
-                        resolve_pane_session(&state, &connection_id, msg_sid, session_id, pane_id)
-                            .await
-                    {
-                        let Ok((_project_id, _project_guard)) =
-                            state.active_session_operation(&sid.to_string()).await
-                        else {
-                            continue;
-                        };
-                        tracing::info!(
-                            "Removing pane {} from session {} (cleanup_action={:?})",
-                            pane_id,
-                            sid,
-                            cleanup_action,
-                        );
-                        state.sessions.cancel_pane_reboot(&sid, pane_id);
-                        let outcome = state
-                            .sessions
-                            .route_to_cli_for_pane(
-                                &sid,
-                                pane_id,
-                                ServerToCli::RemovePane {
-                                    session_id: sid,
-                                    pane_id,
-                                    cleanup_action,
-                                },
-                            )
-                            .await;
-                        match outcome {
-                            // Drop any terminal scrollback for this pane so a
-                            // later pane that reuses the id doesn't inherit the
-                            // dead pane's frames on attach.
-                            CliRouteOutcome::Delivered(_) => {
-                                state.sessions.clear_terminal_scrollback(&sid, pane_id)
-                            }
-                            // Its machine stopped meanwhile: the tab stays,
-                            // stopped there, and so does what it last showed.
-                            CliRouteOutcome::MachineNotRunning { .. } => {
-                                send_policy_error(
-                                    &state,
-                                    &connection_id,
-                                    undelivered_message(&state, &outcome),
-                                )
-                                .await
-                            }
-                            CliRouteOutcome::NoInstance | CliRouteOutcome::Undelivered => {
-                                state.sessions.clear_terminal_scrollback(&sid, pane_id)
-                            }
-                        }
-                    }
+                    handle_remove_pane(
+                        &state,
+                        &connection_id,
+                        msg_sid,
+                        session_id,
+                        pane_id,
+                        cleanup_action,
+                    )
+                    .await;
                 }
                 Ok(WebToServer::UpdatePaneLabel {
                     session_id: msg_sid,
@@ -7420,47 +7595,8 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     session_id: msg_sid,
                     pane_ids,
                 }) => {
-                    if let Some(sid) =
-                        resolve_target_session(&state, &connection_id, msg_sid, session_id).await
-                    {
-                        let Ok((_project_id, _project_guard)) =
-                            state.active_session_operation(&sid.to_string()).await
-                        else {
-                            continue;
-                        };
-                        tracing::info!("Reordering panes in session {}", sid);
-                        let panes = state.sessions.get_session_panes(&sid);
-                        let order_map: std::collections::HashMap<u32, usize> = pane_ids
-                            .iter()
-                            .enumerate()
-                            .map(|(i, &id)| (id, i))
-                            .collect();
-                        let mut ordered: Vec<shared::PaneConfig> = Vec::new();
-                        let mut remaining: Vec<shared::PaneConfig> = Vec::new();
-                        for pane in panes {
-                            if let Some(&pos) = order_map.get(&pane.pane_id) {
-                                ordered.push(pane);
-                            } else {
-                                remaining.push(pane);
-                            }
-                        }
-                        ordered.sort_by_key(|p| {
-                            order_map.get(&p.pane_id).copied().unwrap_or(usize::MAX)
-                        });
-                        let new_panes = [ordered, remaining].concat();
-                        state.sessions.set_session_panes(&sid, new_panes.clone());
-                        let _ = state.storage.save_pane_list(&sid, &new_panes).await;
-                        state
-                            .sessions
-                            .route_to_web(
-                                &sid,
-                                ServerToWeb::PaneList {
-                                    session_id: sid,
-                                    panes: new_panes,
-                                },
-                            )
-                            .await;
-                    }
+                    handle_reorder_panes(&state, &connection_id, msg_sid, session_id, pane_ids)
+                        .await;
                 }
                 Ok(WebToServer::StartBot {
                     session_id: msg_sid,
@@ -9371,6 +9507,59 @@ mod project_instance_tests {
         assert!(a.drain().is_empty());
     }
 
+    /// An answer naming no pane whose decision the server no longer holds,
+    /// as after a server restart, goes to the primary only for a viewer who
+    /// may use the primary's machine. Passing the session's check only shows
+    /// that some instance admits them.
+    #[tokio::test]
+    async fn an_unresolved_answer_reaches_the_primary_only_for_a_viewer_allowed_there() {
+        let (p, member) = hosted_project().await;
+        let mut b = p.instance(p.m6, HOST_B);
+        let mut a = p.instance(p.m5, HOST_A);
+        let member_web = p.viewer(member, &[]);
+        let answer = |connection_id: Uuid| {
+            let state = p.state.clone();
+            let session = p.session;
+            async move {
+                route_decision_answer(
+                    &state,
+                    &connection_id,
+                    &session,
+                    None,
+                    ServerToCli::AnswerQuestion {
+                        session_id: session,
+                        tool_use_id: "toolu-restarted".to_string(),
+                        answers: std::collections::HashMap::from([(
+                            "Which?".to_string(),
+                            "This".to_string(),
+                        )]),
+                    },
+                )
+                .await
+            }
+        };
+
+        assert!(has_session_runtime_access(&p.state, &p.session, &member).await);
+        let refused = answer(member_web.id).await.unwrap_err();
+        assert!(
+            refused.starts_with("Access denied") && refused.contains(HOST_B),
+            "{refused}"
+        );
+        assert!(b.drain().is_empty() && a.drain().is_empty());
+
+        // With zoo-005, which the member may use, as the primary, it goes there.
+        p.state
+            .sessions
+            .detach_cli_instance(&p.session, &b.id)
+            .unwrap();
+        answer(member_web.id).await.unwrap();
+        assert!(matches!(
+            a.drain().as_slice(),
+            [ServerToCli::AnswerQuestion { .. }]
+        ));
+        assert!(b.drain().is_empty());
+    }
+
     /// Forgetting a stopped machine drops its tagged tabs and the untagged
     /// ones attributed to its host from the roster, persists that, tells
     /// viewers, and tells every running instance so a shared `.apas` drops
@@ -9570,6 +9759,269 @@ mod project_instance_tests {
         assert!(errors_seen.is_empty(), "{errors_seen:?}");
     }
 
+    /// Closing an untagged tab that the running instance it goes to does not
+    /// have removes it from the roster: that instance's reports leave
+    /// untagged tabs alone, and nothing else would ever remove it. Its id is
+    /// remembered rather than freed, since an untagged entry left in some
+    /// `.apas` comes back when an instance adopts it. A tab the instance
+    /// reported, and one an older CLI owns, are left to their reports.
+    #[tokio::test]
+    async fn closing_a_tab_no_instance_runs_removes_it() {
+        let p = project().await;
+        let mut a = p.instance(p.m5, HOST_A);
+        let mut web = p.viewer(p.owner, &[]);
+        p.roster(vec![
+            pane(2, None, Some(HOST_A)),
+            pane(4, None, None),
+            pane(7, Some(p.m5), Some(HOST_A)),
+        ]);
+        p.state
+            .sessions
+            .merge_instance_roster(&p.session, &a.id, vec![pane(7, None, None)])
+            .unwrap();
+        assert_eq!(p.pane_ids(), vec![2, 4, 7], "zoo-005's report keeps them");
+
+        for pane_id in [2, 4] {
+            handle_remove_pane(&p.state, &web.id, Some(p.session), None, pane_id, None).await;
+            assert!(
+                matches!(
+                    a.drain().as_slice(),
+                    [ServerToCli::RemovePane { pane_id: closed, .. }] if *closed == pane_id
+                ),
+                "pane {pane_id}"
+            );
+        }
+        assert_eq!(p.pane_ids(), vec![7]);
+        let persisted = p
+            .state
+            .storage
+            .load_pane_roster(&p.session)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            persisted
+                .iter()
+                .map(|pane| pane.pane_id)
+                .collect::<Vec<_>>(),
+            vec![7]
+        );
+        let received = web.drain();
+        assert!(errors(&received).is_empty(), "{received:?}");
+        assert!(received.iter().any(|message| matches!(
+            message,
+            ServerToWeb::PaneList { panes, .. }
+                if panes.iter().map(|pane| pane.pane_id).collect::<Vec<_>>() == vec![7]
+        )));
+        let forgotten = p.state.sessions.get_session(&p.session).unwrap().forgotten_panes;
+        assert_eq!(forgotten.get(&2), Some(&None));
+        assert_eq!(forgotten.get(&4), Some(&None));
+
+        // zoo-005's own tab goes when its report omits it.
+        handle_remove_pane(&p.state, &web.id, Some(p.session), None, 7, None).await;
+        assert_eq!(removed_panes(&a.drain()), vec![7]);
+        assert_eq!(p.pane_ids(), vec![7]);
+
+        // An older CLI runs every untagged tab, and its report decides.
+        p.state
+            .sessions
+            .detach_cli_instance(&p.session, &a.id)
+            .unwrap();
+        let mut older = p.instance_with(p.m6, HOST_B, &[]);
+        p.roster(vec![pane(3, None, Some(HOST_B))]);
+        handle_remove_pane(&p.state, &web.id, Some(p.session), None, 3, None).await;
+        assert_eq!(removed_panes(&older.drain()), vec![3]);
+        assert_eq!(p.pane_ids(), vec![3]);
+    }
+
+    /// The panes `RemovePane` closed among `messages`.
+    fn removed_panes(messages: &[ServerToCli]) -> Vec<u32> {
+        messages
+            .iter()
+            .filter_map(|message| match message {
+                ServerToCli::RemovePane { pane_id, .. } => Some(*pane_id),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Reordering tabs before anything has loaded the roster, as after a
+    /// server restart while zoo-005's instance is attaching, loads it first.
+    /// The stopped laptop's tab keeps its place in memory and on disk, and
+    /// zoo-005's report merges beside it instead of into an empty roster.
+    #[tokio::test]
+    async fn reordering_before_the_roster_is_loaded_keeps_every_tab() {
+        let p = project().await;
+        p.state
+            .storage
+            .save_pane_list(
+                &p.session,
+                &[
+                    pane(517, Some(p.m6), Some(HOST_B)),
+                    pane(3, Some(p.m5), Some(HOST_A)),
+                ],
+            )
+            .await
+            .unwrap();
+        let restarted = AppState::new(p.state.db.clone(), p.state.config.clone());
+        restarted
+            .sessions
+            .set_session_project(p.session, p.project_id());
+        let cli = Uuid::new_v4();
+        let (cli_tx, _cli_rx) = mpsc::channel(16);
+        restarted.sessions.register_cli(cli, p.owner, cli_tx, None);
+        restarted.sessions.set_cli_capabilities(
+            cli,
+            CAPABLE_CLI
+                .iter()
+                .map(|capability| capability.to_string())
+                .collect(),
+        );
+        assert!(matches!(
+            restarted.sessions.attach_cli_instance(
+                p.session,
+                cli,
+                Some(p.m5),
+                Some(format!("/work/{HOST_A}")),
+                Some(HOST_A.to_string()),
+            ),
+            AttachOutcome::Attached { .. }
+        ));
+        let web = Uuid::new_v4();
+        let (web_tx, _web_rx) = mpsc::channel(64);
+        restarted.sessions.register_web(web, web_tx);
+        restarted.sessions.set_web_user(web, p.owner);
+        assert!(restarted
+            .sessions
+            .attach_web_to_session(&p.session, web, None));
+        let ids = |panes: &[PaneConfig]| panes.iter().map(|pane| pane.pane_id).collect::<Vec<_>>();
+
+        handle_reorder_panes(&restarted, &web, Some(p.session), None, vec![3, 517]).await;
+
+        assert_eq!(
+            ids(&restarted.sessions.get_session_panes(&p.session)),
+            vec![3, 517]
+        );
+        let persisted = restarted
+            .storage
+            .load_pane_roster(&p.session)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(ids(&persisted), vec![3, 517]);
+        let merged = restarted
+            .sessions
+            .merge_instance_roster(&p.session, &cli, vec![pane(3, None, None)])
+            .unwrap();
+        assert_eq!(ids(&merged), vec![3, 517]);
+        assert_eq!(merged[1].machine_id, Some(p.m6));
+    }
+
+    /// Forgetting a separate checkout's tabs does not free their ids. New
+    /// tabs elsewhere get other ids, before and after a server restart, so
+    /// when that checkout runs the project again its tabs come back instead
+    /// of being dropped as another machine's. Once back, their ids are in
+    /// use rather than remembered.
+    #[tokio::test]
+    async fn a_forgotten_machines_tabs_come_back_with_their_ids() {
+        let p = project().await;
+        let mut a = p.running(p.m5, HOST_A);
+        let mut web = p.requester();
+        let forgotten: Vec<u32> = (40..50).collect();
+        let fresh: Vec<u32> = (50..60).collect();
+        let free: Vec<u32> = forgotten.iter().chain(&fresh).copied().collect();
+        let mut roster = crowded_roster(&p, &free);
+        roster.extend(
+            forgotten
+                .iter()
+                .map(|pane_id| pane(*pane_id, Some(p.m6), Some(HOST_B))),
+        );
+        p.roster(roster);
+
+        forget_machine_panes(&p.state, &web.id, p.session, p.m6).await;
+        assert!(errors(&web.drain()).is_empty());
+        let mut remembered: Vec<u32> = p
+            .state
+            .storage
+            .load_forgotten_panes(&p.session)
+            .await
+            .unwrap()
+            .iter()
+            .map(|forgotten| {
+                assert_eq!(forgotten.machine_id, Some(p.m6));
+                forgotten.pane_id
+            })
+            .collect();
+        remembered.sort();
+        assert_eq!(remembered, forgotten, "saved for after a restart");
+
+        // After a restart the ids are read back with the roster.
+        let restarted = AppState::new(p.state.db.clone(), p.state.config.clone());
+        restarted
+            .sessions
+            .attach_web_to_session(&p.session, Uuid::new_v4(), None);
+        assert!(resolve_pane_roster(&restarted, &p.session).await.is_some());
+        let mut allocated: Vec<u32> = (0..fresh.len())
+            .map(|_| restarted.sessions.allocate_pane_id(&p.session, Some(p.m5)).unwrap())
+            .collect();
+        allocated.sort();
+        assert_eq!(allocated, fresh, "the restarted server avoids them too");
+
+        // zoo-005's new tabs take the free ids and it reports them.
+        for request in 0..fresh.len() {
+            p.add_pane(&web, Some(p.m5), Some(&format!("new-{request}")))
+                .await;
+        }
+        let mut added: Vec<u32> = added_panes(&a.drain())
+            .iter()
+            .map(|pane| pane.pane_id)
+            .collect();
+        added.sort();
+        assert_eq!(added, fresh);
+        let zoo_005: Vec<PaneConfig> = p
+            .state
+            .sessions
+            .get_session_panes(&p.session)
+            .into_iter()
+            .chain(fresh.iter().map(|pane_id| pane(*pane_id, Some(p.m5), Some(HOST_A))))
+            .collect();
+        p.state
+            .sessions
+            .merge_instance_roster(&p.session, &a.id, zoo_005)
+            .unwrap();
+
+        // The checkout runs the project again and reports its tabs: each one
+        // is back as its own, none dropped as zoo-005's.
+        let laptop = p.instance(p.m6, HOST_B);
+        let merged = p
+            .state
+            .sessions
+            .merge_instance_roster(
+                &p.session,
+                &laptop.id,
+                forgotten
+                    .iter()
+                    .map(|pane_id| pane(*pane_id, None, None))
+                    .collect(),
+            )
+            .unwrap();
+        for pane_id in &forgotten {
+            let back = merged
+                .iter()
+                .find(|pane| pane.pane_id == *pane_id)
+                .expect("the tab is back");
+            assert_eq!(back.machine_id, Some(p.m6), "pane {pane_id}");
+        }
+        crate::routes::ws_cli::persist_pane_roster(&p.state, &p.session).await;
+        assert!(p
+            .state
+            .storage
+            .load_forgotten_panes(&p.session)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
     /// The project view's Start starts each online, capable machine that owns
     /// tabs, counting an untagged tab for its attributed host, and falls back
     /// to the machine it named only when none qualifies. The Machines page's
@@ -9645,6 +10097,149 @@ mod project_instance_tests {
         assert!(errors(&web.drain()).is_empty());
     }
 
+    /// A project-wide Start or Close from an account that cannot see the
+    /// project is answered as a per-machine one is, with a bare "Machine not
+    /// found". It never names the hosts that run the project or own its
+    /// tabs, and nothing is started or stopped.
+    #[tokio::test]
+    async fn a_project_wide_request_from_a_stranger_names_no_host() {
+        let p = project().await;
+        let stranger = Uuid::new_v4();
+        p.state.db.create_user(&user(stranger)).await.unwrap();
+        let mut d5 = p.daemon(p.m5, HOST_A, CAPABLE_DAEMON);
+        let mut d6 = p.daemon(p.m6, HOST_B, CAPABLE_DAEMON);
+        let _a = p.instance(p.m5, HOST_A);
+        let _b = p.instance(p.m6, HOST_B);
+        p.roster(vec![
+            pane(3, Some(p.m5), Some(HOST_A)),
+            pane(4, Some(p.m6), Some(HOST_B)),
+        ]);
+        let mut web = p.viewer(stranger, &[shared::PROJECT_POLICY_CAPABILITY]);
+        let elsewhere = Uuid::new_v4();
+
+        for all_instances in [true, false] {
+            start_machine_project(
+                &p.state,
+                &web.id,
+                &stranger,
+                elsewhere,
+                &p.project_id(),
+                all_instances,
+            )
+            .await;
+            stop_machine_project(
+                &p.state,
+                &web.id,
+                &stranger,
+                elsewhere,
+                &p.project_id(),
+                all_instances,
+            )
+            .await;
+            assert_eq!(
+                errors(&web.drain()),
+                vec!["Machine not found".to_string(); 2],
+                "all_instances {all_instances}"
+            );
+        }
+        assert!(d5.drain().is_empty() && d6.drain().is_empty());
+    }
+
+    /// A project only registered on its owner's machine, by `apas register`
+    /// or a bare `apas`, has no record or placement on the server until it
+    /// first starts. A Start from the Machines page places it as that start's
+    /// `SessionStart` would, and starts it. Another account's project that
+    /// the machine happens to list, and a suspended one, are still refused.
+    #[tokio::test]
+    async fn a_project_only_registered_on_its_owners_machine_starts() {
+        let p = project().await;
+        let other = Uuid::new_v4();
+        p.state.db.create_user(&user(other)).await.unwrap();
+        let registered = Uuid::new_v4().to_string();
+        let foreign = Uuid::new_v4().to_string();
+        p.state
+            .db
+            .authorize_project_registration(&foreign, &other.to_string())
+            .await
+            .unwrap();
+        // Shared with the owner, so its access is not what refuses it.
+        let suspended = Uuid::new_v4().to_string();
+        p.state
+            .db
+            .authorize_project_registration(&suspended, &other.to_string())
+            .await
+            .unwrap();
+        p.state
+            .db
+            .add_project_member(&other.to_string(), &suspended, &p.owner.to_string())
+            .await
+            .unwrap();
+        assert!(p
+            .state
+            .db
+            .set_project_lifecycle(
+                &other.to_string(),
+                &suspended,
+                crate::db::ProjectLifecycle::Suspended,
+            )
+            .await
+            .unwrap());
+        let m7 = Uuid::new_v4();
+        let listed = |project_id: &str| shared::MachineProjectInfo {
+            project_id: project_id.to_string(),
+            name: None,
+            path: format!("/work/{project_id}"),
+            preferred_machine_id: None,
+            is_running: false,
+            pid: None,
+            memory_kb: None,
+            last_error: None,
+            git_remote: None,
+        };
+        let mut daemon = p.daemon_with(
+            p.owner,
+            m7,
+            HOST_C,
+            CAPABLE_DAEMON,
+            vec![listed(&registered), listed(&foreign), listed(&suspended)],
+        );
+        let mut web = p.viewer(p.owner, &[shared::PROJECT_POLICY_CAPABILITY]);
+        let placed = |project_id: String| {
+            let db = p.state.db.clone();
+            let owner = p.owner.to_string();
+            async move {
+                db.project_is_placed_in_cluster(&project_id, &owner)
+                    .await
+                    .unwrap()
+            }
+        };
+
+        start_machine_project(&p.state, &web.id, &p.owner, m7, &registered, false).await;
+        assert!(errors(&web.drain()).is_empty());
+        assert!(matches!(
+            daemon.drain().as_slice(),
+            [ServerToDaemon::StartProjectCli { project_id, .. }] if *project_id == registered
+        ));
+        assert!(placed(registered.clone()).await);
+        assert_eq!(
+            p.state
+                .db
+                .get_project(&registered)
+                .await
+                .unwrap()
+                .unwrap()
+                .owner_user_id,
+            p.owner.to_string()
+        );
+
+        for refused in [&foreign, &suspended] {
+            start_machine_project(&p.state, &web.id, &p.owner, m7, refused, false).await;
+            assert_eq!(errors(&web.drain()), vec!["Machine not found".to_string()]);
+            assert!(daemon.drain().is_empty(), "{refused} is not started");
+            assert!(!placed(refused.clone()).await, "{refused} is not placed");
+        }
+    }
+
     /// A reboot reaches only the instance on the machine it names, else the
     /// primary; a named machine that runs no instance is refused by name,
     /// and only the target's own panes can block it.
@@ -9688,7 +10283,12 @@ mod project_instance_tests {
         let p = project().await;
         let mut a = p.instance(p.m5, HOST_A);
         let mut b = p.instance(p.m6, HOST_B);
-        let mut web = p.viewer(p.owner, &[shared::PROJECT_POLICY_CAPABILITY]);
+        // Only a client that keeps an inventory per machine names one.
+        let mut web = p.viewer(
+            p.owner,
+            &[shared::PROJECT_POLICY_CAPABILITY, PROJECT_INSTANCES_CAPABILITY],
+        );
+        let mut older = p.viewer(p.owner, &[shared::PROJECT_POLICY_CAPABILITY]);
         let inventory = |hosting: bool| shared::CliLifecycleInventory {
             persistent_terminal_hosting: hosting,
             ..shared::CliLifecycleInventory::default()
@@ -9725,6 +10325,18 @@ mod project_instance_tests {
                 inventory: Some(inventory),
                 ..
             } if *machine == p.m6 && !inventory.persistent_terminal_hosting
+        )));
+        // A viewer with one inventory per session, the primary's, sees the
+        // request's progress without zoo-006's inventory, which would
+        // replace the primary's.
+        assert!(older.drain().iter().any(|message| matches!(
+            message,
+            ServerToWeb::CliLifecycleStatus {
+                phase: shared::CliLifecyclePhase::Accepted,
+                machine_id: Some(machine),
+                inventory: None,
+                ..
+            } if *machine == p.m6
         )));
         assert!(p
             .state
@@ -10251,7 +10863,7 @@ mod project_instance_tests {
         assert!(b.drain().is_empty());
     }
 
-    /// An older CLI on the named machine owns the whole roster, so its new
+    /// An older CLI on the named machine reports its panes untagged, so its new
     /// pane stays untagged.
     #[tokio::test]
     async fn an_older_cli_on_the_named_machine_gets_an_untagged_pane() {

@@ -58,4 +58,25 @@ describe("MobileTerminalKeyBar", () => {
     }
     expect(sendTerminalInput).not.toHaveBeenCalled();
   });
+
+  it("disables every key, with the reason, while the pane cannot take input", () => {
+    // Its machine is not running the project: the server would refuse each
+    // key, and each refusal would be an error toast.
+    const reason = "zoo-006 is not running this project. Start it on zoo-006 first.";
+    const sendTerminalInput = vi.fn();
+    act(() => {
+      useStore.setState({
+        sendTerminalInput: sendTerminalInput as StoreState["sendTerminalInput"],
+      });
+    });
+    render(<MobileTerminalKeyBar paneId={17} connected disabledReason={reason} />);
+
+    const toolbar = screen.getByRole("toolbar", { name: "Terminal keys" });
+    for (const button of toolbar.querySelectorAll("button")) {
+      expect(button.hasAttribute("disabled")).toBe(true);
+      expect(button.getAttribute("title")).toBe(reason);
+      fireEvent.click(button);
+    }
+    expect(sendTerminalInput).not.toHaveBeenCalled();
+  });
 });

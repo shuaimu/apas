@@ -19,8 +19,11 @@ import { TabbedView } from "./TabbedView";
  */
 
 // xterm.js needs canvas APIs jsdom lacks; these tests are about the view.
+// The stub shows what the view tells the terminal about taking input.
 vi.mock("./TerminalPane", () => ({
-  TerminalPane: ({ paneId }: { paneId: number }) => <div data-testid={`terminal-pane-${paneId}`} />,
+  TerminalPane: ({ paneId, inputDisabledReason }: { paneId: number; inputDisabledReason?: string }) => (
+    <div data-testid={`terminal-pane-${paneId}`} data-input-disabled={inputDisabledReason} />
+  ),
 }));
 
 const SID = "20000000-0000-4000-8000-000000000001";
@@ -211,6 +214,19 @@ describe("a tab whose machine is not running the project", () => {
     expect(confirm).not.toHaveBeenCalled();
     expect(sent("remove_pane")).toEqual([]);
     expect(screen.getByText(STOPPED)).toBeTruthy();
+  });
+
+  it("keeps the terminal readable but tells it to send no keys or sizes", async () => {
+    // Each key or size it sent would only come back refused, as an error
+    // toast; opening the tab alone sends two sizes.
+    seed(11);
+    const { container } = render(<TabbedView />);
+    const stopped = await screen.findByTestId("terminal-pane-11");
+    expect(stopped.getAttribute("data-input-disabled")).toBe(STOPPED);
+
+    fireEvent.click(container.querySelector('[data-tab-id="10"]') as Element);
+    const running = await screen.findByTestId("terminal-pane-10");
+    expect(running.hasAttribute("data-input-disabled")).toBe(false);
   });
 
   it("keeps the conversation input's draft but will not send it", async () => {

@@ -342,10 +342,11 @@ fn canonical_git_remote_matches_the_cli() {
 }
 
 /// Only projects the caller owns or hosts match, by the remote one of their
-/// sessions recorded. Hosting by placement counts, and so does ownership
-/// alone; belonging to a project, a stranger's project, another repository
-/// and a project being deleted do not. A suspended project is still the
-/// caller's to join.
+/// sessions recorded. Hosting by placement counts; belonging to a project, a
+/// stranger's project, another repository and a project being deleted do
+/// not. Neither does a project whose session runs under another account,
+/// owned or not, since a checkout joined to it could never start. A
+/// suspended project is still the caller's to join.
 #[tokio::test]
 async fn matches_projects_the_caller_owns_or_hosts_by_their_sessions_remote() {
     let f = Fixture::new().await;
@@ -354,9 +355,10 @@ async fn matches_projects_the_caller_owns_or_hosts_by_their_sessions_remote() {
     let owned = f.project(caller).await;
     f.session(owned, caller, Some(REPO)).await;
 
-    // Another account's project, hosted in the caller's cluster.
+    // Another account's project, hosted in the caller's cluster, whose
+    // session the caller's machines run.
     let hosted = f.project(other).await;
-    f.session(hosted, other, Some(REPO)).await;
+    f.session(hosted, caller, Some(REPO)).await;
     assert!(f
         .state
         .db
@@ -444,25 +446,26 @@ async fn matches_projects_the_caller_owns_or_hosts_by_their_sessions_remote() {
         .await
         .unwrap());
 
+    // The handed-over project's session still runs under the account that
+    // handed it over, so no checkout of the caller's could start as an
+    // instance of it: it is not offered, though the caller owns it.
     let answer = f.lookup(caller, REPO, None).await;
     assert_eq!(answer.git_remote, REPO);
-    assert_eq!(
-        ids(&answer.projects),
-        sorted(vec![owned, hosted, suspended, transferred])
-    );
+    assert_eq!(ids(&answer.projects), sorted(vec![owned, hosted, suspended]));
     assert!(answer.projects.iter().all(|project| project.has_session));
     assert!(answer.local.is_none());
 
     // Each account sees its own: the stranger theirs, and the account that
     // shared one project with the caller and handed over another those it
-    // owns, and the handed-over one, which its cluster still hosts.
+    // owns and runs, and the handed-over one, which its cluster still hosts
+    // and runs. The project it owns that runs under the caller is not.
     assert_eq!(
         ids(&f.lookup(stranger, REPO, None).await.projects),
         vec![strangers]
     );
     assert_eq!(
         ids(&f.lookup(other, REPO, None).await.projects),
-        sorted(vec![hosted, shared_with, transferred])
+        sorted(vec![shared_with, transferred])
     );
 }
 
@@ -739,14 +742,20 @@ async fn lists_each_checkout_once_with_whether_it_runs() {
             (Some(zoo5), "zoo-005".to_string(), path.to_string(), false),
         ]
     );
+    // A project that runs under another account is not one to join, but as
+    // a checkout's own identity its checkouts are still listed.
+    assert!(answer
+        .projects
+        .iter()
+        .all(|project| project.project_id != hosted_elsewhere));
+    let own = f
+        .lookup(caller, REPO, Some(hosted_elsewhere))
+        .await
+        .local
+        .expect("the caller's own project");
     assert_eq!(
-        checkouts(hosted_elsewhere),
-        vec![(
-            Some(theirs),
-            "theirs".to_string(),
-            "/srv/repo".to_string(),
-            true
-        )]
+        checkouts_of(&own),
+        vec![(Some(theirs), "theirs", "/srv/repo", true)]
     );
     assert_eq!(
         checkouts(older),

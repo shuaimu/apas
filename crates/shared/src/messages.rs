@@ -71,6 +71,12 @@ pub const LOCAL_PROJECT_REGISTRATION_CAPABILITY: &str = "local_project_registrat
 /// lives in the shared `config.toml`, so every host on a shared home would
 /// report the same machine.
 ///
+/// A server that implements instances echoes it to a daemon that advertised
+/// it, in [`ServerToDaemon::Registered`]'s `negotiated_capabilities`. A daemon
+/// that does not see it echoed starts projects as daemons did before
+/// instances, because a server that does not echo it keeps one CLI per
+/// session.
+///
 /// Web and mobile clients advertise it too, in `Authenticate.capabilities`,
 /// to receive [`ServerToWeb::SessionInstances`]; a server that implements
 /// instances echoes it in `Authenticated.negotiated_capabilities`, so a client
@@ -900,11 +906,16 @@ pub enum ServerToCli {
 pub enum ServerToCliScope {
     /// The message is for one existing pane: deliver it to the instance that
     /// owns that pane and to no other, whichever instance is primary. A pane
-    /// with no `machine_id`, or one the roster does not list, has no owner
-    /// yet and goes to the primary instance as a fallback; see
-    /// [`PaneConfig::machine_id`]. The legacy deadloop pause/resume carry no
-    /// pane id but act only on [`PANE_ID_DEADLOOP`], so they are in this
-    /// class with that id.
+    /// tagged with a machine goes to the instance attached on that machine,
+    /// and is refused as stopped there when none is, even while a CLI without
+    /// [`PROJECT_INSTANCES_CAPABILITY`] is the sole instance. A pane with no
+    /// `machine_id` has no owner yet: it goes to the instance on its
+    /// attributed host, else to a sole instance without the capability, else,
+    /// when it has no attributed host, to the primary, and is otherwise
+    /// refused as stopped on that host; see [`PaneConfig::machine_id`]. A
+    /// pane the roster does not list goes to the primary as a fallback. The
+    /// legacy deadloop pause/resume carry no pane id but act only on
+    /// [`PANE_ID_DEADLOOP`], so they are in this class with that id.
     Pane(u32),
     /// `AddPane`: deliver it to the instance on `machine_id`, the
     /// `pane_config.machine_id` the server assigned to the new pane, or to the
@@ -1113,6 +1124,25 @@ pub enum ServerToDaemon {
         machine_id: Uuid,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         cluster_owner_user_id: Option<Uuid>,
+        /// The capabilities from the daemon's `DaemonToServer::Register` that
+        /// this server honours, as `ServerToWeb::Authenticated` does for
+        /// viewers. A daemon may rely only on the ones documented as echoed
+        /// here; today that is [`PROJECT_INSTANCES_CAPABILITY`], which a
+        /// server implementing project instances echoes whenever the daemon
+        /// advertised it. Absent from older servers.
+        ///
+        /// A daemon that advertised [`PROJECT_INSTANCES_CAPABILITY`] and does
+        /// not find it here has reached a server that keeps one CLI per
+        /// session: a second machine's `SessionStart` replaces the first
+        /// machine's instance there, and that instance's tabs can no longer be
+        /// controlled. For as long as this connection lasts, the daemon
+        /// handles every `StartProjectCli` as daemons did before instances,
+        /// refusing a project another live host runs rather than starting an
+        /// instance beside it. It decides again at every registration, because
+        /// the server can be upgraded or rolled back while the daemon runs,
+        /// and it never stops an instance already running because of this.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        negotiated_capabilities: Vec<String>,
     },
 
     /// Registration failed
@@ -2686,9 +2716,10 @@ pub struct MobilePaneSummary {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage_limited: Option<UsageLimited>,
     /// Machine whose project instance runs this pane; see
-    /// [`PaneConfig::machine_id`]. Absent from older servers and for panes
-    /// written before multi-machine instances, which no machine owns yet and
-    /// whose controls go to the session's primary instance.
+    /// [`PaneConfig::machine_id`]. Absent from older servers, for panes
+    /// written before multi-machine instances, and for panes reported by a
+    /// CLI without [`PROJECT_INSTANCES_CAPABILITY`]. No machine owns those
+    /// yet; [`PaneConfig::machine_id`] says where their controls go.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub machine_id: Option<Uuid>,
     /// Display name for the pane's host badge; see [`PaneConfig::hostname`].
@@ -3452,12 +3483,19 @@ pub struct PaneConfig {
     /// and controls live on exactly one of them for the pane's lifetime. The
     /// server assigns this from the authenticated instance that reports the
     /// pane, overriding whatever the pane data says, so no instance can claim
-    /// another machine's panes.
+    /// another machine's panes. A tagged pane's controls go only to the
+    /// instance attached on its machine, whichever instance is primary and
+    /// whether or not that one has [`PROJECT_INSTANCES_CAPABILITY`]; with
+    /// none attached there, they are refused as stopped on that machine.
     ///
-    /// `None` = written before multi-machine instances. No machine owns such
-    /// a pane yet. Its controls go to the session's primary instance as a
-    /// fallback, and the first instance that reports it adopts it. When
-    /// instance M reports its roster, the server:
+    /// `None` = written before multi-machine instances, or reported by a CLI
+    /// without [`PROJECT_INSTANCES_CAPABILITY`]. No machine owns such a pane
+    /// until a capable instance reports it, which adopts it. Until then its
+    /// controls go to the instance on its attributed host (`hostname`), else
+    /// to the sole attached instance when that lacks the capability, else,
+    /// when it has no attributed host, to the primary; otherwise they are
+    /// refused as stopped on that host. When capable instance M reports its
+    /// roster, the server:
     /// - replaces every pane tagged M, so a pane tagged M that M no longer
     ///   reports is gone;
     /// - tags M on a reported pane whose roster entry is untagged (adoption
@@ -3470,16 +3508,33 @@ pub struct PaneConfig {
     /// separate checkout can join, and become primary, while the pre-upgrade
     /// host is stopped. If the primary owned untagged panes, that checkout's
     /// first, empty roster would erase every tab the host still has, with no
-    /// stopped badge and nothing to forget. A CLI without
-    /// [`PROJECT_INSTANCES_CAPABILITY`] is only ever the session's sole
-    /// instance and still replaces the whole roster, as before.
+    /// stopped badge and nothing to forget.
+    ///
+    /// A CLI without the capability is only ever the session's sole instance,
+    /// and nothing it reports is tagged. When it reports its roster, the
+    /// server:
+    /// - takes every pane it reports, untagged and attributed to its host, in
+    ///   place of that id's entry whatever the entry's tag: on a shared home
+    ///   such a CLI restores and runs every pane in the `.apas`, as before
+    ///   instances;
+    /// - removes every untagged pane it did not report, and every pane tagged
+    ///   with its own machine id (the one its `SessionStart` named, if any)
+    ///   that it did not report;
+    /// - keeps every pane tagged for another machine that it did not report,
+    ///   listed as stopped on that machine, with its id still allocated.
+    ///
+    /// The last rule is for a separate checkout, whose tabs such a CLI cannot
+    /// see. Replacing the whole roster would erase them while their machine is
+    /// stopped, leaving nothing to start or forget until it ran the project
+    /// again, and would free their ids for another pane.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub machine_id: Option<Uuid>,
     /// Hostname of `machine_id`, for display only. Hosts get renamed, so
-    /// routing and ownership always use `machine_id`. On an untagged pane the
-    /// server may keep the host it last recorded the pane under, so the tab is
-    /// not shown under whichever instance happens to be primary. It never
-    /// implies ownership.
+    /// ownership always uses `machine_id`. On an untagged pane the server
+    /// keeps the host it last recorded the pane under, if any: its attributed
+    /// host, so the tab is not shown under whichever instance happens to be
+    /// primary. That host is a display and routing hint (see `machine_id`),
+    /// and never implies ownership.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hostname: Option<String>,
 }
@@ -6292,6 +6347,87 @@ mod project_instances_tests {
                 assert_eq!(error, None);
             }
             other => panic!("expected ProjectRuntimeStarted, got {other:?}"),
+        }
+    }
+
+    /// A daemon learns from its registration whether the server runs
+    /// instances: an older server sends no list, which reads as "no", and an
+    /// older daemon reads the new registration exactly as before.
+    #[test]
+    fn daemon_registration_says_whether_the_server_runs_instances() {
+        let machine_id = Uuid::new_v4();
+        let owner = Uuid::new_v4();
+        let older_server: ServerToDaemon = serde_json::from_value(json!({
+            "type": "registered",
+            "machine_id": machine_id,
+            "cluster_owner_user_id": owner,
+        }))
+        .unwrap();
+        match older_server {
+            ServerToDaemon::Registered {
+                negotiated_capabilities,
+                ..
+            } => assert!(negotiated_capabilities.is_empty()),
+            other => panic!("expected Registered, got {other:?}"),
+        }
+
+        let nothing_echoed = serde_json::to_value(ServerToDaemon::Registered {
+            machine_id,
+            cluster_owner_user_id: Some(owner),
+            negotiated_capabilities: Vec::new(),
+        })
+        .unwrap();
+        assert!(
+            nothing_echoed.get("negotiated_capabilities").is_none(),
+            "an empty list stays off the wire: {nothing_echoed}"
+        );
+
+        let echoed = serde_json::to_value(ServerToDaemon::Registered {
+            machine_id,
+            cluster_owner_user_id: Some(owner),
+            negotiated_capabilities: vec![PROJECT_INSTANCES_CAPABILITY.to_string()],
+        })
+        .unwrap();
+        assert_eq!(
+            echoed["negotiated_capabilities"],
+            json!([PROJECT_INSTANCES_CAPABILITY])
+        );
+        match serde_json::from_value::<ServerToDaemon>(echoed.clone()).unwrap() {
+            ServerToDaemon::Registered {
+                machine_id: got,
+                cluster_owner_user_id,
+                negotiated_capabilities,
+            } => {
+                assert_eq!(got, machine_id);
+                assert_eq!(cluster_owner_user_id, Some(owner));
+                assert_eq!(
+                    negotiated_capabilities,
+                    vec![PROJECT_INSTANCES_CAPABILITY.to_string()]
+                );
+            }
+            other => panic!("expected Registered, got {other:?}"),
+        }
+
+        // The variant as daemons predating the field declare it. Failing to
+        // parse here would fail their registration outright, since a daemon
+        // propagates a registration reply it cannot read as an error.
+        #[derive(Debug, Deserialize)]
+        #[serde(tag = "type", rename_all = "snake_case")]
+        enum OlderServerToDaemon {
+            Registered {
+                machine_id: Uuid,
+                #[serde(default)]
+                cluster_owner_user_id: Option<Uuid>,
+            },
+        }
+        match serde_json::from_value::<OlderServerToDaemon>(echoed).unwrap() {
+            OlderServerToDaemon::Registered {
+                machine_id: got,
+                cluster_owner_user_id,
+            } => {
+                assert_eq!(got, machine_id);
+                assert_eq!(cluster_owner_user_id, Some(owner));
+            }
         }
     }
 

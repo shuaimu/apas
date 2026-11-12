@@ -2165,10 +2165,11 @@ struct RuntimeStart {
 /// Open the project in `working_dir` for `owner` and take its panes.
 ///
 /// An instance restores only the panes tagged with its machine, after
-/// adopting the untagged ones when no other machine runs the project. A pane
-/// tagged for another machine is never restored, even while that machine is
-/// stopped: its process, terminal and history belong there. A runtime without
-/// the capability restores every pane, as a CLI from before instances does.
+/// adopting the untagged ones unless another machine claimed the project
+/// first or runs it alone. A pane tagged for another machine is never
+/// restored, even while that machine is stopped: its process, terminal and
+/// history belong there. A runtime without the capability restores every
+/// pane, as a CLI from before instances does.
 fn open_runtime(working_dir: &Path, owner: &PaneOwner) -> Result<RuntimeStart> {
     let start = crate::project_instances::open_instance(working_dir, owner)?;
     tracing::info!(
@@ -2769,8 +2770,9 @@ async fn run_inner(
     let cursor_agent_path = resolve_binary_path(&config.local.cursor_agent_path);
 
     // Open `.apas` and take this machine's panes: its own, plus the untagged
-    // ones when no other machine runs the project. Nothing here regenerates a
-    // file that does not parse; the project fails to start instead.
+    // ones unless another machine claimed the project first or runs it alone.
+    // Nothing here regenerates a file that does not parse; the project fails
+    // to start instead.
     let owner = instance.owner();
     let RuntimeStart {
         metadata,

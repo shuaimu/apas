@@ -20,6 +20,9 @@ use uuid::Uuid;
 const INITIAL_RECONNECT_DELAY: Duration = Duration::from_secs(1);
 const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(30);
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
+/// How long a stop waits for a project's task to finish tearing down before
+/// giving up on it.
+const PROJECT_STOP_WAIT: Duration = Duration::from_secs(30);
 
 /// How often the daemon checks whether a newer `apas` has been installed.
 ///
@@ -412,6 +415,64 @@ struct RunningProject {
     handle: tokio::task::JoinHandle<()>,
 }
 
+/// The newest start of each project on this host, by project id; see
+/// [`StartClaim`].
+type ClaimStarts = Arc<Mutex<HashMap<String, u64>>>;
+
+/// This host's claims on a project, held by the task of one start of it.
+///
+/// [`InstanceClaimGuard`] releases them however that task ends. But a stop
+/// that gives up waiting for a task leaves it running detached, and the
+/// project can be started here again meanwhile: `claim_project` finds the
+/// claims still this host's, and the new task runs under the very same files.
+/// Released unconditionally, the old task's eventual end deleted them from
+/// under the new one, and until a heartbeat retook them a daemon on another
+/// host that runs projects alone, one predating instances say, could start
+/// the project beside it. So every start takes the next number for its
+/// project, and a task releases the claims only while its start is still the
+/// newest. Otherwise they are the newer start's, and its task releases them
+/// when it ends.
+struct StartClaim {
+    guard: Option<InstanceClaimGuard>,
+    starts: ClaimStarts,
+    project_id: String,
+    start: u64,
+}
+
+impl StartClaim {
+    /// Leave the claims in place when this goes, as
+    /// [`InstanceClaimGuard::keep`] does.
+    fn keep(mut self) {
+        if let Some(guard) = self.guard.take() {
+            guard.keep();
+        }
+    }
+}
+
+impl Drop for StartClaim {
+    fn drop(&mut self) {
+        let Some(guard) = self.guard.take() else {
+            return;
+        };
+        // Under the lock a start holds while it claims, so no start can take
+        // the claims between this check and the release.
+        let starts = self
+            .starts
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if starts.get(&self.project_id) == Some(&self.start) {
+            drop(guard);
+        } else {
+            tracing::info!(
+                project_id = %self.project_id,
+                "the project was started here again while this task was ending; its claims \
+                 are that start's"
+            );
+            guard.keep();
+        }
+    }
+}
+
 /// A project asking to be replaced.
 ///
 /// The task cannot restart itself — it is the thing being replaced, and only
@@ -587,6 +648,11 @@ struct DaemonState {
     /// The NFS-shared config dir holding the claims, resolved once so a
     /// project's task can release its claims from any thread.
     registry_dir: PathBuf,
+    /// The start of each project that owns this host's claims on it.
+    claim_starts: ClaimStarts,
+    /// How long a stop waits for a project's task: [`PROJECT_STOP_WAIT`],
+    /// which tests shorten.
+    stop_wait: Duration,
     git_remotes: GitRemotes,
     launcher: ProjectLauncher,
 }
@@ -608,6 +674,8 @@ impl DaemonState {
             sessions: HashMap::new(),
             claim_mode,
             registry_dir: config_dir_for_registry(),
+            claim_starts: ClaimStarts::default(),
+            stop_wait: PROJECT_STOP_WAIT,
             git_remotes: GitRemotes::new(),
             launcher: project_runtime_launcher(),
         }
@@ -1013,8 +1081,17 @@ impl DaemonState {
         //
         // Written before the task starts, so the instance deciding whether to
         // adopt untagged panes already sees it, and so does a peer starting
-        // the same project at the same moment.
+        // the same project at the same moment: the earlier of the two claims
+        // is the one that adopts.
+        //
+        // Claimed under the project's start count, which this start then
+        // takes, so a task of an earlier start that is still ending cannot
+        // release the claims between the two; see `StartClaim`.
         let machine_id = self.machine_info.machine_id;
+        let claim_starts = self.claim_starts.clone();
+        let mut starts = claim_starts
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         match crate::daemon_registry::claim_project(
             &self.registry_dir,
             project_id,
@@ -1023,6 +1100,7 @@ impl DaemonState {
             self.claim_mode,
         ) {
             Ok(ClaimOutcome::HeldBy(refusal)) => {
+                drop(starts);
                 return Ok(StartOutcome::Refused(
                     self.record_start_refusal(project_id, refusal.reason()),
                 ));
@@ -1034,6 +1112,12 @@ impl DaemonState {
                 tracing::warn!(project_id, %err, "could not record project claim");
             }
         }
+        let start = {
+            let newest = starts.entry(project_id.to_string()).or_insert(0);
+            *newest += 1;
+            *newest
+        };
+        drop(starts);
         if self.claim_mode == ClaimMode::Instances {
             // Running beside other machines is the point of instances, but it
             // is also what an operator chasing a duplicate needs to see.
@@ -1056,12 +1140,18 @@ impl DaemonState {
             }
         }
         // Released when the task ends, however it ends, except when it asks
-        // for the daemon to be replaced.
-        let claim = InstanceClaimGuard::new(
-            self.registry_dir.clone(),
-            project_id.to_string(),
-            machine_id,
-        );
+        // for the daemon to be replaced or the project was started here again
+        // meanwhile.
+        let claim = StartClaim {
+            guard: Some(InstanceClaimGuard::new(
+                self.registry_dir.clone(),
+                project_id.to_string(),
+                machine_id,
+            )),
+            starts: self.claim_starts.clone(),
+            project_id: project_id.to_string(),
+            start,
+        };
 
         // The project runs here, as a task of this instance. It used to be a
         // headless CLI in its own tmux session, which this daemon then could
@@ -1201,13 +1291,14 @@ impl DaemonState {
     ///
     /// Bounded, because teardown kills pane children and joins roughly thirty
     /// threads: a project that will not stop must not hold the instance that
-    /// every other project is running in.
+    /// every other project is running in. A task given up on keeps running
+    /// detached until it ends.
     async fn stop_running_project(&mut self, project_id: &str) -> bool {
         let Some(project) = self.running.remove(project_id) else {
             return true;
         };
         project.shutdown.store(true, Ordering::SeqCst);
-        match tokio::time::timeout(std::time::Duration::from_secs(30), project.handle).await {
+        match tokio::time::timeout(self.stop_wait, project.handle).await {
             Ok(Ok(())) => {
                 tracing::info!(project_id, "project stopped");
                 true
@@ -1221,7 +1312,8 @@ impl DaemonState {
             Err(_) => {
                 tracing::warn!(
                     project_id,
-                    "project did not stop within 30s; abandoning the wait"
+                    wait = ?self.stop_wait,
+                    "project did not stop in time; abandoning the wait"
                 );
                 false
             }
@@ -1236,7 +1328,9 @@ impl DaemonState {
             // covers claims of ours with no task behind them, such as those of
             // a project a replaced daemon ran and this one did not resume. A
             // task still tearing down keeps its claims until it ends; nothing
-            // refreshes them meanwhile, so they lapse if it never does.
+            // refreshes them meanwhile, so they lapse if it never does. If the
+            // project is started here again first, they are that start's, and
+            // the old task's end leaves them alone (`StartClaim`).
             crate::daemon_registry::release_project(
                 &self.registry_dir,
                 project_id,
@@ -2871,6 +2965,21 @@ mod instance_tests {
         })
     }
 
+    /// A runtime whose teardown outlasts a stop's wait: it ends once `release`
+    /// is set, whatever `shutdown` says, and sets `ended` as it does.
+    fn slow_to_stop(release: Arc<AtomicBool>, ended: Arc<AtomicBool>) -> ProjectLauncher {
+        Arc::new(move |_launch: ProjectLaunch| {
+            let (release, ended) = (release.clone(), ended.clone());
+            Box::pin(async move {
+                while !release.load(Ordering::SeqCst) {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+                ended.store(true, Ordering::SeqCst);
+                Ok(ProjectOutcome::Completed)
+            })
+        })
+    }
+
     fn now_secs() -> u64 {
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -3135,6 +3244,56 @@ mod instance_tests {
         assert!(h.state.stop_running_project("proj-reboot").await);
         assert_eq!(h.start("proj-reboot"), StartOutcome::Started);
         assert!(h.instance_path("proj-reboot", h.machine()).exists());
+    }
+
+    /// A stop that gives up on a task leaves it running detached, and the
+    /// project can be started here again before that task ends. The claims are
+    /// the new start's then. The old task's end used to delete them from under
+    /// the new one, and until a heartbeat retook them an older daemon on
+    /// another host could start the project beside it.
+    #[tokio::test]
+    async fn a_task_a_stop_gave_up_on_leaves_the_next_starts_claims_alone() {
+        let mut h = harness(ClaimMode::Instances, Ending::WhenStopped);
+        h.state.stop_wait = Duration::from_millis(50);
+        let release = Arc::new(AtomicBool::new(false));
+        let ended = Arc::new(AtomicBool::new(false));
+        h.state.launcher = slow_to_stop(release.clone(), ended.clone());
+        h.add_project("proj-slow");
+        assert_eq!(h.start("proj-slow"), StartOutcome::Started);
+
+        // The stop gives up; the old task runs on and keeps the claims.
+        h.state.stop_project("proj-slow").await.unwrap();
+        assert!(!ended.load(Ordering::SeqCst));
+        assert!(h.instance_path("proj-slow", h.machine()).exists());
+        assert!(h.guard_path("proj-slow").exists());
+
+        h.state.launcher = launcher(Ending::WhenStopped);
+        assert_eq!(h.start("proj-slow"), StartOutcome::Started);
+
+        release.store(true, Ordering::SeqCst);
+        for _ in 0..400 {
+            if ended.load(Ordering::SeqCst) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        // The old task's claims went, or stayed, in the same poll that ended
+        // it, which on this single-threaded test runtime is over by now.
+        assert!(ended.load(Ordering::SeqCst), "the old task ended");
+        assert!(
+            h.instance_path("proj-slow", h.machine()).exists(),
+            "the new start's instance claim survives the old task's end"
+        );
+        assert!(h.guard_path("proj-slow").exists(), "and so does the guard");
+        assert_eq!(
+            h.read(&h.guard_path("proj-slow"))["instances"],
+            serde_json::json!(true)
+        );
+
+        // The new start's own end still releases them.
+        h.state.stop_project("proj-slow").await.unwrap();
+        assert!(!h.instance_path("proj-slow", h.machine()).exists());
+        assert!(!h.guard_path("proj-slow").exists());
     }
 
     /// The daemon's own shutdown stops each project the same way, so the

@@ -296,6 +296,26 @@ describe("the new-tab machine step", () => {
     expect(onAddTab).toHaveBeenCalledWith("claude", undefined, undefined, "terminal", undefined);
   });
 
+  it("says a stopped project starts first, even when its machine is the only choice", () => {
+    // `+` on a stopped project starts it, relaunching its saved tabs, so the
+    // step that says so is never hidden.
+    const { onAddTab } = renderBar({
+      machineChoices: choices({ instances: [], machines: [machine(ZOO5, "zoo-005")], canClone: false }),
+    });
+    openInteractive();
+    const step = screen.getByRole("group", { name: "Run on" });
+    const starts = within(step).getByRole("group", { name: "Starts the project first" });
+    const zoo5 = within(starts).getByRole("radio", { name: /^zoo-005/ }) as HTMLInputElement;
+    expect(zoo5.checked).toBe(true);
+    expect(within(starts).getByText("Registered · the project starts there, then the tab opens")).toBeTruthy();
+
+    fireEvent.click(screen.getByText("Claude"));
+    expect(onAddTab).toHaveBeenCalledWith(
+      "claude", undefined, undefined, "terminal",
+      expect.objectContaining({ machineId: ZOO5, kind: "registered" }),
+    );
+  });
+
   it("requires picking a machine when the only choice is a clone", () => {
     const { onAddTab } = renderBar({
       machineChoices: choices({ instances: [], machines: [machine(LAPTOP, "laptop", { registered: false })] }),

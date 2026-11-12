@@ -483,6 +483,15 @@ pub async fn launch_task(
             )
         })?;
     let _launch_guard = state.mobile_task_launch_guard(request.request_id).await;
+    // A launch starts the project when nothing runs it, so a project its
+    // owner's machine only registered is placed first, as a web Start does.
+    super::ws_web::place_registered_project(
+        &state,
+        &user_id,
+        &request.machine_id,
+        &request.project_id,
+    )
+    .await;
     if !super::ws_web::has_machine_project_runtime_access(
         &state,
         &user_id,
@@ -622,7 +631,7 @@ pub async fn launch_task(
     let existing = state.sessions.get_session_panes(&session_id);
     if !existing.iter().any(|pane| pane.pane_id == pane_id) {
         // An instance that can share the project owns the panes tagged with
-        // its machine; an older CLI owns the whole roster, untagged.
+        // its machine; an older CLI's stay untagged.
         let tag = instance
             .as_ref()
             .filter(|instance| instance.capable)

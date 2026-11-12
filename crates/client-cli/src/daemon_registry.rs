@@ -167,6 +167,7 @@ impl ProjectClaim {
         InstanceHolder {
             machine_id: self.machine_id,
             hostname: self.hostname.clone(),
+            claimed_at: self.claimed_at,
             age_secs: now.saturating_sub(self.heartbeat),
         }
     }
@@ -203,6 +204,11 @@ impl ClaimMode {
 pub struct InstanceHolder {
     pub machine_id: Uuid,
     pub hostname: String,
+    /// Unix seconds when the holder claimed the project: when its instance
+    /// started, or, for a host seen only through the guard, when it took the
+    /// guard. Orders starts for adopting untagged panes
+    /// ([`LiveInstances::blocks_adoption`]).
+    pub claimed_at: u64,
     /// Seconds since the holder last refreshed its claim.
     pub age_secs: u64,
 }
@@ -258,13 +264,47 @@ pub struct LiveInstances {
     /// the project alone: a daemon predating instances, or one whose machine
     /// id is configured.
     pub exclusive_legacy: Option<InstanceHolder>,
+    /// This machine's own live instance claim, which its daemon writes before
+    /// it starts the instance. `None` for a run no daemon claimed, such as a
+    /// standalone `apas --headless`.
+    pub own: Option<InstanceHolder>,
 }
 
 impl LiveInstances {
-    /// Whether any other machine runs the project. Adopting untagged panes
-    /// must check this: only an instance with no live peer may take them.
+    /// Whether any other machine runs the project.
     pub fn any(&self) -> bool {
         !self.machines.is_empty() || self.exclusive_legacy.is_some()
+    }
+
+    /// Whether this machine's instance, starting now, must leave the
+    /// project's untagged panes unadopted.
+    ///
+    /// A host that runs the project alone always rules it out: it runs every
+    /// untagged pane itself. Otherwise the earliest claimant adopts, so this
+    /// machine is ruled out only by another machine whose live claim is older
+    /// than its own, compared by `claimed_at` and then by machine id, which
+    /// gives two machines claiming in the same second one answer between them.
+    ///
+    /// Order, not presence, decides because each daemon writes its claim
+    /// before its instance reaches this check. Two machines starting the
+    /// project together each saw the other's claim, and when presence alone
+    /// ruled adoption out, neither adopted: the untagged tabs stayed on no
+    /// machine, listed under a host that did not run them, until every
+    /// instance stopped. Adopting beside a later claimant takes nothing it
+    /// runs, since an instance with the capability never runs an untagged
+    /// pane; and adoption happens under the project lock on a fresh read, so
+    /// each pane is tagged by one of them only. A run with no claim of its own
+    /// has no start to order, and any other live instance rules it out.
+    pub fn blocks_adoption(&self) -> bool {
+        if self.exclusive_legacy.is_some() {
+            return true;
+        }
+        let Some(own) = &self.own else {
+            return self.any();
+        };
+        self.machines
+            .iter()
+            .any(|other| (other.claimed_at, other.machine_id) < (own.claimed_at, own.machine_id))
     }
 }
 
@@ -890,13 +930,14 @@ impl Drop for InstanceClaimGuard {
     }
 }
 
-/// The other machines running `project_id`, from their live claims.
+/// The other machines running `project_id`, from their live claims, and
+/// this machine's own live claim beside them.
 ///
-/// For the decision to adopt untagged panes at instance start: adopt only
-/// when [`LiveInstances::any`] is false. The daemon writes this machine's
-/// claim before it starts the instance, so two instances starting together
-/// each see the other's claim and neither adopts. Pass this machine's id so
-/// its own claim is excluded.
+/// For the decision to adopt untagged panes at instance start: adopt unless
+/// [`LiveInstances::blocks_adoption`]. The daemon writes this machine's claim
+/// before it starts the instance, so two instances starting together each
+/// see the other's claim, and the earlier claimant adopts. Pass this
+/// machine's id so its own claim is told apart from the others.
 ///
 /// Liveness is the claim's heartbeat ([`STALE_AFTER_SECS`]), never a pid.
 pub fn live_instance_machines(
@@ -922,7 +963,9 @@ fn live_instance_machines_at(
 ) -> LiveInstances {
     let mut live = LiveInstances::default();
     for claim in live_instance_claims(config_dir, project_id, now) {
-        if claim.machine_id != own_machine_id {
+        if claim.machine_id == own_machine_id {
+            live.own = Some(claim.holder(now));
+        } else {
             live.machines.push(claim.holder(now));
         }
     }
@@ -1247,8 +1290,9 @@ mod tests {
         let guard = read_claim(&claim_path(dir.path(), "p1")).unwrap();
         assert_eq!(guard.hostname, "zoo-005", "the guard stays with its holder");
 
-        // Each sees the other as a live instance, which is what keeps either
-        // from adopting untagged panes.
+        // Each sees the other as a live instance, and its own claim beside it.
+        // Claimed in the same second, the two are ordered by machine id for
+        // adopting untagged panes: exactly one of them may.
         let seen_by_6 = live_instance_machines_at(dir.path(), "p1", m6, &zoo6, now);
         assert_eq!(
             seen_by_6
@@ -1269,6 +1313,14 @@ mod tests {
             vec!["zoo-006"]
         );
         assert!(seen_by_5.any());
+        assert_eq!(seen_by_5.own.as_ref().map(|own| own.machine_id), Some(m5));
+        assert_eq!(seen_by_6.own.as_ref().map(|own| own.machine_id), Some(m6));
+        assert_ne!(
+            seen_by_5.blocks_adoption(),
+            seen_by_6.blocks_adoption(),
+            "one answer between them"
+        );
+        assert_eq!(seen_by_5.blocks_adoption(), m6 < m5);
     }
 
     /// The bug this prevents: shared projects.json + a /proc-only guard let
@@ -1713,10 +1765,21 @@ mod tests {
             vec![InstanceHolder {
                 machine_id: live,
                 hostname: "zoo-006".to_string(),
+                claimed_at: now,
                 age_secs: 0,
             }]
         );
         assert!(seen.exclusive_legacy.is_none());
+        assert_eq!(
+            seen.own,
+            Some(InstanceHolder {
+                machine_id: mine,
+                hostname: "me".to_string(),
+                claimed_at: now,
+                age_secs: 0,
+            }),
+            "this machine's own claim is reported apart from the others"
+        );
 
         // An older daemon's guard is reported as such.
         let older = TempDir::new().unwrap();
@@ -1732,6 +1795,105 @@ mod tests {
             Some("zoo-002".to_string())
         );
         assert!(seen.machines.is_empty());
+    }
+
+    /// Instances starting together each see the other's claim, because both
+    /// daemons claim before either instance runs. The earlier claimant adopts
+    /// untagged panes; when presence alone decided, neither did.
+    #[test]
+    fn only_the_earliest_live_claimant_may_adopt() {
+        let dir = TempDir::new().unwrap();
+        let now = now_secs();
+        let instances = ClaimMode::Instances;
+        // The earlier claimant gets the larger id, so it is the claim times,
+        // not the tie-break, that order these two.
+        let mut ids = [Uuid::new_v4(), Uuid::new_v4()];
+        ids.sort();
+        let (later, earlier) = (ids[0], ids[1]);
+        let (zoo5, zoo6) = (host("zoo-005", 11), host("zoo-006", 12));
+        claim_project_at(
+            dir.path(),
+            "p1",
+            "/proj",
+            earlier,
+            instances,
+            &zoo5,
+            now - 30,
+        )
+        .unwrap();
+        claim_project_at(dir.path(), "p1", "/proj", later, instances, &zoo6, now).unwrap();
+        // A claim that went stale long ago counts for nothing, however early.
+        let zoo4 = host("zoo-004", 13);
+        let long_ago = now - STALE_AFTER_SECS - 300;
+        claim_project_at(
+            dir.path(),
+            "p1",
+            "/proj",
+            Uuid::nil(),
+            instances,
+            &zoo4,
+            long_ago,
+        )
+        .unwrap();
+        let seen = |machine: Uuid, actor: &Actor| {
+            live_instance_machines_at(dir.path(), "p1", machine, actor, now)
+        };
+
+        assert!(!seen(earlier, &zoo5).blocks_adoption());
+        assert!(seen(later, &zoo6).blocks_adoption());
+
+        // A run no daemon claimed, such as a standalone `--headless`, has no
+        // start to order: any other live instance rules it out, and nothing
+        // does when nothing else runs.
+        let unclaimed = seen(Uuid::new_v4(), &host("zoo-007", 14));
+        assert!(unclaimed.own.is_none());
+        assert!(unclaimed.blocks_adoption());
+        let alone = TempDir::new().unwrap();
+        assert!(
+            !live_instance_machines_at(alone.path(), "p1", earlier, &zoo5, now).blocks_adoption()
+        );
+
+        // A capable host seen only through the guard is ordered by when it
+        // took the guard.
+        let guard_only = TempDir::new().unwrap();
+        claim_project_at(
+            guard_only.path(),
+            "p1",
+            "/proj",
+            earlier,
+            instances,
+            &zoo5,
+            now - 30,
+        )
+        .unwrap();
+        let mut guard = other_host_claim("p1", "zoo-009", now);
+        guard.instances = true;
+        guard.machine_id = Uuid::new_v4();
+        for (claimed_at, blocks) in [(now - 60, true), (now, false)] {
+            guard.claimed_at = claimed_at;
+            write_atomic(
+                &claim_path(guard_only.path(), "p1"),
+                &guard,
+                &host("zoo-009", 1),
+            )
+            .unwrap();
+            let seen = live_instance_machines_at(guard_only.path(), "p1", earlier, &zoo5, now);
+            assert_eq!(
+                seen.blocks_adoption(),
+                blocks,
+                "guard claimed at {claimed_at}"
+            );
+        }
+
+        // A host that runs the project alone rules out even the earliest
+        // claimant: it runs every untagged pane itself.
+        write_atomic(
+            &claim_path(dir.path(), "p1"),
+            &other_host_claim("p1", "zoo-002", now),
+            &host("zoo-002", 1),
+        )
+        .unwrap();
+        assert!(seen(earlier, &zoo5).blocks_adoption());
     }
 
     /// A temp name carrying only the pid could be the same name on two hosts

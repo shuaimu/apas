@@ -9,10 +9,12 @@ import {
   describeTabHosts,
   forgetMachineTabsCopy,
   groupMachineChoices,
+  hostList,
   instanceRebootTargets,
   launchStatus,
   machineChoiceDetail,
   projectHostLabel,
+  projectStartHosts,
   sessionIsOwned,
   stoppedOnHostReason,
   type TabHostsInput,
@@ -145,9 +147,11 @@ describe("describeTabHosts", () => {
       instances: [instance(ZOO5, "zoo-005", { primary: true, runtimeAccess: true }), instance(ZOO6, "zoo-006", { runtimeAccess: false })],
       machines: [machine(ZOO5, "zoo-005"), machine(ZOO6, "zoo-006")],
     });
+    // The server's own refusal, so the disabled tab and a refused control
+    // (sent before this viewer learned of the change) read the same.
     expect(result.tabs.get(2)).toMatchObject({
       state: "no_access",
-      refusal: "You do not have access to run tabs on zoo-006.",
+      refusal: "Access denied: you cannot use zoo-006, which runs this project instance",
       badge: true,
     });
     expect(result.tabs.get(2)?.stopped).toBeUndefined();
@@ -198,6 +202,45 @@ describe("describeTabHosts", () => {
     // Nothing runs beside it, so an older daemon may start the project as it
     // always could.
     expect(result.tabs.get(2)?.stopped?.startDisabledReason).toBeUndefined();
+  });
+});
+
+describe("projectStartHosts", () => {
+  it("names the machines that own tabs, not a tab-less last primary", () => {
+    // All tabs are zoo-005's; the laptop, joined with no tabs, stopped last
+    // and so is the session's recorded host. Open starts zoo-005 only.
+    const machines = [machine(ZOO5, "zoo-005"), machine(LAPTOP, "laptop")];
+    const panes = [pane(1, ZOO5, "zoo-005"), pane(2, ZOO5, "zoo-005")];
+    expect(projectStartHosts({ panes, machines, projectId: PROJECT })).toEqual(["zoo-005"]);
+
+    // Nothing qualifies when the owner is offline or older: the server then
+    // starts the machine the request names, which the caller shows instead.
+    for (const owner of [
+      machine(ZOO5, "zoo-005", { daemonConnected: false, projectInstancesAvailable: false }),
+      machine(ZOO5, "zoo-005", { projectInstancesAvailable: false }),
+      machine(ZOO5, "zoo-005", { registered: false }),
+    ]) {
+      expect(projectStartHosts({ panes, machines: [owner, machine(LAPTOP, "laptop")], projectId: PROJECT })).toEqual([]);
+    }
+    expect(projectStartHosts({ panes: [], machines, projectId: PROJECT })).toEqual([]);
+  });
+
+  it("counts an untagged tab for the machine of its attributed host, and lists every owner", () => {
+    const machines = [machine(ZOO6, "zoo-006"), machine(ZOO5, "zoo-005"), machine(LAPTOP, "laptop")];
+    expect(projectStartHosts({
+      panes: [pane(1, null, " ZOO-005 "), pane(2, ZOO6, "zoo-006"), pane(3, null, null)],
+      machines,
+      projectId: PROJECT,
+    })).toEqual(["zoo-005", "zoo-006"]);
+    // Another id is another project's inventory entry.
+    expect(projectStartHosts({ panes: [pane(2, ZOO6, "zoo-006")], machines, projectId: SESSION })).toEqual([]);
+  });
+
+  it("joins host names for a sentence", () => {
+    expect(hostList([])).toBe("");
+    expect(hostList(["zoo-005"])).toBe("zoo-005");
+    expect(hostList(["zoo-005", "zoo-006"])).toBe("zoo-005 and zoo-006");
+    expect(hostList(["zoo-005", "zoo-006", "laptop"])).toBe("zoo-005, zoo-006 and laptop");
   });
 });
 
@@ -292,7 +335,7 @@ describe("instanceRebootTargets", () => {
       { [ZOO5]: zoo5 },
     )).toEqual([
       { key: ZOO5, machineId: ZOO5, hostname: "zoo-005", primary: true, inventory: zoo5, disabledReason: undefined },
-      { key: ZOO6, machineId: ZOO6, hostname: "zoo-006", primary: false, inventory: undefined, disabledReason: "You do not have access to run tabs on zoo-006." },
+      { key: ZOO6, machineId: ZOO6, hostname: "zoo-006", primary: false, inventory: undefined, disabledReason: "Access denied: you cannot use zoo-006, which runs this project instance" },
     ]);
     expect(instanceRebootTargets([instance(undefined, "laptop", { primary: true })], { [LEGACY_MACHINE_KEY]: legacy })[0])
       .toMatchObject({ key: "host:laptop", machineId: undefined, inventory: legacy });

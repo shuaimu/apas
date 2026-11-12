@@ -35,6 +35,7 @@ import {
   selectSessionInstances,
   type SessionInstance,
 } from "./projectInstances";
+import { noRuntimeAccessReason } from "./tabHosts";
 
 // UUID generator with fallback for environments without crypto.randomUUID
 function generateId(): string {
@@ -1466,7 +1467,8 @@ function newTabRefusal(
     const instance = selectSessionInstances(state, sessionId)
       .find((candidate) => candidate.machineId === machineId);
     if (instance?.runtimeAccess === false) {
-      return `You do not have access to run tabs on ${instance.hostname}.`;
+      // The server's own refusal for a tab on that instance.
+      return noRuntimeAccessReason(instance.hostname);
     }
   } else if (!state.isAttached) {
     return "Project is not running. Start the CLI client first.";

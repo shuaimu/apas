@@ -15,9 +15,10 @@
 //!   keeps every other pane as the file has it;
 //! * [`update_project_settings`] changes project-level fields, and
 //!   [`update_pane`] one pane, without touching anything else;
-//! * [`start_instance`] adopts untagged panes when no other machine runs the
-//!   project, and returns the panes this instance restores ([`open_instance`]
-//!   first creates a missing file, as a runtime starting in a folder must);
+//! * [`start_instance`] adopts untagged panes unless another machine claimed
+//!   the project first or runs it alone, and returns the panes this instance
+//!   restores ([`open_instance`] first creates a missing file, as a runtime
+//!   starting in a folder must);
 //! * [`forget_machine_panes`] drops one machine's entries.
 //!
 //! [`read_project_metadata`] is the reader for periodic and background reads.
@@ -245,21 +246,26 @@ pub fn open_instance(dir: &Path, owner: &PaneOwner) -> Result<InstanceStart> {
 /// Take this runtime's panes as it starts: adopt the untagged ones when it
 /// may, and return the ones it restores.
 ///
-/// An instance adopts every untagged pane, tagging it with its machine, only
-/// when no other machine has a live instance claim for the project
-/// ([`another_machine_runs`]). The daemon writes this machine's claim before
-/// it starts the runtime, so two instances starting together each see the
-/// other's claim and neither adopts. Adoption also happens under the lock on a
-/// fresh read, so an instance never takes a pane another one has already
-/// tagged. A pane tagged for another machine is never adopted or restored. A
-/// sole runtime adopts nothing and restores every pane.
+/// An instance adopts every untagged pane, tagging it with its machine,
+/// unless another machine rules it out ([`another_machine_blocks_adoption`]):
+/// one that runs the project alone, or one whose live instance claim is older
+/// than this machine's. The daemon writes this machine's claim before it
+/// starts the runtime, so two instances starting together each see the
+/// other's claim: the earlier claimant adopts, and the other starts with none
+/// of those panes. Adoption happens under the lock on a fresh read, so an
+/// instance never takes a pane another one has already tagged. Untagged
+/// entries that appear while an instance runs wait for its next start. A pane
+/// tagged for another machine is never adopted or restored. A sole runtime
+/// adopts nothing and restores every pane.
 ///
 /// The file must exist; [`open_instance`] creates a missing one first. A file
 /// that does not parse, or that belongs to another project, is an error and is
 /// left as it is.
 pub fn start_instance(dir: &Path, project_id: Uuid, owner: &PaneOwner) -> Result<InstanceStart> {
     start_instance_with(dir, project_id, owner, LOCK_WAIT, || match owner {
-        PaneOwner::Instance { machine_id, .. } => another_machine_runs(project_id, *machine_id),
+        PaneOwner::Instance { machine_id, .. } => {
+            another_machine_blocks_adoption(project_id, *machine_id)
+        }
         PaneOwner::Sole => false,
     })
 }
@@ -269,10 +275,10 @@ fn start_instance_with(
     project_id: Uuid,
     owner: &PaneOwner,
     wait: Duration,
-    another_machine_runs: impl FnOnce() -> bool,
+    adoption_blocked: impl FnOnce() -> bool,
 ) -> Result<InstanceStart> {
     let (adopted, metadata) = transact(dir, project_id, wait, WhenMissing::Fail, |document| {
-        Ok(document.adopt_untagged(owner, another_machine_runs))
+        Ok(document.adopt_untagged(owner, adoption_blocked))
     })?;
     if !adopted.is_empty() {
         tracing::info!(?adopted, "adopted untagged panes for this machine");
@@ -422,18 +428,19 @@ pub fn forget_machine_panes(dir: &Path, project_id: Uuid, machine_id: Uuid) -> R
     Ok(forgotten)
 }
 
-/// Whether another machine has a live instance claim for the project, which
-/// rules out adopting its untagged panes. A host that cannot read the claims
-/// answers yes: not adopting is the answer that can never put one pane on two
-/// machines.
-pub fn another_machine_runs(project_id: Uuid, own_machine_id: Uuid) -> bool {
+/// Whether another machine's claim on the project rules out this one adopting
+/// its untagged panes: a host runs it alone, or another machine claimed it
+/// before this one did ([`crate::daemon_registry::LiveInstances::blocks_adoption`]).
+/// A host that cannot read the claims answers yes: not adopting is the answer
+/// that can never put one pane on two machines.
+pub fn another_machine_blocks_adoption(project_id: Uuid, own_machine_id: Uuid) -> bool {
     match Config::config_dir() {
         Ok(config_dir) => crate::daemon_registry::live_instance_machines(
             &config_dir,
             &project_id.to_string(),
             own_machine_id,
         )
-        .any(),
+        .blocks_adoption(),
         Err(error) => {
             tracing::warn!(%error, "cannot read instance claims; not adopting untagged panes");
             true
@@ -796,12 +803,12 @@ impl Document {
     }
 
     /// Tag every untagged pane with this instance's machine, unless another
-    /// machine runs the project. `another_machine_runs` is asked only when
-    /// there is something to adopt.
+    /// machine rules it out. `adoption_blocked` is asked only when there is
+    /// something to adopt.
     fn adopt_untagged(
         &mut self,
         owner: &PaneOwner,
-        another_machine_runs: impl FnOnce() -> bool,
+        adoption_blocked: impl FnOnce() -> bool,
     ) -> Vec<u32> {
         if owner.machine_id().is_none() {
             return Vec::new();
@@ -835,10 +842,11 @@ impl Document {
         if adoptable.is_empty() {
             return Vec::new();
         }
-        if another_machine_runs() {
+        if adoption_blocked() {
             tracing::info!(
                 untagged = adoptable.len(),
-                "another machine runs this project, so its untagged panes stay unowned"
+                "another machine claimed this project first or runs it alone, so its untagged \
+                 panes are not adopted here"
             );
             return Vec::new();
         }
@@ -1615,23 +1623,60 @@ mod tests {
         assert_eq!(pane_ids(&start.metadata.panes), vec![1, 2, 3]);
     }
 
+    fn now() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+    }
+
+    /// The live claim `host`'s daemon writes for `machine` before it starts an
+    /// instance of `project`, claimed at `claimed_at`. Returns its path, which
+    /// that daemon removes when the instance stops. Written by hand because
+    /// `claim_project` stamps the current second, and two claims made in one
+    /// second would be ordered by their random machine ids.
+    fn claim_written_by(
+        config: &Path,
+        project: Uuid,
+        machine: Uuid,
+        host: &str,
+        claimed_at: u64,
+    ) -> PathBuf {
+        let path = config
+            .join("claims")
+            .join(project.to_string())
+            .join(format!("{machine}.json"));
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            serde_json::json!({
+                "project_id": project.to_string(),
+                "project_path": "/home/u/demo",
+                "hostname": host,
+                "machine_id": machine,
+                "pid": 4242,
+                "claimed_at": claimed_at,
+                "heartbeat": now(),
+                "instances": true,
+            })
+            .to_string(),
+        )
+        .unwrap();
+        path
+    }
+
     #[test]
     fn a_second_instance_leaves_untagged_panes_to_the_running_one() {
-        // zoo-005 runs the project; its daemon claimed it per machine. An
-        // instance starting on zoo-006 restores nothing.
+        // zoo-005 runs the project; its daemon claimed it per machine when it
+        // started it. An instance starting on zoo-006 after that restores
+        // nothing.
         let config = isolated_config_dir();
         let (me, running) = (Uuid::new_v4(), Uuid::new_v4());
         let (dir, project) = project_with(vec![pane(1, Uuid::new_v4()), pane(2, Uuid::new_v4())]);
-        claim_project(
-            config.path(),
-            &project.to_string(),
-            &dir.path().display().to_string(),
-            running,
-            ClaimMode::Instances,
-        )
-        .unwrap();
+        let running_claim =
+            claim_written_by(config.path(), project, running, "zoo-005", now() - 100);
         // This machine's own claim, which its daemon wrote before starting it,
-        // does not count.
+        // does not count against it: it is what orders the two starts.
         claim_project(
             config.path(),
             &project.to_string(),
@@ -1648,10 +1693,74 @@ mod tests {
         assert!(start.panes.is_empty());
         assert_eq!(bytes(dir.path()), before, "nothing was tagged");
 
-        // Once zoo-005's claim is released, the next start adopts them.
-        crate::daemon_registry::release_project(config.path(), &project.to_string(), running);
+        // Once zoo-005 stops and its daemon releases its claim, the next start
+        // adopts them.
+        std::fs::remove_file(running_claim).unwrap();
         let start = start_instance(dir.path(), project, &instance(me, "zoo-006")).unwrap();
         assert_eq!(start.adopted, vec![1, 2]);
+    }
+
+    /// Both daemons claim before either instance reaches its adoption check.
+    /// When the mere presence of another claim ruled adoption out, two
+    /// instances starting together each saw the other, neither adopted, and
+    /// the untagged tabs stayed on no machine while listed under one. The
+    /// earlier claimant adopts them, whichever instance reaches the file first.
+    #[test]
+    fn instances_starting_together_leave_untagged_panes_to_the_first_claimant() {
+        let config = isolated_config_dir();
+        for zoo5_reaches_the_file_first in [true, false] {
+            let (zoo5, zoo6) = (Uuid::new_v4(), Uuid::new_v4());
+            let (dir, project) =
+                project_with(vec![pane(1, Uuid::new_v4()), pane(2, Uuid::new_v4())]);
+            // Both claims are on disk before either instance starts, zoo-005's
+            // a second older than zoo-006's.
+            let claimed = now();
+            claim_written_by(config.path(), project, zoo5, "zoo-005", claimed - 1);
+            claim_written_by(config.path(), project, zoo6, "zoo-006", claimed);
+            let start_on_5 =
+                || start_instance(dir.path(), project, &instance(zoo5, "zoo-005")).unwrap();
+            let start_on_6 =
+                || start_instance(dir.path(), project, &instance(zoo6, "zoo-006")).unwrap();
+
+            let (on_5, on_6) = if zoo5_reaches_the_file_first {
+                let on_5 = start_on_5();
+                (on_5, start_on_6())
+            } else {
+                let on_6 = start_on_6();
+                (start_on_5(), on_6)
+            };
+
+            let case = format!("zoo-005 first: {zoo5_reaches_the_file_first}");
+            assert_eq!(on_5.adopted, vec![1, 2], "{case}");
+            assert_eq!(pane_ids(&on_5.panes), vec![1, 2], "{case}");
+            assert!(on_6.adopted.is_empty(), "{case}");
+            assert!(on_6.panes.is_empty(), "{case}");
+            assert_eq!(
+                panes_of(&on_disk(dir.path()), Some(zoo5)),
+                vec![1, 2],
+                "{case}"
+            );
+        }
+    }
+
+    /// Claimed in the same second, the two are ordered by machine id, so
+    /// exactly one of them adopts.
+    #[test]
+    fn claimants_of_the_same_second_are_ordered_by_machine_id() {
+        let config = isolated_config_dir();
+        let mut ids = [Uuid::new_v4(), Uuid::new_v4()];
+        ids.sort();
+        let (smaller, larger) = (ids[0], ids[1]);
+        let (dir, project) = project_with(vec![pane(1, Uuid::new_v4())]);
+        let claimed = now();
+        claim_written_by(config.path(), project, smaller, "zoo-005", claimed);
+        claim_written_by(config.path(), project, larger, "zoo-006", claimed);
+
+        let on_larger = start_instance(dir.path(), project, &instance(larger, "zoo-006")).unwrap();
+        assert!(on_larger.adopted.is_empty());
+        let on_smaller =
+            start_instance(dir.path(), project, &instance(smaller, "zoo-005")).unwrap();
+        assert_eq!(on_smaller.adopted, vec![1]);
     }
 
     #[test]

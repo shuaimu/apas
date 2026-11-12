@@ -406,7 +406,11 @@ pub struct PaneWorkSummaryService {
     storage: FileStorage,
     config: SummaryConfig,
     runtime: Mutex<SummaryRuntime>,
-    availability: DashMap<Uuid, PaneWorkSummaryAvailability>,
+    /// What a summarizer last reported, by (session, CLI connection of the
+    /// instance whose summarizer it was). Each machine's instance has its own
+    /// summarizer and configuration, so one instance's report says nothing
+    /// about another's; a reconnect is a new connection and starts afresh.
+    availability: DashMap<(Uuid, Uuid), PaneWorkSummaryAvailability>,
     refreshes: DashMap<(Uuid, u32, DateTime<Utc>), DateTime<Utc>>,
     recovered_sessions: DashMap<Uuid, ()>,
     recovered_windows: DashMap<(Uuid, u32, DateTime<Utc>), ()>,
@@ -592,17 +596,21 @@ impl PaneWorkSummaryService {
         if !self.config.enabled {
             return PaneWorkSummaryAvailability::SummarizerDisabled;
         }
-        let supported = match self.sessions.pane_owner(&session_id, pane_id) {
-            PaneOwner::Instance(owner) => self
-                .sessions
-                .cli_supports_capability(&owner.cli_id, PANE_WORK_SUMMARY_CAPABILITY),
-            PaneOwner::NotRunning { .. } | PaneOwner::NoInstance => false,
+        let owner = match self.sessions.pane_owner(&session_id, pane_id) {
+            PaneOwner::Instance(owner)
+                if self
+                    .sessions
+                    .cli_supports_capability(&owner.cli_id, PANE_WORK_SUMMARY_CAPABILITY) =>
+            {
+                owner
+            }
+            PaneOwner::Instance(_) | PaneOwner::NotRunning { .. } | PaneOwner::NoInstance => {
+                return PaneWorkSummaryAvailability::CliUpdateRequired
+            }
         };
-        if !supported {
-            return PaneWorkSummaryAvailability::CliUpdateRequired;
-        }
+        // Whether this instance's own summarizer reported itself unavailable.
         self.availability
-            .get(&session_id)
+            .get(&(session_id, owner.cli_id))
             .map(|entry| *entry)
             .unwrap_or(PaneWorkSummaryAvailability::Available)
     }
@@ -1013,8 +1021,13 @@ impl PaneWorkSummaryService {
                 }
             }
             PaneWorkSummaryResultKind::Unavailable => {
+                // Only this instance's summarizer is known to be unavailable;
+                // entries of connections that have closed are dropped here, so
+                // the map holds at most one per live connection and session.
+                self.availability
+                    .retain(|(_, reporter), _| self.sessions.is_cli_connected(reporter));
                 self.availability.insert(
-                    result.session_id,
+                    (result.session_id, cli_id),
                     PaneWorkSummaryAvailability::SummarizerUnavailable,
                 );
                 use std::sync::atomic::Ordering;
@@ -2353,6 +2366,97 @@ mod service_tests {
             primary_rx.try_recv().is_err(),
             "the primary runs none of pane 7"
         );
+    }
+
+    /// One machine's summarizer reporting itself unavailable says nothing
+    /// about another machine's: only the tabs of the instance whose job came
+    /// back unavailable show it, and its reconnect starts afresh.
+    #[tokio::test]
+    async fn one_instances_unavailable_summarizer_marks_only_its_own_tabs() {
+        let (service, db, storage, sessions) = test_service().await;
+        let owner = Uuid::new_v4();
+        let session_id = Uuid::new_v4();
+        add_user_and_session(&db, owner, session_id).await;
+        let attach = |machine_id: Uuid, host: &str| {
+            let cli_id = Uuid::new_v4();
+            let (cli_tx, cli_rx) = mpsc::channel(8);
+            sessions.register_cli(cli_id, owner, cli_tx, Some("test".to_string()));
+            sessions.set_cli_capabilities(
+                cli_id,
+                vec![
+                    shared::PROJECT_INSTANCES_CAPABILITY.to_string(),
+                    PANE_WORK_SUMMARY_CAPABILITY.to_string(),
+                ],
+            );
+            assert!(matches!(
+                sessions.attach_cli_instance(
+                    session_id,
+                    cli_id,
+                    Some(machine_id),
+                    Some(format!("/work/{host}")),
+                    Some(host.to_string()),
+                ),
+                crate::session::AttachOutcome::Attached { .. }
+            ));
+            (cli_id, cli_rx)
+        };
+        let (m5, m6) = (Uuid::new_v4(), Uuid::new_v4());
+        let (cli5, mut rx5) = attach(m5, "zoo-005");
+        let (_cli6, _rx6) = attach(m6, "zoo-006");
+        let pane = |pane_id: u32, machine_id: Uuid, host: &str| {
+            let mut pane = shared::PaneConfig::defaults().remove(0);
+            pane.pane_id = pane_id;
+            pane.machine_id = Some(machine_id);
+            pane.hostname = Some(host.to_string());
+            pane
+        };
+        sessions.set_session_panes(
+            &session_id,
+            vec![pane(3, m5, "zoo-005"), pane(7, m6, "zoo-006")],
+        );
+        storage
+            .append_message(
+                &session_id,
+                &StoredMessage {
+                    id: "source-3".to_string(),
+                    role: "assistant".to_string(),
+                    content: "Reworked the retry loop and ran its tests.".to_string(),
+                    message_type: "text".to_string(),
+                    created_at: (Utc::now() - Duration::hours(4)).to_rfc3339(),
+                    pane_type: Some("3".to_string()),
+                },
+            )
+            .await
+            .unwrap();
+
+        service
+            .reconcile_completed_for_pane(session_id, 3)
+            .await
+            .unwrap();
+        let ServerToCli::GeneratePaneWorkSummary { job } =
+            tokio::time::timeout(std::time::Duration::from_secs(5), rx5.recv())
+                .await
+                .expect("zoo-005's CLI receives the job")
+                .unwrap()
+        else {
+            panic!("expected a summary job")
+        };
+        let mut unavailable = result_for(&job, "");
+        unavailable.kind = PaneWorkSummaryResultKind::Unavailable;
+        unavailable.output = None;
+        unavailable.error = Some("Cross-provider summarization is disabled".to_string());
+        assert!(service.accept_result(cli5, unavailable).await);
+
+        let (_, on_zoo_005) = service.list_for_pane(session_id, 3).await.unwrap();
+        let (_, on_zoo_006) = service.list_for_pane(session_id, 7).await.unwrap();
+        assert_eq!(on_zoo_005, PaneWorkSummaryAvailability::SummarizerUnavailable);
+        assert_eq!(on_zoo_006, PaneWorkSummaryAvailability::Available);
+
+        // zoo-005 reconnects: a new connection, whose summarizer is unknown.
+        sessions.unregister_cli(&cli5);
+        let (_cli5_again, _rx5_again) = attach(m5, "zoo-005");
+        let (_, after_reconnect) = service.list_for_pane(session_id, 3).await.unwrap();
+        assert_eq!(after_reconnect, PaneWorkSummaryAvailability::Available);
     }
 
     #[tokio::test]

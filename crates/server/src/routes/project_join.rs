@@ -99,7 +99,9 @@ pub struct ProjectsByRemoteQuery {
 /// with that remote. The machine inventory is what lets a registered project
 /// that never started match. Such a project may have no project record yet:
 /// only the caller's machine lists it, and its first start makes it the
-/// caller's. Another account's machines never count.
+/// caller's. Another account's machines never count. A project whose session
+/// runs under another account is not offered either: a checkout of the
+/// caller's could never start as an instance of it.
 ///
 /// No match is an empty answer, never a 404, which the CLI takes to mean a
 /// server that predates this route.
@@ -175,6 +177,15 @@ pub async fn projects_by_remote(
             }
             None => listed_on(&inventory, &project_id),
         };
+        // Nor is one whose session runs under another account, such as a
+        // project the caller owns that was provisioned on a cluster owner's
+        // machine. Every instance runs under its session's account and a
+        // `SessionStart` from any other is refused, so a checkout joined to
+        // it could never start; `join_refusal` refuses a clone-to-join of it
+        // for the same reason.
+        if joinable && runs_under_another_account(&state, &project_id, &user.id).await? {
+            continue;
+        }
         if joinable {
             projects.push(remote_match(
                 &state,
@@ -227,6 +238,21 @@ pub async fn projects_by_remote(
         projects,
         local,
     }))
+}
+
+/// Whether `project_id`'s session, the one its checkouts start (its id is
+/// the project's), belongs to an account other than `user_id`. A project
+/// with no session yet runs under whoever first starts it.
+async fn runs_under_another_account(
+    state: &AppState,
+    project_id: &str,
+    user_id: &str,
+) -> Result<bool, AppError> {
+    Ok(state
+        .db
+        .get_session(project_id)
+        .await?
+        .is_some_and(|session| session.user_id != user_id))
 }
 
 /// Whether one of the caller's own machines lists `project_id`.

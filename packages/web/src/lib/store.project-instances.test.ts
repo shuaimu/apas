@@ -373,7 +373,7 @@ describe("correlated new tabs", () => {
     useStore.setState({ sessions: [project({ instances: [instance(ZOO6, "zoo-006", { primary: true, runtimeAccess: false })] })] });
     const ws = await openSocket();
     negotiate();
-    expect(addTerminal(ZOO6).error).toMatch(/do not have access to run tabs on zoo-006/);
+    expect(addTerminal(ZOO6).error).toBe("Access denied: you cannot use zoo-006, which runs this project instance");
     expect(sentFrames(ws, "add_pane")).toHaveLength(0);
   });
 

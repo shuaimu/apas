@@ -392,6 +392,14 @@ pub struct SessionState {
     /// ids are allocated against these as well as `panes`, under this
     /// session's lock, so concurrent adds never draw the same id.
     pub pane_reservations: HashMap<u32, pane_launches::PaneIdReservation>,
+    /// Ids of tabs that left the roster while a machine may still hold them,
+    /// each with the machine it was tagged for (`None` for an untagged tab);
+    /// see [`crate::storage::ForgottenPane`]. New ids avoid these, so a tab
+    /// that comes back never meets a newer tab with its id.
+    pub forgotten_panes: HashMap<u32, Option<Uuid>>,
+    /// `forgotten_panes` includes what `forgotten-panes.json` holds. Until
+    /// then the set is not saved, which would drop the ids on disk.
+    pub forgotten_panes_loaded: bool,
 }
 
 impl SessionState {
@@ -412,6 +420,8 @@ impl SessionState {
             instances: Vec::new(),
             roster_seeded: false,
             pane_reservations: HashMap::new(),
+            forgotten_panes: HashMap::new(),
+            forgotten_panes_loaded: false,
         }
     }
 
@@ -2553,6 +2563,8 @@ impl SessionManager {
             instances: s.instances.clone(),
             roster_seeded: s.roster_seeded,
             pane_reservations: s.pane_reservations.clone(),
+            forgotten_panes: s.forgotten_panes.clone(),
+            forgotten_panes_loaded: s.forgotten_panes_loaded,
         })
     }
 
@@ -2602,6 +2614,36 @@ impl SessionManager {
         }
     }
 
+    /// Put the panes `pane_ids` lists first, in that order, and every other
+    /// pane after them in its current order; return the roster. Done under
+    /// the session's lock, so a roster report merging meanwhile is never
+    /// undone by a copy read before it. `None` when the roster is not loaded,
+    /// where an empty cache only means "not read yet": reordering and saving
+    /// it would replace the persisted roster with nothing.
+    pub fn reorder_session_panes(
+        &self,
+        session_id: &Uuid,
+        pane_ids: &[u32],
+    ) -> Option<Vec<PaneConfig>> {
+        let mut session = self.sessions.get_mut(session_id)?;
+        if !session.roster_seeded {
+            return None;
+        }
+        let order: HashMap<u32, usize> = pane_ids
+            .iter()
+            .enumerate()
+            .map(|(index, pane_id)| (*pane_id, index))
+            .collect();
+        let (mut ordered, remaining): (Vec<PaneConfig>, Vec<PaneConfig>) = session
+            .panes
+            .iter()
+            .cloned()
+            .partition(|pane| order.contains_key(&pane.pane_id));
+        ordered.sort_by_key(|pane| order.get(&pane.pane_id).copied());
+        session.panes = [ordered, remaining].concat();
+        Some(session.panes.clone())
+    }
+
     /// The cached roster, or `None` when the session is not in memory, so a
     /// save never recreates a deleted session's directory with an empty one.
     pub fn pane_roster_snapshot(&self, session_id: &Uuid) -> Option<Vec<PaneConfig>> {
@@ -2625,8 +2667,10 @@ impl SessionManager {
     ///
     /// A roster that is not loaded is left alone rather than saved as empty.
     /// Statuses, idle times, retained terminals, in-flight reboots and
-    /// pending decisions of the removed panes go with them, since ids are
-    /// reused for new panes.
+    /// pending decisions of the removed panes go with them. Their ids are
+    /// recorded as forgotten, not freed: the machine keeps its tabs and
+    /// reports them again if it runs the project again, and a newer tab given
+    /// one of their ids meanwhile would have it dropped as another machine's.
     pub fn forget_machine_panes(
         &self,
         session_id: &Uuid,
@@ -2668,6 +2712,9 @@ impl SessionManager {
                 return Ok(Vec::new());
             }
             session.replace_roster(kept);
+            for pane in &removed {
+                session.forgotten_panes.insert(pane.pane_id, pane.machine_id);
+            }
             removed
                 .into_iter()
                 .map(|pane| pane.pane_id)

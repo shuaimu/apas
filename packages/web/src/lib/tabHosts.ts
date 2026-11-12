@@ -8,6 +8,7 @@ import {
   instanceHostSummary,
   LEGACY_MACHINE_KEY,
   projectPlacement,
+  sameHost,
   type PaneMachineFields,
   type SessionInstance,
 } from "./projectInstances";
@@ -32,9 +33,14 @@ export function stoppedOnHostReason(hostname: string | undefined): string {
     : "This tab's machine is not running this project.";
 }
 
-/** Matches the store's refusal for a new tab on such a machine. */
+/**
+ * The server's refusal, word for word, for a control on an instance this
+ * viewer may not use: a pane control, a reboot of that instance, or a new
+ * tab on it. The store refuses a new tab there with it too, so a disabled
+ * control, a local refusal and a refused request all read the same.
+ */
 export function noRuntimeAccessReason(hostname: string): string {
-  return `You do not have access to run tabs on ${hostname}.`;
+  return `Access denied: you cannot use ${hostname}, which runs this project instance`;
 }
 
 /**
@@ -152,7 +158,7 @@ export function describeTabHosts(input: TabHostsInput): TabHosts {
     const refusal = state === "running"
       ? undefined
       : state === "no_access"
-        ? noRuntimeAccessReason(hostname ?? place.instance?.hostname ?? "this machine")
+        ? noRuntimeAccessReason(hostname ?? place.instance?.hostname ?? "that machine")
         : stoppedOnHostReason(hostname);
 
     let stopped: StoppedMachineActions | undefined;
@@ -180,6 +186,40 @@ export function describeTabHosts(input: TabHostsInput): TabHosts {
     });
   }
   return { tabs, spansMachines: placement.spansMachines };
+}
+
+/**
+ * The hosts the project view's Open starts, as the server picks them for a
+ * project-wide Start: each machine that owns tabs of the project (an untagged
+ * tab counts for the machine its attributed host names), lists `projectId`,
+ * is online, and can run an instance beside others. Empty when none
+ * qualifies; the server then starts only the machine the request names.
+ * Tabs never move between machines, so this is not necessarily the host the
+ * session last recorded: an instance with no tabs may have been the last
+ * primary.
+ */
+export function projectStartHosts(input: {
+  panes: PaneMachineFields[];
+  machines: MachineWithProjects[];
+  /** The id the Start request sends, as the machines' inventory knows it. */
+  projectId: string;
+}): string[] {
+  const { panes, machines, projectId } = input;
+  return machines
+    .filter((entry) => entry.daemonConnected
+      && entry.projectInstancesAvailable
+      && entry.projects.some((project) => project.projectId === projectId)
+      && panes.some((pane) => pane.machine_id
+        ? pane.machine_id === entry.machine.machineId
+        : sameHost(pane.hostname, entry.machine.hostname)))
+    .map((entry) => entry.machine.hostname)
+    .sort((a, b) => a.localeCompare(b));
+}
+
+/** "zoo-005", "zoo-005 and zoo-006", "zoo-005, zoo-006 and zoo-007". */
+export function hostList(hosts: string[]): string {
+  if (hosts.length <= 1) return hosts[0] ?? "";
+  return `${hosts.slice(0, -1).join(", ")} and ${hosts[hosts.length - 1]}`;
 }
 
 /** How a tab's host state reads after its host name. */

@@ -1613,9 +1613,10 @@ export interface MobilePaneSummary {
   label?: string | null;
   /**
    * Machine whose project instance runs this pane; see
-   * [`PaneConfig::machine_id`]. Absent from older servers and for panes
-   * written before multi-machine instances, which no machine owns yet and
-   * whose controls go to the session's primary instance.
+   * [`PaneConfig::machine_id`]. Absent from older servers, for panes
+   * written before multi-machine instances, and for panes reported by a
+   * CLI without [`PROJECT_INSTANCES_CAPABILITY`]. No machine owns those
+   * yet; [`PaneConfig::machine_id`] says where their controls go.
    */
   machine_id?: string | null;
   /**
@@ -2243,10 +2244,11 @@ export interface PaneConfig {
   goal?: string | null;
   /**
    * Hostname of `machine_id`, for display only. Hosts get renamed, so
-   * routing and ownership always use `machine_id`. On an untagged pane the
-   * server may keep the host it last recorded the pane under, so the tab is
-   * not shown under whichever instance happens to be primary. It never
-   * implies ownership.
+   * ownership always uses `machine_id`. On an untagged pane the server
+   * keeps the host it last recorded the pane under, if any: its attributed
+   * host, so the tab is not shown under whichever instance happens to be
+   * primary. That host is a display and routing hint (see `machine_id`),
+   * and never implies ownership.
    */
   hostname?: string | null;
   is_paused?: boolean;
@@ -2280,12 +2282,19 @@ export interface PaneConfig {
    * and controls live on exactly one of them for the pane's lifetime. The
    * server assigns this from the authenticated instance that reports the
    * pane, overriding whatever the pane data says, so no instance can claim
-   * another machine's panes.
+   * another machine's panes. A tagged pane's controls go only to the
+   * instance attached on its machine, whichever instance is primary and
+   * whether or not that one has [`PROJECT_INSTANCES_CAPABILITY`]; with
+   * none attached there, they are refused as stopped on that machine.
    *
-   * `None` = written before multi-machine instances. No machine owns such
-   * a pane yet. Its controls go to the session's primary instance as a
-   * fallback, and the first instance that reports it adopts it. When
-   * instance M reports its roster, the server:
+   * `None` = written before multi-machine instances, or reported by a CLI
+   * without [`PROJECT_INSTANCES_CAPABILITY`]. No machine owns such a pane
+   * until a capable instance reports it, which adopts it. Until then its
+   * controls go to the instance on its attributed host (`hostname`), else
+   * to the sole attached instance when that lacks the capability, else,
+   * when it has no attributed host, to the primary; otherwise they are
+   * refused as stopped on that host. When capable instance M reports its
+   * roster, the server:
    * - replaces every pane tagged M, so a pane tagged M that M no longer
    *   reports is gone;
    * - tags M on a reported pane whose roster entry is untagged (adoption
@@ -2298,9 +2307,25 @@ export interface PaneConfig {
    * separate checkout can join, and become primary, while the pre-upgrade
    * host is stopped. If the primary owned untagged panes, that checkout's
    * first, empty roster would erase every tab the host still has, with no
-   * stopped badge and nothing to forget. A CLI without
-   * [`PROJECT_INSTANCES_CAPABILITY`] is only ever the session's sole
-   * instance and still replaces the whole roster, as before.
+   * stopped badge and nothing to forget.
+   *
+   * A CLI without the capability is only ever the session's sole instance,
+   * and nothing it reports is tagged. When it reports its roster, the
+   * server:
+   * - takes every pane it reports, untagged and attributed to its host, in
+   *   place of that id's entry whatever the entry's tag: on a shared home
+   *   such a CLI restores and runs every pane in the `.apas`, as before
+   *   instances;
+   * - removes every untagged pane it did not report, and every pane tagged
+   *   with its own machine id (the one its `SessionStart` named, if any)
+   *   that it did not report;
+   * - keeps every pane tagged for another machine that it did not report,
+   *   listed as stopped on that machine, with its id still allocated.
+   *
+   * The last rule is for a separate checkout, whose tabs such a CLI cannot
+   * see. Replacing the whole roster would erase them while their machine is
+   * stopped, leaving nothing to start or forget until it ran the project
+   * again, and would free their ids for another pane.
    */
   machine_id?: string | null;
   /**

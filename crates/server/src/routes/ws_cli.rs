@@ -209,6 +209,7 @@ fn admit_inbound(
 /// capable instance's report merged into nothing would drop every stopped
 /// machine's tabs. A failed read leaves the roster as it is.
 async fn ensure_pane_roster_loaded(state: &AppState, session_id: &Uuid) {
+    ensure_forgotten_panes_loaded(state, session_id).await;
     if state.sessions.pane_roster_seeded(session_id) {
         return;
     }
@@ -227,9 +228,29 @@ async fn ensure_pane_roster_loaded(state: &AppState, session_id: &Uuid) {
     }
 }
 
+/// Read the session's forgotten pane ids once, before anything allocates an
+/// id against them or saves them. Every path that hands out a pane id runs
+/// behind an instance's `SessionStart`, which loads the roster and with it
+/// these. A failed read leaves them unloaded, so nothing overwrites the file,
+/// and the next roster load tries again.
+pub(crate) async fn ensure_forgotten_panes_loaded(state: &AppState, session_id: &Uuid) {
+    if state.sessions.forgotten_panes_loaded(session_id) {
+        return;
+    }
+    match state.storage.load_forgotten_panes(session_id).await {
+        Ok(stored) => state.sessions.hydrate_forgotten_panes(session_id, stored),
+        Err(error) => tracing::warn!(
+            %session_id,
+            %error,
+            "failed to load the forgotten pane ids; new panes may reuse them"
+        ),
+    }
+}
+
 /// Persist the session's current roster, tags and attributed hosts
-/// included, so stopped instances' tabs survive a server restart.
-async fn persist_pane_roster(state: &AppState, session_id: &Uuid) {
+/// included, so stopped instances' tabs survive a server restart, and the
+/// ids of forgotten tabs, which stay unavailable to new panes across one.
+pub(crate) async fn persist_pane_roster(state: &AppState, session_id: &Uuid) {
     if let Err(error) = state
         .storage
         .save_pane_roster_latest(session_id, || state.sessions.pane_roster_snapshot(session_id))
@@ -237,6 +258,43 @@ async fn persist_pane_roster(state: &AppState, session_id: &Uuid) {
     {
         tracing::warn!("Failed to persist pane list for session {}: {}", session_id, error);
     }
+    if let Err(error) = state
+        .storage
+        .save_forgotten_panes_latest(session_id, || {
+            state.sessions.forgotten_panes_snapshot(session_id)
+        })
+        .await
+    {
+        tracing::warn!(%session_id, %error, "failed to persist the forgotten pane ids");
+    }
+}
+
+/// A refused `SessionStart` also fails the new panes waiting for that
+/// machine's instance, saying why. Its daemon has already answered that the
+/// runtime started, so without this they would wait out their time limit and
+/// be told the machine "did not start this project".
+fn refuse_waiting_panes(
+    state: &AppState,
+    session_id: Uuid,
+    machine_id: Option<Uuid>,
+    hostname: Option<&str>,
+    why: &str,
+) {
+    let Some(machine_id) = machine_id else {
+        return;
+    };
+    let host = state
+        .sessions
+        .machine_hostname(&machine_id)
+        .or_else(|| hostname.map(str::to_string))
+        .map(|host| host.trim().to_string())
+        .filter(|host| !host.is_empty())
+        .unwrap_or_else(|| "The machine".to_string());
+    state.sessions.refuse_instance_start(
+        session_id,
+        machine_id,
+        &format!("{host} started this project, but the server refused its instance: {why}"),
+    );
 }
 
 /// Move the session's database row after an instance left: inactive when it
@@ -267,17 +325,41 @@ async fn persist_instance_detach(state: &AppState, detach: &InstanceDetach) {
     }
 }
 
-async fn route_lifecycle_to_authorized_web(
+/// Relay a lifecycle inventory or status to the session's viewers that may
+/// still see the session.
+///
+/// A viewer that did not negotiate [`shared::PROJECT_INSTANCES_CAPABILITY`]
+/// keeps one inventory per session, which any inventory it receives
+/// replaces, and its reboot and lifecycle requests name no machine and so
+/// reach the primary. It is sent only the primary's inventory, and another
+/// machine's status without the inventory that status carries; otherwise its
+/// reboot confirmation would count another machine's tabs while the reboot
+/// restarted the primary's. `replay_instances_after_attach` gives such a
+/// viewer the primary's inventory alone for the same reason.
+/// `only_older_viewers` leaves out the viewers that keep one inventory per
+/// machine.
+pub(crate) async fn route_lifecycle_to_authorized_web(
     state: &AppState,
     session_id: Uuid,
     message: ServerToWeb,
+    only_older_viewers: bool,
 ) {
     let web_ids = state
         .sessions
         .get_session(&session_id)
         .map(|session| session.web_connection_ids)
         .unwrap_or_default();
+    let primary_machine = state
+        .sessions
+        .primary_instance(&session_id)
+        .map(|primary| primary.machine_id);
     for web_id in web_ids {
+        let per_machine = state
+            .sessions
+            .web_supports_capability(&web_id, shared::PROJECT_INSTANCES_CAPABILITY);
+        if per_machine && only_older_viewers {
+            continue;
+        }
         let authorized = match state.sessions.get_web_user(&web_id) {
             Some(user_id) => state
                 .db
@@ -286,10 +368,83 @@ async fn route_lifecycle_to_authorized_web(
                 .unwrap_or(false),
             None => false,
         };
-        if authorized {
-            state.sessions.send_to_web(&web_id, message.clone()).await;
+        if !authorized {
+            continue;
+        }
+        let frame = if per_machine {
+            Some(message.clone())
+        } else {
+            single_inventory_frame(&message, primary_machine)
+        };
+        if let Some(frame) = frame {
+            state.sessions.send_to_web(&web_id, frame).await;
         }
     }
+}
+
+/// `message` as a viewer that keeps one lifecycle inventory per session, the
+/// primary's, receives it, or `None` for nothing. `primary_machine` is the
+/// primary's machine (itself `None` for an instance that reported none), or
+/// `None` with no instance attached, when every frame is the session's, as
+/// with one instance it always was.
+fn single_inventory_frame(
+    message: &ServerToWeb,
+    primary_machine: Option<Option<Uuid>>,
+) -> Option<ServerToWeb> {
+    let from_primary =
+        |machine_id: &Option<Uuid>| primary_machine.is_none_or(|primary| primary == *machine_id);
+    match message {
+        ServerToWeb::CliLifecycleInventory { machine_id, .. } => {
+            from_primary(machine_id).then(|| message.clone())
+        }
+        ServerToWeb::CliLifecycleStatus {
+            session_id,
+            request_id,
+            operation,
+            phase,
+            message: text,
+            inventory: Some(_),
+            machine_id,
+        } if !from_primary(machine_id) => Some(ServerToWeb::CliLifecycleStatus {
+            session_id: *session_id,
+            request_id: *request_id,
+            operation: *operation,
+            phase: *phase,
+            message: text.clone(),
+            inventory: None,
+            machine_id: *machine_id,
+        }),
+        _ => Some(message.clone()),
+    }
+}
+
+/// After the primary hands over, a viewer that keeps one lifecycle inventory
+/// per session holds the departed primary's, while its next reboot request
+/// reaches the new primary. Send it the new primary's, once that instance
+/// has reported one.
+async fn relay_primary_inventory_after_handover(state: &AppState, detach: &InstanceDetach) {
+    let (true, Some(primary)) = (detach.was_primary, &detach.primary) else {
+        return;
+    };
+    let Some((machine_id, inventory)) = state
+        .sessions
+        .attached_lifecycle_inventories(&detach.session_id)
+        .into_iter()
+        .find(|(machine, _)| *machine == primary.machine_id)
+    else {
+        return;
+    };
+    route_lifecycle_to_authorized_web(
+        state,
+        detach.session_id,
+        ServerToWeb::CliLifecycleInventory {
+            session_id: detach.session_id,
+            inventory,
+            machine_id,
+        },
+        true,
+    )
+    .await;
 }
 
 /// Minimum supported client version (YY.MM.COMMIT format)
@@ -811,6 +966,13 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                         project_id,
                                         reason
                                     );
+                                    refuse_waiting_panes(
+                                        &state,
+                                        session_id,
+                                        machine_id,
+                                        hostname.as_deref(),
+                                        &reason,
+                                    );
                                     state
                                         .sessions
                                         .send_to_cli(
@@ -852,6 +1014,15 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                             "Rejecting SessionStart from CLI {} (user {}): {}",
                                             cli_id, user_id, reason
                                         );
+                                        // The CLI's reason names the session's owner; the
+                                        // panes' requester is told only why.
+                                        refuse_waiting_panes(
+                                            &state,
+                                            session_id,
+                                            machine_id,
+                                            hostname.as_deref(),
+                                            "this project's session belongs to another account",
+                                        );
                                         state
                                             .sessions
                                             .send_to_cli(
@@ -885,6 +1056,13 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                             user_id,
                                             session_id,
                                             reason
+                                        );
+                                        refuse_waiting_panes(
+                                            &state,
+                                            session_id,
+                                            machine_id,
+                                            hostname.as_deref(),
+                                            &reason,
                                         );
                                         state
                                             .sessions
@@ -1360,6 +1538,8 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                 match state.sessions.leave_session(&session_id, &cli_id) {
                                     SessionLeave::Detached(detach) => {
                                         persist_instance_detach(&state, &detach).await;
+                                        relay_primary_inventory_after_handover(&state, &detach)
+                                            .await;
                                         tracing::info!(
                                             "Instance {} left session {}: {}",
                                             cli_id,
@@ -1660,6 +1840,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                         inventory,
                                         machine_id,
                                     },
+                                    false,
                                 )
                                 .await;
                             }
@@ -1703,7 +1884,13 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                     duration_ms = status.created_at.elapsed().as_millis(),
                                     "CLI lifecycle progress"
                                 );
-                                route_lifecycle_to_authorized_web(&state, session_id, status.message()).await;
+                                route_lifecycle_to_authorized_web(
+                                    &state,
+                                    session_id,
+                                    status.message(),
+                                    false,
+                                )
+                                .await;
                             }
                             Ok(CliToServer::TerminalExited { session_id, pane_id, instance_id, status }) => {
                                 let Ok((_project_id, _operation_guard)) = state
@@ -2054,6 +2241,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
     let detached = state.sessions.detach_cli_instances(&cli_id);
     for detach in &detached {
         persist_instance_detach(&state, detach).await;
+        relay_primary_inventory_after_handover(&state, detach).await;
     }
 
     state.sessions.unregister_cli(&cli_id);
@@ -2881,10 +3069,26 @@ mod instance_tests {
 
     /// An in-memory web viewer of `session_id`, signed in as the owner.
     fn viewer(harness: &Harness, session_id: Uuid) -> mpsc::Receiver<ServerToWeb> {
+        viewer_with(harness, session_id, &[])
+    }
+
+    /// [`viewer`] on a client that negotiated `capabilities`.
+    fn viewer_with(
+        harness: &Harness,
+        session_id: Uuid,
+        capabilities: &[&str],
+    ) -> mpsc::Receiver<ServerToWeb> {
         let connection_id = Uuid::new_v4();
         let (tx, rx) = mpsc::channel(256);
         harness.state.sessions.register_web(connection_id, tx);
         harness.state.sessions.set_web_user(connection_id, harness.user_id);
+        harness.state.sessions.set_web_capabilities(
+            connection_id,
+            capabilities
+                .iter()
+                .map(|capability| capability.to_string())
+                .collect(),
+        );
         assert!(harness
             .state
             .sessions
@@ -3054,9 +3258,54 @@ mod instance_tests {
         );
     }
 
+    /// A new pane waiting for the instance the server asked a machine's
+    /// daemon to start fails as soon as that instance's `SessionStart` is
+    /// refused, with the reason, rather than at its time limit as a start
+    /// that never happened.
+    #[tokio::test]
+    async fn a_refused_instance_fails_the_panes_waiting_for_it() {
+        let harness = harness().await;
+        let session = Uuid::new_v4();
+        let m6 = Uuid::new_v4();
+        let sessions = &harness.state.sessions;
+        let (mut older, _) = connect_cli(&harness, false).await;
+        start(&mut older, session_start(session, Uuid::new_v4(), HOST_A, Some(vec![pane(3)]))).await;
+        let crate::session::pane_launches::InstanceStartWait::Waiting {
+            waiter,
+            start: Some(_),
+            outcome,
+        } = sessions.wait_for_instance_start(session, m6, Some(&session.to_string()))
+        else {
+            panic!("the pane begins a start of zoo-006's instance");
+        };
+
+        // Its daemon started the runtime, whose CLI is refused beside the
+        // older one.
+        let (mut b, _) = connect_cli(&harness, true).await;
+        send(&mut b, session_start(session, m6, HOST_B, Some(Vec::new()))).await;
+        receive(&mut b, |message| matches!(message, ServerToCli::SessionRejected { .. })).await;
+
+        match sessions
+            .await_instance_start(waiter, outcome, Duration::from_secs(5))
+            .await
+        {
+            Some(crate::session::pane_launches::InstanceStartOutcome::Refused(reason)) => {
+                assert!(
+                    reason.starts_with(&format!(
+                        "{HOST_B} started this project, but the server refused its instance:"
+                    )) && reason.contains(HOST_A),
+                    "{reason}"
+                );
+            }
+            other => panic!("expected the refusal, got {other:?}"),
+        }
+    }
+
     /// A start without a roster changes nothing, an empty one removes only
     /// that machine's tabs, inventories name their machine, and only the
-    /// primary's copy of the legacy flags is relayed.
+    /// primary's copy of the legacy flags is relayed. A viewer that keeps
+    /// one inventory per session gets only the primary's, also after the
+    /// primary hands over.
     #[tokio::test]
     async fn instance_reports_stay_scoped_to_their_machine() {
         let harness = harness().await;
@@ -3070,6 +3319,7 @@ mod instance_tests {
         assert_eq!(sessions.get_session_panes(&session).len(), 1, "None changes nothing");
 
         let mut web = viewer(&harness, session);
+        let mut per_machine = viewer_with(&harness, session, &[PROJECT_INSTANCES_CAPABILITY]);
         send(&mut b, CliToServer::PaneList {
             session_id: session,
             panes: vec![pane(4)],
@@ -3094,7 +3344,8 @@ mod instance_tests {
         );
 
         // zoo-006's copy of the legacy flags is not the session's; its
-        // inventory, sent after it on the same socket, is relayed by machine.
+        // inventory, sent after it on the same socket, is relayed by machine
+        // to a viewer that keeps one per machine.
         send(&mut b, CliToServer::ProjectFlagsChanged {
             session_id: session,
             auto_approve_todos: false,
@@ -3111,7 +3362,7 @@ mod instance_tests {
             },
         })
         .await;
-        let (inventory, before) = receive_web(&mut web, |message| {
+        let (inventory, before) = receive_web(&mut per_machine, |message| {
             matches!(message, ServerToWeb::CliLifecycleInventory { .. })
         })
         .await;
@@ -3141,7 +3392,7 @@ mod instance_tests {
             disallowed_tab_types: Vec::new(),
         })
         .await;
-        let (flags, _) = receive_web(&mut web, |message| {
+        let (flags, before) = receive_web(&mut web, |message| {
             matches!(message, ServerToWeb::ProjectFlagsChanged { .. })
         })
         .await;
@@ -3151,6 +3402,49 @@ mod instance_tests {
                 auto_approve_todos: true,
                 ..
             }
+        ));
+        // A viewer with one inventory per session would let zoo-006's replace
+        // the primary's, though its reboot request reaches the primary.
+        assert!(
+            !before
+                .iter()
+                .any(|message| matches!(message, ServerToWeb::CliLifecycleInventory { .. })),
+            "{before:?}"
+        );
+
+        // The primary's own inventory reaches it.
+        let primary_inventory = CliLifecycleInventory {
+            persistent_terminal_hosting: false,
+            panes: Vec::new(),
+        };
+        send(&mut a, CliToServer::CliLifecycleInventory {
+            session_id: session,
+            inventory: primary_inventory.clone(),
+        })
+        .await;
+        let (inventory, _) = receive_web(&mut web, |message| {
+            matches!(message, ServerToWeb::CliLifecycleInventory { .. })
+        })
+        .await;
+        assert!(matches!(
+            inventory,
+            ServerToWeb::CliLifecycleInventory { machine_id: Some(machine), .. } if machine == m5
+        ));
+
+        // zoo-005 leaves and zoo-006 becomes the primary: that viewer is sent
+        // zoo-006's inventory now, which its next reboot request concerns.
+        a.close(None).await.unwrap();
+        let (inventory, _) = receive_web(&mut web, |message| {
+            matches!(message, ServerToWeb::CliLifecycleInventory { .. })
+        })
+        .await;
+        assert!(matches!(
+            inventory,
+            ServerToWeb::CliLifecycleInventory {
+                machine_id: Some(machine),
+                inventory: CliLifecycleInventory { persistent_terminal_hosting: true, .. },
+                ..
+            } if machine == m6
         ));
     }
 
