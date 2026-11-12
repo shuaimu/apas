@@ -3,6 +3,7 @@ use anyhow::Result;
 use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use uuid::Uuid;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Config {
@@ -101,6 +102,35 @@ pub struct DaemonConfig {
     pub machine_id: Option<String>,
     #[serde(default)]
     pub project_roots: Vec<String>,
+}
+
+impl DaemonConfig {
+    /// This host's machine id: `machine_id` when it parses as a UUID,
+    /// otherwise derived from `user@hostname`. The daemon and every project
+    /// run on the host resolve it here, so a standalone `--headless` run
+    /// reports the same machine the daemon would.
+    ///
+    /// Derived per host rather than minted and persisted. A random id saved
+    /// to `config.toml`, which lives on the shared NFS home, was donated by
+    /// whichever host ran first to every other host in the cluster, and the
+    /// server's machine map, keyed by it, collapsed them into one flickering
+    /// entry. A derived id needs no storage, survives reboots, and differs
+    /// per host. An explicitly configured value still wins, for overrides.
+    pub fn resolved_machine_id(&self) -> Uuid {
+        self.machine_id
+            .as_ref()
+            .and_then(|raw| Uuid::parse_str(raw).ok())
+            .unwrap_or_else(crate::daemon_registry::derive_machine_id)
+    }
+
+    /// Whether runs on this host may advertise
+    /// `shared::PROJECT_INSTANCES_CAPABILITY`. Any `machine_id` setting turns
+    /// it off, even one that fails to parse: see
+    /// [`crate::daemon_registry::project_instances_supported`], which the
+    /// daemon decides its claim mode with too.
+    pub fn project_instances_supported(&self) -> bool {
+        crate::daemon_registry::project_instances_supported(self.machine_id.as_deref())
+    }
 }
 
 fn default_codex_path() -> String {
@@ -328,7 +358,41 @@ impl Config {
 
 #[cfg(test)]
 mod tests {
-    use super::Config;
+    use super::{Config, DaemonConfig};
+    use uuid::Uuid;
+
+    fn daemon(machine_id: Option<&str>) -> DaemonConfig {
+        DaemonConfig {
+            machine_id: machine_id.map(String::from),
+            ..DaemonConfig::default()
+        }
+    }
+
+    #[test]
+    fn the_machine_id_is_derived_unless_a_parseable_one_is_configured() {
+        let derived = crate::daemon_registry::derive_machine_id();
+        assert_eq!(daemon(None).resolved_machine_id(), derived);
+        let configured = Uuid::new_v4();
+        assert_eq!(
+            daemon(Some(&configured.to_string())).resolved_machine_id(),
+            configured
+        );
+        assert_eq!(
+            daemon(Some("not-a-uuid")).resolved_machine_id(),
+            derived,
+            "an unparseable value falls back, as it always has"
+        );
+    }
+
+    #[test]
+    fn any_configured_machine_id_turns_instances_off() {
+        // That setting lives in the shared config.toml, so every host on the
+        // home would report the same machine.
+        assert!(daemon(None).project_instances_supported());
+        assert!(daemon(Some("  ")).project_instances_supported());
+        assert!(!daemon(Some(&Uuid::new_v4().to_string())).project_instances_supported());
+        assert!(!daemon(Some("not-a-uuid")).project_instances_supported());
+    }
 
     #[test]
     fn retired_legacy_local_keys_are_ignored_and_not_serialized() {

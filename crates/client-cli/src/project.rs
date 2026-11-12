@@ -254,11 +254,6 @@ impl ProjectMetadata {
     pub fn get_pane(&self, pane_id: u32) -> Option<&PaneConfig> {
         self.panes.iter().find(|p| p.pane_id == pane_id)
     }
-
-    /// Get a mutable pane by ID
-    pub fn get_pane_mut(&mut self, pane_id: u32) -> Option<&mut PaneConfig> {
-        self.panes.iter_mut().find(|p| p.pane_id == pane_id)
-    }
 }
 
 pub fn project_registry_path() -> Result<PathBuf> {
@@ -506,6 +501,246 @@ fn register_local_project_at_registry_path(
             .with_context(|| format!("Persist project registry {}", registry_path.display()))?;
         Ok((project, registry.projects))
     })
+}
+
+/// A folder as `apas register` reads it before deciding whether it may take
+/// another project's identity: its `.apas`, and what the registry lists for
+/// it. [`join_project`] goes ahead only while the folder still reads exactly
+/// this way.
+#[derive(Debug, Clone)]
+pub struct FolderIdentity {
+    /// The folder, canonical.
+    pub dir: PathBuf,
+    /// `.apas` exactly as read; `None` when the folder has none.
+    metadata_bytes: Option<Vec<u8>>,
+    /// The same `.apas` parsed, legacy panes migrated.
+    metadata: Option<ProjectMetadata>,
+    /// The registry's entry for this folder.
+    registered: Option<RegisteredProject>,
+    /// Every registry entry, read together with the above.
+    registry: Vec<RegisteredProject>,
+}
+
+impl FolderIdentity {
+    /// The identity the folder registers under: its `.apas`'s, else the one
+    /// the registry recorded for the folder, which registration recovers.
+    pub fn project_id(&self) -> Option<Uuid> {
+        match &self.metadata {
+            Some(metadata) => Some(metadata.id),
+            None => self
+                .registered
+                .as_ref()
+                .and_then(|entry| Uuid::parse_str(&entry.project_id).ok()),
+        }
+    }
+
+    /// The tabs `.apas` records. A file from before `panes` existed counts its
+    /// legacy deadloop and interactive sessions, which are history too.
+    pub fn pane_count(&self) -> usize {
+        self.metadata
+            .as_ref()
+            .map_or(0, |metadata| metadata.panes.len())
+    }
+
+    /// Where the registry lists `project_id`, when that is another folder.
+    pub fn registered_elsewhere(&self, project_id: Uuid) -> Option<&RegisteredProject> {
+        self.registry.iter().find(|entry| {
+            Uuid::parse_str(&entry.project_id).ok() == Some(project_id)
+                && normalize_project_path(Path::new(&entry.path)) != self.dir
+        })
+    }
+}
+
+/// Read a folder's identity for `apas register`, changing nothing.
+///
+/// As strict as registration: the folder must exist, `.apas` must be a regular
+/// file that parses, and the registry must parse. A missing `.apas` is not an
+/// error; the registry's entry for the folder, if any, is then its identity.
+pub fn inspect_folder(dir: &Path) -> Result<FolderIdentity> {
+    let input = dir.to_str().context("Folder path is not valid UTF-8")?;
+    let dir = resolve_local_project_path(input)?;
+    let registry_path = crate::config::Config::config_dir()?.join(USER_PROJECTS_FILE);
+    with_project_registry_lock(&registry_path, false, || {
+        let registry = read_local_registration_registry(&registry_path)?;
+        let metadata_path = dir.join(APAS_FILE);
+        let metadata_bytes = read_registration_file(&metadata_path)?;
+        let metadata = match &metadata_bytes {
+            Some(bytes) => {
+                let mut metadata: ProjectMetadata =
+                    serde_json::from_slice(bytes).with_context(|| {
+                        format!("Parse project metadata {}", metadata_path.display())
+                    })?;
+                metadata.migrate_legacy();
+                Some(metadata)
+            }
+            None => None,
+        };
+        let registered = find_registered_project_by_path_in_registry(&registry, &dir);
+        if let (None, Some(entry)) = (&metadata, &registered) {
+            Uuid::parse_str(&entry.project_id)
+                .context("Registered folder has an invalid project identity")?;
+        }
+        Ok(FolderIdentity {
+            dir: dir.clone(),
+            metadata_bytes,
+            metadata,
+            registered,
+            registry: registry.projects,
+        })
+    })
+}
+
+/// Give a folder another project's identity: `.apas` with `project_id` and no
+/// panes, and the folder's registry entry replaced. `apas register` calls this
+/// only for a pristine identity, one with no tabs and no session on the
+/// server, which nothing would miss.
+///
+/// `folder` is what the caller read before asking the server about that
+/// identity, and the join goes ahead only while the folder still reads exactly
+/// that way. It all happens under the registry lock, so no registration lands
+/// in between, and `.apas` is replaced under its current identity's project
+/// lock, which a runtime writing the file holds.
+///
+/// Refused when the registry lists `project_id` at another folder: a registry
+/// holds one folder per project, and on a home shared between machines that
+/// checkout is already in reach here. If the registry cannot be written,
+/// `.apas` is put back, so the folder never has one identity in `.apas` and
+/// another in the registry.
+pub fn join_project(
+    folder: &FolderIdentity,
+    project_id: Uuid,
+    name: Option<String>,
+) -> Result<RegisteredProject> {
+    let dir = &folder.dir;
+    anyhow::ensure!(
+        folder.project_id() != Some(project_id),
+        "{} is already project {}",
+        dir.display(),
+        project_id
+    );
+    anyhow::ensure!(
+        folder.pane_count() == 0,
+        "{} has tabs; only a folder whose project has none can join another project",
+        dir.display()
+    );
+    if let (Some(metadata), Some(entry)) = (&folder.metadata, &folder.registered) {
+        anyhow::ensure!(
+            Uuid::parse_str(&entry.project_id).ok() == Some(metadata.id),
+            "{} names project {}, but the registry lists the folder as {}",
+            dir.display(),
+            metadata.id,
+            entry.project_id
+        );
+    }
+    let path = dir
+        .to_str()
+        .context("Folder path is not valid UTF-8")?
+        .to_string();
+    let name = name.or_else(|| {
+        dir.file_name()
+            .and_then(|name| name.to_str())
+            .map(String::from)
+    });
+    let registry_path = crate::config::Config::config_dir()?.join(USER_PROJECTS_FILE);
+    with_project_registry_lock(&registry_path, true, || {
+        let mut registry = read_local_registration_registry(&registry_path)?;
+        if let Some(entry) = registry.projects.iter().find(|entry| {
+            Uuid::parse_str(&entry.project_id).ok() == Some(project_id)
+                && normalize_project_path(Path::new(&entry.path)) != *dir
+        }) {
+            anyhow::bail!(
+                "Project {} is already registered on this machine at {}. A home shared between \
+                 machines already sees that checkout, so start the project there instead",
+                project_id,
+                entry.path
+            );
+        }
+        // Registry lock, then project lock: the one order allowed.
+        let _current = folder
+            .metadata
+            .as_ref()
+            .map(|current| crate::project_instances::lock_project_metadata(current.id))
+            .transpose()?;
+        let metadata_path = dir.join(APAS_FILE);
+        let registered_here = find_registered_project_by_path_in_registry(&registry, dir)
+            .map(|entry| entry.project_id);
+        anyhow::ensure!(
+            read_registration_file(&metadata_path)? == folder.metadata_bytes
+                && registered_here
+                    == folder
+                        .registered
+                        .as_ref()
+                        .map(|entry| entry.project_id.clone()),
+            "{} changed while registration was deciding; run `apas register` again",
+            dir.display()
+        );
+
+        let bytes = serde_json::to_vec_pretty(&ProjectMetadata::with_id_and_name(
+            project_id,
+            name.clone(),
+        ))?;
+        match &folder.metadata_bytes {
+            Some(_) => crate::project_instances::write_metadata_file(&metadata_path, &bytes)?,
+            None => publish_new_metadata(dir, &metadata_path, &bytes)?,
+        }
+
+        let project = RegisteredProject {
+            project_id: project_id.to_string(),
+            name: name.clone(),
+            path: path.clone(),
+        };
+        registry
+            .projects
+            .retain(|entry| normalize_project_path(Path::new(&entry.path)) != *dir);
+        registry.projects.push(project.clone());
+        registry.projects.sort_by(|a, b| a.path.cmp(&b.path));
+        if let Err(error) = write_project_registry(&registry_path, &registry) {
+            let restored = match &folder.metadata_bytes {
+                Some(original) => {
+                    crate::project_instances::write_metadata_file(&metadata_path, original)
+                }
+                None => std::fs::remove_file(&metadata_path)
+                    .with_context(|| format!("Remove {}", metadata_path.display())),
+            };
+            let error = error.context(format!(
+                "Persist project registry {}",
+                registry_path.display()
+            ));
+            return Err(match restored {
+                Ok(()) => error,
+                Err(restore_error) => error.context(format!(
+                    "{} could not be put back ({restore_error:#}) and now names project {}",
+                    metadata_path.display(),
+                    project_id
+                )),
+            });
+        }
+        Ok(project)
+    })
+}
+
+/// Publish a fully written `.apas` where there was none, never replacing a
+/// file that appeared meanwhile.
+fn publish_new_metadata(dir: &Path, metadata_path: &Path, bytes: &[u8]) -> Result<()> {
+    let mut staged =
+        tempfile::NamedTempFile::new_in(dir).context("Create project metadata staging file")?;
+    staged.write_all(bytes)?;
+    staged.as_file().sync_all()?;
+    match staged.persist_noclobber(metadata_path) {
+        Ok(_) => {
+            // Published either way. Failing here would skip the registry
+            // update after the file is already in place.
+            if let Err(error) = std::fs::File::open(dir).and_then(|dir| dir.sync_all()) {
+                tracing::debug!(%error, dir = %dir.display(), "could not sync the project directory");
+            }
+            Ok(())
+        }
+        Err(err) if err.error.kind() == std::io::ErrorKind::AlreadyExists => anyhow::bail!(
+            "{} appeared while registration was deciding; run `apas register` again",
+            metadata_path.display()
+        ),
+        Err(err) => Err(err.error).context("Publish project metadata"),
+    }
 }
 
 /// Remove exactly one project/path pair from the local registry. This is used
@@ -824,12 +1059,19 @@ pub fn get_or_create_project(dir: &Path) -> Result<ProjectMetadata> {
 }
 
 /// Save project metadata back to the .apas file
+///
+/// This replaces the whole file with `metadata`. Instances sharing a `.apas`
+/// change it through `project_instances` instead, which rewrites only what
+/// the writer owns; this takes the same lock, so it never lands in the middle
+/// of one of their writes. The registry is updated after the lock is released:
+/// the project lock is never held while taking the registry's.
 pub fn save_project(dir: &Path, metadata: &ProjectMetadata) -> Result<()> {
     let apas_path = dir.join(APAS_FILE);
     let content = serde_json::to_string_pretty(metadata)?;
-    let tmp_path = project_metadata_tmp_path(&apas_path);
-    std::fs::write(&tmp_path, &content)?;
-    std::fs::rename(&tmp_path, &apas_path)?;
+    {
+        let _lock = crate::project_instances::lock_project_metadata(metadata.id)?;
+        crate::project_instances::write_metadata_file(&apas_path, content.as_bytes())?;
+    }
     if let Err(err) = register_project(dir, metadata) {
         tracing::warn!("Failed to register project in user registry: {}", err);
     }
@@ -837,15 +1079,30 @@ pub fn save_project(dir: &Path, metadata: &ProjectMetadata) -> Result<()> {
     Ok(())
 }
 
-fn project_metadata_tmp_path(path: &Path) -> PathBuf {
+/// Where a write of `.apas` stages its content before renaming it into
+/// place. Every host on a shared home writes into the same directory and pids
+/// repeat across hosts, so the host is part of the name as well as the pid;
+/// the counter separates writers within one process.
+pub(crate) fn project_metadata_tmp_path(path: &Path) -> PathBuf {
     let file_name = path
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or(APAS_FILE);
+    let host: String = crate::daemon_registry::hostname()
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '.' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
     let counter = APAS_METADATA_TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
     path.with_file_name(format!(
-        "{}.{}.{}.tmp",
+        "{}.{}.{}.{}.tmp",
         file_name,
+        host,
         std::process::id(),
         counter
     ))
@@ -858,9 +1115,9 @@ fn project_metadata_tmp_path(path: &Path) -> PathBuf {
 /// when launching a project and wrong when merely asking whether one is
 /// already running here.
 pub fn read_project_id(dir: &Path) -> Option<uuid::Uuid> {
-    let raw = std::fs::read_to_string(get_apas_path(dir)).ok()?;
-    let metadata: ProjectMetadata = serde_json::from_str(&raw).ok()?;
-    Some(metadata.id)
+    crate::project_instances::read_project_metadata(dir)
+        .ok()
+        .map(|metadata| metadata.id)
 }
 
 pub fn get_apas_path(dir: &Path) -> PathBuf {
@@ -1665,6 +1922,48 @@ mod tests {
         assert!(tmp_name.starts_with(".apas."));
         assert!(tmp_name.contains(&format!(".{}.", std::process::id())));
         assert!(tmp_name.ends_with(".tmp"));
+        // Pids repeat across the hosts of a shared home, so the host is named
+        // too, or two hosts could stage into one file.
+        let host = crate::daemon_registry::hostname();
+        if host
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.')
+        {
+            assert!(
+                tmp_name.starts_with(&format!(".apas.{host}.{}.", std::process::id())),
+                "{tmp_name}"
+            );
+        }
+    }
+
+    #[test]
+    fn save_project_waits_for_the_project_lock() {
+        // A whole-document save must not land between another instance's
+        // locked re-read and its rename, or that instance's write would
+        // replace it.
+        with_isolated_config(|| {
+            let dir = tempfile::tempdir().expect("temp project dir");
+            let metadata = ProjectMetadata::with_name("locked".to_string());
+            let held = crate::project_instances::lock_project_metadata(metadata.id)
+                .expect("take the project lock");
+            let config_dir = crate::config::Config::config_dir().expect("config dir");
+            let saver = {
+                let dir = dir.path().to_path_buf();
+                let metadata = metadata.clone();
+                std::thread::spawn(move || {
+                    crate::config::test_config::with_config_dir(&config_dir, || {
+                        save_project(&dir, &metadata)
+                    })
+                })
+            };
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            assert!(!saver.is_finished(), "the save waits for the lock");
+            assert!(!dir.path().join(APAS_FILE).exists());
+
+            drop(held);
+            saver.join().expect("saver").expect("save");
+            assert_eq!(read_project_id(dir.path()), Some(metadata.id));
+        });
     }
 
     #[test]
@@ -1743,5 +2042,126 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&existing_dir);
         let _ = std::fs::remove_dir_all(&target_dir);
+    }
+
+    /// A join acts on what registration read before it asked the server. If a
+    /// runtime or another registration changed the folder since, the join is
+    /// refused rather than replacing what they did.
+    #[test]
+    fn a_join_refuses_a_folder_that_changed_after_it_was_read() {
+        with_isolated_config(|| {
+            let dir = tempfile::tempdir().expect("temp project dir");
+            let input = dir.path().to_str().expect("utf-8");
+            let (own, _) = register_local_project(input).expect("register");
+            let own_id = Uuid::parse_str(&own.project_id).expect("id");
+            let metadata_path = dir.path().join(APAS_FILE);
+            let original = std::fs::read(&metadata_path).expect("read");
+            let folder = inspect_folder(dir.path()).expect("inspect");
+            assert_eq!(folder.project_id(), Some(own_id));
+            assert_eq!(folder.pane_count(), 0);
+            let target = Uuid::new_v4();
+
+            // A runtime saved a tab meanwhile.
+            let with_tab = serde_json::json!({
+                "id": own_id, "name": own.name, "created_at": "2026-01-01T00:00:00Z",
+                "panes": [{
+                    "pane_id": 3, "provider": "codex", "mode": "interactive",
+                    "session_id": Uuid::new_v4(),
+                }],
+            });
+            let changed = serde_json::to_vec_pretty(&with_tab).expect("json");
+            std::fs::write(&metadata_path, &changed).expect("write");
+            let error = join_project(&folder, target, None).expect_err("refused");
+            assert!(error.to_string().contains("changed"), "{error:#}");
+            assert_eq!(std::fs::read(&metadata_path).expect("read"), changed);
+
+            // The registry moved on meanwhile.
+            std::fs::write(&metadata_path, &original).expect("write");
+            assert!(unregister_project(dir.path(), own_id).expect("unregister"));
+            let error = join_project(&folder, target, None).expect_err("refused");
+            assert!(error.to_string().contains("changed"), "{error:#}");
+            assert_eq!(read_project_id(dir.path()), Some(own_id));
+            assert!(list_registered_projects().expect("registry").is_empty());
+
+            // Back as it was read, it goes ahead.
+            register_local_project(input).expect("register again");
+            let joined = join_project(&folder, target, Some("joined".to_string())).expect("join");
+            assert_eq!(joined.project_id, target.to_string());
+            assert_eq!(read_project_id(dir.path()), Some(target));
+            let registered = list_registered_projects().expect("registry");
+            assert_eq!(registered.len(), 1);
+            assert_eq!(registered[0].project_id, target.to_string());
+            assert_eq!(registered[0].name.as_deref(), Some("joined"));
+        });
+    }
+
+    /// A folder whose `.apas` is gone still has the identity the registry
+    /// recorded for it, which registration would recover. Joining replaces
+    /// that entry rather than leaving the folder registered twice.
+    #[test]
+    fn a_join_replaces_an_identity_only_the_registry_remembers() {
+        with_isolated_config(|| {
+            let dir = tempfile::tempdir().expect("temp project dir");
+            let (own, _) =
+                register_local_project(dir.path().to_str().expect("utf-8")).expect("register");
+            std::fs::remove_file(dir.path().join(APAS_FILE)).expect("remove .apas");
+            let folder = inspect_folder(dir.path()).expect("inspect");
+            assert_eq!(
+                folder.project_id(),
+                Some(Uuid::parse_str(&own.project_id).expect("id"))
+            );
+
+            let target = Uuid::new_v4();
+            join_project(&folder, target, None).expect("join");
+            assert_eq!(read_project_id(dir.path()), Some(target));
+            let registered = list_registered_projects().expect("registry");
+            assert_eq!(registered.len(), 1);
+            assert_eq!(registered[0].project_id, target.to_string());
+            assert_eq!(registered[0].path, own.path);
+        });
+    }
+
+    /// A folder must never name one project in `.apas` and another in the
+    /// registry, so a registry that cannot be written undoes the join.
+    #[cfg(unix)]
+    #[test]
+    fn a_join_puts_the_metadata_back_when_the_registry_cannot_be_written() {
+        use std::os::unix::fs::PermissionsExt;
+        // Permissions do not stop root, and this needs the write to fail.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        with_isolated_config(|| {
+            let dir = tempfile::tempdir().expect("temp project dir");
+            let input = dir.path().to_str().expect("utf-8");
+            let (own, _) = register_local_project(input).expect("register");
+            let own_id = Uuid::parse_str(&own.project_id).expect("id");
+            let metadata_path = dir.path().join(APAS_FILE);
+            let original = std::fs::read(&metadata_path).expect("read");
+            let folder = inspect_folder(dir.path()).expect("inspect");
+            // Every lock file the join opens exists already, so the only thing
+            // a read-only config directory stops is the registry's write.
+            drop(crate::project_instances::lock_project_metadata(own_id).expect("lock"));
+            let config_dir = crate::config::Config::config_dir().expect("config dir");
+            let registry_path = config_dir.join(USER_PROJECTS_FILE);
+            let registry_before = std::fs::read(&registry_path).expect("registry");
+
+            std::fs::set_permissions(&config_dir, std::fs::Permissions::from_mode(0o500))
+                .expect("read-only");
+            let result = join_project(&folder, Uuid::new_v4(), None);
+            std::fs::set_permissions(&config_dir, std::fs::Permissions::from_mode(0o700))
+                .expect("writable again");
+
+            let error = result.expect_err("the registry cannot be written");
+            assert!(
+                format!("{error:#}").contains("Persist project registry"),
+                "{error:#}"
+            );
+            assert_eq!(std::fs::read(&metadata_path).expect("read"), original);
+            assert_eq!(
+                std::fs::read(&registry_path).expect("registry"),
+                registry_before
+            );
+        });
     }
 }

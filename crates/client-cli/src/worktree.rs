@@ -18,7 +18,7 @@ use std::process::Command;
 
 use shared::PaneCleanupAction;
 
-use crate::project;
+use crate::project_instances;
 
 const DEFAULT_WORKTREES_BASE: &str = ".apas-worktrees";
 
@@ -94,8 +94,11 @@ pub fn add(
     branch: Option<String>,
     custom_path: Option<PathBuf>,
 ) -> Result<()> {
-    let mut metadata = project::get_or_create_project(project_dir).context("reading .apas")?;
-    metadata.migrate_legacy();
+    // Read, never regenerate: this edits one pane of a project that must
+    // already exist, and on a shared home the same file holds other machines'
+    // panes too.
+    let metadata =
+        project_instances::read_project_metadata(project_dir).context("reading .apas")?;
 
     let pane = metadata
         .get_pane(pane_id)
@@ -120,10 +123,40 @@ pub fn add(
         .clone()
         .unwrap_or_else(|| format!("apas-pane-{}", pane_id));
 
-    if let Some(pane_mut) = metadata.get_pane_mut(pane_id) {
-        pane_mut.worktree_path = Some(abs_path_str.clone());
+    // Recorded on a fresh read under the project lock, changing only this
+    // pane's assignment. The worktree was created outside the lock, because
+    // `git worktree add` can take a while and every instance's saves wait on
+    // that lock, so the pane is checked again here.
+    let recorded = project_instances::update_pane(project_dir, metadata.id, pane_id, |pane| {
+        match pane.worktree_path.clone() {
+            Some(existing) => Err(existing),
+            None => {
+                pane.worktree_path = Some(abs_path_str.clone());
+                Ok(())
+            }
+        }
+    })
+    .context("saving .apas")?;
+    match recorded {
+        Some(Ok(())) => {}
+        Some(Err(existing)) => {
+            return Err(anyhow!(
+                "pane {} was given worktree_path = {} while its worktree was being created at {}; \
+                 that new worktree is not recorded and was NOT removed",
+                pane_id,
+                existing,
+                abs_path_str,
+            ));
+        }
+        None => {
+            return Err(anyhow!(
+                "pane {} left this project's .apas while its worktree was being created at {}; \
+                 that new worktree is not recorded and was NOT removed",
+                pane_id,
+                abs_path_str,
+            ));
+        }
     }
-    project::save_project(project_dir, &metadata).context("saving .apas")?;
 
     println!(
         "✓ Created worktree for pane {} at {} (branch {})",
@@ -136,14 +169,16 @@ pub fn add(
 }
 
 pub fn remove(project_dir: &Path, pane_id: u32) -> Result<()> {
-    let mut metadata = project::get_or_create_project(project_dir).context("reading .apas")?;
-
-    let pane = metadata
-        .get_pane_mut(pane_id)
-        .ok_or_else(|| anyhow!("pane {} not found in this project's .apas", pane_id))?;
-
-    let prev = pane.worktree_path.take();
-    project::save_project(project_dir, &metadata).context("saving .apas")?;
+    let project_id = project_instances::read_project_metadata(project_dir)
+        .context("reading .apas")?
+        .id;
+    // Only this pane's assignment changes, under the project lock; every other
+    // pane and field stays as the file has it.
+    let prev = project_instances::update_pane(project_dir, project_id, pane_id, |pane| {
+        pane.worktree_path.take()
+    })
+    .context("saving .apas")?
+    .ok_or_else(|| anyhow!("pane {} not found in this project's .apas", pane_id))?;
 
     match prev {
         Some(p) => {
@@ -162,7 +197,8 @@ pub fn remove(project_dir: &Path, pane_id: u32) -> Result<()> {
 }
 
 pub fn list(project_dir: &Path) -> Result<()> {
-    let metadata = project::get_or_create_project(project_dir).context("reading .apas")?;
+    let metadata =
+        project_instances::read_project_metadata(project_dir).context("reading .apas")?;
 
     let mut found = false;
     for pane in &metadata.panes {
@@ -1140,6 +1176,162 @@ mod tests {
         assert!(
             proj.join("feature.txt").exists(),
             "merge brought in the file"
+        );
+    }
+
+    // --- `.apas` writes: one pane's assignment, never the whole file ---------
+
+    /// A `.apas` in `dir`: pane 7 untagged, pane 8 tagged for another machine
+    /// and carrying a field from a newer build, plus a top-level field this
+    /// build does not know. Returns the other machine's id.
+    fn write_shared_metadata(dir: &Path, pane_8_worktree: Option<&str>) -> uuid::Uuid {
+        let other_machine = uuid::Uuid::new_v4();
+        let pane = |pane_id: u32| shared::PaneConfig {
+            pane_id,
+            provider: shared::Provider::Codex,
+            mode: shared::PaneMode::Interactive,
+            kind: shared::PaneKind::Terminal,
+            session_id: uuid::Uuid::new_v4(),
+            is_paused: false,
+            stop_requested: false,
+            prompt: None,
+            min_iteration_interval_minutes: None,
+            label: Some(format!("Tab {pane_id}")),
+            model: None,
+            effort: None,
+            worktree_path: None,
+            role: None,
+            goal: None,
+            backstory: None,
+            plan_review_mode: shared::PlanReviewMode::default(),
+            manual_mode: false,
+            managed: false,
+            machine_id: None,
+            hostname: None,
+        };
+        let mut other = pane(8);
+        other.machine_id = Some(other_machine);
+        other.hostname = Some("zoo-006".to_string());
+        other.worktree_path = pane_8_worktree.map(str::to_string);
+        let mut metadata = crate::project::ProjectMetadata::with_id_and_name(
+            uuid::Uuid::new_v4(),
+            Some("demo".to_string()),
+        );
+        metadata.panes = vec![pane(7), other];
+        let mut json = serde_json::to_value(&metadata).unwrap();
+        json["future_setting"] = serde_json::json!("kept");
+        json["panes"][1]["future_pane_field"] = serde_json::json!(42);
+        std::fs::write(dir.join(".apas"), serde_json::to_vec_pretty(&json).unwrap()).unwrap();
+        other_machine
+    }
+
+    fn metadata_json(dir: &Path) -> serde_json::Value {
+        serde_json::from_slice(&std::fs::read(dir.join(".apas")).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn adding_a_worktree_records_only_that_panes_path() {
+        let _config = crate::config::test_config::isolated_config_dir();
+        let tmp = TempDir::new().expect("tmpdir");
+        let origin = tmp.path().join("origin.git");
+        let seed = tmp.path().join("seed");
+        let proj = tmp.path().join("proj");
+        let git = |args: &[&str]| {
+            let status = Command::new("git").args(args).status().expect("git");
+            assert!(status.success(), "git {} failed", args.join(" "));
+        };
+        git(&[
+            "init",
+            "--bare",
+            "-q",
+            "-b",
+            "master",
+            origin.to_str().unwrap(),
+        ]);
+        git(&[
+            "clone",
+            "-q",
+            origin.to_str().unwrap(),
+            seed.to_str().unwrap(),
+        ]);
+        run_git(&seed, &["config", "user.email", "t@e"]);
+        run_git(&seed, &["config", "user.name", "t"]);
+        std::fs::write(seed.join("initial.txt"), b"initial").unwrap();
+        run_git(&seed, &["add", "initial.txt"]);
+        run_git(&seed, &["commit", "-q", "-m", "initial"]);
+        run_git(&seed, &["push", "-q", "origin", "master"]);
+        git(&[
+            "clone",
+            "-q",
+            origin.to_str().unwrap(),
+            proj.to_str().unwrap(),
+        ]);
+        let other_machine = write_shared_metadata(&proj, None);
+
+        add(&proj, 7, None, None).expect("add worktree");
+
+        let json = metadata_json(&proj);
+        let recorded = json["panes"][0]["worktree_path"]
+            .as_str()
+            .expect("recorded");
+        assert!(Path::new(recorded).join("initial.txt").exists());
+        // Another machine's pane, and what a newer build wrote, are untouched.
+        assert!(json["panes"][1].get("worktree_path").is_none());
+        assert_eq!(json["panes"][1]["machine_id"], other_machine.to_string());
+        assert_eq!(json["panes"][1]["future_pane_field"], 42);
+        assert_eq!(json["future_setting"], "kept");
+
+        let refused = add(&proj, 7, None, None).unwrap_err();
+        assert!(
+            refused.to_string().contains("already has worktree_path"),
+            "{refused}"
+        );
+    }
+
+    #[test]
+    fn removing_a_worktree_assignment_changes_only_that_pane() {
+        let _config = crate::config::test_config::isolated_config_dir();
+        let dir = TempDir::new().expect("tmpdir");
+        let other_machine = write_shared_metadata(dir.path(), Some("/work/pane-8"));
+
+        remove(dir.path(), 8).expect("remove");
+
+        let json = metadata_json(dir.path());
+        assert!(json["panes"][1].get("worktree_path").is_none());
+        assert_eq!(
+            json["panes"][1]["machine_id"],
+            other_machine.to_string(),
+            "the pane stays the machine's it was"
+        );
+        assert_eq!(json["panes"][1]["future_pane_field"], 42);
+        assert_eq!(json["future_setting"], "kept");
+        assert_eq!(json["panes"][0]["pane_id"], 7);
+        assert!(
+            remove(dir.path(), 99).is_err(),
+            "an unknown pane is an error"
+        );
+    }
+
+    #[test]
+    fn worktree_commands_never_create_or_regenerate_project_metadata() {
+        let _config = crate::config::test_config::isolated_config_dir();
+        let dir = TempDir::new().expect("tmpdir");
+        let metadata = dir.path().join(".apas");
+
+        assert!(list(dir.path()).is_err());
+        assert!(remove(dir.path(), 7).is_err());
+        assert!(add(dir.path(), 7, None, None).is_err());
+        assert!(!metadata.exists(), "no project is created as a side effect");
+
+        let corrupt = b"{\"id\": ".to_vec();
+        std::fs::write(&metadata, &corrupt).unwrap();
+        assert!(list(dir.path()).is_err());
+        assert!(remove(dir.path(), 7).is_err());
+        assert!(add(dir.path(), 7, None, None).is_err());
+        assert_eq!(
+            std::fs::read(&metadata).unwrap(),
+            corrupt,
+            "left exactly as it is"
         );
     }
 }

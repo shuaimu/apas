@@ -19,6 +19,9 @@ use uuid::Uuid;
 
 use crate::mobile_metrics::MobileMetric;
 use crate::routes::auth::verify_token;
+use crate::session::instances::PaneOwner;
+use crate::session::pane_launches::{InstanceStartOutcome, InstanceStartWait};
+use crate::session::{CliRouteOutcome, InstanceAttachment};
 use crate::state::AppState;
 
 const SERVER_VERSION: &str = env!("APAS_SERVER_VERSION");
@@ -223,13 +226,15 @@ async fn resolve_pane_roster(
     session_id: &Uuid,
 ) -> Option<Vec<shared::PaneConfig>> {
     let cached = state.sessions.get_session_panes(session_id);
-    if !cached.is_empty() {
+    if !cached.is_empty() || state.sessions.pane_roster_seeded(session_id) {
         return Some(cached);
     }
     match state.storage.load_pane_roster(session_id).await {
+        // Seeds only a roster nothing has set yet: an instance's report may
+        // have merged while this read was in flight, and must not be undone.
         Ok(Some(stored)) => {
-            state.sessions.set_session_panes(session_id, stored.clone());
-            Some(stored)
+            let roster = state.sessions.hydrate_pane_roster(session_id, stored);
+            Some(attribute_unhosted_panes(state, session_id, roster).await)
         }
         Ok(None) => None,
         Err(error) => {
@@ -241,6 +246,52 @@ async fn resolve_pane_roster(
             None
         }
     }
+}
+
+/// Give the untagged panes of a roster loaded from `panes.json` the host they
+/// lack. Only a roster persisted before panes carried hosts has such panes,
+/// and they ran on the host the session last recorded, which an instance's
+/// `SessionStart` stamps the same way. Until then they would show no host, a
+/// project-wide Start could not count them for their machine, and forgetting
+/// that machine would leave them behind. The attribution is a display and
+/// routing hint only; it never makes a machine their owner.
+async fn attribute_unhosted_panes(
+    state: &AppState,
+    session_id: &Uuid,
+    mut roster: Vec<shared::PaneConfig>,
+) -> Vec<shared::PaneConfig> {
+    let unhosted = |pane: &shared::PaneConfig| pane.machine_id.is_none() && pane.hostname.is_none();
+    if !roster.iter().any(unhosted) {
+        return roster;
+    }
+    let recorded_host = match state.db.get_session(&session_id.to_string()).await {
+        Ok(Some(row)) => row
+            .hostname
+            .map(|host| host.trim().to_string())
+            .filter(|host| !host.is_empty()),
+        _ => None,
+    };
+    let Some(host) = recorded_host else {
+        return roster;
+    };
+    if !state.sessions.has_session_state(session_id) {
+        for pane in roster.iter_mut().filter(|pane| unhosted(pane)) {
+            pane.hostname = Some(host.clone());
+        }
+        return roster;
+    }
+    if state.sessions.stamp_untagged_pane_hosts(session_id, &host) {
+        if let Err(error) = state
+            .storage
+            .save_pane_roster_latest(session_id, || {
+                state.sessions.pane_roster_snapshot(session_id)
+            })
+            .await
+        {
+            tracing::warn!(%session_id, %error, "failed to persist attributed pane hosts");
+        }
+    }
+    state.sessions.get_session_panes(session_id)
 }
 
 fn infer_panes_from_messages(
@@ -532,6 +583,260 @@ pub(crate) async fn has_machine_project_runtime_access(
             .ok()
             .flatten()
             .is_some()
+}
+
+/// Every known pane of a project, across the sessions that belong to it:
+/// the roster in memory where one is loaded, else the persisted one.
+async fn project_roster(state: &AppState, project_id: &str) -> Vec<shared::PaneConfig> {
+    let mut panes = Vec::new();
+    for session_id in state.sessions.project_session_ids(project_id) {
+        if let Some(roster) = resolve_pane_roster(state, &session_id).await {
+            panes.extend(roster);
+        }
+    }
+    panes
+}
+
+/// The machines a project-wide Start starts: each online machine that owns
+/// tabs of the project, lists it, and can run an instance beside others.
+/// Tabs never move between machines, so starting anywhere else would leave
+/// them stopped. An untagged tab counts for the machine its attributed host
+/// names. Empty when no machine qualifies.
+async fn project_start_machines(state: &AppState, project_id: &str) -> Vec<Uuid> {
+    let panes = project_roster(state, project_id).await;
+    let tagged: HashSet<Uuid> = panes.iter().filter_map(|pane| pane.machine_id).collect();
+    let attributed: HashSet<String> = panes
+        .iter()
+        .filter(|pane| pane.machine_id.is_none())
+        .filter_map(|pane| pane.hostname.as_deref())
+        .map(normalize_machine_hostname)
+        .filter(|host| !host.is_empty())
+        .collect();
+    let mut machines: Vec<Uuid> = state
+        .sessions
+        .machines_listing_project(project_id)
+        .into_iter()
+        .filter(|machine_id| {
+            state.sessions.is_daemon_connected(machine_id)
+                && state
+                    .sessions
+                    .daemon_supports_capability(machine_id, shared::PROJECT_INSTANCES_CAPABILITY)
+                && (tagged.contains(machine_id)
+                    || state
+                        .sessions
+                        .machine_hostname(machine_id)
+                        .is_some_and(|host| {
+                            attributed.contains(&normalize_machine_hostname(&host))
+                        }))
+        })
+        .collect();
+    machines.sort();
+    machines
+}
+
+/// The machines a project-wide Close stops: `machine_id`, which a Close
+/// always stopped, and every machine with an instance of the project
+/// attached.
+fn project_stop_machines(state: &AppState, project_id: &str, machine_id: Uuid) -> Vec<Uuid> {
+    let mut machines = vec![machine_id];
+    for session_id in state.sessions.project_session_ids(project_id) {
+        for instance in state.sessions.session_attachments(&session_id) {
+            if let Some(attached) = instance.machine_id {
+                if !machines.contains(&attached) {
+                    machines.push(attached);
+                }
+            }
+        }
+    }
+    machines
+}
+
+/// A refusal for one machine of a request that may cover several, naming
+/// that machine's host when it does.
+fn machine_refusal(state: &AppState, machine_id: Uuid, several: bool, reason: &str) -> String {
+    if !several {
+        return reason.to_string();
+    }
+    let host = state
+        .sessions
+        .machine_hostname(&machine_id)
+        .unwrap_or_else(|| machine_id.to_string());
+    format!("{host}: {reason}")
+}
+
+/// The policy a daemon is sent with `StartProjectCli`, or why the project
+/// must not be started: it is suspended, or its policy cannot be read.
+async fn start_policy(
+    state: &AppState,
+    project_id: &str,
+) -> Result<shared::EffectiveProjectPolicy, String> {
+    match state.db.get_project(project_id).await {
+        Ok(Some(project)) if project.lifecycle_status == "suspended" => {
+            Err("This project is suspended; reactivate it before starting the CLI".to_string())
+        }
+        Ok(Some(project)) => match state.db.get_effective_project_policy(&project.id).await {
+            Ok(policy) => Ok(policy),
+            Err(err) => {
+                tracing::warn!(%err, %project_id, "project policy lookup failed");
+                Err("Could not verify project policy".to_string())
+            }
+        },
+        Ok(None) => Err("Canonical project metadata is unavailable".to_string()),
+        Err(err) => {
+            tracing::warn!(%err, %project_id, "project lifecycle lookup failed");
+            Err("Could not verify project lifecycle".to_string())
+        }
+    }
+}
+
+/// `StartMachineProjectCli`. A per-machine Start on the Machines page, and
+/// every older client, starts only `machine_id`. The project view's Start
+/// (`all_instances`) starts each machine [`project_start_machines`] names,
+/// and `machine_id` only when none qualifies. Each machine is authorized as
+/// a per-machine Start would be, and when several were chosen a refusal names
+/// the host it concerns.
+async fn start_machine_project(
+    state: &AppState,
+    connection_id: &Uuid,
+    user_id: &Uuid,
+    machine_id: Uuid,
+    project_id: &str,
+    all_instances: bool,
+) {
+    let fanned_out = if all_instances {
+        project_start_machines(state, project_id).await
+    } else {
+        Vec::new()
+    };
+    let several = !fanned_out.is_empty();
+    let targets = if several {
+        fanned_out
+    } else {
+        vec![machine_id]
+    };
+
+    let mut authorized = Vec::new();
+    for target in targets {
+        if has_machine_project_runtime_access(state, user_id, &target, project_id).await {
+            authorized.push(target);
+        } else {
+            send_policy_error(
+                state,
+                connection_id,
+                machine_refusal(state, target, several, "Machine not found"),
+            )
+            .await;
+        }
+    }
+    if authorized.is_empty() {
+        return;
+    }
+    let incompatible =
+        "The web client or machine daemon is incompatible with cluster project policy";
+    if !state
+        .sessions
+        .web_supports_capability(connection_id, shared::PROJECT_POLICY_CAPABILITY)
+    {
+        send_policy_error(state, connection_id, incompatible).await;
+        return;
+    }
+    let mut compatible = Vec::new();
+    for target in authorized {
+        if state
+            .sessions
+            .daemon_supports_capability(&target, shared::PROJECT_POLICY_CAPABILITY)
+        {
+            compatible.push(target);
+        } else {
+            send_policy_error(
+                state,
+                connection_id,
+                machine_refusal(state, target, several, incompatible),
+            )
+            .await;
+        }
+    }
+    if compatible.is_empty() {
+        return;
+    }
+    let daemon_policy = match start_policy(state, project_id).await {
+        Ok(policy) => policy,
+        Err(message) => {
+            send_policy_error(state, connection_id, message).await;
+            return;
+        }
+    };
+
+    for target in compatible {
+        if !state
+            .sessions
+            .send_to_daemon(
+                &target,
+                ServerToDaemon::StartProjectCli {
+                    project_id: project_id.to_string(),
+                    policy: Some(daemon_policy.clone()),
+                    request_id: None,
+                },
+            )
+            .await
+        {
+            send_policy_error(
+                state,
+                connection_id,
+                machine_refusal(state, target, several, "Daemon is offline"),
+            )
+            .await;
+        }
+    }
+}
+
+/// `StopMachineProjectCli`. A per-machine Stop, and every older client,
+/// stops only `machine_id`; the project view's Close (`all_instances`) stops
+/// every machine [`project_stop_machines`] names. Each machine is authorized
+/// as a per-machine Stop would be.
+async fn stop_machine_project(
+    state: &AppState,
+    connection_id: &Uuid,
+    user_id: &Uuid,
+    machine_id: Uuid,
+    project_id: &str,
+    all_instances: bool,
+) {
+    let targets = if all_instances {
+        project_stop_machines(state, project_id, machine_id)
+    } else {
+        vec![machine_id]
+    };
+    let several = targets.len() > 1;
+    for target in targets {
+        if !has_machine_project_runtime_access(state, user_id, &target, project_id).await {
+            send_policy_error(
+                state,
+                connection_id,
+                machine_refusal(state, target, several, "Machine not found"),
+            )
+            .await;
+            continue;
+        }
+        if !state
+            .sessions
+            .send_to_daemon(
+                &target,
+                ServerToDaemon::StopProjectCli {
+                    project_id: project_id.to_string(),
+                    request_id: None,
+                },
+            )
+            .await
+        {
+            send_policy_error(
+                state,
+                connection_id,
+                machine_refusal(state, target, several, "Daemon is offline"),
+            )
+            .await;
+        }
+    }
 }
 
 async fn resolve_project_creation_target(
@@ -1191,26 +1496,36 @@ async fn handle_omp_question_answer(state: &AppState, connection_id: &Uuid, comm
     if replay_or_claim_mutation_request(state, connection_id, Some(&request_id)).await {
         return;
     }
-    let result: Result<crate::session::OmpAnswerReceipt, &str> = async {
+    let result: Result<crate::session::OmpAnswerReceipt, String> = async {
         resolve_target_session(state, connection_id, Some(session_id), None)
             .await
             .ok_or("This project runtime is unavailable or access was denied")?;
         if !tool_use_id.starts_with("omp:") || tool_use_id.len() > 1024 {
-            return Err("This is not an OMP question");
+            return Err("This is not an OMP question".into());
         }
         if !state.sessions.get_session_panes(&session_id).iter().any(|pane| {
             pane.pane_id == pane_id
                 && pane.kind.is_terminal()
                 && pane.provider == shared::Provider::Omp
         }) {
-            return Err("This OMP terminal pane is no longer available");
+            return Err("This OMP terminal pane is no longer available".into());
         }
-        if !state.sessions.session_supports_capability(&session_id, shared::OMP_QUESTION_CAPABILITY) {
-            return Err("Update the project CLI before answering OMP questions here; use the terminal meanwhile");
+        // The question's dialog is in the instance that runs the pane, so the
+        // answer, its capability check and the waiter all name that instance.
+        let owner = match state.sessions.pane_owner(&session_id, pane_id) {
+            PaneOwner::Instance(owner) => owner,
+            PaneOwner::NotRunning { machine_id, hostname } => {
+                return Err(not_running_message(state, machine_id, hostname));
+            }
+            PaneOwner::NoInstance => return Err("The project runtime is unavailable".into()),
+        };
+        if let Some(refusal) = instance_access_refusal(state, connection_id, &session_id, &owner).await {
+            return Err(refusal);
         }
-        let cli_id = state.sessions.get_session(&session_id)
-            .and_then(|session| session.cli_client_id)
-            .ok_or("The project runtime is unavailable")?;
+        if !state.sessions.cli_supports_capability(&owner.cli_id, shared::OMP_QUESTION_CAPABILITY) {
+            return Err("Update the project CLI before answering OMP questions here; use the terminal meanwhile".into());
+        }
+        let cli_id = owner.cli_id;
         let decision = state.sessions.claim_pending_decision(
             session_id, &tool_use_id, Some(pane_id), shared::MutationKind::Question,
         ).ok_or("This question was already answered or is no longer current")?;
@@ -1218,7 +1533,7 @@ async fn handle_omp_question_answer(state: &AppState, connection_id: &Uuid, comm
             session_id, pane_id, cli_id, tool_use_id.clone(), request_id.clone(),
         ) else {
             state.sessions.restore_pending_decision(session_id, tool_use_id.clone(), decision);
-            return Err("An answer for this pane is already being processed");
+            return Err("An answer for this pane is already being processed".into());
         };
         let routed = state.sessions.send_to_cli(&cli_id, ServerToCli::AnswerOmpQuestion {
             session_id,
@@ -1232,7 +1547,7 @@ async fn handle_omp_question_answer(state: &AppState, connection_id: &Uuid, comm
         if !routed {
             state.sessions.cancel_omp_answer_waiter(session_id, pane_id, &request_id);
             state.sessions.restore_pending_decision(session_id, tool_use_id.clone(), decision);
-            return Err("The project runtime is unavailable; no answer was delivered");
+            return Err("The project runtime is unavailable; no answer was delivered".into());
         }
         let response = tokio::time::timeout(Duration::from_secs(5), receiver).await;
         state.sessions.cancel_omp_answer_waiter(session_id, pane_id, &request_id);
@@ -1283,15 +1598,17 @@ pub(crate) fn pane_summaries(
 ) -> Vec<shared::MobilePaneSummary> {
     let working = state.sessions.get_pane_statuses(session_id);
     let idle_since = state.sessions.get_pane_idle_since(session_id);
-    let cli_client_id = state
-        .sessions
-        .get_session(session_id)
-        .and_then(|session| session.cli_client_id);
     state
         .sessions
         .get_session_panes(session_id)
         .into_iter()
         .map(|pane| {
+            // Usage limits are per CLI, and each machine's instance runs its
+            // own; a pane whose machine is not running has none to report.
+            let owner_cli = match state.sessions.pane_owner(session_id, pane.pane_id) {
+                PaneOwner::Instance(owner) => Some(owner.cli_id),
+                PaneOwner::NotRunning { .. } | PaneOwner::NoInstance => None,
+            };
             let status = working
                 .iter()
                 .find(|(_, id, _)| *id == pane.pane_id)
@@ -1315,7 +1632,7 @@ pub(crate) fn pane_summaries(
                     | shared::Provider::Deepseek => Some(pane.provider),
                     _ => None,
                 };
-            let usage_limited = cli_client_id
+            let usage_limited = owner_cli
                 .zip(usage_provider)
                 .and_then(|(cli_id, provider)| state.sessions.get_usage_limits(&cli_id, provider))
                 .and_then(|limits| {
@@ -1336,41 +1653,37 @@ pub(crate) fn pane_summaries(
                     .then(|| idle_since.get(&pane.pane_id).cloned())
                     .flatten(),
                 usage_limited,
-                machine_id: None,
-                hostname: None,
+                machine_id: pane.machine_id,
+                hostname: pane.hostname,
             }
         })
         .collect()
 }
 
-async fn effective_policy_for_launch(
+/// The project policy a launch on `target` runs under, or why there is none
+/// to launch under. `target` is the instance that will run what is launched:
+/// its CLI must understand server-owned policy, whatever the other instances'
+/// CLIs do. `None` leaves that check out, for an instance that is not running
+/// yet. `web_policy_capable` is whether the requesting web client understands
+/// server-owned policy, read from its connection when it asked.
+async fn launch_policy(
     state: &AppState,
-    connection_id: &Uuid,
     session_id: &Uuid,
-) -> Option<shared::EffectiveProjectPolicy> {
-    if !state
-        .sessions
-        .web_supports_capability(connection_id, shared::PROJECT_POLICY_CAPABILITY)
-    {
-        send_policy_error(
-            state,
-            connection_id,
-            "This web client is incompatible with cluster project policy; reload after updating the web deployment",
-        )
-        .await;
-        return None;
+    web_policy_capable: bool,
+    target: Option<InstanceTarget>,
+) -> Result<shared::EffectiveProjectPolicy, String> {
+    if !web_policy_capable {
+        return Err("This web client is incompatible with cluster project policy; reload after updating the web deployment".to_string());
     }
-    if !state
-        .sessions
-        .session_supports_capability(session_id, shared::PROJECT_POLICY_CAPABILITY)
-    {
-        send_policy_error(
+    if let Some(target) = target {
+        if !instance_supports_capability(
             state,
-            connection_id,
-            "The project host CLI is incompatible with cluster project policy; update and reconnect it before launching panes",
-        )
-        .await;
-        return None;
+            session_id,
+            target,
+            shared::PROJECT_POLICY_CAPABILITY,
+        ) {
+            return Err("The project host CLI is incompatible with cluster project policy; update and reconnect it before launching panes".to_string());
+        }
     }
     let project = match state
         .db
@@ -1378,30 +1691,37 @@ async fn effective_policy_for_launch(
         .await
     {
         Ok(Some(project)) => project,
-        Ok(None) => {
-            send_policy_error(state, connection_id, "Project policy is unavailable").await;
-            return None;
-        }
+        Ok(None) => return Err("Project policy is unavailable".to_string()),
         Err(err) => {
             tracing::warn!(%err, %session_id, "project policy lookup failed");
-            send_policy_error(state, connection_id, "Could not verify project policy").await;
-            return None;
+            return Err("Could not verify project policy".to_string());
         }
     };
     match state.db.get_effective_project_policy(&project.id).await {
-        Ok(policy) if !policy.project_suspended => Some(policy),
-        Ok(_) => {
-            send_policy_error(
-                state,
-                connection_id,
-                "This project is suspended; reactivate it before launching panes",
-            )
-            .await;
-            None
-        }
+        Ok(policy) if !policy.project_suspended => Ok(policy),
+        Ok(_) => Err("This project is suspended; reactivate it before launching panes".to_string()),
         Err(err) => {
             tracing::warn!(%err, project_id = %project.id, "effective project policy lookup failed");
-            send_policy_error(state, connection_id, "Could not verify project policy").await;
+            Err("Could not verify project policy".to_string())
+        }
+    }
+}
+
+/// [`launch_policy`] for a request from `connection_id`, reporting a refusal
+/// to it.
+async fn effective_policy_for_launch(
+    state: &AppState,
+    connection_id: &Uuid,
+    session_id: &Uuid,
+    target: InstanceTarget,
+) -> Option<shared::EffectiveProjectPolicy> {
+    let web_policy_capable = state
+        .sessions
+        .web_supports_capability(connection_id, shared::PROJECT_POLICY_CAPABILITY);
+    match launch_policy(state, session_id, web_policy_capable, Some(target)).await {
+        Ok(policy) => Some(policy),
+        Err(message) => {
+            send_policy_error(state, connection_id, message).await;
             None
         }
     }
@@ -1415,13 +1735,17 @@ async fn effective_policy_for_cli_reboot(
     state: &AppState,
     connection_id: &Uuid,
     session_id: &Uuid,
+    target: InstanceTarget,
 ) -> Option<shared::EffectiveProjectPolicy> {
     if state
         .sessions
         .web_supports_capability(connection_id, shared::PROJECT_POLICY_CAPABILITY)
-        && !state
-            .sessions
-            .session_supports_capability(session_id, shared::PROJECT_POLICY_CAPABILITY)
+        && !instance_supports_capability(
+            state,
+            session_id,
+            target,
+            shared::PROJECT_POLICY_CAPABILITY,
+        )
     {
         send_policy_error(
             state,
@@ -1431,9 +1755,35 @@ async fn effective_policy_for_cli_reboot(
         .await;
         return None;
     }
-    effective_policy_for_launch(state, connection_id, session_id).await
+    effective_policy_for_launch(state, connection_id, session_id, target).await
 }
 
+/// Why the project's policy forbids launching this profile on `target`
+/// (see [`launch_policy`]), if it does.
+async fn profile_launch_refusal(
+    state: &AppState,
+    session_id: &Uuid,
+    kind: shared::PaneKind,
+    provider: shared::Provider,
+    model: Option<&str>,
+    web_policy_capable: bool,
+    target: Option<InstanceTarget>,
+) -> Result<(), String> {
+    if shared::is_retired_launch(provider, model) {
+        return Err("Unsupported provider: this backend has been retired".to_string());
+    }
+    let policy = launch_policy(state, session_id, web_policy_capable, target).await?;
+    if policy.allows(kind, provider, model) {
+        return Ok(());
+    }
+    Err(format!(
+        "Launch profile '{}' is disabled by cluster policy (policy version {})",
+        shared::launch_profile_key(kind, provider, model),
+        policy.version
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn authorize_profile_launch(
     state: &AppState,
     connection_id: &Uuid,
@@ -1442,36 +1792,31 @@ async fn authorize_profile_launch(
     provider: shared::Provider,
     model: Option<&str>,
     managed: bool,
+    target: InstanceTarget,
 ) -> bool {
-    if shared::is_retired_launch(provider, model) {
-        send_policy_error(
-            state,
-            connection_id,
-            "Unsupported provider: this backend has been retired",
-        )
-        .await;
-        return false;
-    }
-    let Some(policy) = effective_policy_for_launch(state, connection_id, session_id).await else {
-        return false;
-    };
     // `managed` is vestigial: an older `.apas` may still carry it, and it no
     // longer selects a different kind of pane or a different policy.
     let _ = managed;
-    if policy.allows(kind, provider, model) {
-        return true;
-    }
-    send_policy_error(
+    let web_policy_capable = state
+        .sessions
+        .web_supports_capability(connection_id, shared::PROJECT_POLICY_CAPABILITY);
+    match profile_launch_refusal(
         state,
-        connection_id,
-        format!(
-            "Launch profile '{}' is disabled by cluster policy (policy version {})",
-            shared::launch_profile_key(kind, provider, model),
-            policy.version
-        ),
+        session_id,
+        kind,
+        provider,
+        model,
+        web_policy_capable,
+        Some(target),
     )
-    .await;
-    false
+    .await
+    {
+        Ok(()) => true,
+        Err(message) => {
+            send_policy_error(state, connection_id, message).await;
+            false
+        }
+    }
 }
 
 /// Authorize creation of a brand-new pane. Structured agent panes are a
@@ -1501,43 +1846,79 @@ fn required_terminal_capability(
     }
 }
 
+/// Why `target`'s CLI cannot host `provider`'s terminal, if it cannot.
+fn terminal_capability_refusal(
+    state: &AppState,
+    session_id: &Uuid,
+    provider: shared::Provider,
+    target: InstanceTarget,
+) -> Result<(), String> {
+    let Some((capability, message)) = required_terminal_capability(provider) else {
+        return Ok(());
+    };
+    if instance_supports_capability(state, session_id, target, capability) {
+        return Ok(());
+    }
+    Err(message.to_string())
+}
+
 async fn requires_capable_terminal_cli(
     state: &AppState,
     connection_id: &Uuid,
     session_id: &Uuid,
     provider: shared::Provider,
+    target: InstanceTarget,
 ) -> bool {
-    let Some((capability, message)) = required_terminal_capability(provider) else {
-        return true;
-    };
-    if state
-        .sessions
-        .session_supports_capability(session_id, capability)
-    {
-        return true;
-    }
-    send_policy_error(state, connection_id, message).await;
-    false
-}
-
-/// Allocate a server-assigned pane id that is not already in use in the
-/// session. Pane ids 1 and 2 are reserved for legacy deadloop/interactive;
-/// user panes live in 3..=1002. Returns `None` when the range is exhausted.
-///
-/// Ids used to be drawn blindly from the same range, so a new pane could be
-/// assigned an in-use id. The project host then discarded the creation in its
-/// idempotent-duplicate guard and the tab never appeared, with no error
-/// surfaced anywhere — the pane simply vanished between the click and the tab.
-fn allocate_pane_id(used: &HashSet<u32>) -> Option<u32> {
-    for _ in 0..100 {
-        let candidate = 3 + (Uuid::new_v4().as_u128() % 1000) as u32;
-        if !used.contains(&candidate) {
-            return Some(candidate);
+    match terminal_capability_refusal(state, session_id, provider, target) {
+        Ok(()) => true,
+        Err(message) => {
+            send_policy_error(state, connection_id, message).await;
+            false
         }
     }
-    None
 }
 
+/// Why a brand-new pane of this profile must not be created on `target`, if
+/// it must not. `target: None` leaves out what depends on the target
+/// instance's CLI, for an instance that is not running yet; the full check
+/// runs again once it is.
+#[allow(clippy::too_many_arguments)]
+async fn new_pane_launch_refusal(
+    state: &AppState,
+    session_id: &Uuid,
+    kind: shared::PaneKind,
+    provider: shared::Provider,
+    model: Option<&str>,
+    web_policy_capable: bool,
+    target: Option<InstanceTarget>,
+) -> Result<(), String> {
+    if kind == shared::PaneKind::Agent {
+        return Err(
+            "Conversation-only panes are retired. Create a supported terminal pane instead."
+                .to_string(),
+        );
+    }
+    if let (shared::PaneKind::Terminal, Some(target)) = (kind, target) {
+        terminal_capability_refusal(state, session_id, provider, target)?;
+    }
+    profile_launch_refusal(
+        state,
+        session_id,
+        kind,
+        provider,
+        model,
+        web_policy_capable,
+        target,
+    )
+    .await
+}
+
+/// [`new_pane_launch_refusal`] for a request from `connection_id`, reporting
+/// a refusal to it as an `Error`. `AddPane` itself answers a correlated
+/// request with its own result instead, so only the launch-policy tests use
+/// this form. `target` is the instance that will receive the new pane.
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
 async fn authorize_new_pane_launch(
     state: &AppState,
     connection_id: &Uuid,
@@ -1546,31 +1927,30 @@ async fn authorize_new_pane_launch(
     provider: shared::Provider,
     model: Option<&str>,
     managed: bool,
+    target: InstanceTarget,
 ) -> bool {
-    if kind == shared::PaneKind::Agent {
-        send_policy_error(
-            state,
-            connection_id,
-            "Conversation-only panes are retired. Create a supported terminal pane instead.",
-        )
-        .await;
-        return false;
-    }
-    if kind == shared::PaneKind::Terminal
-        && !requires_capable_terminal_cli(state, connection_id, session_id, provider).await
-    {
-        return false;
-    }
-    authorize_profile_launch(
+    // `managed` is vestigial; see `authorize_profile_launch`.
+    let _ = managed;
+    let web_policy_capable = state
+        .sessions
+        .web_supports_capability(connection_id, shared::PROJECT_POLICY_CAPABILITY);
+    match new_pane_launch_refusal(
         state,
-        connection_id,
         session_id,
         kind,
         provider,
         model,
-        managed,
+        web_policy_capable,
+        Some(target),
     )
     .await
+    {
+        Ok(()) => true,
+        Err(message) => {
+            send_policy_error(state, connection_id, message).await;
+            false
+        }
+    }
 }
 
 /// Authorize bringing an **existing** pane back — resume, reboot, start.
@@ -1613,11 +1993,582 @@ async fn authorize_existing_pane_launch(
     if !pane.managed {
         return true;
     }
-    let Some(policy) = effective_policy_for_launch(state, connection_id, session_id).await else {
+    let Some(policy) = effective_policy_for_launch(
+        state,
+        connection_id,
+        session_id,
+        InstanceTarget::Pane(pane_id),
+    )
+    .await
+    else {
         return false;
     };
     let _ = policy;
     true
+}
+
+/// A brand-new pane as the web asked for it.
+#[derive(Debug, Clone)]
+struct NewPaneSpec {
+    provider: shared::Provider,
+    mode: shared::PaneMode,
+    kind: shared::PaneKind,
+    label: Option<String>,
+    prompt: Option<String>,
+    model: Option<String>,
+    isolated_worktree: bool,
+    role: Option<String>,
+    goal: Option<String>,
+    backstory: Option<String>,
+    plan_review_mode: shared::PlanReviewMode,
+    managed: bool,
+}
+
+impl NewPaneSpec {
+    fn pane_config(
+        &self,
+        pane_id: u32,
+        machine_id: Option<Uuid>,
+        hostname: Option<String>,
+    ) -> shared::PaneConfig {
+        shared::PaneConfig {
+            pane_id,
+            provider: self.provider,
+            mode: self.mode.clone(),
+            kind: self.kind,
+            session_id: Uuid::new_v4(),
+            is_paused: false,
+            stop_requested: false,
+            prompt: self.prompt.clone(),
+            min_iteration_interval_minutes: None,
+            label: self.label.clone(),
+            model: self.model.clone(),
+            effort: None,
+            worktree_path: None,
+            role: self.role.clone(),
+            goal: self.goal.clone(),
+            backstory: self.backstory.clone(),
+            plan_review_mode: self.plan_review_mode,
+            manual_mode: false,
+            managed: self.managed,
+            machine_id,
+            hostname,
+        }
+    }
+}
+
+/// One `AddPane` and who sent it. Kept whole so that a pane waiting for its
+/// machine's instance to start is checked and created when that instance
+/// attaches, even if the requesting connection is gone by then.
+#[derive(Debug, Clone)]
+struct NewPaneRequest {
+    connection_id: Uuid,
+    user_id: Uuid,
+    /// Whether the requesting client understands server-owned policy, read
+    /// from its connection when it asked.
+    web_policy_capable: bool,
+    session_id: Uuid,
+    request_id: Option<String>,
+    spec: NewPaneSpec,
+}
+
+/// A machine's host name for messages, or "That machine".
+fn machine_label(state: &AppState, machine_id: Uuid) -> String {
+    state
+        .sessions
+        .machine_hostname(&machine_id)
+        .map(|host| host.trim().to_string())
+        .filter(|host| !host.is_empty())
+        .unwrap_or_else(|| "That machine".to_string())
+}
+
+/// Tell the requester how its `AddPane` went. A request that carried an id
+/// is answered with `AddPaneResult`, on its own connection only, and the
+/// answer is dropped if that connection is gone: older native builds drop
+/// their socket on a frame they do not know. A request without an id is
+/// told only of a failure, as an `Error`, the way every `AddPane` was.
+async fn answer_add_pane(
+    state: &AppState,
+    request: &NewPaneRequest,
+    status: shared::AddPaneStatus,
+    machine_id: Option<Uuid>,
+    pane_id: Option<u32>,
+    error: Option<String>,
+) {
+    let Some(request_id) = &request.request_id else {
+        if let Some(error) = error {
+            send_policy_error(state, &request.connection_id, error).await;
+        }
+        return;
+    };
+    state
+        .sessions
+        .send_to_web(
+            &request.connection_id,
+            ServerToWeb::AddPaneResult {
+                session_id: request.session_id,
+                request_id: request_id.clone(),
+                status,
+                machine_id,
+                pane_id,
+                error,
+            },
+        )
+        .await;
+}
+
+/// Answer with a launch's final outcome: delivered with its machine and pane
+/// id, or failed on `target_machine` with the reason.
+async fn answer_add_pane_launch(
+    state: &AppState,
+    request: &NewPaneRequest,
+    target_machine: Option<Uuid>,
+    result: Result<(Option<Uuid>, u32), String>,
+) {
+    match result {
+        Ok((machine_id, pane_id)) => {
+            answer_add_pane(
+                state,
+                request,
+                shared::AddPaneStatus::Routed,
+                machine_id,
+                Some(pane_id),
+                None,
+            )
+            .await
+        }
+        Err(error) => {
+            tracing::info!(
+                session_id = %request.session_id,
+                machine_id = ?target_machine,
+                %error,
+                "new pane refused"
+            );
+            answer_add_pane(
+                state,
+                request,
+                shared::AddPaneStatus::Failed,
+                target_machine,
+                None,
+                Some(error),
+            )
+            .await
+        }
+    }
+}
+
+/// `AddPane`: create the pane on the instance `machine_id` names, else on
+/// the primary instance, the only target an older client knows. A machine
+/// where the project is registered but not running is started first and
+/// the pane waits for its instance; see [`add_pane_on_machine`].
+async fn handle_add_pane(
+    state: &AppState,
+    connection_id: &Uuid,
+    msg_session_id: Option<Uuid>,
+    fallback_session_id: Option<Uuid>,
+    machine_id: Option<Uuid>,
+    request_id: Option<String>,
+    spec: NewPaneSpec,
+) {
+    let resolved =
+        resolve_target_session(state, connection_id, msg_session_id, fallback_session_id).await;
+    let user_id = state.sessions.get_web_user(connection_id);
+    let (Some(session_id), Some(user_id)) = (resolved, user_id) else {
+        // `resolve_target_session` has said why where it could; a client that
+        // correlates its launches is also told that this one failed.
+        if let (Some(request_id), Some(session_id)) =
+            (request_id, msg_session_id.or(fallback_session_id))
+        {
+            state
+                .sessions
+                .send_to_web(
+                    connection_id,
+                    ServerToWeb::AddPaneResult {
+                        session_id,
+                        request_id,
+                        status: shared::AddPaneStatus::Failed,
+                        machine_id,
+                        pane_id: None,
+                        error: Some(
+                            "This project is unavailable or access was denied".to_string(),
+                        ),
+                    },
+                )
+                .await;
+        }
+        return;
+    };
+    let request = NewPaneRequest {
+        connection_id: *connection_id,
+        user_id,
+        web_policy_capable: state
+            .sessions
+            .web_supports_capability(connection_id, shared::PROJECT_POLICY_CAPABILITY),
+        session_id,
+        request_id,
+        spec,
+    };
+    match machine_id {
+        Some(machine_id) => add_pane_on_machine(state, request, machine_id).await,
+        None => {
+            let primary = state.sessions.primary_instance(&session_id);
+            let result =
+                launch_new_pane(state, &request, primary.as_ref(), InstanceTarget::Primary).await;
+            let target_machine = primary.and_then(|primary| primary.machine_id);
+            answer_add_pane_launch(state, &request, target_machine, result).await;
+        }
+    }
+}
+
+/// Check a new pane against `instance`, which `target` names for the CLI
+/// capability checks, allocate its id, and send it there. The pane is tagged
+/// with the instance's machine when its CLI can share the project; an older
+/// CLI owns the whole roster, and its panes stay untagged. Returns the
+/// machine and pane id it was delivered with.
+async fn launch_new_pane(
+    state: &AppState,
+    request: &NewPaneRequest,
+    instance: Option<&InstanceAttachment>,
+    target: InstanceTarget,
+) -> Result<(Option<Uuid>, u32), String> {
+    let session_id = request.session_id;
+    if let Some(instance) = instance {
+        if let Some(refusal) =
+            user_instance_access_refusal(state, &session_id, &request.user_id, instance).await
+        {
+            return Err(refusal);
+        }
+    }
+    let spec = &request.spec;
+    new_pane_launch_refusal(
+        state,
+        &session_id,
+        spec.kind,
+        spec.provider,
+        spec.model.as_deref(),
+        request.web_policy_capable,
+        Some(target),
+    )
+    .await?;
+    let tag = instance
+        .filter(|instance| instance.capable)
+        .and_then(|instance| instance.machine_id);
+    let pane_id = state
+        .sessions
+        .allocate_pane_id(&session_id, tag)
+        .ok_or_else(|| {
+            "Could not allocate a pane id because the session is full; close a pane and retry."
+                .to_string()
+        })?;
+    let hostname = tag.and(instance.and_then(|instance| instance.hostname.clone()));
+    let pane_config = spec.pane_config(pane_id, tag, hostname);
+    // To the instance just checked, even if the primary hands over meanwhile.
+    let route_machine = instance.and_then(|instance| instance.machine_id);
+    tracing::info!(
+        %session_id,
+        pane_id,
+        machine_id = ?route_machine,
+        isolated_worktree = spec.isolated_worktree,
+        "Adding pane"
+    );
+    let outcome = state
+        .sessions
+        .route_to_cli_on_machine(
+            &session_id,
+            route_machine,
+            ServerToCli::AddPane {
+                session_id,
+                pane_config,
+                isolated_worktree: spec.isolated_worktree,
+                initial_input: None,
+            },
+        )
+        .await;
+    if outcome.delivered() {
+        return Ok((route_machine, pane_id));
+    }
+    state.sessions.release_pane_id(&session_id, pane_id);
+    // A creation the host never receives must not fail silently: without
+    // this the click produces no tab, no error, and no log on the requesting
+    // client.
+    Err(match outcome {
+        CliRouteOutcome::MachineNotRunning { .. } => undelivered_message(state, &outcome),
+        _ => "The project host is unreachable; the pane was not created. Reconnect and retry."
+            .to_string(),
+    })
+}
+
+/// `AddPane` naming `machine_id`. The instance attached there receives the
+/// pane. A machine where the project is registered but not running has its
+/// instance started, and the pane follows when that instance attaches. Any
+/// other machine is refused with the reason: the pane is never created on a
+/// machine the user did not pick.
+async fn add_pane_on_machine(state: &AppState, request: NewPaneRequest, machine_id: Uuid) {
+    let session_id = request.session_id;
+    let wait = if state
+        .sessions
+        .instance_on_machine(&session_id, &machine_id)
+        .is_some()
+    {
+        // Running: wait only for a start of it the server has not finished,
+        // since a pane sent sooner could reach the instance before the
+        // project's policy, without which its CLI refuses every new pane.
+        state
+            .sessions
+            .wait_for_instance_start(session_id, machine_id, None)
+    } else {
+        let target = match start_target(state, &request, machine_id).await {
+            Ok(target) => target,
+            Err(error) => {
+                answer_add_pane_launch(state, &request, Some(machine_id), Err(error)).await;
+                return;
+            }
+        };
+        let wait = state.sessions.wait_for_instance_start(
+            session_id,
+            machine_id,
+            Some(&target.project_id),
+        );
+        if let InstanceStartWait::Waiting {
+            start: Some(start_request),
+            ..
+        } = &wait
+        {
+            let sent = state
+                .sessions
+                .send_to_daemon(
+                    &machine_id,
+                    ServerToDaemon::StartProjectCli {
+                        project_id: target.project_id.clone(),
+                        policy: Some(target.policy),
+                        request_id: Some(*start_request),
+                    },
+                )
+                .await;
+            if !sent {
+                // Every pane that joined this start fails with it.
+                state
+                    .sessions
+                    .fail_instance_start(session_id, machine_id, *start_request);
+                let error = format!("{} is offline", machine_label(state, machine_id));
+                answer_add_pane_launch(state, &request, Some(machine_id), Err(error)).await;
+                return;
+            }
+            tracing::info!(
+                %session_id,
+                %machine_id,
+                request_id = %start_request,
+                "starting the project's instance for a new pane"
+            );
+        }
+        wait
+    };
+    match wait {
+        InstanceStartWait::Ready => {
+            let result = match state.sessions.instance_on_machine(&session_id, &machine_id) {
+                Some(instance) => {
+                    launch_new_pane(
+                        state,
+                        &request,
+                        Some(&instance),
+                        InstanceTarget::Machine(machine_id),
+                    )
+                    .await
+                }
+                None => Err(not_running_message(state, Some(machine_id), None)),
+            };
+            answer_add_pane_launch(state, &request, Some(machine_id), result).await;
+        }
+        InstanceStartWait::Waiting {
+            waiter, outcome, ..
+        } => {
+            // Answered before the wait begins, so `Starting` always reaches the
+            // requester ahead of the final answer.
+            answer_add_pane(
+                state,
+                &request,
+                shared::AddPaneStatus::Starting,
+                Some(machine_id),
+                None,
+                None,
+            )
+            .await;
+            let state = state.clone();
+            tokio::spawn(async move {
+                add_pane_after_start(&state, request, machine_id, waiter, outcome).await;
+            });
+        }
+    }
+}
+
+/// The rest of an `AddPane` whose machine's instance is starting: create the
+/// pane once it has started, or fail with why it did not.
+async fn add_pane_after_start(
+    state: &AppState,
+    request: NewPaneRequest,
+    machine_id: Uuid,
+    waiter: Uuid,
+    outcome: tokio::sync::oneshot::Receiver<InstanceStartOutcome>,
+) {
+    let limit = state.sessions.instance_start_timeout();
+    let result = match state
+        .sessions
+        .await_instance_start(waiter, outcome, limit)
+        .await
+    {
+        Some(InstanceStartOutcome::Started) => {
+            match state
+                .sessions
+                .instance_on_machine(&request.session_id, &machine_id)
+            {
+                Some(instance) => {
+                    launch_new_pane(
+                        state,
+                        &request,
+                        Some(&instance),
+                        InstanceTarget::Machine(machine_id),
+                    )
+                    .await
+                }
+                None => Err(not_running_message(state, Some(machine_id), None)),
+            }
+        }
+        Some(InstanceStartOutcome::Refused(reason)) => Err(reason),
+        Some(InstanceStartOutcome::DaemonGone) => Err(format!(
+            "{} went offline before this project started there",
+            machine_label(state, machine_id)
+        )),
+        None => Err(format!(
+            "{} did not start this project within {} seconds",
+            machine_label(state, machine_id),
+            limit.as_secs().max(1)
+        )),
+    };
+    answer_add_pane_launch(state, &request, Some(machine_id), result).await;
+}
+
+/// What starting a machine's instance for a new pane needs.
+struct StartTarget {
+    project_id: String,
+    policy: shared::EffectiveProjectPolicy,
+}
+
+/// Whether `request` may start the project on `machine_id`, which runs no
+/// instance of it, to create its pane there, and why not otherwise. These
+/// are the checks a per-machine Start makes, plus the pane's launch policy
+/// as far as it does not depend on the CLI that will run it. The rest is
+/// checked once that instance is attached.
+async fn start_target(
+    state: &AppState,
+    request: &NewPaneRequest,
+    machine_id: Uuid,
+) -> Result<StartTarget, String> {
+    let session_id = request.session_id;
+    // A CLI without the capability assumes it is the project's only runtime,
+    // so an instance started beside it would be refused when it attached.
+    if let Some(older) = state
+        .sessions
+        .session_attachments(&session_id)
+        .into_iter()
+        .find(|instance| !instance.capable)
+    {
+        return Err(
+            match older
+                .hostname
+                .as_deref()
+                .map(str::trim)
+                .filter(|host| !host.is_empty())
+            {
+                Some(host) => format!(
+                    "This project is running on {host} with an APAS CLI that cannot share it with other machines. Reboot {host} from the Machines page to update it, or add the tab there."
+                ),
+                None => "This project is running elsewhere with an APAS CLI that cannot share it with other machines; update it, or add the tab there.".to_string(),
+            },
+        );
+    }
+    let row = match state.db.get_session(&session_id.to_string()).await {
+        Ok(Some(row)) => row,
+        Ok(None) => return Err("This project is unavailable".to_string()),
+        Err(error) => {
+            tracing::warn!(%session_id, %error, "session lookup failed");
+            return Err("Could not verify this project".to_string());
+        }
+    };
+    let project_id = row.project_id.clone().unwrap_or_else(|| row.id.clone());
+    let owner = state.sessions.daemon_owner(&machine_id);
+    let visible = match owner {
+        Some(owner) if owner == request.user_id => true,
+        Some(owner) => state
+            .db
+            .cluster_member_can_use_machine(
+                &owner.to_string(),
+                &request.user_id.to_string(),
+                &machine_id.to_string(),
+            )
+            .await
+            .unwrap_or(false),
+        None => false,
+    };
+    if !visible {
+        return Err("That machine is not available to you".to_string());
+    }
+    let host = machine_label(state, machine_id);
+    // Every instance runs under the account the session belongs to, and
+    // another account's instance is refused when it starts.
+    if owner.map(|owner| owner.to_string()).as_deref() != Some(row.user_id.as_str()) {
+        return Err(format!(
+            "{host} is in another account's cluster, so it cannot run an instance of this project"
+        ));
+    }
+    if !state.sessions.is_daemon_connected(&machine_id) {
+        return Err(format!("{host} is offline"));
+    }
+    if !state
+        .sessions
+        .daemon_supports_capability(&machine_id, shared::PROJECT_INSTANCES_CAPABILITY)
+    {
+        return Err(format!(
+            "{host} runs an older APAS that cannot run this project beside other machines. Reboot {host} to update it."
+        ));
+    }
+    // Cloning a checkout onto a machine to join the project is a separate
+    // request, which the client makes before asking for the pane again.
+    if !state
+        .sessions
+        .machines_listing_project(&project_id)
+        .contains(&machine_id)
+    {
+        return Err(format!("This project is not registered on {host}."));
+    }
+    if !has_machine_project_runtime_access(state, &request.user_id, &machine_id, &project_id).await
+        || !machine_runtime_access(state, &session_id, &request.user_id, Some(machine_id))
+            .await
+            .unwrap_or(false)
+    {
+        return Err(format!("Access denied: you cannot use {host} for this project"));
+    }
+    let spec = &request.spec;
+    new_pane_launch_refusal(
+        state,
+        &session_id,
+        spec.kind,
+        spec.provider,
+        spec.model.as_deref(),
+        request.web_policy_capable,
+        None,
+    )
+    .await?;
+    if !state
+        .sessions
+        .daemon_supports_capability(&machine_id, shared::PROJECT_POLICY_CAPABILITY)
+    {
+        return Err(
+            "The web client or machine daemon is incompatible with cluster project policy"
+                .to_string(),
+        );
+    }
+    let policy = start_policy(state, &project_id).await?;
+    Ok(StartTarget { project_id, policy })
 }
 
 #[cfg(test)]
@@ -1751,6 +2702,7 @@ mod retired_launch_authorization_tests {
                 shared::Provider::Claude,
                 None,
                 true,
+                InstanceTarget::Primary,
             )
             .await,
             "only the launch profile decides creation now"
@@ -1780,6 +2732,7 @@ mod retired_launch_authorization_tests {
                 shared::Provider::Claude,
                 None,
                 false,
+                InstanceTarget::Primary,
             )
             .await
         );
@@ -1825,6 +2778,7 @@ mod retired_launch_authorization_tests {
                 shared::Provider::Claude,
                 Some("MiniMax-M2.7"),
                 false,
+                InstanceTarget::Primary,
             )
             .await
         );
@@ -1852,6 +2806,7 @@ mod retired_launch_authorization_tests {
                 shared::Provider::Codex,
                 None,
                 false,
+                InstanceTarget::Primary,
             )
             .await
         );
@@ -1876,6 +2831,7 @@ mod retired_launch_authorization_tests {
                     shared::Provider::Claude,
                     Some(model),
                     false,
+                    InstanceTarget::Primary,
                 )
                 .await
             );
@@ -1893,6 +2849,7 @@ mod retired_launch_authorization_tests {
                 shared::Provider::Claude,
                 Some(shared::DEEPSEEK_RETIRED_PRO_MODEL),
                 false,
+                InstanceTarget::Primary,
             )
             .await
         );
@@ -1907,6 +2864,7 @@ mod retired_launch_authorization_tests {
                 shared::Provider::Claude,
                 Some("deepseek-chat"),
                 false,
+                InstanceTarget::Primary,
             )
             .await
         );
@@ -1931,6 +2889,7 @@ mod retired_launch_authorization_tests {
                     shared::Provider::Claude,
                     None,
                     managed,
+                    InstanceTarget::Primary,
                 )
                 .await
             );
@@ -1957,6 +2916,7 @@ mod retired_launch_authorization_tests {
                 shared::Provider::Codex,
                 None,
                 false,
+                InstanceTarget::Primary,
             )
             .await
         );
@@ -1977,6 +2937,7 @@ mod retired_launch_authorization_tests {
                 shared::Provider::Opencode,
                 None,
                 false,
+                InstanceTarget::Primary,
             )
             .await
         );
@@ -2008,6 +2969,7 @@ mod retired_launch_authorization_tests {
                 shared::Provider::Opencode,
                 None,
                 false,
+                InstanceTarget::Primary,
             )
             .await
         );
@@ -2028,6 +2990,7 @@ mod retired_launch_authorization_tests {
                 shared::Provider::Pi,
                 None,
                 false,
+                InstanceTarget::Primary,
             )
             .await
         );
@@ -2059,6 +3022,7 @@ mod retired_launch_authorization_tests {
                 shared::Provider::Pi,
                 None,
                 false,
+                InstanceTarget::Primary,
             )
             .await
         );
@@ -2086,6 +3050,7 @@ mod retired_launch_authorization_tests {
                 shared::Provider::Pi,
                 None,
                 false,
+                InstanceTarget::Primary,
             )
             .await
         );
@@ -2101,11 +3066,14 @@ mod retired_launch_authorization_tests {
             policy_state().await;
         state.sessions.set_cli_capabilities(cli_id, Vec::new());
 
-        assert!(
-            effective_policy_for_cli_reboot(&state, &connection_id, &session_id)
-                .await
-                .is_none()
-        );
+        assert!(effective_policy_for_cli_reboot(
+            &state,
+            &connection_id,
+            &session_id,
+            InstanceTarget::Primary,
+        )
+        .await
+        .is_none());
 
         let ServerToWeb::Error { message } = web_rx.try_recv().expect("explicit web error") else {
             panic!("expected manual reboot error")
@@ -2310,39 +3278,18 @@ mod retired_launch_authorization_tests {
     }
 }
 
-#[cfg(test)]
-mod pane_id_allocation_tests {
-    use super::*;
-
-    #[test]
-    fn fresh_session_allocates_inside_the_user_range() {
-        for _ in 0..50 {
-            let id = allocate_pane_id(&HashSet::new()).expect("empty range has room");
-            assert!((3..=1002).contains(&id), "reserved ids stay reserved: {id}");
-        }
-    }
-
-    #[test]
-    fn allocation_never_reuses_an_in_use_id() {
-        let used: HashSet<u32> = [3, 226, 676, 1002].into_iter().collect();
-        for _ in 0..100 {
-            let id = allocate_pane_id(&used).expect("range has room");
-            assert!(!used.contains(&id), "collided with an in-use pane: {id}");
-        }
-    }
-
-    #[test]
-    fn exhausted_range_reports_none_instead_of_reusing() {
-        let used: HashSet<u32> = (3..=1002).collect();
-        assert_eq!(allocate_pane_id(&used), None);
-    }
-}
-
-async fn has_session_runtime_access(state: &AppState, session_id: &Uuid, user_id: &Uuid) -> bool {
-    let machine_id = state
-        .sessions
-        .session_machine_id(session_id)
-        .map(|machine_id| machine_id.to_string());
+/// Whether `user_id` may use the session's runtime on `machine_id`. Every
+/// instance of a session runs under the account its row names (`SessionStart`
+/// refuses any other), so only the machine differs between instances: on a
+/// third-party host the viewer's cluster membership may cover some of its
+/// machines and not others.
+async fn machine_runtime_access(
+    state: &AppState,
+    session_id: &Uuid,
+    user_id: &Uuid,
+    machine_id: Option<Uuid>,
+) -> anyhow::Result<bool> {
+    let machine_id = machine_id.map(|machine_id| machine_id.to_string());
     state
         .db
         .check_session_runtime_access(
@@ -2351,7 +3298,465 @@ async fn has_session_runtime_access(state: &AppState, session_id: &Uuid, user_id
             machine_id.as_deref(),
         )
         .await
+}
+
+/// The machine an instance's runtime access is evaluated against. An instance
+/// that reported no machine is the session's only one, and the legacy
+/// inference behind `session_machine_id` names its machine, as it always has.
+fn instance_access_machine(
+    state: &AppState,
+    session_id: &Uuid,
+    instance: &InstanceAttachment,
+) -> Option<Uuid> {
+    instance
+        .machine_id
+        .or_else(|| state.sessions.session_machine_id(session_id))
+}
+
+async fn instance_runtime_access(
+    state: &AppState,
+    session_id: &Uuid,
+    user_id: &Uuid,
+    instance: &InstanceAttachment,
+) -> bool {
+    let machine_id = instance_access_machine(state, session_id, instance);
+    machine_runtime_access(state, session_id, user_id, machine_id)
+        .await
         .unwrap_or(false)
+}
+
+/// Whether `user_id` may use the session's runtime at all: attach to it, and
+/// send it what concerns no one instance. With instances attached, at least
+/// one must run on a machine that admits the user; a control for one pane is
+/// then also checked against that pane's machine (`pane_control_refusal`).
+/// With none attached the machine the session last ran on decides, which is
+/// the rule a single instance always had.
+async fn has_session_runtime_access(state: &AppState, session_id: &Uuid, user_id: &Uuid) -> bool {
+    let attachments = state.sessions.session_attachments(session_id);
+    if attachments.is_empty() {
+        let machine_id = state.sessions.session_machine_id(session_id);
+        return machine_runtime_access(state, session_id, user_id, machine_id)
+            .await
+            .unwrap_or(false);
+    }
+    for instance in &attachments {
+        if instance_runtime_access(state, session_id, user_id, instance).await {
+            return true;
+        }
+    }
+    false
+}
+
+/// The refusal for a control aimed at a machine that runs no instance of the
+/// project. The tab's state lives on that machine, so nothing else can act on
+/// it. Clients show this same wording for such tabs.
+fn not_running_message(
+    state: &AppState,
+    machine_id: Option<Uuid>,
+    hostname: Option<String>,
+) -> String {
+    let host = hostname
+        .map(|host| host.trim().to_string())
+        .filter(|host| !host.is_empty())
+        .or_else(|| {
+            machine_id
+                .and_then(|machine_id| state.sessions.machine_hostname(&machine_id))
+                .map(|host| host.trim().to_string())
+                .filter(|host| !host.is_empty())
+        });
+    match host {
+        Some(host) => format!("{host} is not running this project. Start it on {host} first."),
+        None => "This tab's machine is not running this project.".to_string(),
+    }
+}
+
+/// What a client is told when a control that passed its checks was still
+/// not delivered: its machine stopped in the meantime, or the instance's
+/// connection did not take it.
+fn undelivered_message(state: &AppState, outcome: &CliRouteOutcome) -> String {
+    match outcome {
+        CliRouteOutcome::MachineNotRunning {
+            machine_id,
+            hostname,
+        } => not_running_message(state, *machine_id, hostname.clone()),
+        _ => "The project runtime is unavailable".to_string(),
+    }
+}
+
+/// Why this viewer may not use `instance`, or `None` when they may. Always
+/// evaluated against this instance's own machine: the session's check passes
+/// when any instance admits the viewer, and the one that did may have
+/// detached since, leaving only instances that do not.
+async fn instance_access_refusal(
+    state: &AppState,
+    connection_id: &Uuid,
+    session_id: &Uuid,
+    instance: &InstanceAttachment,
+) -> Option<String> {
+    let Some(user_id) = state.sessions.get_web_user(connection_id) else {
+        return Some("Access denied".to_string());
+    };
+    user_instance_access_refusal(state, session_id, &user_id, instance).await
+}
+
+/// [`instance_access_refusal`] for `user_id`, whose connection may be gone:
+/// a pane waiting for its machine's instance is checked again when it
+/// attaches.
+async fn user_instance_access_refusal(
+    state: &AppState,
+    session_id: &Uuid,
+    user_id: &Uuid,
+    instance: &InstanceAttachment,
+) -> Option<String> {
+    if instance_runtime_access(state, session_id, user_id, instance).await {
+        return None;
+    }
+    let host = instance
+        .hostname
+        .as_deref()
+        .map(str::trim)
+        .filter(|host| !host.is_empty())
+        .unwrap_or("that machine");
+    Some(format!(
+        "Access denied: you cannot use {host}, which runs this project instance"
+    ))
+}
+
+/// Why a control for `pane_id` must not be sent, or `None` when it may go to
+/// the pane's owner. Call it after `resolve_target_session`.
+///
+/// A pane's state lives on the instance that owns it, so a pane whose machine
+/// runs no instance is refused by name rather than sent to another machine.
+/// And passing the session's check only shows that some instance admits the
+/// viewer, so the owner's machine is checked in its own right.
+async fn pane_control_refusal(
+    state: &AppState,
+    connection_id: &Uuid,
+    session_id: &Uuid,
+    pane_id: u32,
+) -> Option<String> {
+    match state.sessions.pane_owner(session_id, pane_id) {
+        PaneOwner::Instance(owner) => {
+            instance_access_refusal(state, connection_id, session_id, &owner).await
+        }
+        PaneOwner::NotRunning {
+            machine_id,
+            hostname,
+        } => Some(not_running_message(state, machine_id, hostname)),
+        // Nothing is attached: routing reports that, as it always has.
+        PaneOwner::NoInstance => None,
+    }
+}
+
+/// [`resolve_target_session`] for a control aimed at one pane. Also refuses,
+/// with the reason, a pane whose machine is not running the project or that
+/// this viewer may not use; see [`pane_control_refusal`].
+async fn resolve_pane_session(
+    state: &AppState,
+    connection_id: &Uuid,
+    msg_session_id: Option<Uuid>,
+    fallback: Option<Uuid>,
+    pane_id: u32,
+) -> Option<Uuid> {
+    let session_id = resolve_target_session(state, connection_id, msg_session_id, fallback).await?;
+    if let Some(refusal) = pane_control_refusal(state, connection_id, &session_id, pane_id).await {
+        send_policy_error(state, connection_id, refusal).await;
+        return None;
+    }
+    Some(session_id)
+}
+
+/// Which of a session's instances a control is evaluated against: what its
+/// CLI supports decides whether the control can be sent at all, and the
+/// other instances' CLIs may be older or newer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InstanceTarget {
+    /// The primary instance, which receives what names no machine.
+    Primary,
+    /// The instance that owns this pane.
+    Pane(u32),
+    /// The instance on this machine.
+    Machine(Uuid),
+}
+
+fn target_instance(
+    state: &AppState,
+    session_id: &Uuid,
+    target: InstanceTarget,
+) -> Option<InstanceAttachment> {
+    match target {
+        InstanceTarget::Primary => state.sessions.primary_instance(session_id),
+        InstanceTarget::Pane(pane_id) => match state.sessions.pane_owner(session_id, pane_id) {
+            PaneOwner::Instance(owner) => Some(owner),
+            PaneOwner::NotRunning { .. } | PaneOwner::NoInstance => None,
+        },
+        InstanceTarget::Machine(machine_id) => {
+            state.sessions.instance_on_machine(session_id, &machine_id)
+        }
+    }
+}
+
+fn instance_supports_capability(
+    state: &AppState,
+    session_id: &Uuid,
+    target: InstanceTarget,
+    capability: &str,
+) -> bool {
+    target_instance(state, session_id, target).is_some_and(|instance| {
+        state
+            .sessions
+            .cli_supports_capability(&instance.cli_id, capability)
+    })
+}
+
+/// The panes `instance` runs, by the same ownership rules that route their
+/// controls. With no instance, every pane, as for a session with one CLI.
+fn instance_panes(
+    state: &AppState,
+    session_id: &Uuid,
+    instance: Option<&InstanceAttachment>,
+) -> Vec<shared::PaneConfig> {
+    let panes = state.sessions.get_session_panes(session_id);
+    let Some(instance) = instance else {
+        return panes;
+    };
+    panes
+        .into_iter()
+        .filter(|pane| {
+            matches!(
+                state.sessions.pane_owner(session_id, pane.pane_id),
+                PaneOwner::Instance(owner) if owner.cli_id == instance.cli_id
+            )
+        })
+        .collect()
+}
+
+/// Fill in, for one viewer, whether they may use each instance's runtime.
+/// An instance whose access cannot be evaluated is left `None`, which clients
+/// treat as usable and leave to the server to decide.
+async fn fill_runtime_access(
+    state: &AppState,
+    session_id: &Uuid,
+    user_id: &Uuid,
+    instances: &mut [shared::SessionInstanceInfo],
+) {
+    for instance in instances
+        .iter_mut()
+        .filter(|instance| instance.runtime_access.is_none())
+    {
+        let machine_id = instance
+            .machine_id
+            .or_else(|| state.sessions.session_machine_id(session_id));
+        match machine_runtime_access(state, session_id, user_id, machine_id).await {
+            Ok(allowed) => instance.runtime_access = Some(allowed),
+            Err(error) => {
+                tracing::warn!(%session_id, %error, "could not evaluate instance runtime access")
+            }
+        }
+    }
+}
+
+/// The session's attached instances as `user_id` sees them.
+pub(crate) async fn viewer_session_instances(
+    state: &AppState,
+    session_id: &Uuid,
+    user_id: &Uuid,
+) -> Vec<shared::SessionInstanceInfo> {
+    let mut instances = state.sessions.session_instances(session_id);
+    fill_runtime_access(state, session_id, user_id, &mut instances).await;
+    instances
+}
+
+/// Fill `runtime_access` into an instance set on its way to one viewer. The
+/// session manager sends the set on every attach, detach and primary
+/// handover without it, because whether a viewer may use an instance depends
+/// on who is viewing and needs the database. Everything else passes through.
+async fn with_viewer_runtime_access(
+    state: &AppState,
+    connection_id: &Uuid,
+    message: ServerToWeb,
+) -> ServerToWeb {
+    let ServerToWeb::SessionInstances {
+        session_id,
+        mut instances,
+    } = message
+    else {
+        return message;
+    };
+    if let Some(user_id) = state.sessions.get_web_user(connection_id) {
+        fill_runtime_access(state, &session_id, &user_id, &mut instances).await;
+    }
+    ServerToWeb::SessionInstances {
+        session_id,
+        instances,
+    }
+}
+
+/// What a viewer that just attached is told about the session's instances,
+/// right after `SessionAttached`.
+///
+/// One that advertised project instances gets the complete instance set and
+/// one lifecycle inventory per attached instance, each naming its machine.
+/// Any other viewer keeps a single inventory per session, the primary's: a
+/// second would replace it, and a reboot confirmation would then count
+/// another machine's tabs. Older native builds would also drop their socket
+/// on the instance-set frame, which is why it is gated at all.
+async fn replay_instances_after_attach(state: &AppState, connection_id: &Uuid, session_id: Uuid) {
+    let mut inventories = state.sessions.attached_lifecycle_inventories(&session_id);
+    if !state
+        .sessions
+        .web_supports_capability(connection_id, shared::PROJECT_INSTANCES_CAPABILITY)
+    {
+        let latest = match inventories.into_iter().next() {
+            Some((machine_id, inventory)) => Some((machine_id, inventory)),
+            // Nothing attached: the inventory last reported, as before.
+            None => state
+                .sessions
+                .lifecycle_inventory(&session_id)
+                .map(|inventory| (None, inventory)),
+        };
+        inventories = latest.into_iter().collect();
+    } else {
+        let instances = match state.sessions.get_web_user(connection_id) {
+            Some(user_id) => viewer_session_instances(state, &session_id, &user_id).await,
+            None => state.sessions.session_instances(&session_id),
+        };
+        state
+            .sessions
+            .send_to_web(
+                connection_id,
+                ServerToWeb::SessionInstances {
+                    session_id,
+                    instances,
+                },
+            )
+            .await;
+    }
+    for (machine_id, inventory) in inventories {
+        state
+            .sessions
+            .send_to_web(
+                connection_id,
+                ServerToWeb::CliLifecycleInventory {
+                    session_id,
+                    inventory,
+                    machine_id,
+                },
+            )
+            .await;
+    }
+}
+
+/// `ForgetMachinePanes`: drop the tabs of a machine that will not come back.
+/// Tabs never move between machines, and a stopped machine's tabs cannot be
+/// closed one by one because their state lives there, so this is the only
+/// way to clear them. It edits the project's roster for everyone, so it
+/// takes the authority project settings do.
+///
+/// The server roster loses the machine's tagged tabs and the untagged ones
+/// attributed to its host. Running instances are told too: one sharing this
+/// project's `.apas` removes the entries tagged with that machine, while a
+/// separate checkout's holds none. Either kind can come back, untagged ones
+/// when an instance adopts them and the rest if that machine runs the
+/// project again, because each instance reports its own tabs.
+async fn forget_machine_panes(
+    state: &AppState,
+    connection_id: &Uuid,
+    session_id: Uuid,
+    machine_id: Uuid,
+) {
+    if !can_manage_project_settings(state, connection_id, &session_id).await {
+        send_policy_error(
+            state,
+            connection_id,
+            "Only the project owner or the operator of a cluster hosting it can forget a machine's tabs",
+        )
+        .await;
+        return;
+    }
+    let Ok((_project_id, _project_guard)) = state
+        .active_session_operation(&session_id.to_string())
+        .await
+    else {
+        return;
+    };
+    // After a server restart a stopped machine's tabs may exist only in
+    // `panes.json`; the roster must be loaded before anything is removed.
+    let roster = resolve_pane_roster(state, &session_id)
+        .await
+        .unwrap_or_default();
+    // A daemon that has not connected since a restart has no hostname here,
+    // but the tabs it reported carry it.
+    let hostname = state.sessions.machine_hostname(&machine_id).or_else(|| {
+        roster
+            .iter()
+            .find(|pane| pane.machine_id == Some(machine_id))
+            .and_then(|pane| pane.hostname.clone())
+    });
+    let removed =
+        match state
+            .sessions
+            .forget_machine_panes(&session_id, machine_id, hostname.as_deref())
+        {
+            Ok(removed) => removed,
+            Err(refused) => {
+                let host = refused
+                    .hostname
+                    .or(hostname)
+                    .map(|host| host.trim().to_string())
+                    .filter(|host| !host.is_empty())
+                    .unwrap_or_else(|| "That machine".to_string());
+                send_policy_error(
+                    state,
+                    connection_id,
+                    format!(
+                        "{host} is running this project. Stop it there before forgetting its tabs."
+                    ),
+                )
+                .await;
+                return;
+            }
+        };
+    if !removed.is_empty() {
+        if let Err(error) = state
+            .storage
+            .save_pane_roster_latest(&session_id, || {
+                state.sessions.pane_roster_snapshot(&session_id)
+            })
+            .await
+        {
+            tracing::warn!(%session_id, %error, "failed to persist the roster after forgetting a machine");
+        }
+        state
+            .sessions
+            .route_to_web(
+                &session_id,
+                ServerToWeb::PaneList {
+                    session_id,
+                    panes: state.sessions.get_session_panes(&session_id),
+                },
+            )
+            .await;
+    }
+    if !state.sessions.session_attachments(&session_id).is_empty() {
+        state
+            .sessions
+            .route_to_cli(
+                &session_id,
+                ServerToCli::ForgetMachinePanes {
+                    session_id,
+                    machine_id,
+                },
+            )
+            .await;
+    }
+    tracing::info!(
+        %session_id,
+        %machine_id,
+        host = hostname.as_deref().unwrap_or("unknown"),
+        removed = ?removed,
+        "forgot a machine's tabs"
+    );
 }
 
 async fn reject_session_attachment(
@@ -2436,16 +3841,11 @@ async fn resolve_target_session(
                 {
                     return None;
                 }
-                let cli_client_id = match state.db.get_session(&sid.to_string()).await {
-                    Ok(Some(db_session)) => db_session
-                        .cli_client_id
-                        .and_then(|id| Uuid::parse_str(&id).ok())
-                        .filter(|id| state.sessions.is_cli_connected(id)),
-                    _ => None,
-                };
+                // The session's attached instances, not its database row,
+                // say which CLIs run it.
                 state
                     .sessions
-                    .attach_web_to_session(&sid, *connection_id, cli_client_id);
+                    .attach_web_to_session(&sid, *connection_id, None);
                 tracing::info!(
                     "Auto-attached web connection {} to session {} for control message (access verified)",
                     connection_id,
@@ -2541,6 +3941,287 @@ fn lifecycle_cli_message(
     })
 }
 
+/// The instance a reboot or lifecycle request is for: the one on `machine_id`,
+/// else the primary. `Err` carries the refusal for a named machine that runs
+/// no instance; the request must not land on another machine instead.
+fn lifecycle_target(
+    state: &AppState,
+    session_id: &Uuid,
+    machine_id: Option<Uuid>,
+) -> Result<Option<InstanceAttachment>, String> {
+    match machine_id {
+        Some(machine_id) => state
+            .sessions
+            .instance_on_machine(session_id, &machine_id)
+            .map(Some)
+            .ok_or_else(|| not_running_message(state, Some(machine_id), None)),
+        None => Ok(state.sessions.primary_instance(session_id)),
+    }
+}
+
+/// The first pane of `instance` whose retired backend cannot run at all, and
+/// so blocks rebooting that instance. Other machines' panes are not
+/// relaunched by it and do not block it.
+fn retired_instance_pane(
+    state: &AppState,
+    session_id: &Uuid,
+    instance: Option<&InstanceAttachment>,
+) -> Option<shared::PaneConfig> {
+    instance_panes(state, session_id, instance)
+        .into_iter()
+        .find(|pane| shared::is_retired_launch(pane.provider, pane.model.as_deref()))
+}
+
+/// `RebootCli` for a session this connection may use: reboot the instance on
+/// `machine_id`, else the primary. Projects run inside their machine's
+/// daemon, so this replaces that host's daemon and every project in it and
+/// leaves the other machines' instances running.
+async fn handle_reboot_cli(
+    state: &AppState,
+    connection_id: &Uuid,
+    session_id: Uuid,
+    machine_id: Option<Uuid>,
+) {
+    let target = match lifecycle_target(state, &session_id, machine_id) {
+        Ok(target) => target,
+        Err(refusal) => {
+            send_policy_error(state, connection_id, refusal).await;
+            return;
+        }
+    };
+    if let Some(instance) = &target {
+        if let Some(refusal) =
+            instance_access_refusal(state, connection_id, &session_id, instance).await
+        {
+            send_policy_error(state, connection_id, refusal).await;
+            return;
+        }
+    }
+    let capability_target = machine_id
+        .map(InstanceTarget::Machine)
+        .unwrap_or(InstanceTarget::Primary);
+    // Called for its own gate — it refuses a reboot from a web client when
+    // the project CLI is too old for it — not for the policy itself, which no
+    // longer decides anything here.
+    if effective_policy_for_cli_reboot(state, connection_id, &session_id, capability_target)
+        .await
+        .is_none()
+    {
+        return;
+    }
+    if let Some(pane) = retired_instance_pane(state, &session_id, target.as_ref()) {
+        send_policy_error(
+            state,
+            connection_id,
+            format!(
+                "Pane {} uses an unsupported retired provider and blocks CLI reboot",
+                pane.pane_id
+            ),
+        )
+        .await;
+        return;
+    }
+    tracing::info!(%session_id, ?machine_id, "Rebooting CLI");
+    // To the instance just checked, even if the primary hands over meanwhile.
+    let route_machine =
+        machine_id.or_else(|| target.as_ref().and_then(|instance| instance.machine_id));
+    let outcome = state
+        .sessions
+        .route_to_cli_on_machine(&session_id, route_machine, reboot_cli_message(session_id))
+        .await;
+    if !outcome.delivered() {
+        let message = match outcome {
+            CliRouteOutcome::MachineNotRunning { .. } => undelivered_message(state, &outcome),
+            _ => "The CLI reboot request could not be delivered. Reboot the CLI manually on the project host, then try again.".to_string(),
+        };
+        send_policy_error(state, connection_id, message).await;
+    }
+}
+
+/// `CliLifecycleRequest` for a session this connection may use. The
+/// operation is for the instance on `machine_id`, else the primary: that
+/// instance's CLI must support it, the request carries that instance's
+/// inventory, and it is bound to that instance's machine so progress another
+/// machine reports can never complete it.
+async fn handle_cli_lifecycle_request(
+    state: &AppState,
+    connection_id: &Uuid,
+    session_id: Uuid,
+    request_user: Uuid,
+    request_id: Uuid,
+    operation: shared::CliLifecycleOperation,
+    machine_id: Option<Uuid>,
+) {
+    let failed = |message: String, inventory, machine_id| ServerToWeb::CliLifecycleStatus {
+        session_id,
+        request_id,
+        operation,
+        phase: shared::CliLifecyclePhase::Failed,
+        message: Some(message),
+        inventory,
+        machine_id,
+    };
+    let target = match lifecycle_target(state, &session_id, machine_id) {
+        Ok(target) => target,
+        Err(refusal) => {
+            state
+                .sessions
+                .send_to_web(connection_id, failed(refusal, None, machine_id))
+                .await;
+            return;
+        }
+    };
+    let target_machine =
+        machine_id.or_else(|| target.as_ref().and_then(|instance| instance.machine_id));
+    if let Some(instance) = &target {
+        if let Some(refusal) =
+            instance_access_refusal(state, connection_id, &session_id, instance).await
+        {
+            state
+                .sessions
+                .send_to_web(connection_id, failed(refusal, None, target_machine))
+                .await;
+            return;
+        }
+    }
+    // That instance's own inventory: a reboot confirmation must count only
+    // the tabs it would restart.
+    let inventory = match &target {
+        Some(instance) => state
+            .sessions
+            .attached_lifecycle_inventories(&session_id)
+            .into_iter()
+            .find(|(machine, _)| *machine == instance.machine_id)
+            .map(|(_, inventory)| inventory),
+        None => state.sessions.lifecycle_inventory(&session_id),
+    };
+    let supported = target.as_ref().is_some_and(|instance| {
+        state
+            .sessions
+            .cli_supports_capability(&instance.cli_id, shared::CLI_LIFECYCLE_CAPABILITY)
+    });
+    let Some(cli_message) = lifecycle_cli_message(supported, session_id, request_id, operation)
+    else {
+        state
+            .sessions
+            .send_to_web(
+                connection_id,
+                failed(
+                    "This project CLI is too old for safe lifecycle controls. Upgrade it on the project host."
+                        .to_string(),
+                    inventory,
+                    target_machine,
+                ),
+            )
+            .await;
+        return;
+    };
+
+    if operation == shared::CliLifecycleOperation::RebootCli {
+        // Same here: called for the too-old-CLI gate. Only a retired backend
+        // blocks the reboot now, since it cannot run at all; being outside
+        // the allowlist no longer does — see `authorize_existing_pane_launch`.
+        let capability_target = machine_id
+            .map(InstanceTarget::Machine)
+            .unwrap_or(InstanceTarget::Primary);
+        if effective_policy_for_cli_reboot(state, connection_id, &session_id, capability_target)
+            .await
+            .is_none()
+        {
+            return;
+        }
+        if let Some(pane) = retired_instance_pane(state, &session_id, target.as_ref()) {
+            send_policy_error(
+                state,
+                connection_id,
+                format!(
+                    "Pane {} uses a retired backend and blocks CLI reboot",
+                    pane.pane_id
+                ),
+            )
+            .await;
+            return;
+        }
+    }
+
+    match state
+        .sessions
+        .claim_lifecycle_request(request_id, session_id, request_user, operation)
+    {
+        crate::session::LifecycleRequestClaim::Conflict => {
+            state
+                .sessions
+                .send_to_web(
+                    connection_id,
+                    failed(
+                        "That request ID is already bound to another lifecycle operation."
+                            .to_string(),
+                        None,
+                        target_machine,
+                    ),
+                )
+                .await;
+        }
+        crate::session::LifecycleRequestClaim::InFlight(status)
+        | crate::session::LifecycleRequestClaim::Replay(status) => {
+            state
+                .sessions
+                .send_to_web(connection_id, status.message())
+                .await;
+        }
+        crate::session::LifecycleRequestClaim::New => {
+            state
+                .sessions
+                .bind_lifecycle_request(request_id, target_machine, inventory.clone());
+            let accepted = state
+                .sessions
+                .update_lifecycle_request(
+                    request_id,
+                    session_id,
+                    operation,
+                    shared::CliLifecyclePhase::Accepted,
+                    None,
+                    inventory,
+                )
+                .expect("new lifecycle request must be retained");
+            broadcast_lifecycle_status(state, session_id, accepted.message()).await;
+            let outcome = state
+                .sessions
+                .route_to_cli_on_machine(&session_id, target_machine, cli_message)
+                .await;
+            if !outcome.delivered() {
+                let message = match outcome {
+                    CliRouteOutcome::MachineNotRunning { .. } => undelivered_message(state, &outcome),
+                    _ => "The request could not be delivered. Start or restart the CLI manually on the project host.".to_string(),
+                };
+                if let Some(failed) = state.sessions.update_lifecycle_request(
+                    request_id,
+                    session_id,
+                    operation,
+                    shared::CliLifecyclePhase::Failed,
+                    Some(message),
+                    None,
+                ) {
+                    broadcast_lifecycle_status(state, session_id, failed.message()).await;
+                }
+                return;
+            }
+
+            let timeout_state = state.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(crate::session::LIFECYCLE_REQUEST_TIMEOUT).await;
+                if let Some(timed_out) =
+                    timeout_state.sessions.timeout_lifecycle_request(request_id)
+                {
+                    tracing::warn!(%session_id, %request_id, ?operation, "CLI lifecycle operation timed out");
+                    broadcast_lifecycle_status(&timeout_state, session_id, timed_out.message())
+                        .await;
+                }
+            });
+        }
+    }
+}
+
 async fn broadcast_lifecycle_status(state: &AppState, session_id: Uuid, message: ServerToWeb) {
     let web_ids = state
         .sessions
@@ -2610,16 +4291,30 @@ async fn handle_web_input(
         }
     }
 
+    // The pane that receives the input, and so the instance it goes to. A CLI
+    // applies input that names no pane to the legacy pane it means, which is
+    // the interactive one unless the client named the type.
+    let target_pane = pane_id.unwrap_or_else(|| {
+        pane_type
+            .map(|pane_type| shared::PaneConfig::pane_id_from_legacy(&pane_type))
+            .unwrap_or(shared::PANE_ID_INTERACTIVE)
+    });
+    if let Some(refusal) = pane_control_refusal(state, connection_id, &sid, target_pane).await {
+        send_policy_error(state, connection_id, refusal).await;
+        return;
+    }
+
     tracing::info!(
         "Routing input to session {}: {:?}",
         sid,
         text.chars().take(50).collect::<String>()
     );
 
-    let sent = state
+    let outcome = state
         .sessions
-        .route_to_cli(
+        .route_to_cli_for_pane(
             &sid,
+            target_pane,
             ServerToCli::Input {
                 session_id: sid,
                 data: text.clone(),
@@ -2628,7 +4323,7 @@ async fn handle_web_input(
         )
         .await;
 
-    if sent {
+    if outcome.delivered() {
         let effective_pane_id =
             pane_id.or_else(|| pane_type.map(|p| shared::PaneConfig::pane_id_from_legacy(&p)));
         let created_at = chrono::Utc::now().to_rfc3339();
@@ -2690,16 +4385,144 @@ async fn handle_web_input(
         .await;
     } else {
         tracing::warn!("Failed to route input to CLI for session {}", sid);
+        let message = match outcome {
+            CliRouteOutcome::MachineNotRunning { .. } => undelivered_message(state, &outcome),
+            _ => "CLI client not connected".to_string(),
+        };
         state
             .sessions
-            .send_to_web(
-                connection_id,
-                ServerToWeb::Error {
-                    message: "CLI client not connected".to_string(),
-                },
-            )
+            .send_to_web(connection_id, ServerToWeb::Error { message })
             .await;
     }
+}
+
+/// Deliver the answer to a pending decision (a question or a plan review),
+/// which names no pane on the wire. A claimed decision is no longer there
+/// for routing to look up, so the caller passes its pane, or the pane the
+/// client named, and the answer goes to the instance that owns it. With
+/// neither, routing resolves a decision still pending, else it goes to the
+/// primary, as an answer whose decision cannot be resolved always has.
+/// Returns the error to acknowledge with.
+async fn route_decision_answer(
+    state: &AppState,
+    connection_id: &Uuid,
+    session_id: &Uuid,
+    pane_id: Option<u32>,
+    message: ServerToCli,
+) -> Result<(), String> {
+    let outcome = match pane_id {
+        Some(pane_id) => {
+            if let Some(refusal) =
+                pane_control_refusal(state, connection_id, session_id, pane_id).await
+            {
+                return Err(refusal);
+            }
+            state
+                .sessions
+                .route_to_cli_for_pane(session_id, pane_id, message)
+                .await
+        }
+        None => {
+            state
+                .sessions
+                .route_to_cli_by_scope(session_id, message)
+                .await
+        }
+    };
+    if outcome.delivered() {
+        Ok(())
+    } else {
+        Err(undelivered_message(state, &outcome))
+    }
+}
+
+/// Approve (`"y"`) or reject (`"n"`) a pending tool call. The CLI receives
+/// the answer as `Input` for the decision's pane, so it goes to the instance
+/// that owns that pane; an answer naming no pane is applied to the legacy
+/// interactive pane, whose instance receives it. A refused or undelivered
+/// answer gives the decision back so another surface can still resolve it.
+#[allow(clippy::too_many_arguments)]
+async fn handle_approval_decision(
+    state: &AppState,
+    connection_id: &Uuid,
+    fallback_session_id: Option<Uuid>,
+    msg_sid: Option<Uuid>,
+    tool_call_id: String,
+    pane_id: Option<u32>,
+    request_id: Option<String>,
+    data: &str,
+) {
+    let Some(sid) =
+        resolve_target_session(state, connection_id, msg_sid, fallback_session_id).await
+    else {
+        return;
+    };
+    if replay_or_claim_mutation_request(state, connection_id, request_id.as_deref()).await {
+        return;
+    }
+    let claimed = state.sessions.claim_pending_decision(
+        sid,
+        &tool_call_id,
+        pane_id,
+        shared::MutationKind::Approval,
+    );
+    if claimed.is_none() && request_id.is_some() {
+        send_mutation_ack(
+            state,
+            connection_id,
+            request_id.as_deref(),
+            sid,
+            pane_id,
+            shared::MutationKind::Approval,
+            Err("This approval was already resolved or is no longer current"),
+        )
+        .await;
+        return;
+    }
+    let target_pane = claimed
+        .as_ref()
+        .and_then(|decision| decision.pane_id)
+        .or(pane_id);
+    let owner_pane = target_pane.unwrap_or(shared::PANE_ID_INTERACTIVE);
+    let result = match pane_control_refusal(state, connection_id, &sid, owner_pane).await {
+        Some(refusal) => Err(refusal),
+        None => {
+            let outcome = state
+                .sessions
+                .route_to_cli_for_pane(
+                    &sid,
+                    owner_pane,
+                    ServerToCli::Input {
+                        session_id: sid,
+                        data: data.to_string(),
+                        pane_id: target_pane,
+                    },
+                )
+                .await;
+            if outcome.delivered() {
+                Ok(())
+            } else {
+                Err(undelivered_message(state, &outcome))
+            }
+        }
+    };
+    if result.is_err() {
+        if let Some(decision) = claimed {
+            state
+                .sessions
+                .restore_pending_decision(sid, tool_call_id, decision);
+        }
+    }
+    send_mutation_ack(
+        state,
+        connection_id,
+        request_id.as_deref(),
+        sid,
+        target_pane,
+        shared::MutationKind::Approval,
+        result,
+    )
+    .await;
 }
 
 /// Shared with the CLI's answer-keystroke pacing: both write on a person's
@@ -2769,6 +4592,11 @@ async fn handle_terminal_conversation_input(
                 .await;
             return;
         }
+    }
+
+    if let Some(refusal) = pane_control_refusal(state, connection_id, &sid, pane_id).await {
+        send_policy_error(state, connection_id, refusal).await;
+        return;
     }
 
     let input_frame = terminal_conversation_frame(&text);
@@ -3539,6 +5367,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
             if !crate::jobs::web_outbound_allowed(&outbound_state, connection_id, &msg).await {
                 continue;
             }
+            let msg = with_viewer_runtime_access(&outbound_state, &connection_id, msg).await;
             let text = serde_json::to_string(&msg).unwrap();
             if sender.send(Message::Text(text.into())).await.is_err() {
                 break;
@@ -3742,6 +5571,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                                 shared::PROJECT_POLICY_CAPABILITY
                                                     | shared::PANE_WORK_SUMMARY_CAPABILITY
                                                     | shared::AUTONOMOUS_JOBS_CAPABILITY
+                                                    | shared::PROJECT_INSTANCES_CAPABILITY
                                                     | "mobile_bootstrap_v1"
                                                     | "mobile_coding_mutations_v1"
                                                     | "mobile_terminal_v1"
@@ -4037,71 +5867,15 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     pane_id,
                     request_id,
                 }) => {
-                    let Some(sid) =
-                        resolve_target_session(&state, &connection_id, msg_sid, session_id).await
-                    else {
-                        continue;
-                    };
-                    if replay_or_claim_mutation_request(
+                    handle_approval_decision(
                         &state,
                         &connection_id,
-                        request_id.as_deref(),
-                    )
-                    .await
-                    {
-                        continue;
-                    }
-                    let claimed = state.sessions.claim_pending_decision(
-                        sid,
-                        &tool_call_id,
+                        session_id,
+                        msg_sid,
+                        tool_call_id,
                         pane_id,
-                        shared::MutationKind::Approval,
-                    );
-                    if claimed.is_none() && request_id.is_some() {
-                        send_mutation_ack(
-                            &state,
-                            &connection_id,
-                            request_id.as_deref(),
-                            sid,
-                            pane_id,
-                            shared::MutationKind::Approval,
-                            Err("This approval was already resolved or is no longer current"),
-                        )
-                        .await;
-                        continue;
-                    }
-                    let target_pane = claimed
-                        .as_ref()
-                        .and_then(|decision| decision.pane_id)
-                        .or(pane_id);
-                    let routed = state
-                        .sessions
-                        .route_to_cli(
-                            &sid,
-                            ServerToCli::Input {
-                                session_id: sid,
-                                data: "y".to_string(),
-                                pane_id: target_pane,
-                            },
-                        )
-                        .await;
-                    if !routed {
-                        if let Some(decision) = claimed {
-                            state
-                                .sessions
-                                .restore_pending_decision(sid, tool_call_id, decision);
-                        }
-                    }
-                    send_mutation_ack(
-                        &state,
-                        &connection_id,
-                        request_id.as_deref(),
-                        sid,
-                        target_pane,
-                        shared::MutationKind::Approval,
-                        routed
-                            .then_some(())
-                            .ok_or("The project runtime is unavailable"),
+                        request_id,
+                        "y",
                     )
                     .await;
                 }
@@ -4111,79 +5885,31 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     pane_id,
                     request_id,
                 }) => {
-                    let Some(sid) =
-                        resolve_target_session(&state, &connection_id, msg_sid, session_id).await
-                    else {
-                        continue;
-                    };
-                    if replay_or_claim_mutation_request(
+                    handle_approval_decision(
                         &state,
                         &connection_id,
-                        request_id.as_deref(),
-                    )
-                    .await
-                    {
-                        continue;
-                    }
-                    let claimed = state.sessions.claim_pending_decision(
-                        sid,
-                        &tool_call_id,
+                        session_id,
+                        msg_sid,
+                        tool_call_id,
                         pane_id,
-                        shared::MutationKind::Approval,
-                    );
-                    if claimed.is_none() && request_id.is_some() {
-                        send_mutation_ack(
-                            &state,
-                            &connection_id,
-                            request_id.as_deref(),
-                            sid,
-                            pane_id,
-                            shared::MutationKind::Approval,
-                            Err("This approval was already resolved or is no longer current"),
-                        )
-                        .await;
-                        continue;
-                    }
-                    let target_pane = claimed
-                        .as_ref()
-                        .and_then(|decision| decision.pane_id)
-                        .or(pane_id);
-                    let routed = state
-                        .sessions
-                        .route_to_cli(
-                            &sid,
-                            ServerToCli::Input {
-                                session_id: sid,
-                                data: "n".to_string(),
-                                pane_id: target_pane,
-                            },
-                        )
-                        .await;
-                    if !routed {
-                        if let Some(decision) = claimed {
-                            state
-                                .sessions
-                                .restore_pending_decision(sid, tool_call_id, decision);
-                        }
-                    }
-                    send_mutation_ack(
-                        &state,
-                        &connection_id,
-                        request_id.as_deref(),
-                        sid,
-                        target_pane,
-                        shared::MutationKind::Approval,
-                        routed
-                            .then_some(())
-                            .ok_or("The project runtime is unavailable"),
+                        request_id,
+                        "n",
                     )
                     .await;
                 }
                 Ok(WebToServer::PauseDeadloop {
                     session_id: msg_sid,
                 }) => {
-                    if let Some(sid) =
-                        resolve_target_session(&state, &connection_id, msg_sid, session_id).await
+                    // The CLI pauses only its deadloop pane, so the instance
+                    // that owns that pane receives it.
+                    if let Some(sid) = resolve_pane_session(
+                        &state,
+                        &connection_id,
+                        msg_sid,
+                        session_id,
+                        shared::PANE_ID_DEADLOOP,
+                    )
+                    .await
                     {
                         tracing::info!("Pausing deadloop for session {}", sid);
                         state
@@ -4195,8 +5921,14 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                 Ok(WebToServer::ResumeDeadloop {
                     session_id: msg_sid,
                 }) => {
-                    if let Some(sid) =
-                        resolve_target_session(&state, &connection_id, msg_sid, session_id).await
+                    if let Some(sid) = resolve_pane_session(
+                        &state,
+                        &connection_id,
+                        msg_sid,
+                        session_id,
+                        shared::PANE_ID_DEADLOOP,
+                    )
+                    .await
                     {
                         if let Some(pane) = state
                             .sessions
@@ -4224,74 +5956,19 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                 }
                 Ok(WebToServer::RebootCli {
                     session_id: msg_sid,
-                    // Until sessions hold per-machine attachments, the only
-                    // instance is the primary one that `None` names.
-                    machine_id: _,
+                    machine_id,
                 }) => {
                     if let Some(sid) =
                         resolve_target_session(&state, &connection_id, msg_sid, session_id).await
                     {
-                        // Called for its own gate — it refuses a reboot from a
-                        // web client when the project CLI is too old for it —
-                        // not for the policy itself, which no longer decides
-                        // anything here.
-                        if effective_policy_for_cli_reboot(&state, &connection_id, &sid)
-                            .await
-                            .is_none()
-                        {
-                            continue;
-                        }
-                        if let Some(pane) =
-                            state
-                                .sessions
-                                .get_session_panes(&sid)
-                                .into_iter()
-                                .find(|pane| {
-                                    shared::is_retired_launch(pane.provider, pane.model.as_deref())
-                                })
-                        {
-                            send_policy_error(
-                                &state,
-                                &connection_id,
-                                format!(
-                                    "Pane {} uses an unsupported retired provider and blocks CLI reboot",
-                                    pane.pane_id
-                                ),
-                            )
-                            .await;
-                            continue;
-                        }
-                        // Called for its own gate — it refuses a reboot from a
-                        // web client when the project CLI is too old for it —
-                        // not for the policy itself, which no longer decides
-                        // anything here.
-                        if effective_policy_for_cli_reboot(&state, &connection_id, &sid)
-                            .await
-                            .is_none()
-                        {
-                            continue;
-                        }
-                        tracing::info!("Rebooting CLI for session {}", sid);
-                        let routed = state
-                            .sessions
-                            .route_to_cli(&sid, reboot_cli_message(sid))
-                            .await;
-                        if !routed {
-                            send_policy_error(
-                                &state,
-                                &connection_id,
-                                "The CLI reboot request could not be delivered. Reboot the CLI manually on the project host, then try again.",
-                            )
-                            .await;
-                        }
+                        handle_reboot_cli(&state, &connection_id, sid, machine_id).await;
                     }
                 }
                 Ok(WebToServer::CliLifecycleRequest {
                     session_id: sid,
                     request_id,
                     operation,
-                    // See `RebootCli`: one instance per session for now.
-                    machine_id: _,
+                    machine_id,
                 }) => {
                     // A client running a bundle from before an operation was
                     // retired decodes to `None`. Drop the request; the socket
@@ -4311,168 +5988,21 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     let Some(request_user) = state.sessions.get_web_user(&connection_id) else {
                         continue;
                     };
-                    let cli_message = lifecycle_cli_message(
-                        state.sessions.session_supports_capability(
-                            &target_sid,
-                            shared::CLI_LIFECYCLE_CAPABILITY,
-                        ),
-                        target_sid,
-                        request_id,
-                        operation,
-                    );
-                    if cli_message.is_none() {
-                        state
-                            .sessions
-                            .send_to_web(
-                                &connection_id,
-                                ServerToWeb::CliLifecycleStatus {
-                                    session_id: target_sid,
-                                    request_id,
-                                    operation,
-                                    phase: shared::CliLifecyclePhase::Failed,
-                                    message: Some(
-                                        "This project CLI is too old for safe lifecycle controls. Upgrade it on the project host."
-                                            .to_string(),
-                                    ),
-                                    inventory: state
-                                        .sessions
-                                        .lifecycle_inventory(&target_sid),
-                                    machine_id: None,
-                                },
-                            )
-                            .await;
-                        continue;
-                    }
-
-                    if operation == shared::CliLifecycleOperation::RebootCli {
-                        // Same here: called for the too-old-CLI gate. Only a
-                        // retired backend blocks the reboot now, since it cannot
-                        // run at all; being outside the allowlist no longer
-                        // does — see `authorize_existing_pane_launch`.
-                        if effective_policy_for_cli_reboot(&state, &connection_id, &target_sid)
-                            .await
-                            .is_none()
-                        {
-                            continue;
-                        }
-                        if let Some(pane) = state
-                            .sessions
-                            .get_session_panes(&target_sid)
-                            .into_iter()
-                            .find(|pane| {
-                                shared::is_retired_launch(pane.provider, pane.model.as_deref())
-                            })
-                        {
-                            send_policy_error(
-                                &state,
-                                &connection_id,
-                                format!(
-                                    "Pane {} uses a retired backend and blocks CLI reboot",
-                                    pane.pane_id
-                                ),
-                            )
-                            .await;
-                            continue;
-                        }
-                    }
-
-                    match state.sessions.claim_lifecycle_request(
-                        request_id,
+                    handle_cli_lifecycle_request(
+                        &state,
+                        &connection_id,
                         target_sid,
                         request_user,
+                        request_id,
                         operation,
-                    ) {
-                        crate::session::LifecycleRequestClaim::Conflict => {
-                            state
-                                .sessions
-                                .send_to_web(
-                                    &connection_id,
-                                    ServerToWeb::CliLifecycleStatus {
-                                        session_id: target_sid,
-                                        request_id,
-                                        operation,
-                                        phase: shared::CliLifecyclePhase::Failed,
-                                        message: Some(
-                                            "That request ID is already bound to another lifecycle operation."
-                                                .to_string(),
-                                        ),
-                                        inventory: None,
-                                        machine_id: None,
-                                    },
-                                )
-                                .await;
-                        }
-                        crate::session::LifecycleRequestClaim::InFlight(status)
-                        | crate::session::LifecycleRequestClaim::Replay(status) => {
-                            state
-                                .sessions
-                                .send_to_web(&connection_id, status.message())
-                                .await;
-                        }
-                        crate::session::LifecycleRequestClaim::New => {
-                            let accepted = state
-                                .sessions
-                                .update_lifecycle_request(
-                                    request_id,
-                                    target_sid,
-                                    operation,
-                                    shared::CliLifecyclePhase::Accepted,
-                                    None,
-                                    state.sessions.lifecycle_inventory(&target_sid),
-                                )
-                                .expect("new lifecycle request must be retained");
-                            broadcast_lifecycle_status(&state, target_sid, accepted.message())
-                                .await;
-                            let routed = state
-                                .sessions
-                                .route_to_cli(
-                                    &target_sid,
-                                    cli_message.expect("capability was checked above"),
-                                )
-                                .await;
-                            if !routed {
-                                if let Some(failed) = state.sessions.update_lifecycle_request(
-                                    request_id,
-                                    target_sid,
-                                    operation,
-                                    shared::CliLifecyclePhase::Failed,
-                                    Some(
-                                        "The request could not be delivered. Start or restart the CLI manually on the project host."
-                                            .to_string(),
-                                    ),
-                                    None,
-                                ) {
-                                    broadcast_lifecycle_status(&state, target_sid, failed.message())
-                                        .await;
-                                }
-                                continue;
-                            }
-
-                            let timeout_state = state.clone();
-                            tokio::spawn(async move {
-                                tokio::time::sleep(crate::session::LIFECYCLE_REQUEST_TIMEOUT).await;
-                                if let Some(timed_out) =
-                                    timeout_state.sessions.timeout_lifecycle_request(request_id)
-                                {
-                                    tracing::warn!(%target_sid, %request_id, ?operation, "CLI lifecycle operation timed out");
-                                    broadcast_lifecycle_status(
-                                        &timeout_state,
-                                        target_sid,
-                                        timed_out.message(),
-                                    )
-                                    .await;
-                                }
-                            });
-                        }
-                    }
+                        machine_id,
+                    )
+                    .await;
                 }
                 Ok(WebToServer::StartMachineProjectCli {
                     machine_id,
                     project_id,
-                    // A project-wide start fans out once sessions hold
-                    // per-machine attachments; until then the project runs
-                    // on one machine, so both meanings start `machine_id`.
-                    all_instances: _,
+                    all_instances,
                 }) => {
                     let Some(uid) = user_id else {
                         state
@@ -4488,119 +6018,26 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     };
 
                     tracing::info!(
-                        "StartMachineProjectCli: user={} machine={} project={}",
+                        "StartMachineProjectCli: user={} machine={} project={} all_instances={}",
                         uid,
                         machine_id,
-                        project_id
+                        project_id,
+                        all_instances
                     );
-                    let allowed =
-                        has_machine_project_runtime_access(&state, &uid, &machine_id, &project_id)
-                            .await;
-
-                    if !allowed {
-                        state
-                            .sessions
-                            .send_to_web(
-                                &connection_id,
-                                ServerToWeb::Error {
-                                    message: "Machine not found".to_string(),
-                                },
-                            )
-                            .await;
-                        continue;
-                    }
-
-                    if !state
-                        .sessions
-                        .web_supports_capability(&connection_id, shared::PROJECT_POLICY_CAPABILITY)
-                        || !state.sessions.daemon_supports_capability(
-                            &machine_id,
-                            shared::PROJECT_POLICY_CAPABILITY,
-                        )
-                    {
-                        send_policy_error(
-                            &state,
-                            &connection_id,
-                            "The web client or machine daemon is incompatible with cluster project policy",
-                        )
-                        .await;
-                        continue;
-                    }
-                    let daemon_policy = match state.db.get_project(&project_id).await {
-                        Ok(Some(project)) if project.lifecycle_status == "suspended" => {
-                            send_policy_error(
-                                &state,
-                                &connection_id,
-                                "This project is suspended; reactivate it before starting the CLI",
-                            )
-                            .await;
-                            continue;
-                        }
-                        Ok(Some(project)) => {
-                            match state.db.get_effective_project_policy(&project.id).await {
-                                Ok(policy) => policy,
-                                Err(err) => {
-                                    tracing::warn!(%err, %project_id, "project policy lookup failed");
-                                    send_policy_error(
-                                        &state,
-                                        &connection_id,
-                                        "Could not verify project policy",
-                                    )
-                                    .await;
-                                    continue;
-                                }
-                            }
-                        }
-                        Ok(None) => {
-                            send_policy_error(
-                                &state,
-                                &connection_id,
-                                "Canonical project metadata is unavailable",
-                            )
-                            .await;
-                            continue;
-                        }
-                        Err(err) => {
-                            tracing::warn!(%err, %project_id, "project lifecycle lookup failed");
-                            send_policy_error(
-                                &state,
-                                &connection_id,
-                                "Could not verify project lifecycle",
-                            )
-                            .await;
-                            continue;
-                        }
-                    };
-
-                    if !state
-                        .sessions
-                        .send_to_daemon(
-                            &machine_id,
-                            ServerToDaemon::StartProjectCli {
-                                project_id,
-                                policy: Some(daemon_policy),
-                                request_id: None,
-                            },
-                        )
-                        .await
-                    {
-                        state
-                            .sessions
-                            .send_to_web(
-                                &connection_id,
-                                ServerToWeb::Error {
-                                    message: "Daemon is offline".to_string(),
-                                },
-                            )
-                            .await;
-                    }
+                    start_machine_project(
+                        &state,
+                        &connection_id,
+                        &uid,
+                        machine_id,
+                        &project_id,
+                        all_instances,
+                    )
+                    .await;
                 }
                 Ok(WebToServer::StopMachineProjectCli {
                     machine_id,
                     project_id,
-                    // See `StartMachineProjectCli`: one instance per project
-                    // for now, so both meanings stop `machine_id`.
-                    all_instances: _,
+                    all_instances,
                 }) => {
                     let Some(uid) = user_id else {
                         state
@@ -4615,44 +6052,15 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                         continue;
                     };
 
-                    let allowed =
-                        has_machine_project_runtime_access(&state, &uid, &machine_id, &project_id)
-                            .await;
-
-                    if !allowed {
-                        state
-                            .sessions
-                            .send_to_web(
-                                &connection_id,
-                                ServerToWeb::Error {
-                                    message: "Machine not found".to_string(),
-                                },
-                            )
-                            .await;
-                        continue;
-                    }
-
-                    if !state
-                        .sessions
-                        .send_to_daemon(
-                            &machine_id,
-                            ServerToDaemon::StopProjectCli {
-                                project_id,
-                                request_id: None,
-                            },
-                        )
-                        .await
-                    {
-                        state
-                            .sessions
-                            .send_to_web(
-                                &connection_id,
-                                ServerToWeb::Error {
-                                    message: "Daemon is offline".to_string(),
-                                },
-                            )
-                            .await;
-                    }
+                    stop_machine_project(
+                        &state,
+                        &connection_id,
+                        &uid,
+                        machine_id,
+                        &project_id,
+                        all_instances,
+                    )
+                    .await;
                 }
                 Ok(WebToServer::RebootDaemon { machine_id }) => {
                     let Some(uid) = user_id else {
@@ -4732,9 +6140,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     clone_url,
                     base_path,
                     request_id,
-                    // Clone-to-join is not implemented on this server yet; the
-                    // request creates a separate project, as older servers do.
-                    join_project_id: _,
+                    join_project_id,
                 }) => {
                     let Some(uid) = user_id else {
                         state
@@ -4748,6 +6154,29 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             .await;
                         continue;
                     };
+
+                    // Another checkout of an existing project, onto one of the
+                    // requester's own machines: a separate, owner-only path.
+                    if let Some(project_id) = join_project_id {
+                        super::project_join::create_joined_instance(
+                            &state,
+                            &connection_id,
+                            uid,
+                            super::project_join::JoinRequest {
+                                machine_id,
+                                cluster_owner_user_id,
+                                git_remote,
+                                instance_name,
+                                branch,
+                                clone_url,
+                                base_path,
+                                request_id,
+                                project_id,
+                            },
+                        )
+                        .await;
+                        continue;
+                    }
 
                     let (_machine_owner, requested_cluster, shared_request) =
                         match resolve_project_creation_target(
@@ -5034,7 +6463,8 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     pane_id,
                 }) => {
                     let Some(sid) =
-                        resolve_target_session(&state, &connection_id, msg_sid, session_id).await
+                        resolve_pane_session(&state, &connection_id, msg_sid, session_id, pane_id)
+                            .await
                     else {
                         continue;
                     };
@@ -5055,7 +6485,8 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     pane_id,
                 }) => {
                     let Some(sid) =
-                        resolve_target_session(&state, &connection_id, msg_sid, session_id).await
+                        resolve_pane_session(&state, &connection_id, msg_sid, session_id, pane_id)
+                            .await
                     else {
                         continue;
                     };
@@ -5080,7 +6511,8 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     pane_id,
                 }) => {
                     let Some(sid) =
-                        resolve_target_session(&state, &connection_id, msg_sid, session_id).await
+                        resolve_pane_session(&state, &connection_id, msg_sid, session_id, pane_id)
+                            .await
                     else {
                         continue;
                     };
@@ -5112,101 +6544,33 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     plan_review_mode,
                     managed,
                     kind,
-                    // Machine targeting and correlated results arrive with
-                    // per-machine attachments; until then every new pane goes
-                    // to the session's one instance and nothing answers the
-                    // request id, exactly as on an older server.
-                    machine_id: _,
-                    request_id: _,
+                    machine_id,
+                    request_id,
                 }) => {
-                    if let Some(sid) =
-                        resolve_target_session(&state, &connection_id, msg_sid, session_id).await
-                    {
-                        if !authorize_new_pane_launch(
-                            &state,
-                            &connection_id,
-                            &sid,
-                            kind,
-                            provider,
-                            model.as_deref(),
-                            managed,
-                        )
-                        .await
-                        {
-                            continue;
-                        }
-                        // Generate a pane id no pane in this session is using
-                        // (1 and 2 are reserved for legacy deadloop/interactive).
-                        let occupied: HashSet<u32> = state
-                            .sessions
-                            .get_session_panes(&sid)
-                            .iter()
-                            .map(|pane| pane.pane_id)
-                            .collect();
-                        let Some(pane_id) = allocate_pane_id(&occupied) else {
-                            send_policy_error(
-                                &state,
-                                &connection_id,
-                                "Could not allocate a pane id because the session is full; close a pane and retry.",
-                            )
-                            .await;
-                            continue;
-                        };
-                        let pane_config = shared::PaneConfig {
-                            pane_id,
-                            provider,
-                            mode,
-                            kind,
-                            session_id: uuid::Uuid::new_v4(),
-                            is_paused: false,
-                            stop_requested: false,
-                            prompt,
-                            min_iteration_interval_minutes: None,
-                            label,
-                            model,
-                            effort: None,
-                            worktree_path: None,
-                            role,
-                            goal,
-                            backstory,
-                            plan_review_mode,
-                            manual_mode: false,
-                            managed,
-                            machine_id: None,
-                            hostname: None,
-                        };
-                        tracing::info!(
-                            "Adding pane {} to session {} (isolated_worktree={})",
-                            pane_id,
-                            sid,
-                            isolated_worktree,
-                        );
-                        let routed = state
-                            .sessions
-                            .route_to_cli(
-                                &sid,
-                                ServerToCli::AddPane {
-                                    session_id: sid,
-                                    pane_config: pane_config.clone(),
-                                    isolated_worktree,
-                                    initial_input: None,
-                                },
-                            )
-                            .await;
-                        // A creation the host never receives must not fail
-                        // silently: without this the click produces no tab,
-                        // no error, and no log on the requesting client.
-                        if !routed {
-                            send_policy_error(
-                                &state,
-                                &connection_id,
-                                "The project host is unreachable; the pane was not created. Reconnect and retry.",
-                            )
-                            .await;
-                        }
-                        // Also broadcast PaneList to web clients
-                        // (CLI will send back updated pane config)
-                    }
+                    let spec = NewPaneSpec {
+                        provider,
+                        mode,
+                        kind,
+                        label,
+                        prompt,
+                        model,
+                        isolated_worktree,
+                        role,
+                        goal,
+                        backstory,
+                        plan_review_mode,
+                        managed,
+                    };
+                    handle_add_pane(
+                        &state,
+                        &connection_id,
+                        msg_sid,
+                        session_id,
+                        machine_id,
+                        request_id,
+                        spec,
+                    )
+                    .await;
                 }
                 Ok(WebToServer::RemovePane {
                     session_id: msg_sid,
@@ -5214,7 +6578,8 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     cleanup_action,
                 }) => {
                     if let Some(sid) =
-                        resolve_target_session(&state, &connection_id, msg_sid, session_id).await
+                        resolve_pane_session(&state, &connection_id, msg_sid, session_id, pane_id)
+                            .await
                     {
                         let Ok((_project_id, _project_guard)) =
                             state.active_session_operation(&sid.to_string()).await
@@ -5228,10 +6593,11 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             cleanup_action,
                         );
                         state.sessions.cancel_pane_reboot(&sid, pane_id);
-                        state
+                        let outcome = state
                             .sessions
-                            .route_to_cli(
+                            .route_to_cli_for_pane(
                                 &sid,
+                                pane_id,
                                 ServerToCli::RemovePane {
                                     session_id: sid,
                                     pane_id,
@@ -5239,10 +6605,27 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                 },
                             )
                             .await;
-                        // Drop any terminal scrollback for this pane so a
-                        // later pane that reuses the id doesn't inherit the
-                        // dead pane's frames on attach.
-                        state.sessions.clear_terminal_scrollback(&sid, pane_id);
+                        match outcome {
+                            // Drop any terminal scrollback for this pane so a
+                            // later pane that reuses the id doesn't inherit the
+                            // dead pane's frames on attach.
+                            CliRouteOutcome::Delivered(_) => {
+                                state.sessions.clear_terminal_scrollback(&sid, pane_id)
+                            }
+                            // Its machine stopped meanwhile: the tab stays,
+                            // stopped there, and so does what it last showed.
+                            CliRouteOutcome::MachineNotRunning { .. } => {
+                                send_policy_error(
+                                    &state,
+                                    &connection_id,
+                                    undelivered_message(&state, &outcome),
+                                )
+                                .await
+                            }
+                            CliRouteOutcome::NoInstance | CliRouteOutcome::Undelivered => {
+                                state.sessions.clear_terminal_scrollback(&sid, pane_id)
+                            }
+                        }
                     }
                 }
                 Ok(WebToServer::UpdatePaneLabel {
@@ -5251,7 +6634,8 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     label,
                 }) => {
                     if let Some(sid) =
-                        resolve_target_session(&state, &connection_id, msg_sid, session_id).await
+                        resolve_pane_session(&state, &connection_id, msg_sid, session_id, pane_id)
+                            .await
                     {
                         let Ok((_project_id, _project_guard)) =
                             state.active_session_operation(&sid.to_string()).await
@@ -5330,17 +6714,29 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                         .await;
                         continue;
                     }
-                    tracing::info!("Interrupting pane {} in session {}", pane_id, sid);
-                    let routed = state
-                        .sessions
-                        .route_to_cli(
-                            &sid,
-                            ServerToCli::InterruptPane {
-                                session_id: sid,
-                                pane_id,
-                            },
-                        )
-                        .await;
+                    let result =
+                        match pane_control_refusal(&state, &connection_id, &sid, pane_id).await {
+                            Some(refusal) => Err(refusal),
+                            None => {
+                                tracing::info!("Interrupting pane {} in session {}", pane_id, sid);
+                                let outcome = state
+                                    .sessions
+                                    .route_to_cli_for_pane(
+                                        &sid,
+                                        pane_id,
+                                        ServerToCli::InterruptPane {
+                                            session_id: sid,
+                                            pane_id,
+                                        },
+                                    )
+                                    .await;
+                                if outcome.delivered() {
+                                    Ok(())
+                                } else {
+                                    Err(undelivered_message(&state, &outcome))
+                                }
+                            }
+                        };
                     send_mutation_ack(
                         &state,
                         &connection_id,
@@ -5348,9 +6744,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                         sid,
                         Some(pane_id),
                         shared::MutationKind::Interrupt,
-                        routed
-                            .then_some(())
-                            .ok_or("The project runtime is unavailable"),
+                        result,
                     )
                     .await;
                 }
@@ -5400,18 +6794,23 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             tool_use_id,
                             approve,
                         );
-                        let routed = state
-                            .sessions
-                            .route_to_cli(
-                                &sid,
-                                ServerToCli::PlanReviewAnswer {
-                                    session_id: sid,
-                                    tool_use_id: tool_use_id.clone(),
-                                    approve,
-                                },
-                            )
-                            .await;
-                        if !routed {
+                        let target_pane = claimed
+                            .as_ref()
+                            .and_then(|decision| decision.pane_id)
+                            .or(pane_id);
+                        let result = route_decision_answer(
+                            &state,
+                            &connection_id,
+                            &sid,
+                            target_pane,
+                            ServerToCli::PlanReviewAnswer {
+                                session_id: sid,
+                                tool_use_id: tool_use_id.clone(),
+                                approve,
+                            },
+                        )
+                        .await;
+                        if result.is_err() {
                             if let Some(decision) = claimed {
                                 state
                                     .sessions
@@ -5425,9 +6824,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             sid,
                             pane_id,
                             shared::MutationKind::PlanReview,
-                            routed
-                                .then_some(())
-                                .ok_or("The project runtime is unavailable"),
+                            result,
                         )
                         .await;
                     }
@@ -5438,7 +6835,8 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     mode,
                 }) => {
                     if let Some(sid) =
-                        resolve_target_session(&state, &connection_id, msg_sid, session_id).await
+                        resolve_pane_session(&state, &connection_id, msg_sid, session_id, pane_id)
+                            .await
                     {
                         tracing::info!(
                             "Update pane {} plan_review_mode for session {} → {:?}",
@@ -5465,7 +6863,8 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     manual_mode,
                 }) => {
                     if let Some(sid) =
-                        resolve_target_session(&state, &connection_id, msg_sid, session_id).await
+                        resolve_pane_session(&state, &connection_id, msg_sid, session_id, pane_id)
+                            .await
                     {
                         tracing::info!(
                             "Update pane {} manual_mode for session {} → {}",
@@ -5491,9 +6890,14 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     pane_id,
                     data_b64,
                 }) => {
-                    let Some(sid) =
-                        resolve_target_session(&state, &connection_id, Some(msg_sid), session_id)
-                            .await
+                    let Some(sid) = resolve_pane_session(
+                        &state,
+                        &connection_id,
+                        Some(msg_sid),
+                        session_id,
+                        pane_id,
+                    )
+                    .await
                     else {
                         continue;
                     };
@@ -5532,9 +6936,14 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     cols,
                     rows,
                 }) => {
-                    let Some(sid) =
-                        resolve_target_session(&state, &connection_id, Some(msg_sid), session_id)
-                            .await
+                    let Some(sid) = resolve_pane_session(
+                        &state,
+                        &connection_id,
+                        Some(msg_sid),
+                        session_id,
+                        pane_id,
+                    )
+                    .await
                     else {
                         continue;
                     };
@@ -5642,7 +7051,8 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     backstory,
                 }) => {
                     if let Some(sid) =
-                        resolve_target_session(&state, &connection_id, msg_sid, session_id).await
+                        resolve_pane_session(&state, &connection_id, msg_sid, session_id, pane_id)
+                            .await
                     {
                         tracing::info!(
                             "Updating pane {} role for session {} (role={:?}, goal={:?})",
@@ -5671,7 +7081,8 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     pane_id,
                 }) => {
                     if let Some(sid) =
-                        resolve_target_session(&state, &connection_id, msg_sid, session_id).await
+                        resolve_pane_session(&state, &connection_id, msg_sid, session_id, pane_id)
+                            .await
                     {
                         tracing::info!(
                             "Requesting pane diff for pane {} in session {}",
@@ -5695,7 +7106,8 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     pane_id,
                 }) => {
                     if let Some(sid) =
-                        resolve_target_session(&state, &connection_id, msg_sid, session_id).await
+                        resolve_pane_session(&state, &connection_id, msg_sid, session_id, pane_id)
+                            .await
                     {
                         tracing::info!("Create PR for pane {} in session {}", pane_id, sid);
                         state
@@ -5821,18 +7233,23 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             "Forwarding AskUserQuestion answers to CLI for session {}",
                             sid
                         );
-                        let routed = state
-                            .sessions
-                            .route_to_cli(
-                                &sid,
-                                ServerToCli::AnswerQuestion {
-                                    session_id: sid,
-                                    tool_use_id: tool_use_id.clone(),
-                                    answers,
-                                },
-                            )
-                            .await;
-                        if !routed {
+                        let target_pane = claimed
+                            .as_ref()
+                            .and_then(|decision| decision.pane_id)
+                            .or(pane_id);
+                        let result = route_decision_answer(
+                            &state,
+                            &connection_id,
+                            &sid,
+                            target_pane,
+                            ServerToCli::AnswerQuestion {
+                                session_id: sid,
+                                tool_use_id: tool_use_id.clone(),
+                                answers,
+                            },
+                        )
+                        .await;
+                        if result.is_err() {
                             if let Some(decision) = claimed {
                                 state
                                     .sessions
@@ -5846,9 +7263,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             sid,
                             pane_id,
                             shared::MutationKind::Question,
-                            routed
-                                .then_some(())
-                                .ok_or("The project runtime is unavailable"),
+                            result,
                         )
                         .await;
                     }
@@ -5859,7 +7274,8 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     effort,
                 }) => {
                     if let Some(sid) =
-                        resolve_target_session(&state, &connection_id, msg_sid, session_id).await
+                        resolve_pane_session(&state, &connection_id, msg_sid, session_id, pane_id)
+                            .await
                     {
                         let Ok((_project_id, _project_guard)) =
                             state.active_session_operation(&sid.to_string()).await
@@ -5910,7 +7326,8 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     model,
                 }) => {
                     if let Some(sid) =
-                        resolve_target_session(&state, &connection_id, msg_sid, session_id).await
+                        resolve_pane_session(&state, &connection_id, msg_sid, session_id, pane_id)
+                            .await
                     {
                         let Ok((_project_id, _project_guard)) =
                             state.active_session_operation(&sid.to_string()).await
@@ -5939,6 +7356,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                 &connection_id,
                                 &sid,
                                 desired_provider,
+                                InstanceTarget::Pane(pane_id),
                             )
                             .await
                         {
@@ -5952,6 +7370,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             desired_provider,
                             trimmed.as_deref(),
                             existing.managed,
+                            InstanceTarget::Pane(pane_id),
                         )
                         .await
                         {
@@ -6051,7 +7470,8 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     effort,
                 }) => {
                     if let Some(sid) =
-                        resolve_target_session(&state, &connection_id, msg_sid, session_id).await
+                        resolve_pane_session(&state, &connection_id, msg_sid, session_id, pane_id)
+                            .await
                     {
                         let Ok((_project_id, _project_guard)) =
                             state.active_session_operation(&sid.to_string()).await
@@ -6110,7 +7530,8 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     pane_id,
                 }) => {
                     if let Some(sid) =
-                        resolve_target_session(&state, &connection_id, msg_sid, session_id).await
+                        resolve_pane_session(&state, &connection_id, msg_sid, session_id, pane_id)
+                            .await
                     {
                         let Ok((_project_id, _project_guard)) =
                             state.active_session_operation(&sid.to_string()).await
@@ -6245,20 +7666,12 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                         continue;
                     };
 
-                    // Look up CLI client ID from database, but only trust it if
-                    // the CLI is actually connected (prevents stale IDs after server restart)
-                    let cli_client_id = match state.db.get_session(&sid.to_string()).await {
-                        Ok(Some(db_session)) => db_session
-                            .cli_client_id
-                            .and_then(|id| Uuid::parse_str(&id).ok())
-                            .filter(|id| state.sessions.is_cli_connected(id)),
-                        _ => None,
-                    };
-
-                    // Attach to an existing CLI session to observe output
+                    // Attach to the session to observe its instances' output. The
+                    // instances attached to it, not its database row, say which
+                    // CLIs run it.
                     if state
                         .sessions
-                        .attach_web_to_session(&sid, connection_id, cli_client_id)
+                        .attach_web_to_session(&sid, connection_id, None)
                     {
                         session_id = Some(sid);
                         state
@@ -6296,19 +7709,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             )
                             .await;
 
-                        if let Some(inventory) = state.sessions.lifecycle_inventory(&sid) {
-                            state
-                                .sessions
-                                .send_to_web(
-                                    &connection_id,
-                                    ServerToWeb::CliLifecycleInventory {
-                                        session_id: sid,
-                                        inventory,
-                                        machine_id: None,
-                                    },
-                                )
-                                .await;
-                        }
+                        replay_instances_after_attach(&state, &connection_id, sid).await;
 
                         // Replay current usage stats so the Overview panel is
                         // populated immediately on attach / hard refresh.
@@ -6615,6 +8016,13 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             panes: pane_summaries(&state, &session_id, is_active),
                             instances: Vec::new(),
                         });
+                    }
+                    // Every host a project runs on, not only the primary's, each
+                    // with whether this viewer may use it, which needs the
+                    // database and so is filled in once the list is built.
+                    for session in &mut sessions {
+                        session.instances =
+                            viewer_session_instances(&state, &session.id, &uid).await;
                     }
 
                     state
@@ -6944,17 +8352,15 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     }
                 }
                 Ok(WebToServer::ForgetMachinePanes {
-                    session_id: sid,
+                    session_id: msg_sid,
                     machine_id,
                 }) => {
-                    // Ignored, as older servers ignore the unknown message:
-                    // until sessions hold per-machine attachments every pane
-                    // belongs to the one instance, so there is nothing to forget.
-                    tracing::warn!(
-                        session_id = %sid,
-                        %machine_id,
-                        "Ignoring forget_machine_panes: multi-machine project instances are not supported by this server yet"
-                    );
+                    if let Some(sid) =
+                        resolve_target_session(&state, &connection_id, Some(msg_sid), session_id)
+                            .await
+                    {
+                        forget_machine_panes(&state, &connection_id, sid, machine_id).await;
+                    }
                 }
                 Err(e) => {
                     tracing::warn!("Failed to parse message: {}", e);
@@ -7212,5 +8618,2105 @@ mod project_settings_permission_tests {
         state.sessions.register_web(anon_conn, tx);
 
         assert!(!can_manage_project_settings(&state, &anon_conn, &session_id).await);
+    }
+}
+
+/// One project running on several machines, seen from the web: controls go
+/// to the instance that owns their pane or names their machine, a stopped
+/// machine's tabs are refused by name, runtime access is evaluated per
+/// machine, project-wide Start and Close cover every machine concerned, and
+/// viewers that asked are told about every instance.
+#[cfg(test)]
+mod project_instance_tests {
+    use super::*;
+    use crate::config::Config;
+    use crate::db::{Database, Session, User};
+    use crate::session::AttachOutcome;
+    use shared::{PaneConfig, PROJECT_INSTANCES_CAPABILITY};
+
+    const HOST_A: &str = "zoo-005";
+    const HOST_B: &str = "zoo-006";
+    const HOST_C: &str = "zoo-007";
+
+    /// What a capable instance's CLI advertises.
+    const CAPABLE_CLI: &[&str] = &[
+        PROJECT_INSTANCES_CAPABILITY,
+        shared::PROJECT_POLICY_CAPABILITY,
+        shared::CLI_LIFECYCLE_CAPABILITY,
+        shared::OMP_QUESTION_CAPABILITY,
+    ];
+    const CAPABLE_DAEMON: &[&str] = &[
+        PROJECT_INSTANCES_CAPABILITY,
+        shared::PROJECT_POLICY_CAPABILITY,
+    ];
+
+    struct Endpoint<T> {
+        id: Uuid,
+        rx: mpsc::Receiver<T>,
+    }
+
+    impl<T> Endpoint<T> {
+        fn drain(&mut self) -> Vec<T> {
+            let mut received = Vec::new();
+            while let Ok(message) = self.rx.try_recv() {
+                received.push(message);
+            }
+            received
+        }
+    }
+
+    struct Project {
+        state: AppState,
+        /// The project's owner.
+        owner: Uuid,
+        /// The account whose CLIs and daemons run the project; the owner
+        /// unless the project is hosted in another account's cluster.
+        host: Uuid,
+        session: Uuid,
+        m5: Uuid,
+        m6: Uuid,
+        dir: std::path::PathBuf,
+    }
+
+    impl Drop for Project {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    fn user(id: Uuid) -> User {
+        User {
+            id: id.to_string(),
+            email: format!("{id}@example.test"),
+            password_hash: "hash".to_string(),
+            created_at: None,
+            cluster_role: "user".to_string(),
+            account_status: "active".to_string(),
+        }
+    }
+
+    async fn project_on(owner: Uuid, host: Uuid, users: &[Uuid]) -> Project {
+        let dir = std::env::temp_dir().join(format!("apas-project-instances-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("apas.db").to_string_lossy().to_string();
+        let db = Database::new(&db_path).await.unwrap();
+        db.run_migrations().await.unwrap();
+        for id in users {
+            db.create_user(&user(*id)).await.unwrap();
+        }
+        let session = Uuid::new_v4();
+        db.authorize_project_registration(&session.to_string(), &owner.to_string())
+            .await
+            .unwrap();
+        db.create_session(&Session {
+            id: session.to_string(),
+            user_id: host.to_string(),
+            cli_client_id: None,
+            working_dir: Some(format!("/work/{HOST_A}")),
+            hostname: Some(HOST_A.to_string()),
+            status: "active".to_string(),
+            created_at: None,
+            updated_at: None,
+            is_paused: false,
+            project_id: Some(session.to_string()),
+            git_remote: None,
+            git_remote_url: None,
+        })
+        .await
+        .unwrap();
+        let mut config = Config::default();
+        config.database.path = db_path;
+        let state = AppState::new(db, config);
+        state
+            .sessions
+            .set_session_project(session, session.to_string());
+        Project {
+            state,
+            owner,
+            host,
+            session,
+            m5: Uuid::new_v4(),
+            m6: Uuid::new_v4(),
+            dir,
+        }
+    }
+
+    /// A project its owner runs on their own machines.
+    async fn project() -> Project {
+        let owner = Uuid::new_v4();
+        project_on(owner, owner, &[owner]).await
+    }
+
+    impl Project {
+        fn project_id(&self) -> String {
+            self.session.to_string()
+        }
+
+        fn cli(&self, capabilities: &[&str]) -> Endpoint<ServerToCli> {
+            let id = Uuid::new_v4();
+            let (tx, rx) = mpsc::channel(64);
+            self.state.sessions.register_cli(id, self.host, tx, None);
+            self.state.sessions.set_cli_capabilities(
+                id,
+                capabilities
+                    .iter()
+                    .map(|capability| capability.to_string())
+                    .collect(),
+            );
+            Endpoint { id, rx }
+        }
+
+        /// An instance of the project on `machine_id` whose CLI advertises
+        /// `capabilities`.
+        fn instance_with(
+            &self,
+            machine_id: Uuid,
+            host: &str,
+            capabilities: &[&str],
+        ) -> Endpoint<ServerToCli> {
+            let cli = self.cli(capabilities);
+            assert!(matches!(
+                self.state.sessions.attach_cli_instance(
+                    self.session,
+                    cli.id,
+                    Some(machine_id),
+                    Some(format!("/work/{host}")),
+                    Some(host.to_string()),
+                ),
+                AttachOutcome::Attached { .. }
+            ));
+            cli
+        }
+
+        fn instance(&self, machine_id: Uuid, host: &str) -> Endpoint<ServerToCli> {
+            self.instance_with(machine_id, host, CAPABLE_CLI)
+        }
+
+        /// A web connection of `user` attached to the project's session.
+        fn viewer(&self, user_id: Uuid, capabilities: &[&str]) -> Endpoint<ServerToWeb> {
+            let id = Uuid::new_v4();
+            let (tx, rx) = mpsc::channel(256);
+            self.state.sessions.register_web(id, tx);
+            self.state.sessions.set_web_user(id, user_id);
+            self.state.sessions.set_web_capabilities(
+                id,
+                capabilities
+                    .iter()
+                    .map(|capability| capability.to_string())
+                    .collect(),
+            );
+            assert!(self
+                .state
+                .sessions
+                .attach_web_to_session(&self.session, id, None));
+            Endpoint { id, rx }
+        }
+
+        /// A connected daemon that lists the project.
+        fn daemon(
+            &self,
+            machine_id: Uuid,
+            host: &str,
+            capabilities: &[&str],
+        ) -> Endpoint<ServerToDaemon> {
+            let (tx, rx) = mpsc::channel(16);
+            self.state.sessions.register_daemon(
+                machine_id,
+                self.host,
+                tx,
+                shared::MachineInfo {
+                    machine_id,
+                    hostname: host.to_string(),
+                    os: "linux".to_string(),
+                    arch: "x86_64".to_string(),
+                    daemon_version: None,
+                    deepseek_backend: None,
+                    last_seen: None,
+                },
+                vec![shared::MachineProjectInfo {
+                    project_id: self.project_id(),
+                    name: None,
+                    path: format!("/work/{host}"),
+                    preferred_machine_id: None,
+                    is_running: false,
+                    pid: None,
+                    memory_kb: None,
+                    last_error: None,
+                    git_remote: None,
+                }],
+            );
+            self.state.sessions.set_daemon_capabilities(
+                machine_id,
+                capabilities
+                    .iter()
+                    .map(|capability| capability.to_string())
+                    .collect(),
+            );
+            Endpoint { id: machine_id, rx }
+        }
+
+        fn roster(&self, panes: Vec<PaneConfig>) {
+            self.state.sessions.set_session_panes(&self.session, panes);
+        }
+
+        fn pane_ids(&self) -> Vec<u32> {
+            self.state
+                .sessions
+                .get_session_panes(&self.session)
+                .iter()
+                .map(|pane| pane.pane_id)
+                .collect()
+        }
+    }
+
+    fn pane(pane_id: u32, machine_id: Option<Uuid>, hostname: Option<&str>) -> PaneConfig {
+        let mut pane = PaneConfig::defaults().remove(0);
+        pane.pane_id = pane_id;
+        pane.kind = shared::PaneKind::Terminal;
+        pane.label = None;
+        pane.machine_id = machine_id;
+        pane.hostname = hostname.map(str::to_string);
+        pane
+    }
+
+    fn errors(messages: &[ServerToWeb]) -> Vec<String> {
+        messages
+            .iter()
+            .filter_map(|message| match message {
+                ServerToWeb::Error { message } => Some(message.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn not_running(host: &str) -> String {
+        format!("{host} is not running this project. Start it on {host} first.")
+    }
+
+    fn started(daemon: &mut Endpoint<ServerToDaemon>) -> bool {
+        daemon
+            .drain()
+            .iter()
+            .any(|message| matches!(message, ServerToDaemon::StartProjectCli { .. }))
+    }
+
+    fn stopped(daemon: &mut Endpoint<ServerToDaemon>) -> bool {
+        daemon
+            .drain()
+            .iter()
+            .any(|message| matches!(message, ServerToDaemon::StopProjectCli { .. }))
+    }
+
+    /// A control for a tab whose machine runs no instance is refused by
+    /// naming that machine, whether the tab is tagged for it or only
+    /// attributed to its host, and nothing reaches the instance that runs.
+    /// A tab no host is known for still goes to the primary.
+    #[tokio::test]
+    async fn a_stopped_machines_tab_is_refused_by_name() {
+        let p = project().await;
+        let mut a = p.instance(p.m5, HOST_A);
+        let mut web = p.viewer(p.owner, &[]);
+        p.roster(vec![
+            pane(3, Some(p.m5), Some(HOST_A)),
+            pane(4, Some(p.m6), Some(HOST_B)),
+            pane(5, None, Some(HOST_B)),
+            pane(6, None, None),
+        ]);
+
+        for pane_id in [4, 5] {
+            assert_eq!(
+                resolve_pane_session(&p.state, &web.id, Some(p.session), None, pane_id).await,
+                None
+            );
+            assert_eq!(
+                errors(&web.drain()),
+                vec![not_running(HOST_B)],
+                "pane {pane_id}"
+            );
+            handle_web_input(
+                &p.state,
+                &web.id,
+                None,
+                Some(p.session),
+                "keep going".to_string(),
+                None,
+                Some(pane_id),
+                None,
+            )
+            .await;
+            assert_eq!(
+                errors(&web.drain()),
+                vec![not_running(HOST_B)],
+                "pane {pane_id}"
+            );
+        }
+        assert!(a.drain().is_empty(), "nothing reaches the running instance");
+
+        for pane_id in [3, 6] {
+            assert_eq!(
+                resolve_pane_session(&p.state, &web.id, Some(p.session), None, pane_id).await,
+                Some(p.session),
+                "pane {pane_id}"
+            );
+        }
+        handle_web_input(
+            &p.state,
+            &web.id,
+            None,
+            Some(p.session),
+            "for the unhosted tab".to_string(),
+            None,
+            Some(6),
+            None,
+        )
+        .await;
+        assert!(matches!(
+            a.drain().as_slice(),
+            [ServerToCli::Input {
+                pane_id: Some(6),
+                ..
+            }]
+        ));
+        assert!(errors(&web.drain()).is_empty());
+    }
+
+    /// Typed input, approvals, answers and pane controls for a tab on the
+    /// secondary machine reach that machine's instance and no other; input
+    /// naming no pane goes to whichever instance runs the interactive pane.
+    #[tokio::test]
+    async fn controls_reach_only_the_instance_that_owns_the_pane() {
+        let p = project().await;
+        let mut a = p.instance(p.m5, HOST_A);
+        let mut b = p.instance(p.m6, HOST_B);
+        let mut web = p.viewer(p.owner, &[]);
+        p.roster(vec![
+            pane(shared::PANE_ID_INTERACTIVE, Some(p.m6), Some(HOST_B)),
+            pane(3, Some(p.m5), Some(HOST_A)),
+            pane(4, Some(p.m6), Some(HOST_B)),
+        ]);
+
+        handle_web_input(
+            &p.state,
+            &web.id,
+            None,
+            Some(p.session),
+            "typed".to_string(),
+            None,
+            Some(4),
+            None,
+        )
+        .await;
+        assert!(matches!(
+            b.drain().as_slice(),
+            [ServerToCli::Input {
+                pane_id: Some(4),
+                ..
+            }]
+        ));
+        handle_web_input(
+            &p.state,
+            &web.id,
+            None,
+            Some(p.session),
+            "no pane named".to_string(),
+            None,
+            None,
+            None,
+        )
+        .await;
+        assert!(matches!(
+            b.drain().as_slice(),
+            [ServerToCli::Input { pane_id: None, .. }]
+        ));
+
+        p.state.sessions.register_pending_decision(
+            p.session,
+            "approval-4".to_string(),
+            Some(4),
+            shared::MutationKind::Approval,
+        );
+        handle_approval_decision(
+            &p.state,
+            &web.id,
+            None,
+            Some(p.session),
+            "approval-4".to_string(),
+            None,
+            Some("approve-1".to_string()),
+            "y",
+        )
+        .await;
+        assert!(matches!(
+            b.drain().as_slice(),
+            [ServerToCli::Input { pane_id: Some(4), data, .. }] if data == "y"
+        ));
+        assert!(web.drain().iter().any(|message| matches!(
+            message,
+            ServerToWeb::MutationAck { request_id, accepted: true, .. } if request_id == "approve-1"
+        )));
+
+        // A question's answer names no pane on the wire; its decision does,
+        // and the handler has claimed it by the time the answer is routed.
+        p.state.sessions.register_pending_decision(
+            p.session,
+            "toolu_question".to_string(),
+            Some(4),
+            shared::MutationKind::Question,
+        );
+        let decision = p
+            .state
+            .sessions
+            .claim_pending_decision(
+                p.session,
+                "toolu_question",
+                None,
+                shared::MutationKind::Question,
+            )
+            .unwrap();
+        route_decision_answer(
+            &p.state,
+            &web.id,
+            &p.session,
+            decision.pane_id,
+            ServerToCli::AnswerQuestion {
+                session_id: p.session,
+                tool_use_id: "toolu_question".to_string(),
+                answers: std::collections::HashMap::new(),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            b.drain().as_slice(),
+            [ServerToCli::AnswerQuestion { .. }]
+        ));
+
+        // Pane controls follow the pane, whichever instance is primary.
+        let sid = resolve_pane_session(&p.state, &web.id, Some(p.session), None, 3)
+            .await
+            .unwrap();
+        p.state
+            .sessions
+            .route_to_cli(
+                &sid,
+                ServerToCli::PausePane {
+                    session_id: sid,
+                    pane_id: 3,
+                },
+            )
+            .await;
+        assert!(matches!(
+            a.drain().as_slice(),
+            [ServerToCli::PausePane { pane_id: 3, .. }]
+        ));
+        assert!(b.drain().is_empty());
+        assert!(errors(&web.drain()).is_empty());
+    }
+
+    /// An approval for a tab whose machine stopped is refused by name, and
+    /// the decision stays pending for when that machine runs again.
+    #[tokio::test]
+    async fn an_answer_for_a_stopped_machines_tab_is_refused_and_kept() {
+        let p = project().await;
+        let mut a = p.instance(p.m5, HOST_A);
+        let mut web = p.viewer(p.owner, &[]);
+        p.roster(vec![
+            pane(3, Some(p.m5), Some(HOST_A)),
+            pane(4, Some(p.m6), Some(HOST_B)),
+        ]);
+        p.state.sessions.register_pending_decision(
+            p.session,
+            "approval-4".to_string(),
+            Some(4),
+            shared::MutationKind::Approval,
+        );
+
+        handle_approval_decision(
+            &p.state,
+            &web.id,
+            None,
+            Some(p.session),
+            "approval-4".to_string(),
+            Some(4),
+            Some("reject-1".to_string()),
+            "n",
+        )
+        .await;
+        assert!(web.drain().iter().any(|message| matches!(
+            message,
+            ServerToWeb::MutationAck { request_id, accepted: false, error: Some(error), .. }
+                if request_id == "reject-1" && *error == not_running(HOST_B)
+        )));
+        assert!(a.drain().is_empty());
+        assert!(p
+            .state
+            .sessions
+            .claim_pending_decision(
+                p.session,
+                "approval-4",
+                Some(4),
+                shared::MutationKind::Approval,
+            )
+            .is_some());
+    }
+
+    /// The OMP answer, its capability check and the waiter for its receipt
+    /// all name the instance that runs the asking pane, even when the
+    /// primary's CLI could not take the answer.
+    #[tokio::test]
+    async fn an_omp_answer_goes_to_the_instance_that_asked() {
+        let p = project().await;
+        let mut a = p.instance_with(
+            p.m5,
+            HOST_A,
+            &[
+                PROJECT_INSTANCES_CAPABILITY,
+                shared::PROJECT_POLICY_CAPABILITY,
+            ],
+        );
+        let mut b = p.instance(p.m6, HOST_B);
+        let mut web = p.viewer(p.owner, &[]);
+        let mut asking = pane(7, Some(p.m6), Some(HOST_B));
+        asking.provider = shared::Provider::Omp;
+        p.roster(vec![asking]);
+        p.state.sessions.register_pending_decision(
+            p.session,
+            "omp:7:native:question".to_string(),
+            Some(7),
+            shared::MutationKind::Question,
+        );
+        let answer = WebToServer::AnswerOmpQuestion {
+            session_id: p.session,
+            pane_id: 7,
+            tool_use_id: "omp:7:native:question".to_string(),
+            dialog_id: Uuid::new_v4(),
+            request_id: "omp-answer-1".to_string(),
+            answers: Vec::new(),
+            cancel: true,
+        };
+
+        tokio::join!(
+            handle_omp_question_answer(&p.state, &web.id, answer),
+            async {
+                let message = tokio::time::timeout(Duration::from_secs(5), b.rx.recv())
+                    .await
+                    .expect("the asking instance receives it")
+                    .unwrap();
+                assert!(matches!(
+                    message,
+                    ServerToCli::AnswerOmpQuestion { pane_id: 7, .. }
+                ));
+                assert!(p.state.sessions.finish_omp_answer(
+                    p.session,
+                    7,
+                    b.id,
+                    "omp:7:native:question",
+                    "omp-answer-1",
+                    crate::session::OmpAnswerReceipt {
+                        accepted: true,
+                        pending: false,
+                        error: None,
+                    },
+                ));
+            },
+        );
+        assert!(web.drain().iter().any(|message| matches!(
+            message,
+            ServerToWeb::MutationAck { request_id, accepted: true, .. } if request_id == "omp-answer-1"
+        )));
+        assert!(a.drain().is_empty());
+    }
+
+    /// A project hosted in another account's cluster, viewed by a project
+    /// member whose membership of that cluster covers only zoo-005.
+    async fn hosted_project() -> (Project, Uuid) {
+        let owner = Uuid::new_v4();
+        let host = Uuid::new_v4();
+        let member = Uuid::new_v4();
+        let p = project_on(owner, host, &[owner, host, member]).await;
+        p.state
+            .db
+            .add_project_member(&owner.to_string(), &p.project_id(), &member.to_string())
+            .await
+            .unwrap();
+        let token_hash = Uuid::new_v4().to_string();
+        p.state
+            .db
+            .create_shared_cluster_invitation(
+                &Uuid::new_v4().to_string(),
+                &token_hash,
+                &host.to_string(),
+                &format!("{member}@example.test"),
+                &(chrono::Utc::now() + chrono::Duration::hours(1))
+                    .format("%Y-%m-%d %H:%M:%S")
+                    .to_string(),
+            )
+            .await
+            .unwrap();
+        p.state
+            .db
+            .accept_shared_cluster_invitation(&token_hash, &member.to_string())
+            .await
+            .unwrap()
+            .unwrap();
+        p.state
+            .db
+            .update_cluster_member_policy(
+                &host.to_string(),
+                &member.to_string(),
+                Some(vec![p.m5.to_string()]),
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        (p, member)
+    }
+
+    /// Runtime access is evaluated per machine: the member may attach while
+    /// zoo-005 runs an instance and use its tabs, is refused zoo-006's tabs
+    /// and reboot by name, and is told which instances they may use. With
+    /// only zoo-006 running they may not use the project at all.
+    #[tokio::test]
+    async fn runtime_access_is_evaluated_per_machine() {
+        let (p, member) = hosted_project().await;
+        let mut a = p.instance(p.m5, HOST_A);
+        let mut b = p.instance(p.m6, HOST_B);
+        let mut web = p.viewer(member, &[PROJECT_INSTANCES_CAPABILITY]);
+        p.roster(vec![
+            pane(3, Some(p.m5), Some(HOST_A)),
+            pane(4, Some(p.m6), Some(HOST_B)),
+        ]);
+
+        assert!(has_session_runtime_access(&p.state, &p.session, &member).await);
+        assert_eq!(
+            resolve_pane_session(&p.state, &web.id, Some(p.session), None, 3).await,
+            Some(p.session)
+        );
+        assert_eq!(
+            resolve_pane_session(&p.state, &web.id, Some(p.session), None, 4).await,
+            None
+        );
+        let refused = errors(&web.drain());
+        assert_eq!(refused.len(), 1);
+        assert!(
+            refused[0].starts_with("Access denied") && refused[0].contains(HOST_B),
+            "{refused:?}"
+        );
+        handle_reboot_cli(&p.state, &web.id, p.session, Some(p.m6)).await;
+        assert!(errors(&web.drain())[0].starts_with("Access denied"));
+        assert!(b.drain().is_empty());
+
+        // The instance set this viewer is sent says which instances it may use,
+        // both when replayed on attach and when broadcast on a change.
+        replay_instances_after_attach(&p.state, &web.id, p.session).await;
+        let access = |message: &ServerToWeb| match message {
+            ServerToWeb::SessionInstances { instances, .. } => Some(
+                instances
+                    .iter()
+                    .map(|instance| (instance.machine_id, instance.runtime_access))
+                    .collect::<Vec<_>>(),
+            ),
+            _ => None,
+        };
+        let expected = vec![(Some(p.m5), Some(true)), (Some(p.m6), Some(false))];
+        assert_eq!(web.drain().iter().find_map(access), Some(expected.clone()));
+        let broadcast = ServerToWeb::SessionInstances {
+            session_id: p.session,
+            instances: p.state.sessions.session_instances(&p.session),
+        };
+        assert_eq!(
+            access(&broadcast).unwrap()[1].1,
+            None,
+            "broadcast unevaluated"
+        );
+        let delivered = with_viewer_runtime_access(&p.state, &web.id, broadcast).await;
+        assert_eq!(access(&delivered), Some(expected));
+
+        // A narrowed membership keeps the viewer while an instance it may
+        // use runs, and detaches it once none does.
+        let allowed = HashSet::from([p.m5]);
+        assert_eq!(
+            p.state
+                .sessions
+                .enforce_cluster_machine_access_for_user(p.host, member, Some(&allowed))
+                .await,
+            0
+        );
+        assert!(p
+            .state
+            .sessions
+            .is_web_attached_to_session(&p.session, &web.id));
+        p.state
+            .sessions
+            .detach_cli_instance(&p.session, &a.id)
+            .unwrap();
+        assert!(!has_session_runtime_access(&p.state, &p.session, &member).await);
+        // With zoo-005 gone between the session's check and a pane control,
+        // the pane check still evaluates zoo-006 in its own right.
+        assert!(pane_control_refusal(&p.state, &web.id, &p.session, 4)
+            .await
+            .is_some_and(|refusal| refusal.starts_with("Access denied")));
+        assert_eq!(
+            p.state
+                .sessions
+                .enforce_cluster_machine_access_for_user(p.host, member, Some(&allowed))
+                .await,
+            1
+        );
+        assert!(!p
+            .state
+            .sessions
+            .is_web_attached_to_session(&p.session, &web.id));
+        assert!(a.drain().is_empty());
+    }
+
+    /// Forgetting a stopped machine drops its tagged tabs and the untagged
+    /// ones attributed to its host from the roster, persists that, tells
+    /// viewers, and tells every running instance so a shared `.apas` drops
+    /// the machine's entries too.
+    #[tokio::test]
+    async fn forgetting_a_stopped_machine_drops_its_tabs_everywhere() {
+        let p = project().await;
+        let mut a = p.instance(p.m5, HOST_A);
+        let _d6 = p.daemon(p.m6, HOST_B, CAPABLE_DAEMON);
+        let mut web = p.viewer(p.owner, &[]);
+        p.roster(vec![
+            pane(3, Some(p.m5), Some(HOST_A)),
+            pane(4, Some(p.m6), Some(HOST_B)),
+            pane(5, None, Some(HOST_B)),
+            pane(6, None, Some(HOST_A)),
+        ]);
+        p.state
+            .sessions
+            .append_terminal_output(&p.session, 4, None, b"last frame", 1);
+        p.state.sessions.register_pending_decision(
+            p.session,
+            "approval-5".to_string(),
+            Some(5),
+            shared::MutationKind::Approval,
+        );
+
+        forget_machine_panes(&p.state, &web.id, p.session, p.m6).await;
+
+        assert_eq!(p.pane_ids(), vec![3, 6]);
+        let persisted = p
+            .state
+            .storage
+            .load_pane_roster(&p.session)
+            .await
+            .unwrap()
+            .expect("the roster is persisted");
+        assert_eq!(
+            persisted
+                .iter()
+                .map(|pane| pane.pane_id)
+                .collect::<Vec<_>>(),
+            vec![3, 6]
+        );
+        let received = web.drain();
+        assert!(errors(&received).is_empty(), "{received:?}");
+        assert!(received.iter().any(|message| matches!(
+            message,
+            ServerToWeb::PaneList { panes, .. }
+                if panes.iter().map(|pane| pane.pane_id).collect::<Vec<_>>() == vec![3, 6]
+        )));
+        assert!(matches!(
+            a.drain().as_slice(),
+            [ServerToCli::ForgetMachinePanes { machine_id, .. }] if *machine_id == p.m6
+        ));
+        assert!(p.state.sessions.terminal_snapshot(&p.session, 4).is_none());
+        assert!(p
+            .state
+            .sessions
+            .claim_pending_decision(
+                p.session,
+                "approval-5",
+                Some(5),
+                shared::MutationKind::Approval,
+            )
+            .is_none());
+    }
+
+    /// Only someone who may change project settings can forget a machine,
+    /// never while that machine runs an instance (which would report its
+    /// tabs again), nor while a CLI that reported no machine runs on its host.
+    #[tokio::test]
+    async fn forgetting_is_refused_without_authority_or_while_the_machine_runs() {
+        let owner = Uuid::new_v4();
+        let member = Uuid::new_v4();
+        let p = project_on(owner, owner, &[owner, member]).await;
+        p.state
+            .db
+            .add_project_member(&owner.to_string(), &p.project_id(), &member.to_string())
+            .await
+            .unwrap();
+        let mut a = p.instance(p.m5, HOST_A);
+        let mut b = p.instance(p.m6, HOST_B);
+        let mut owner_web = p.viewer(owner, &[]);
+        let mut member_web = p.viewer(member, &[]);
+        let roster = vec![
+            pane(3, Some(p.m5), Some(HOST_A)),
+            pane(4, Some(p.m6), Some(HOST_B)),
+        ];
+        p.roster(roster.clone());
+
+        forget_machine_panes(&p.state, &member_web.id, p.session, p.m6).await;
+        assert!(errors(&member_web.drain())[0].starts_with("Only the project owner"));
+        forget_machine_panes(&p.state, &owner_web.id, p.session, p.m6).await;
+        assert_eq!(
+            errors(&owner_web.drain()),
+            vec![format!(
+                "{HOST_B} is running this project. Stop it there before forgetting its tabs."
+            )]
+        );
+        assert_eq!(p.pane_ids(), vec![3, 4]);
+        assert!(a.drain().is_empty() && b.drain().is_empty());
+
+        // A CLI without the capability that reported no machine owns every
+        // pane it reports; on zoo-006's host it may be zoo-006 itself.
+        p.state
+            .sessions
+            .detach_cli_instance(&p.session, &a.id)
+            .unwrap();
+        p.state
+            .sessions
+            .detach_cli_instance(&p.session, &b.id)
+            .unwrap();
+        let older = p.cli(&[]);
+        assert!(matches!(
+            p.state.sessions.attach_cli_instance(
+                p.session,
+                older.id,
+                None,
+                None,
+                Some(HOST_B.to_string()),
+            ),
+            AttachOutcome::Attached { .. }
+        ));
+        p.roster(roster.clone());
+        forget_machine_panes(&p.state, &owner_web.id, p.session, p.m6).await;
+        assert_eq!(errors(&owner_web.drain()).len(), 1);
+        assert_eq!(p.pane_ids(), vec![3, 4]);
+
+        // A capable instance under another machine id on that host, such as
+        // the same host after its machine id changed, reports its own tabs
+        // tagged and does not keep the old id's tabs from being forgotten.
+        p.state
+            .sessions
+            .detach_cli_instance(&p.session, &older.id)
+            .unwrap();
+        let mut renamed = p.instance(Uuid::new_v4(), HOST_B);
+        p.roster(roster);
+        forget_machine_panes(&p.state, &owner_web.id, p.session, p.m6).await;
+        assert!(errors(&owner_web.drain()).is_empty());
+        assert_eq!(p.pane_ids(), vec![3]);
+        assert!(matches!(
+            renamed.drain().as_slice(),
+            [ServerToCli::ForgetMachinePanes { machine_id, .. }] if *machine_id == p.m6
+        ));
+    }
+
+    /// After a server restart a stopped machine's tabs are known only from
+    /// `panes.json`, with the host they were last reported under; forgetting
+    /// that machine loads them first and never saves the roster empty.
+    #[tokio::test]
+    async fn forgetting_after_a_restart_loads_the_persisted_roster() {
+        let p = project().await;
+        p.state
+            .storage
+            .save_pane_list(
+                &p.session,
+                &[
+                    pane(3, Some(p.m5), Some(HOST_A)),
+                    pane(4, Some(p.m6), Some(HOST_B)),
+                    pane(5, None, Some(HOST_B)),
+                ],
+            )
+            .await
+            .unwrap();
+        let restarted = AppState::new(p.state.db.clone(), p.state.config.clone());
+        let id = Uuid::new_v4();
+        let (tx, mut rx) = mpsc::channel(64);
+        restarted.sessions.register_web(id, tx);
+        restarted.sessions.set_web_user(id, p.owner);
+        assert!(restarted
+            .sessions
+            .attach_web_to_session(&p.session, id, None));
+        restarted
+            .sessions
+            .set_session_project(p.session, p.project_id());
+
+        forget_machine_panes(&restarted, &id, p.session, p.m6).await;
+
+        let ids = |panes: &[PaneConfig]| panes.iter().map(|pane| pane.pane_id).collect::<Vec<_>>();
+        assert_eq!(
+            ids(&restarted.sessions.get_session_panes(&p.session)),
+            vec![3]
+        );
+        let persisted = restarted
+            .storage
+            .load_pane_roster(&p.session)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(ids(&persisted), vec![3]);
+        let mut errors_seen = Vec::new();
+        while let Ok(message) = rx.try_recv() {
+            if let ServerToWeb::Error { message } = message {
+                errors_seen.push(message);
+            }
+        }
+        assert!(errors_seen.is_empty(), "{errors_seen:?}");
+    }
+
+    /// The project view's Start starts each online, capable machine that owns
+    /// tabs, counting an untagged tab for its attributed host, and falls back
+    /// to the machine it named only when none qualifies. The Machines page's
+    /// per-machine Start starts that machine alone.
+    #[tokio::test]
+    async fn a_project_wide_start_starts_each_machine_that_owns_tabs() {
+        let p = project().await;
+        let m7 = Uuid::new_v4();
+        let mut d5 = p.daemon(p.m5, HOST_A, CAPABLE_DAEMON);
+        let mut d6 = p.daemon(p.m6, HOST_B, CAPABLE_DAEMON);
+        let mut d7 = p.daemon(m7, HOST_C, CAPABLE_DAEMON);
+        let mut web = p.viewer(p.owner, &[shared::PROJECT_POLICY_CAPABILITY]);
+        p.roster(vec![
+            pane(3, Some(p.m5), Some(HOST_A)),
+            pane(4, None, Some(HOST_B)),
+        ]);
+        let project_id = p.project_id();
+        let start = |machine_id: Uuid, all_instances: bool| {
+            start_machine_project(
+                &p.state,
+                &web.id,
+                &p.owner,
+                machine_id,
+                &project_id,
+                all_instances,
+            )
+        };
+
+        start(m7, true).await;
+        assert!(started(&mut d5) && started(&mut d6));
+        assert!(!started(&mut d7), "zoo-007 owns no tabs");
+
+        start(m7, false).await;
+        assert!(started(&mut d7));
+        assert!(!started(&mut d5) && !started(&mut d6));
+
+        // A daemon that cannot run an instance beside others does not qualify.
+        p.state
+            .sessions
+            .set_daemon_capabilities(p.m6, vec![shared::PROJECT_POLICY_CAPABILITY.to_string()]);
+        start(m7, true).await;
+        assert!(started(&mut d5));
+        assert!(!started(&mut d6) && !started(&mut d7));
+
+        // With no tabs anywhere, the named machine starts.
+        p.roster(Vec::new());
+        start(p.m6, true).await;
+        assert!(started(&mut d6));
+        assert!(!started(&mut d5) && !started(&mut d7));
+        assert!(errors(&web.drain()).is_empty());
+    }
+
+    /// The project view's Close stops every machine with an instance
+    /// attached, as well as the machine it named; a per-machine Stop stops
+    /// that machine alone.
+    #[tokio::test]
+    async fn a_project_wide_close_stops_every_attached_instance() {
+        let p = project().await;
+        let m7 = Uuid::new_v4();
+        let mut d5 = p.daemon(p.m5, HOST_A, CAPABLE_DAEMON);
+        let mut d6 = p.daemon(p.m6, HOST_B, CAPABLE_DAEMON);
+        let mut d7 = p.daemon(m7, HOST_C, CAPABLE_DAEMON);
+        let _a = p.instance(p.m5, HOST_A);
+        let _b = p.instance(p.m6, HOST_B);
+        let mut web = p.viewer(p.owner, &[]);
+
+        stop_machine_project(&p.state, &web.id, &p.owner, m7, &p.project_id(), true).await;
+        assert!(stopped(&mut d5) && stopped(&mut d6) && stopped(&mut d7));
+
+        stop_machine_project(&p.state, &web.id, &p.owner, p.m5, &p.project_id(), false).await;
+        assert!(stopped(&mut d5));
+        assert!(!stopped(&mut d6) && !stopped(&mut d7));
+        assert!(errors(&web.drain()).is_empty());
+    }
+
+    /// A reboot reaches only the instance on the machine it names, else the
+    /// primary; a named machine that runs no instance is refused by name,
+    /// and only the target's own panes can block it.
+    #[tokio::test]
+    async fn a_reboot_reaches_only_the_named_machines_instance() {
+        let p = project().await;
+        let m7 = Uuid::new_v4();
+        let _d7 = p.daemon(m7, HOST_C, CAPABLE_DAEMON);
+        let mut a = p.instance(p.m5, HOST_A);
+        let mut b = p.instance(p.m6, HOST_B);
+        let mut web = p.viewer(p.owner, &[shared::PROJECT_POLICY_CAPABILITY]);
+        let mut retired = pane(3, Some(p.m5), Some(HOST_A));
+        retired.model = Some("MiniMax-M2.7".to_string());
+        p.roster(vec![retired, pane(4, Some(p.m6), Some(HOST_B))]);
+
+        handle_reboot_cli(&p.state, &web.id, p.session, Some(p.m6)).await;
+        assert!(matches!(
+            b.drain().as_slice(),
+            [ServerToCli::RebootCli { .. }]
+        ));
+        assert!(a.drain().is_empty());
+        assert!(errors(&web.drain()).is_empty());
+
+        handle_reboot_cli(&p.state, &web.id, p.session, None).await;
+        assert!(errors(&web.drain())[0].contains("retired provider"));
+        assert!(
+            a.drain().is_empty(),
+            "the primary's own retired pane blocks it"
+        );
+
+        handle_reboot_cli(&p.state, &web.id, p.session, Some(m7)).await;
+        assert_eq!(errors(&web.drain()), vec![not_running(HOST_C)]);
+        assert!(a.drain().is_empty() && b.drain().is_empty());
+    }
+
+    /// A lifecycle request reaches only the named machine's instance, carries
+    /// that instance's inventory, names its machine, and ignores progress
+    /// reported by another machine.
+    #[tokio::test]
+    async fn a_lifecycle_request_is_bound_to_its_machine() {
+        let p = project().await;
+        let mut a = p.instance(p.m5, HOST_A);
+        let mut b = p.instance(p.m6, HOST_B);
+        let mut web = p.viewer(p.owner, &[shared::PROJECT_POLICY_CAPABILITY]);
+        let inventory = |hosting: bool| shared::CliLifecycleInventory {
+            persistent_terminal_hosting: hosting,
+            ..shared::CliLifecycleInventory::default()
+        };
+        p.state
+            .sessions
+            .set_lifecycle_inventory(p.session, Some(p.m5), inventory(true));
+        p.state
+            .sessions
+            .set_lifecycle_inventory(p.session, Some(p.m6), inventory(false));
+        let request = Uuid::new_v4();
+        let operation = shared::CliLifecycleOperation::RebootCli;
+
+        handle_cli_lifecycle_request(
+            &p.state,
+            &web.id,
+            p.session,
+            p.owner,
+            request,
+            operation,
+            Some(p.m6),
+        )
+        .await;
+        assert!(matches!(
+            b.drain().as_slice(),
+            [ServerToCli::CliLifecycleRequest { request_id, .. }] if *request_id == request
+        ));
+        assert!(a.drain().is_empty());
+        assert!(web.drain().iter().any(|message| matches!(
+            message,
+            ServerToWeb::CliLifecycleStatus {
+                phase: shared::CliLifecyclePhase::Accepted,
+                machine_id: Some(machine),
+                inventory: Some(inventory),
+                ..
+            } if *machine == p.m6 && !inventory.persistent_terminal_hosting
+        )));
+        assert!(p
+            .state
+            .sessions
+            .update_lifecycle_request_from_instance(
+                request,
+                p.session,
+                Some(p.m5),
+                operation,
+                shared::CliLifecyclePhase::Failed,
+                None,
+                None,
+            )
+            .is_none());
+        assert!(p
+            .state
+            .sessions
+            .update_lifecycle_request_from_instance(
+                request,
+                p.session,
+                Some(p.m6),
+                operation,
+                shared::CliLifecyclePhase::Succeeded,
+                None,
+                None,
+            )
+            .is_some());
+
+        let missing = Uuid::new_v4();
+        let unknown_machine = Uuid::new_v4();
+        handle_cli_lifecycle_request(
+            &p.state,
+            &web.id,
+            p.session,
+            p.owner,
+            missing,
+            operation,
+            Some(unknown_machine),
+        )
+        .await;
+        assert!(web.drain().iter().any(|message| matches!(
+            message,
+            ServerToWeb::CliLifecycleStatus {
+                request_id,
+                phase: shared::CliLifecyclePhase::Failed,
+                machine_id: Some(machine),
+                message: Some(text),
+                ..
+            } if *request_id == missing
+                && *machine == unknown_machine
+                && text.contains("is not running this project")
+        )));
+        assert!(a.drain().is_empty() && b.drain().is_empty());
+    }
+
+    /// Right after attaching, a viewer that advertised project instances is
+    /// sent the instance set and one inventory per instance; any other
+    /// viewer gets no instance set and only the primary's inventory.
+    #[tokio::test]
+    async fn only_a_viewer_that_asked_is_sent_the_instance_set() {
+        let p = project().await;
+        let _a = p.instance(p.m5, HOST_A);
+        let _b = p.instance(p.m6, HOST_B);
+        for machine in [p.m5, p.m6] {
+            p.state.sessions.set_lifecycle_inventory(
+                p.session,
+                Some(machine),
+                shared::CliLifecycleInventory::default(),
+            );
+        }
+        let mut capable = p.viewer(p.owner, &[PROJECT_INSTANCES_CAPABILITY]);
+        let mut older = p.viewer(p.owner, &[]);
+
+        replay_instances_after_attach(&p.state, &capable.id, p.session).await;
+        replay_instances_after_attach(&p.state, &older.id, p.session).await;
+
+        let capable = capable.drain();
+        assert!(matches!(
+            capable.first(),
+            Some(ServerToWeb::SessionInstances { instances, .. })
+                if instances.len() == 2
+                    && instances[0].primary
+                    && instances.iter().all(|instance| instance.runtime_access == Some(true))
+        ));
+        let inventories = |messages: &[ServerToWeb]| {
+            messages
+                .iter()
+                .filter_map(|message| match message {
+                    ServerToWeb::CliLifecycleInventory { machine_id, .. } => Some(*machine_id),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(inventories(&capable), vec![Some(p.m5), Some(p.m6)]);
+        let older = older.drain();
+        assert!(!older
+            .iter()
+            .any(|message| matches!(message, ServerToWeb::SessionInstances { .. })));
+        assert_eq!(inventories(&older), vec![Some(p.m5)]);
+    }
+
+    /// Pane summaries name each tab's machine, show an untagged tab under
+    /// its attributed host, and read usage limits from the CLI of the
+    /// instance that runs the tab.
+    #[tokio::test]
+    async fn pane_summaries_carry_each_tabs_machine_and_its_instances_limits() {
+        let p = project().await;
+        let _a = p.instance(p.m5, HOST_A);
+        let b = p.instance(p.m6, HOST_B);
+        p.roster(vec![
+            pane(3, Some(p.m5), Some(HOST_A)),
+            pane(4, Some(p.m6), Some(HOST_B)),
+            pane(5, None, Some(HOST_B)),
+        ]);
+        p.state.sessions.update_usage_limits(
+            b.id,
+            shared::Provider::Claude,
+            shared::UsageLimits {
+                five_hour: None,
+                seven_day: None,
+                fetched_at: None,
+                usage_limited: Some(shared::UsageLimited {
+                    window: "weekly".to_string(),
+                    resets_at: None,
+                    model: None,
+                }),
+            },
+        );
+
+        let summaries = pane_summaries(&p.state, &p.session, true);
+        let summary = |pane_id: u32| {
+            summaries
+                .iter()
+                .find(|summary| summary.pane_id == pane_id)
+                .unwrap()
+        };
+        assert_eq!(summary(3).machine_id, Some(p.m5));
+        assert_eq!(summary(3).hostname.as_deref(), Some(HOST_A));
+        assert!(summary(3).usage_limited.is_none());
+        assert_eq!(summary(4).machine_id, Some(p.m6));
+        assert!(summary(4).usage_limited.is_some());
+        assert_eq!(summary(5).machine_id, None);
+        assert_eq!(summary(5).hostname.as_deref(), Some(HOST_B));
+        assert!(summary(5).usage_limited.is_some());
+    }
+
+    /// Stopping the runtime rejects every instance on its own connection and
+    /// stops every daemon that lists the project.
+    #[tokio::test]
+    async fn stopping_the_runtime_rejects_every_instance() {
+        let p = project().await;
+        let mut d5 = p.daemon(p.m5, HOST_A, CAPABLE_DAEMON);
+        let mut d6 = p.daemon(p.m6, HOST_B, CAPABLE_DAEMON);
+        let mut a = p.instance(p.m5, HOST_A);
+        let mut b = p.instance(p.m6, HOST_B);
+
+        p.state.sessions.stop_project_runtime(&p.project_id()).await;
+
+        for cli in [&mut a, &mut b] {
+            assert!(cli
+                .drain()
+                .iter()
+                .any(|message| matches!(message, ServerToCli::SessionRejected { .. })));
+        }
+        assert!(stopped(&mut d5) && stopped(&mut d6));
+        assert!(p.state.sessions.session_attachments(&p.session).is_empty());
+    }
+
+    /// Deletion's runtime cleanup waits for each machine's purge
+    /// acknowledgement, not only the first one's.
+    #[tokio::test]
+    async fn deletion_waits_for_every_machines_purge_acknowledgement() {
+        let p = project().await;
+        let capabilities = &[
+            PROJECT_INSTANCES_CAPABILITY,
+            shared::PANE_HOST_CLEANUP_ACK_CAPABILITY,
+        ];
+        let mut d5 = p.daemon(p.m5, HOST_A, capabilities);
+        let mut d6 = p.daemon(p.m6, HOST_B, capabilities);
+        let _a = p.instance(p.m5, HOST_A);
+        let _b = p.instance(p.m6, HOST_B);
+        let sessions = p.state.sessions.clone();
+        let project_id = p.project_id();
+        let cleanup =
+            tokio::spawn(
+                async move { sessions.confirm_project_runtime_stopped(&project_id).await },
+            );
+
+        let stop_request = |message: ServerToDaemon| match message {
+            ServerToDaemon::StopProjectCli {
+                request_id: Some(request_id),
+                ..
+            } => request_id,
+            other => panic!("expected a correlated stop, got {other:?}"),
+        };
+        // zoo-005 acknowledges at once; zoo-006 holds its acknowledgement.
+        let held = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::select! {
+                Some(message) = d5.rx.recv() => {
+                    p.state.sessions.complete_project_runtime_stop(
+                        stop_request(message), p.project_id(), true, 0, None,
+                    );
+                    stop_request(d6.rx.recv().await.unwrap())
+                }
+                Some(message) = d6.rx.recv() => stop_request(message),
+            }
+        })
+        .await
+        .expect("zoo-006 is asked to stop");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!cleanup.is_finished(), "zoo-006 has not acknowledged yet");
+        p.state
+            .sessions
+            .complete_project_runtime_stop(held, p.project_id(), true, 0, None);
+        if let Ok(Some(message)) =
+            tokio::time::timeout(Duration::from_millis(200), d5.rx.recv()).await
+        {
+            p.state.sessions.complete_project_runtime_stop(
+                stop_request(message),
+                p.project_id(),
+                true,
+                0,
+                None,
+            );
+        }
+        assert_eq!(cleanup.await.unwrap().unwrap(), 2);
+    }
+
+    // New panes: targeted at a machine, started there when it is stopped,
+    // allocated unique ids, and answered only to the requester.
+
+    fn new_pane() -> NewPaneSpec {
+        NewPaneSpec {
+            provider: shared::Provider::Claude,
+            mode: shared::PaneMode::Interactive,
+            kind: shared::PaneKind::Terminal,
+            label: None,
+            prompt: None,
+            model: None,
+            isolated_worktree: false,
+            role: None,
+            goal: None,
+            backstory: None,
+            plan_review_mode: shared::PlanReviewMode::default(),
+            managed: false,
+        }
+    }
+
+    impl Project {
+        /// An instance on `machine_id` that has finished starting, as one
+        /// does once its `SessionStart` has been handled.
+        fn running_with(
+            &self,
+            machine_id: Uuid,
+            host: &str,
+            capabilities: &[&str],
+        ) -> Endpoint<ServerToCli> {
+            let cli = self.instance_with(machine_id, host, capabilities);
+            self.state
+                .sessions
+                .instance_started(self.session, machine_id, cli.id);
+            cli
+        }
+
+        fn running(&self, machine_id: Uuid, host: &str) -> Endpoint<ServerToCli> {
+            self.running_with(machine_id, host, CAPABLE_CLI)
+        }
+
+        /// A viewer of the owner's on a client that correlates its launches.
+        fn requester(&self) -> Endpoint<ServerToWeb> {
+            self.viewer(
+                self.owner,
+                &[shared::PROJECT_POLICY_CAPABILITY, PROJECT_INSTANCES_CAPABILITY],
+            )
+        }
+
+        async fn add_pane(
+            &self,
+            web: &Endpoint<ServerToWeb>,
+            machine_id: Option<Uuid>,
+            request_id: Option<&str>,
+        ) {
+            handle_add_pane(
+                &self.state,
+                &web.id,
+                Some(self.session),
+                None,
+                machine_id,
+                request_id.map(str::to_string),
+                new_pane(),
+            )
+            .await;
+        }
+
+        /// A connected daemon of `owner`'s with `projects` in its inventory.
+        fn daemon_with(
+            &self,
+            owner: Uuid,
+            machine_id: Uuid,
+            host: &str,
+            capabilities: &[&str],
+            projects: Vec<shared::MachineProjectInfo>,
+        ) -> Endpoint<ServerToDaemon> {
+            let (tx, rx) = mpsc::channel(16);
+            self.state.sessions.register_daemon(
+                machine_id,
+                owner,
+                tx,
+                shared::MachineInfo {
+                    machine_id,
+                    hostname: host.to_string(),
+                    os: "linux".to_string(),
+                    arch: "x86_64".to_string(),
+                    daemon_version: None,
+                    deepseek_backend: None,
+                    last_seen: None,
+                },
+                projects,
+            );
+            self.state.sessions.set_daemon_capabilities(
+                machine_id,
+                capabilities
+                    .iter()
+                    .map(|capability| capability.to_string())
+                    .collect(),
+            );
+            Endpoint { id: machine_id, rx }
+        }
+    }
+
+    #[derive(Debug, Clone, PartialEq)]
+    struct AddResult {
+        request_id: String,
+        status: shared::AddPaneStatus,
+        machine_id: Option<Uuid>,
+        pane_id: Option<u32>,
+        error: Option<String>,
+    }
+
+    fn add_result(message: &ServerToWeb) -> Option<AddResult> {
+        match message {
+            ServerToWeb::AddPaneResult {
+                request_id,
+                status,
+                machine_id,
+                pane_id,
+                error,
+                ..
+            } => Some(AddResult {
+                request_id: request_id.clone(),
+                status: *status,
+                machine_id: *machine_id,
+                pane_id: *pane_id,
+                error: error.clone(),
+            }),
+            _ => None,
+        }
+    }
+
+    fn add_results(messages: &[ServerToWeb]) -> Vec<AddResult> {
+        messages.iter().filter_map(add_result).collect()
+    }
+
+    fn only(mut results: Vec<AddResult>) -> AddResult {
+        assert_eq!(results.len(), 1, "{results:?}");
+        results.remove(0)
+    }
+
+    async fn next_add_result(web: &mut Endpoint<ServerToWeb>) -> AddResult {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let message = web.rx.recv().await.expect("the requester is connected");
+                if let Some(result) = add_result(&message) {
+                    return result;
+                }
+            }
+        })
+        .await
+        .expect("an answer to the new pane")
+    }
+
+    fn added_panes(messages: &[ServerToCli]) -> Vec<PaneConfig> {
+        messages
+            .iter()
+            .filter_map(|message| match message {
+                ServerToCli::AddPane { pane_config, .. } => Some(pane_config.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    async fn next_added_pane(cli: &mut Endpoint<ServerToCli>) -> PaneConfig {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let ServerToCli::AddPane { pane_config, .. } =
+                    cli.rx.recv().await.expect("the instance is connected")
+                {
+                    return pane_config;
+                }
+            }
+        })
+        .await
+        .expect("the new pane reaches the instance")
+    }
+
+    /// The request id of the correlated start the daemon was sent.
+    async fn start_request(daemon: &mut Endpoint<ServerToDaemon>) -> Uuid {
+        let message = tokio::time::timeout(Duration::from_secs(5), daemon.rx.recv())
+            .await
+            .expect("the daemon is asked to start the project")
+            .unwrap();
+        match message {
+            ServerToDaemon::StartProjectCli {
+                request_id: Some(request_id),
+                policy: Some(_),
+                ..
+            } => request_id,
+            other => panic!("expected a correlated start with its policy, got {other:?}"),
+        }
+    }
+
+    /// Every allocatable id except `free`, as zoo-005's panes.
+    fn crowded_roster(p: &Project, free: &[u32]) -> Vec<PaneConfig> {
+        (3..=1002)
+            .filter(|pane_id| !free.contains(pane_id))
+            .map(|pane_id| pane(pane_id, Some(p.m5), Some(HOST_A)))
+            .collect()
+    }
+
+    /// Two adds that no roster report separates draw different ids. With one
+    /// id left, one gets it and the other is told the project is full, where
+    /// both used to be handed the same id. An id whose pane never appears is
+    /// free again once its reservation expires.
+    #[tokio::test]
+    async fn concurrent_adds_never_share_a_pane_id() {
+        let p = project().await;
+        let mut a = p.running(p.m5, HOST_A);
+        let mut web = p.requester();
+        let ids = |panes: Vec<PaneConfig>| {
+            let mut ids: Vec<u32> = panes.iter().map(|pane| pane.pane_id).collect();
+            ids.sort();
+            ids
+        };
+
+        p.roster(crowded_roster(&p, &[40, 41]));
+        tokio::join!(
+            p.add_pane(&web, Some(p.m5), Some("first")),
+            p.add_pane(&web, Some(p.m5), Some("second")),
+        );
+        let results = add_results(&web.drain());
+        assert!(results
+            .iter()
+            .all(|result| result.status == shared::AddPaneStatus::Routed));
+        let mut routed: Vec<u32> = results.iter().filter_map(|result| result.pane_id).collect();
+        routed.sort();
+        assert_eq!(routed, vec![40, 41]);
+        assert_eq!(ids(added_panes(&a.drain())), vec![40, 41]);
+
+        p.roster(crowded_roster(&p, &[50]));
+        tokio::join!(
+            p.add_pane(&web, Some(p.m5), Some("third")),
+            p.add_pane(&web, Some(p.m5), Some("fourth")),
+        );
+        let results = add_results(&web.drain());
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| result.status == shared::AddPaneStatus::Routed)
+                .map(|result| result.pane_id)
+                .collect::<Vec<_>>(),
+            vec![Some(50)]
+        );
+        assert!(results.iter().any(|result| {
+            result.status == shared::AddPaneStatus::Failed
+                && result
+                    .error
+                    .as_deref()
+                    .is_some_and(|error| error.contains("session is full"))
+        }));
+        assert_eq!(ids(added_panes(&a.drain())), vec![50]);
+
+        p.state.sessions.set_pane_launch_timing(
+            Duration::from_millis(30),
+            crate::session::pane_launches::INSTANCE_START_TIMEOUT,
+        );
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        p.add_pane(&web, Some(p.m5), Some("fifth")).await;
+        assert_eq!(only(add_results(&web.drain())).pane_id, Some(50));
+    }
+
+    /// A pane for a machine running the project goes to that machine's
+    /// instance, tagged for it, whichever instance is primary; naming no
+    /// machine still means the primary. Each answer names its machine and
+    /// the pane id.
+    #[tokio::test]
+    async fn a_pane_goes_to_the_instance_on_the_machine_it_names() {
+        let p = project().await;
+        let mut a = p.running(p.m5, HOST_A);
+        let mut b = p.running(p.m6, HOST_B);
+        let mut web = p.requester();
+        p.roster(Vec::new());
+
+        p.add_pane(&web, Some(p.m6), Some("on-zoo-006")).await;
+        let result = only(add_results(&web.drain()));
+        assert_eq!(result.request_id, "on-zoo-006");
+        assert_eq!(
+            (result.status, result.machine_id),
+            (shared::AddPaneStatus::Routed, Some(p.m6))
+        );
+        let added = added_panes(&b.drain());
+        assert_eq!(added.len(), 1);
+        assert_eq!(Some(added[0].pane_id), result.pane_id);
+        assert_eq!(added[0].machine_id, Some(p.m6));
+        assert_eq!(added[0].hostname.as_deref(), Some(HOST_B));
+        assert!(a.drain().is_empty());
+
+        p.add_pane(&web, None, Some("on-primary")).await;
+        let result = only(add_results(&web.drain()));
+        assert_eq!(
+            (result.status, result.machine_id),
+            (shared::AddPaneStatus::Routed, Some(p.m5))
+        );
+        assert_eq!(added_panes(&a.drain())[0].machine_id, Some(p.m5));
+        assert!(b.drain().is_empty());
+    }
+
+    /// An older CLI on the named machine owns the whole roster, so its new
+    /// pane stays untagged.
+    #[tokio::test]
+    async fn an_older_cli_on_the_named_machine_gets_an_untagged_pane() {
+        let p = project().await;
+        let mut older = p.running_with(p.m5, HOST_A, &[shared::PROJECT_POLICY_CAPABILITY]);
+        let mut web = p.requester();
+
+        p.add_pane(&web, Some(p.m5), Some("older")).await;
+        let result = only(add_results(&web.drain()));
+        assert_eq!(
+            (result.status, result.machine_id),
+            (shared::AddPaneStatus::Routed, Some(p.m5))
+        );
+        let added = added_panes(&older.drain());
+        assert_eq!(added.len(), 1);
+        assert_eq!((added[0].machine_id, added[0].hostname.as_deref()), (None, None));
+    }
+
+    /// A pane for a machine that has the project but is not running it
+    /// starts that machine's instance and follows it there: `Starting`, then
+    /// `Routed` once the server has finished the instance's start. Neither
+    /// the daemon's success nor the bare attach routes it.
+    #[tokio::test]
+    async fn a_pane_for_a_stopped_machine_starts_its_instance_first() {
+        let p = project().await;
+        let mut a = p.instance(p.m5, HOST_A);
+        let mut d6 = p.daemon(p.m6, HOST_B, CAPABLE_DAEMON);
+        let mut web = p.requester();
+
+        p.add_pane(&web, Some(p.m6), Some("start-zoo-006")).await;
+        let starting = only(add_results(&web.drain()));
+        assert_eq!(
+            (starting.status, starting.machine_id, starting.pane_id),
+            (shared::AddPaneStatus::Starting, Some(p.m6), None)
+        );
+        let start = start_request(&mut d6).await;
+        assert!(p
+            .state
+            .sessions
+            .instance_start_result(p.m6, start, &p.project_id(), true, None));
+        let mut b = p.instance(p.m6, HOST_B);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(added_panes(&b.drain()).is_empty(), "attached is not started");
+        assert!(add_results(&web.drain()).is_empty());
+
+        p.state.sessions.instance_started(p.session, p.m6, b.id);
+        let routed = next_add_result(&mut web).await;
+        assert_eq!(routed.request_id, "start-zoo-006");
+        assert_eq!(
+            (routed.status, routed.machine_id),
+            (shared::AddPaneStatus::Routed, Some(p.m6))
+        );
+        let added = next_added_pane(&mut b).await;
+        assert_eq!(Some(added.pane_id), routed.pane_id);
+        assert_eq!(added.machine_id, Some(p.m6));
+        assert!(added_panes(&a.drain()).is_empty());
+    }
+
+    /// A pane for an instance that has attached but whose start the server
+    /// is still finishing waits for it, without a second start: sent sooner,
+    /// it could reach the CLI before the project's policy.
+    #[tokio::test]
+    async fn a_pane_waits_for_an_instance_still_finishing_its_start() {
+        let p = project().await;
+        let mut d6 = p.daemon(p.m6, HOST_B, CAPABLE_DAEMON);
+        let mut b = p.instance(p.m6, HOST_B);
+        let mut web = p.requester();
+
+        p.add_pane(&web, Some(p.m6), Some("finishing")).await;
+        assert_eq!(
+            only(add_results(&web.drain())).status,
+            shared::AddPaneStatus::Starting
+        );
+        assert!(added_panes(&b.drain()).is_empty());
+        p.state.sessions.instance_started(p.session, p.m6, b.id);
+        assert_eq!(
+            next_add_result(&mut web).await.status,
+            shared::AddPaneStatus::Routed
+        );
+        assert_eq!(next_added_pane(&mut b).await.machine_id, Some(p.m6));
+        assert!(!started(&mut d6), "the instance was already starting");
+    }
+
+    /// Two panes for a stopped machine share one start of its instance.
+    #[tokio::test]
+    async fn two_panes_for_a_stopped_machine_share_its_start() {
+        let p = project().await;
+        let _a = p.instance(p.m5, HOST_A);
+        let mut d6 = p.daemon(p.m6, HOST_B, CAPABLE_DAEMON);
+        let mut web = p.requester();
+
+        p.add_pane(&web, Some(p.m6), Some("one")).await;
+        p.add_pane(&web, Some(p.m6), Some("two")).await;
+        assert!(add_results(&web.drain())
+            .iter()
+            .all(|result| result.status == shared::AddPaneStatus::Starting));
+        start_request(&mut d6).await;
+        assert!(d6.drain().is_empty(), "one start for both panes");
+
+        let mut b = p.instance(p.m6, HOST_B);
+        p.state.sessions.instance_started(p.session, p.m6, b.id);
+        let mut answered = vec![next_add_result(&mut web).await, next_add_result(&mut web).await];
+        answered.sort_by(|left, right| left.request_id.cmp(&right.request_id));
+        assert_eq!(
+            answered
+                .iter()
+                .map(|result| (result.request_id.as_str(), result.status))
+                .collect::<Vec<_>>(),
+            vec![
+                ("one", shared::AddPaneStatus::Routed),
+                ("two", shared::AddPaneStatus::Routed)
+            ]
+        );
+        assert_ne!(answered[0].pane_id, answered[1].pane_id);
+        let first = next_added_pane(&mut b).await;
+        let second = next_added_pane(&mut b).await;
+        assert_ne!(first.pane_id, second.pane_id);
+    }
+
+    /// The daemon refusing the start fails the pane with its reason.
+    #[tokio::test]
+    async fn a_start_the_daemon_refuses_fails_the_pane() {
+        let p = project().await;
+        let _a = p.instance(p.m5, HOST_A);
+        let mut d6 = p.daemon(p.m6, HOST_B, CAPABLE_DAEMON);
+        let mut web = p.requester();
+
+        p.add_pane(&web, Some(p.m6), Some("refused")).await;
+        assert_eq!(
+            only(add_results(&web.drain())).status,
+            shared::AddPaneStatus::Starting
+        );
+        let start = start_request(&mut d6).await;
+        assert!(p.state.sessions.instance_start_result(
+            p.m6,
+            start,
+            &p.project_id(),
+            false,
+            Some("This project's runtime policy is suspended".to_string()),
+        ));
+        let failed = next_add_result(&mut web).await;
+        assert_eq!(
+            (failed.status, failed.machine_id, failed.error.as_deref()),
+            (
+                shared::AddPaneStatus::Failed,
+                Some(p.m6),
+                Some("This project's runtime policy is suspended")
+            )
+        );
+    }
+
+    /// The daemon leaving fails a pane waiting on its machine at once.
+    #[tokio::test]
+    async fn a_pane_waiting_on_a_machine_fails_when_its_daemon_leaves() {
+        let p = project().await;
+        let _a = p.instance(p.m5, HOST_A);
+        let mut d6 = p.daemon(p.m6, HOST_B, CAPABLE_DAEMON);
+        let mut web = p.requester();
+
+        p.add_pane(&web, Some(p.m6), Some("daemon-left")).await;
+        assert_eq!(
+            only(add_results(&web.drain())).status,
+            shared::AddPaneStatus::Starting
+        );
+        start_request(&mut d6).await;
+        p.state.sessions.unregister_daemon(&p.m6);
+        let failed = next_add_result(&mut web).await;
+        assert_eq!(failed.status, shared::AddPaneStatus::Failed);
+        assert_eq!(
+            failed.error.as_deref(),
+            Some("zoo-006 went offline before this project started there")
+        );
+    }
+
+    /// A pane gives up when its machine's instance does not start in time,
+    /// and an instance that starts afterwards is sent nothing.
+    #[tokio::test]
+    async fn a_pane_waiting_on_a_machine_gives_up_at_its_time_limit() {
+        let p = project().await;
+        let _a = p.instance(p.m5, HOST_A);
+        let mut d6 = p.daemon(p.m6, HOST_B, CAPABLE_DAEMON);
+        let mut web = p.requester();
+        p.state.sessions.set_pane_launch_timing(
+            crate::session::pane_launches::PANE_ID_RESERVATION_TTL,
+            Duration::from_millis(100),
+        );
+
+        p.add_pane(&web, Some(p.m6), Some("too-slow")).await;
+        assert_eq!(
+            only(add_results(&web.drain())).status,
+            shared::AddPaneStatus::Starting
+        );
+        start_request(&mut d6).await;
+        let failed = next_add_result(&mut web).await;
+        assert_eq!(failed.status, shared::AddPaneStatus::Failed);
+        assert!(
+            failed.error.as_deref().is_some_and(|error| {
+                error.starts_with("zoo-006 did not start this project within")
+            }),
+            "{failed:?}"
+        );
+        let mut b = p.instance(p.m6, HOST_B);
+        p.state.sessions.instance_started(p.session, p.m6, b.id);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(added_panes(&b.drain()).is_empty());
+    }
+
+    /// A machine that cannot take the pane is refused with why, and nothing
+    /// is started anywhere.
+    #[tokio::test]
+    async fn a_machine_that_cannot_take_the_pane_is_refused_with_the_reason() {
+        let p = project().await;
+        let mut a = p.instance(p.m5, HOST_A);
+        let mut web = p.requester();
+        let listed = || {
+            vec![shared::MachineProjectInfo {
+                project_id: p.project_id(),
+                name: None,
+                path: "/work/elsewhere".to_string(),
+                preferred_machine_id: None,
+                is_running: false,
+                pid: None,
+                memory_kb: None,
+                last_error: None,
+                git_remote: None,
+            }]
+        };
+        let refusal = |result: AddResult| {
+            assert_eq!(result.status, shared::AddPaneStatus::Failed, "{result:?}");
+            result.error.unwrap()
+        };
+
+        let mut offline = p.daemon(p.m6, HOST_B, CAPABLE_DAEMON);
+        p.state.sessions.unregister_daemon(&p.m6);
+        p.add_pane(&web, Some(p.m6), Some("offline")).await;
+        assert_eq!(refusal(only(add_results(&web.drain()))), "zoo-006 is offline");
+
+        let m7 = Uuid::new_v4();
+        let mut older = p.daemon(m7, HOST_C, &[shared::PROJECT_POLICY_CAPABILITY]);
+        p.add_pane(&web, Some(m7), Some("older")).await;
+        let error = refusal(only(add_results(&web.drain())));
+        assert!(error.ends_with("Reboot zoo-007 to update it."), "{error}");
+
+        let m8 = Uuid::new_v4();
+        let mut unregistered = p.daemon_with(p.host, m8, "zoo-008", CAPABLE_DAEMON, Vec::new());
+        p.add_pane(&web, Some(m8), Some("unregistered")).await;
+        assert_eq!(
+            refusal(only(add_results(&web.drain()))),
+            "This project is not registered on zoo-008."
+        );
+
+        // Another account's machine, which this user may not use, is not
+        // described at all.
+        let m9 = Uuid::new_v4();
+        let mut foreign = p.daemon_with(Uuid::new_v4(), m9, "zoo-009", CAPABLE_DAEMON, listed());
+        p.add_pane(&web, Some(m9), Some("foreign")).await;
+        assert_eq!(
+            refusal(only(add_results(&web.drain()))),
+            "That machine is not available to you"
+        );
+        p.add_pane(&web, Some(Uuid::new_v4()), Some("unknown")).await;
+        assert_eq!(
+            refusal(only(add_results(&web.drain()))),
+            "That machine is not available to you"
+        );
+
+        for daemon in [&mut offline, &mut older, &mut unregistered, &mut foreign] {
+            assert!(!started(daemon));
+        }
+        assert!(added_panes(&a.drain()).is_empty(), "never sent elsewhere");
+    }
+
+    /// An older CLI running the project elsewhere would refuse an instance
+    /// beside it, so a pane for another machine is refused at once.
+    #[tokio::test]
+    async fn a_pane_is_refused_beside_an_older_cli_on_another_machine() {
+        let p = project().await;
+        let mut older = p.instance_with(p.m5, HOST_A, &[shared::PROJECT_POLICY_CAPABILITY]);
+        let mut d6 = p.daemon(p.m6, HOST_B, CAPABLE_DAEMON);
+        let mut web = p.requester();
+
+        p.add_pane(&web, Some(p.m6), Some("beside-older")).await;
+        let result = only(add_results(&web.drain()));
+        assert_eq!(result.status, shared::AddPaneStatus::Failed);
+        let error = result.error.unwrap();
+        assert!(error.contains(HOST_A) && error.contains("cannot share it"), "{error}");
+        assert!(!started(&mut d6));
+        assert!(older.drain().is_empty());
+    }
+
+    /// The answer reaches the connection that asked and no other viewer. A
+    /// requester that leaves while its pane waits still gets the pane; the
+    /// answer to it is dropped.
+    #[tokio::test]
+    async fn only_the_requesting_connection_hears_about_its_pane() {
+        let p = project().await;
+        let _a = p.running(p.m5, HOST_A);
+        let mut d6 = p.daemon(p.m6, HOST_B, CAPABLE_DAEMON);
+        let mut requester = p.requester();
+        let mut other = p.requester();
+
+        p.add_pane(&requester, Some(p.m5), Some("mine")).await;
+        assert_eq!(add_results(&requester.drain()).len(), 1);
+        assert!(add_results(&other.drain()).is_empty());
+
+        p.add_pane(&requester, Some(p.m6), Some("waits")).await;
+        assert_eq!(
+            only(add_results(&requester.drain())).status,
+            shared::AddPaneStatus::Starting
+        );
+        start_request(&mut d6).await;
+        p.state.sessions.unregister_web(&requester.id);
+        let mut b = p.instance(p.m6, HOST_B);
+        p.state.sessions.instance_started(p.session, p.m6, b.id);
+        assert_eq!(next_added_pane(&mut b).await.machine_id, Some(p.m6));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(add_results(&other.drain()).is_empty());
+        assert!(add_results(&requester.drain()).is_empty());
+    }
+
+    /// A request without an id, from a client that predates correlated
+    /// launches, is answered as before: nothing when the pane is sent, an
+    /// `Error` when it is refused, and never an `AddPaneResult`.
+    #[tokio::test]
+    async fn a_request_without_an_id_is_answered_as_before() {
+        let p = project().await;
+        let mut a = p.instance(p.m5, HOST_A);
+        let mut web = p.requester();
+
+        p.add_pane(&web, None, None).await;
+        let received = web.drain();
+        assert!(add_results(&received).is_empty() && errors(&received).is_empty());
+        assert_eq!(added_panes(&a.drain()).len(), 1);
+
+        p.add_pane(&web, Some(Uuid::new_v4()), None).await;
+        let received = web.drain();
+        assert!(add_results(&received).is_empty());
+        assert_eq!(errors(&received), vec!["That machine is not available to you"]);
+    }
+
+    /// End to end over the CLI socket: the instance a pane waits for starts
+    /// with a real `SessionStart`, and the pane reaches it only after the
+    /// project's policy, without which its CLI refuses every new pane. Its
+    /// roster report then clears the id's reservation: with only that id
+    /// free, it can be handed out again as soon as the pane is closed.
+    #[tokio::test]
+    async fn a_waiting_pane_reaches_its_instance_after_the_projects_policy() {
+        use jsonwebtoken::{encode, EncodingKey, Header};
+        use tokio_tungstenite::{connect_async, tungstenite::Message};
+
+        let p = project().await;
+        let mut d6 = p.daemon(p.m6, HOST_B, CAPABLE_DAEMON);
+        let mut web = p.requester();
+        p.roster(crowded_roster(&p, &[77]));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let router = crate::routes::create_router(p.state.clone());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+
+        p.add_pane(&web, Some(p.m6), Some("over-the-socket")).await;
+        assert_eq!(
+            only(add_results(&web.drain())).status,
+            shared::AddPaneStatus::Starting
+        );
+        start_request(&mut d6).await;
+
+        // zoo-006's daemon starts the project: its instance connects and starts.
+        let token = encode(
+            &Header::default(),
+            &crate::routes::auth::Claims {
+                sub: p.host.to_string(),
+                exp: (chrono::Utc::now() + chrono::Duration::hours(1)).timestamp() as usize,
+                device_session_id: None,
+                token_kind: None,
+                credential_version: None,
+            },
+            &EncodingKey::from_secret(p.state.config.auth.jwt_secret.as_bytes()),
+        )
+        .unwrap();
+        let (mut socket, _) = connect_async(format!("ws://{address}/ws/cli")).await.unwrap();
+        let frame = |message: shared::CliToServer| {
+            Message::Text(serde_json::to_string(&message).unwrap())
+        };
+        socket
+            .send(frame(shared::CliToServer::Register {
+                token,
+                version: Some("26.11.0".to_string()),
+                capabilities: vec![
+                    PROJECT_INSTANCES_CAPABILITY.to_string(),
+                    shared::PROJECT_POLICY_CAPABILITY.to_string(),
+                ],
+            }))
+            .await
+            .unwrap();
+        socket
+            .send(frame(shared::CliToServer::SessionStart {
+                session_id: p.session,
+                project_id: Some(p.session),
+                machine_id: Some(p.m6),
+                working_dir: Some(format!("/work/{HOST_B}")),
+                hostname: Some(HOST_B.to_string()),
+                git_remote: None,
+                git_remote_url: None,
+                pane_type: None,
+                panes: Some(Vec::new()),
+            }))
+            .await
+            .unwrap();
+        let received = tokio::time::timeout(Duration::from_secs(5), async {
+            let mut received = Vec::new();
+            loop {
+                let Message::Text(text) = socket.next().await.unwrap().unwrap() else {
+                    continue;
+                };
+                let message: ServerToCli = serde_json::from_str(&text).unwrap();
+                let done = matches!(message, ServerToCli::AddPane { .. });
+                received.push(message);
+                if done {
+                    return received;
+                }
+            }
+        })
+        .await
+        .expect("the waiting pane reaches the instance");
+        let policy_at = received
+            .iter()
+            .position(|message| matches!(message, ServerToCli::ProjectPolicy { .. }))
+            .expect("the instance is sent the project's policy");
+        assert!(policy_at < received.len() - 1, "the policy comes first");
+        let Some(ServerToCli::AddPane { pane_config, .. }) = received.last().cloned() else {
+            unreachable!()
+        };
+        assert_eq!(pane_config.machine_id, Some(p.m6));
+        assert_eq!(pane_config.pane_id, 77);
+        let routed = next_add_result(&mut web).await;
+        assert_eq!(
+            (routed.status, routed.machine_id, routed.pane_id),
+            (shared::AddPaneStatus::Routed, Some(p.m6), Some(77))
+        );
+
+        // The instance reports the pane, then closes it.
+        for (panes, listed) in [(vec![pane_config.clone()], true), (Vec::new(), false)] {
+            socket
+                .send(frame(shared::CliToServer::PaneList {
+                    session_id: p.session,
+                    panes,
+                }))
+                .await
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while p.pane_ids().contains(&77) != listed {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("the report is merged");
+        }
+        p.add_pane(&web, Some(p.m6), Some("again")).await;
+        let again = only(add_results(&web.drain()));
+        assert_eq!(
+            (again.status, again.pane_id),
+            (shared::AddPaneStatus::Routed, Some(77))
+        );
+        server.abort();
     }
 }

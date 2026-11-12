@@ -1,18 +1,19 @@
+use crate::daemon_registry::{ClaimMode, ClaimOutcome, InstanceClaimGuard};
 use anyhow::{Context, Result};
-use futures::{SinkExt, StreamExt};
+use futures::{future::BoxFuture, SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use shared::{
-    DaemonToServer, DeepseekBackendInfo, MachineInfo, MachineProjectInfo, ProjectProvisioningMode,
-    ServerToDaemon,
+    DaemonToServer, DeepseekBackendInfo, EffectiveProjectPolicy, MachineInfo, MachineProjectInfo,
+    ProjectProvisioningMode, ServerToDaemon,
 };
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
-    Arc,
+    Arc, Mutex,
 };
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use uuid::Uuid;
 
@@ -28,6 +29,9 @@ const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
 /// exercised 360x more often than anything could benefit from.
 const USAGE_REFRESH_INTERVAL: Duration = Duration::from_secs(15 * 60);
 const VERSION: &str = env!("APAS_VERSION");
+/// How long a checkout's remote is trusted before it is read again. Remotes
+/// rarely change, and every read runs `git` against a home that may be NFS.
+const GIT_REMOTE_MAX_AGE: Duration = Duration::from_secs(5 * 60);
 const TMUX_SESSION_PREFIX: &str = "apas";
 const DEEPSEEK_API_BASE_URL: &str = "https://api.deepseek.com/anthropic";
 const PROVISIONING_RECEIPT: &str = ".apas-provisioning.json";
@@ -415,12 +419,176 @@ struct RunningProject {
 /// daemon starts a fresh task for it.
 type RestartRequests = tokio::sync::mpsc::UnboundedSender<String>;
 
+/// What a started project's task runs: the project runtime, except in tests.
+/// Everything around it, from claims to the handling of how it ended, is the
+/// same either way.
+type ProjectLauncher = Arc<
+    dyn Fn(ProjectLaunch) -> BoxFuture<'static, Result<crate::mode::dual_pane::ProjectOutcome>>
+        + Send
+        + Sync,
+>;
+
+struct ProjectLaunch {
+    server_url: String,
+    token: String,
+    project_path: PathBuf,
+    shutdown: Arc<AtomicBool>,
+    machine_id: Uuid,
+}
+
+fn project_runtime_launcher() -> ProjectLauncher {
+    Arc::new(|launch: ProjectLaunch| {
+        Box::pin(async move {
+            crate::mode::dual_pane::run_project(
+                &launch.server_url,
+                &launch.token,
+                &launch.project_path,
+                launch.shutdown,
+                launch.machine_id,
+            )
+            .await
+        })
+    })
+}
+
+/// How a request to start a project went.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum StartOutcome {
+    /// A task was started for it.
+    Started,
+    /// Its task was already running here.
+    AlreadyRunning,
+    /// Nothing was started. The reason is also the project's `last_error`.
+    Refused(String),
+}
+
+/// Each registered checkout's canonical `origin`, read off the heartbeat
+/// path.
+///
+/// `normalized_git_remote` runs `git`, which on an NFS home can stall far
+/// longer than a heartbeat may. So the inventory reports whatever was last
+/// read, and reads happen in the background: a slow one delays only the
+/// remote, never the heartbeat.
+#[derive(Clone)]
+struct GitRemotes {
+    entries: Arc<Mutex<HashMap<PathBuf, CachedGitRemote>>>,
+    /// One read runs at a time, so a stalled filesystem ties up one blocking
+    /// thread rather than one more on every heartbeat.
+    reading: Arc<AtomicBool>,
+    read: Arc<dyn Fn(&Path) -> Option<String> + Send + Sync>,
+    max_age: Duration,
+}
+
+struct CachedGitRemote {
+    remote: Option<String>,
+    read_at: Instant,
+}
+
+/// Clears [`GitRemotes::reading`] however the read ends.
+struct ReadingFlag(Arc<AtomicBool>);
+
+impl Drop for ReadingFlag {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
+}
+
+impl GitRemotes {
+    fn new() -> Self {
+        Self::with_reader(Arc::new(|path: &Path| {
+            crate::worktree::normalized_git_remote(path)
+        }))
+    }
+
+    fn with_reader(read: Arc<dyn Fn(&Path) -> Option<String> + Send + Sync>) -> Self {
+        Self {
+            entries: Arc::new(Mutex::new(HashMap::new())),
+            reading: Arc::new(AtomicBool::new(false)),
+            read,
+            max_age: GIT_REMOTE_MAX_AGE,
+        }
+    }
+
+    fn entries(&self) -> std::sync::MutexGuard<'_, HashMap<PathBuf, CachedGitRemote>> {
+        self.entries
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// The last remote read for `path`, without reading anything.
+    fn get(&self, path: &Path) -> Option<String> {
+        self.entries()
+            .get(path)
+            .and_then(|cached| cached.remote.clone())
+    }
+
+    /// Record a remote read elsewhere, by a caller already off the runtime.
+    fn record(&self, path: PathBuf, remote: Option<String>) {
+        self.entries().insert(
+            path,
+            CachedGitRemote {
+                remote,
+                read_at: Instant::now(),
+            },
+        );
+    }
+
+    /// Forget checkouts that are no longer registered, and start reading, in
+    /// the background, every one whose remote is unknown or old. Returns the
+    /// read it started, if any; there is none when everything is current, a
+    /// read is still running, or there is no runtime to run it on.
+    fn refresh(&self, paths: Vec<PathBuf>) -> Option<tokio::task::JoinHandle<()>> {
+        let due: Vec<PathBuf> = {
+            let mut entries = self.entries();
+            let registered: HashSet<&PathBuf> = paths.iter().collect();
+            entries.retain(|path, _| registered.contains(path));
+            paths
+                .iter()
+                .filter(|path| {
+                    entries
+                        .get(*path)
+                        .is_none_or(|cached| cached.read_at.elapsed() >= self.max_age)
+                })
+                .cloned()
+                .collect()
+        };
+        if due.is_empty() {
+            return None;
+        }
+        let runtime = tokio::runtime::Handle::try_current().ok()?;
+        if self
+            .reading
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return None;
+        }
+        let flag = ReadingFlag(self.reading.clone());
+        let remotes = self.clone();
+        Some(runtime.spawn_blocking(move || {
+            let _flag = flag;
+            for path in due {
+                let remote = (remotes.read)(&path);
+                remotes.record(path, remote);
+            }
+        }))
+    }
+}
+
 struct DaemonState {
     machine_info: MachineInfo,
     projects: HashMap<String, ProjectEntry>,
     sessions: HashMap<String, String>,
     /// Projects this instance is running, keyed by project id.
     running: HashMap<String, RunningProject>,
+    /// How this daemon claims what it runs, which also decides whether it
+    /// advertises `project_instances_v1`.
+    claim_mode: ClaimMode,
+    /// The NFS-shared config dir holding the claims, resolved once so a
+    /// project's task can release its claims from any thread.
+    registry_dir: PathBuf,
+    git_remotes: GitRemotes,
+    launcher: ProjectLauncher,
 }
 
 fn should_forget_project(
@@ -432,12 +600,16 @@ fn should_forget_project(
 }
 
 impl DaemonState {
-    fn new(machine_info: MachineInfo) -> Self {
+    fn new(machine_info: MachineInfo, claim_mode: ClaimMode) -> Self {
         Self {
             machine_info,
             projects: HashMap::new(),
             running: HashMap::new(),
             sessions: HashMap::new(),
+            claim_mode,
+            registry_dir: config_dir_for_registry(),
+            git_remotes: GitRemotes::new(),
+            launcher: project_runtime_launcher(),
         }
     }
 
@@ -506,19 +678,25 @@ impl DaemonState {
     ) -> Result<(MachineProjectInfo, Vec<MachineProjectInfo>)> {
         #[cfg(test)]
         let config_dir = crate::config::Config::config_dir()?;
-        let (registered, inventory) = tokio::task::spawn_blocking(move || {
+        let (registered, inventory, remote) = tokio::task::spawn_blocking(move || {
             #[cfg(test)]
-            {
-                crate::config::test_config::with_config_dir(&config_dir, || {
-                    crate::project::register_local_project(&path)
-                })
-            }
+            let registration = crate::config::test_config::with_config_dir(&config_dir, || {
+                crate::project::register_local_project(&path)
+            });
             #[cfg(not(test))]
-            crate::project::register_local_project(&path)
+            let registration = crate::project::register_local_project(&path);
+            // Already off the runtime, so read the checkout's remote here: the
+            // reply carries it rather than waiting for a background read.
+            registration.map(|(registered, inventory)| {
+                let remote = crate::worktree::normalized_git_remote(Path::new(&registered.path));
+                (registered, inventory, remote)
+            })
         })
         .await
         .context("Local folder registration worker failed")??;
         self.apply_project_inventory(inventory);
+        self.git_remotes
+            .record(PathBuf::from(&registered.path), remote);
         let projects = self.snapshot_projects();
         let project = projects
             .iter()
@@ -548,20 +726,6 @@ impl DaemonState {
         }
     }
 
-    /// Claim every project this host is already running.
-    ///
-    /// Claims are otherwise only taken in `start_project`, so a daemon that
-    /// restarts — or re-execs to self-upgrade — comes back owning nothing while
-    /// its project CLIs keep running in their own tmux sessions. During that
-    /// gap a peer sees the projects unclaimed, and its `is_headless_running_for`
-    /// only reads its *own* `/proc`, so it cannot tell they are alive here: a
-    /// `StartProjectCli` there would spawn a second CLI against the same `.apas`
-    /// and worktrees. Reconciling at startup closes the window entirely.
-    ///
-    /// A peer holding the claim for something we are running is logged rather
-    /// than seized. That combination means two CLIs are already live for one
-    /// project, which is the thing claims exist to prevent — stealing the claim
-    /// would hide it, and the operator needs to see it.
     /// Stop anything left over from the process-per-project model.
     ///
     /// This is the one part of the merge that is not additive at rollout. An
@@ -703,39 +867,51 @@ impl DaemonState {
         Ok(())
     }
 
-    fn reconcile_running_claims(&mut self) {
-        let registry_dir = config_dir_for_registry();
-        for (project_id, project) in &self.projects {
-            if !is_headless_running_for(&project.path) {
-                continue;
-            }
-            match crate::daemon_registry::claim_project(
-                &registry_dir,
-                project_id,
-                &project.path.display().to_string(),
-                self.machine_info.machine_id,
-            ) {
-                Ok(crate::daemon_registry::ClaimOutcome::Acquired) => {
-                    tracing::info!(
-                        project_id,
-                        path = %project.path.display(),
-                        "reclaimed a project that was already running here"
-                    );
-                }
-                Ok(crate::daemon_registry::ClaimOutcome::AlreadyOurs) => {}
-                Ok(crate::daemon_registry::ClaimOutcome::HeldBy(peer)) => {
-                    tracing::warn!(
-                        project_id,
-                        peer = %peer.hostname,
-                        heartbeat_age_secs = peer.age_secs,
-                        "project is running here but claimed by a peer — two CLIs may be live for it"
-                    );
-                }
-                Err(err) => {
-                    tracing::warn!(project_id, %err, "could not reconcile project claim");
-                }
-            }
-        }
+    /// Bring this host's claims in line with what it runs: keep them alive
+    /// for every instance running here, retake any that went missing, and let
+    /// every other claim of ours lapse. Run at startup once resumed projects
+    /// have started, and on every heartbeat.
+    ///
+    /// Claims follow this daemon's own tasks. A daemon replaced by `exec`
+    /// leaves the claims of what it was running in place, since no destructor
+    /// runs and the pid stays the same; the replacement takes each back as it
+    /// resumes the project, and whatever it does not resume lapses within
+    /// `STALE_AFTER_SECS`. An external `apas --headless -d <path>` run is not
+    /// claimed: a standalone run takes no claim, and the server decides
+    /// whether such a runtime may attach beside another machine's.
+    ///
+    /// A peer holding the guard exclusively for something running here is
+    /// logged rather than seized. That combination means two runtimes are
+    /// live where only one may be, which is the thing claims exist to prevent
+    /// — stealing the claim would hide it, and the operator needs to see it.
+    fn reconcile_running_claims(&self) {
+        let running: Vec<(String, String)> = self
+            .running
+            .iter()
+            .filter(|(_, project)| !project.handle.is_finished())
+            .filter_map(|(project_id, _)| {
+                self.projects
+                    .get(project_id)
+                    .map(|project| (project_id.clone(), project.path.display().to_string()))
+            })
+            .collect();
+        crate::daemon_registry::refresh_own_claims(
+            &self.registry_dir,
+            self.machine_info.machine_id,
+            self.claim_mode,
+            &running,
+        );
+    }
+
+    /// Start a background read of every checkout whose remote is unknown or
+    /// old; the inventory reports what is known meanwhile.
+    fn refresh_git_remotes(&self) -> Option<tokio::task::JoinHandle<()>> {
+        self.git_remotes.refresh(
+            self.projects
+                .values()
+                .map(|project| project.path.clone())
+                .collect(),
+        )
     }
 
     fn snapshot_projects(&self) -> Vec<MachineProjectInfo> {
@@ -773,7 +949,7 @@ impl DaemonState {
                 pid,
                 memory_kb,
                 last_error: project.last_error.clone(),
-                git_remote: None,
+                git_remote: self.git_remotes.get(&project.path),
             });
         }
 
@@ -781,13 +957,18 @@ impl DaemonState {
         projects
     }
 
+    /// Start a project in this instance, or say why not.
+    ///
+    /// Every refusal becomes the project's `last_error`, so the Machines page
+    /// shows why a start did nothing; refusals used to return silently. `Err`
+    /// is left for a project this daemon does not know.
     fn start_project(
         &mut self,
         project_id: &str,
         server_url: &str,
         token: &str,
         restart_tx: &RestartRequests,
-    ) -> Result<()> {
+    ) -> Result<StartOutcome> {
         // Reap any exited tracked processes before deciding whether to spawn.
         self.reap_exited_processes();
 
@@ -798,56 +979,89 @@ impl DaemonState {
             .get(project_id)
             .is_some_and(|project| !project.handle.is_finished())
         {
-            return Ok(());
+            return Ok(StartOutcome::AlreadyRunning);
         }
         // A task that ended leaves an entry behind; drop it so the project can
         // be started again without manual cleanup.
         self.running.remove(project_id);
 
-        let project = self
+        let project_path = self
             .projects
-            .get_mut(project_id)
+            .get(project_id)
+            .map(|project| project.path.clone())
             .ok_or_else(|| anyhow::anyhow!("Unknown project id: {}", project_id))?;
-
-        // Cross-host guard first. `is_headless_running_for` below only reads
-        // the local /proc, so on a shared-NFS cluster it cannot see a headless
-        // CLI another host already started for this same project -- and both
-        // daemons would spawn one, writing the same .apas and worktrees.
-        // The claim file is how peers tell each other who owns what.
-        match crate::daemon_registry::claim_project(
-            &config_dir_for_registry(),
-            project_id,
-            &project.path.display().to_string(),
-            self.machine_info.machine_id,
-        ) {
-            Ok(crate::daemon_registry::ClaimOutcome::HeldBy(peer)) => {
-                tracing::info!(
-                    project_id,
-                    peer = %peer.hostname,
-                    heartbeat_age_secs = peer.age_secs,
-                    "project is running on another host; skipping spawn"
-                );
-                return Ok(());
-            }
-            Ok(_) => {}
-            Err(err) => {
-                // A claim we cannot write is not worth failing the spawn over;
-                // the local /proc guard below still applies.
-                tracing::warn!(project_id, %err, "could not record project claim");
-            }
-        }
 
         // An externally started `--headless -d <path>` run — the standalone
         // debugging path, or a project left over from the process-per-project
         // model. It is not ours to supervise, but starting a second owner for
         // the same `.apas` and worktrees is exactly what must not happen.
-        if is_headless_running_for(&project.path) {
-            tracing::info!(
-                project_id,
-                "project already has an external headless run; not starting a second"
-            );
-            return Ok(());
+        // Checked before claiming, so this refusal leaves no claim behind.
+        if is_headless_running_for(&project_path) {
+            let reason = "an `apas --headless` run started outside the daemon already runs \
+                          this project on this host";
+            return Ok(StartOutcome::Refused(
+                self.record_start_refusal(project_id, reason.to_string()),
+            ));
         }
+
+        // Cross-host guard. `is_headless_running_for` above only reads the
+        // local /proc, so on a shared-NFS cluster it cannot see a runtime
+        // another host started for this same project. The claim files are how
+        // peers tell each other who runs what: another machine's instance does
+        // not stop a capable daemon from starting one of its own, but a holder
+        // that runs the project alone does.
+        //
+        // Written before the task starts, so the instance deciding whether to
+        // adopt untagged panes already sees it, and so does a peer starting
+        // the same project at the same moment.
+        let machine_id = self.machine_info.machine_id;
+        match crate::daemon_registry::claim_project(
+            &self.registry_dir,
+            project_id,
+            &project_path.display().to_string(),
+            machine_id,
+            self.claim_mode,
+        ) {
+            Ok(ClaimOutcome::HeldBy(refusal)) => {
+                return Ok(StartOutcome::Refused(
+                    self.record_start_refusal(project_id, refusal.reason()),
+                ));
+            }
+            Ok(_) => {}
+            Err(err) => {
+                // A claim we cannot write is not worth failing the spawn over;
+                // the heartbeat retries it for as long as the project runs.
+                tracing::warn!(project_id, %err, "could not record project claim");
+            }
+        }
+        if self.claim_mode == ClaimMode::Instances {
+            // Running beside other machines is the point of instances, but it
+            // is also what an operator chasing a duplicate needs to see.
+            let others = crate::daemon_registry::live_instance_machines(
+                &self.registry_dir,
+                project_id,
+                machine_id,
+            );
+            if others.any() {
+                tracing::info!(
+                    project_id,
+                    machines = ?others
+                        .machines
+                        .iter()
+                        .chain(others.exclusive_legacy.iter())
+                        .map(|holder| holder.hostname.as_str())
+                        .collect::<Vec<_>>(),
+                    "starting another instance of a project that other machines run"
+                );
+            }
+        }
+        // Released when the task ends, however it ends, except when it asks
+        // for the daemon to be replaced.
+        let claim = InstanceClaimGuard::new(
+            self.registry_dir.clone(),
+            project_id.to_string(),
+            machine_id,
+        );
 
         // The project runs here, as a task of this instance. It used to be a
         // headless CLI in its own tmux session, which this daemon then could
@@ -856,13 +1070,15 @@ impl DaemonState {
         //
         // Blocking work inside a project stays on its own threads. Nothing
         // here may block the runtime, or one project would stall the others.
-        let project_path = project.path.clone();
         let project_shutdown = Arc::new(AtomicBool::new(false));
-        let task_shutdown = project_shutdown.clone();
-        let server = server_url.to_string();
-        let token = token.to_string();
+        let launch = (self.launcher)(ProjectLaunch {
+            server_url: server_url.to_string(),
+            token: token.to_string(),
+            project_path,
+            shutdown: project_shutdown.clone(),
+            machine_id,
+        });
         let id_for_task = project_id.to_string();
-        let machine_id = self.machine_info.machine_id;
         let restart_tx = restart_tx.clone();
         let handle = tokio::spawn(async move {
             // Every record this project emits carries its identity: sharing a
@@ -870,15 +1086,7 @@ impl DaemonState {
             // used to separate them for free.
             let span = tracing::info_span!("project", id = %id_for_task);
             let _entered = span.enter();
-            match crate::mode::dual_pane::run_project(
-                &server,
-                &token,
-                &project_path,
-                task_shutdown,
-                machine_id,
-            )
-            .await
-            {
+            match launch.await {
                 Ok(crate::mode::dual_pane::ProjectOutcome::Completed) => {
                     tracing::info!("project stopped");
                 }
@@ -889,6 +1097,11 @@ impl DaemonState {
                 }
                 Ok(crate::mode::dual_pane::ProjectOutcome::RebootRequested) => {
                     tracing::info!("project asked to restart");
+                    // The daemon replaces itself and resumes this project,
+                    // taking its claims back under the same pid. Releasing
+                    // them first would show peers an unclaimed project for
+                    // the length of the update.
+                    claim.keep();
                     // Replacing one project no longer replaces the process,
                     // which is what a reboot used to mean when a process was
                     // a project.
@@ -900,7 +1113,9 @@ impl DaemonState {
             }
         });
 
-        project.last_error = None;
+        if let Some(project) = self.projects.get_mut(project_id) {
+            project.last_error = None;
+        }
         self.running.insert(
             project_id.to_string(),
             RunningProject {
@@ -909,37 +1124,125 @@ impl DaemonState {
             },
         );
         tracing::info!(project_id, "started project in this instance");
-        Ok(())
+        Ok(StartOutcome::Started)
     }
 
-    /// Stop a project and wait for it to finish tearing down.
+    /// Record why a project was not started, as its `last_error`, and return
+    /// that reason for the caller to report.
+    fn record_start_refusal(&mut self, project_id: &str, reason: String) -> String {
+        tracing::warn!(project_id, %reason, "not starting project");
+        if let Some(project) = self.projects.get_mut(project_id) {
+            project.last_error = Some(reason.clone());
+        }
+        reason
+    }
+
+    /// Answer a `StartProjectCli`. Returns what to send back, in order: the
+    /// inventory, then, when the request carried an id, exactly one
+    /// `ProjectRuntimeStarted`, whatever happened. The inventory goes first so
+    /// the server already holds this start's running state and `last_error`
+    /// when the outcome arrives.
+    ///
+    /// `success` means the project now runs in this daemon, including when it
+    /// already did. It is the start, not the attachment: the server still
+    /// waits for the instance's `SessionStart`.
+    fn handle_start_request(
+        &mut self,
+        project_id: String,
+        policy: Option<EffectiveProjectPolicy>,
+        request_id: Option<Uuid>,
+        server_url: &str,
+        token: &str,
+        restart_tx: &RestartRequests,
+    ) -> Vec<DaemonToServer> {
+        let result = match policy {
+            // Fails closed, so a mixed-version rollout cannot revive a
+            // suspended project.
+            None => Err(self.record_start_refusal(
+                &project_id,
+                "the start request carried no cluster policy from the server".to_string(),
+            )),
+            Some(policy) if policy.project_suspended => Err(self.record_start_refusal(
+                &project_id,
+                format!(
+                    "the project is suspended (policy version {})",
+                    policy.version
+                ),
+            )),
+            Some(_) => match self.start_project(&project_id, server_url, token, restart_tx) {
+                Ok(StartOutcome::Started | StartOutcome::AlreadyRunning) => Ok(()),
+                Ok(StartOutcome::Refused(reason)) => Err(reason),
+                Err(err) => {
+                    tracing::warn!("Failed to start project {}: {}", project_id, err);
+                    Err(err.to_string())
+                }
+            },
+        };
+        let mut replies = vec![DaemonToServer::Heartbeat {
+            projects: self.snapshot_projects(),
+        }];
+        if let Some(request_id) = request_id {
+            let (success, error) = match result {
+                Ok(()) => (true, None),
+                Err(reason) => (false, Some(reason)),
+            };
+            replies.push(DaemonToServer::ProjectRuntimeStarted {
+                request_id,
+                project_id,
+                success,
+                error,
+            });
+        }
+        replies
+    }
+
+    /// Stop a project and wait for it to finish tearing down. Returns false
+    /// only when its task was still running when the wait ran out.
     ///
     /// Bounded, because teardown kills pane children and joins roughly thirty
     /// threads: a project that will not stop must not hold the instance that
     /// every other project is running in.
-    async fn stop_running_project(&mut self, project_id: &str) {
+    async fn stop_running_project(&mut self, project_id: &str) -> bool {
         let Some(project) = self.running.remove(project_id) else {
-            return;
+            return true;
         };
         project.shutdown.store(true, Ordering::SeqCst);
         match tokio::time::timeout(std::time::Duration::from_secs(30), project.handle).await {
-            Ok(Ok(())) => tracing::info!(project_id, "project stopped"),
+            Ok(Ok(())) => {
+                tracing::info!(project_id, "project stopped");
+                true
+            }
             Ok(Err(err)) => {
                 // A panicking project unwinds its own task. Reported, and the
                 // instance and every other project carry on.
                 tracing::error!(project_id, %err, "project ended abnormally");
+                true
             }
-            Err(_) => tracing::warn!(
-                project_id,
-                "project did not stop within 30s; abandoning the wait"
-            ),
+            Err(_) => {
+                tracing::warn!(
+                    project_id,
+                    "project did not stop within 30s; abandoning the wait"
+                );
+                false
+            }
         }
     }
 
     async fn stop_project(&mut self, project_id: &str) -> Result<()> {
         // Stop the task first: it owns the panes, and letting it tear down
         // before the pane hosts are shut means it can do so cleanly.
-        self.stop_running_project(project_id).await;
+        if self.stop_running_project(project_id).await {
+            // Its task released its claims as it ended. Releasing here too
+            // covers claims of ours with no task behind them, such as those of
+            // a project a replaced daemon ran and this one did not resume. A
+            // task still tearing down keeps its claims until it ends; nothing
+            // refreshes them meanwhile, so they lapse if it never does.
+            crate::daemon_registry::release_project(
+                &self.registry_dir,
+                project_id,
+                self.machine_info.machine_id,
+            );
+        }
         if let Ok(project_uuid) = Uuid::parse_str(project_id) {
             let stopped = crate::pane_host::shutdown_project_hosts(project_uuid)?;
             if stopped > 0 {
@@ -1074,17 +1377,203 @@ impl DaemonState {
         // doesn't get a "failed" toast for an instance that was created.
         let project_id = metadata.id.to_string();
         self.refresh_projects();
+        // This thread just cloned the checkout, so one more local `git` read
+        // costs little, and the next inventory then files the new checkout
+        // under its repository instead of waiting for a background read.
+        if let Some(path) = self
+            .projects
+            .get(&project_id)
+            .map(|entry| entry.path.clone())
+        {
+            let remote = crate::worktree::normalized_git_remote(&path);
+            self.git_remotes.record(path, remote);
+        }
         if provisioning_mode == ProjectProvisioningMode::TrustedOwner {
-            if let Err(err) = self.start_project(&project_id, server_url, token, restart_tx) {
-                tracing::warn!(
+            match self.start_project(&project_id, server_url, token, restart_tx) {
+                Ok(StartOutcome::Started | StartOutcome::AlreadyRunning) => {}
+                Ok(StartOutcome::Refused(reason)) => tracing::warn!(
+                    "Created instance {} but did not auto-start it: {}",
+                    project_id,
+                    reason
+                ),
+                Err(err) => tracing::warn!(
                     "Created instance {} but failed to auto-start it: {}",
                     project_id,
                     err
-                );
+                ),
             }
         }
 
         Ok((project_id, dest.to_string_lossy().to_string()))
+    }
+
+    /// Answer a `CreateProjectInstance` that joins an existing project
+    /// (`join_existing`). Returns what to send back, in order: the inventory,
+    /// then the acknowledgement, whatever the outcome.
+    ///
+    /// On success the web goes on to add the checkout's first tab, with an
+    /// `AddPane` naming this machine, which the server resolves through its
+    /// inventory of this machine. It handles one daemon's messages in order,
+    /// so with the inventory first it already lists the checkout when the
+    /// acknowledgement reaches the web. The other way round, that request
+    /// would race the inventory refresh.
+    #[allow(clippy::too_many_arguments)]
+    fn handle_join_instance(
+        &mut self,
+        git_remote: &str,
+        instance_name: &str,
+        clone_url: Option<&str>,
+        base_path: Option<&str>,
+        request_id: Option<String>,
+        project_id: Option<&str>,
+        provisioning_mode: ProjectProvisioningMode,
+    ) -> Vec<DaemonToServer> {
+        let ack = match self.join_instance(
+            git_remote,
+            instance_name,
+            clone_url,
+            base_path,
+            project_id,
+            provisioning_mode,
+        ) {
+            Ok((project_id, path)) => {
+                tracing::info!(
+                    "Joined project {} with a new checkout at {}",
+                    project_id,
+                    path
+                );
+                DaemonToServer::ProjectInstanceCreated {
+                    request_id,
+                    project_id: Some(project_id),
+                    path: Some(path),
+                    error: None,
+                }
+            }
+            Err(err) => {
+                tracing::warn!("Joining a project with a new checkout failed: {:#}", err);
+                DaemonToServer::ProjectInstanceCreated {
+                    request_id,
+                    project_id: None,
+                    path: None,
+                    error: Some(format!("{err:#}")),
+                }
+            }
+        };
+        vec![
+            DaemonToServer::Heartbeat {
+                projects: self.snapshot_projects(),
+            },
+            ack,
+        ]
+    }
+
+    /// Clone a repository onto this machine as another checkout of an
+    /// existing project: the checkout takes that project's id with no panes,
+    /// and is registered but not started. Its first tab, added from the web,
+    /// starts it. Returns (project_id, absolute path).
+    ///
+    /// Unlike a new instance it creates no branch, since it joins the
+    /// project's work rather than starting a line of its own, and it is only
+    /// for the owner's own machines. A clone that fails before it is
+    /// registered is removed, as a new instance's is.
+    fn join_instance(
+        &mut self,
+        git_remote: &str,
+        instance_name: &str,
+        clone_url: Option<&str>,
+        base_path: Option<&str>,
+        project_id: Option<&str>,
+        provisioning_mode: ProjectProvisioningMode,
+    ) -> Result<(String, String)> {
+        // The server sends a join only on the owner path, and only to a daemon
+        // advertising instances; shared-cluster provisioning never joins.
+        anyhow::ensure!(
+            provisioning_mode == ProjectProvisioningMode::TrustedOwner,
+            "joining an existing project is only for the owner's own machines"
+        );
+        anyhow::ensure!(
+            self.claim_mode == ClaimMode::Instances,
+            "this machine runs each project alone, because config.toml sets daemon.machine_id, \
+             so it cannot run a project beside another machine"
+        );
+        let project_uuid = project_id
+            .context("the join names no project")
+            .and_then(|id| Uuid::parse_str(id).context("the project to join is not a valid id"))?;
+        let project_id = project_uuid.to_string();
+        // A registry holds one folder per project, and on a home shared
+        // between machines that checkout is already in reach from here.
+        self.refresh_projects();
+        if let Some(existing) = self.projects.get(&project_id) {
+            anyhow::bail!(
+                "project {} is already registered on this machine at {}; start it there instead",
+                project_id,
+                existing.path.display()
+            );
+        }
+
+        let root = match base_path {
+            Some(p) if !p.trim().is_empty() => expand_tilde(p.trim()),
+            _ => dirs::home_dir()
+                .ok_or_else(|| anyhow::anyhow!("could not resolve home directory"))?
+                .join("apas_projects"),
+        };
+        let name = crate::worktree::sanitize_instance_name(instance_name);
+        let dest = crate::worktree::unique_dir(&root.join(&name));
+        if let Some(parent) = dest.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let url = self.resolve_clone_url(git_remote, clone_url);
+
+        let registered = (|| -> Result<(
+            crate::project::RegisteredProject,
+            Vec<crate::project::RegisteredProject>,
+        )> {
+            crate::worktree::clone_repo(&url, &dest)?;
+            // Written outright: a repository that commits a `.apas` would
+            // otherwise hand the checkout another project's id and panes.
+            let metadata = crate::project::ProjectMetadata::with_id_and_name(
+                project_uuid,
+                dest.file_name()
+                    .and_then(|name| name.to_str())
+                    .map(str::to_string),
+            );
+            let bytes = serde_json::to_vec_pretty(&metadata)?;
+            {
+                let _lock = crate::project_instances::lock_project_metadata(project_uuid)?;
+                crate::project_instances::write_metadata_file(
+                    &crate::project::get_apas_path(&dest),
+                    &bytes,
+                )?;
+            }
+            // Strict registration refuses the project at another folder under
+            // the registry lock, where the check above could have raced.
+            let path = std::fs::canonicalize(&dest)?;
+            let path = path
+                .to_str()
+                .context("the checkout's path is not valid UTF-8")?;
+            crate::project::register_local_project(path)
+        })();
+        let (registered, inventory) = match registered {
+            Ok(registered) => registered,
+            Err(err) => {
+                let _ = std::fs::remove_dir_all(&dest);
+                return Err(err);
+            }
+        };
+        tracing::info!(
+            "Cloned {} into {} to join project {}",
+            url,
+            registered.path,
+            project_id
+        );
+        self.apply_project_inventory(inventory);
+        // This thread just cloned it, so one more local `git` read costs
+        // little, and the inventory sent next files the checkout under its
+        // repository at once.
+        let remote = crate::worktree::normalized_git_remote(Path::new(&registered.path));
+        self.git_remotes
+            .record(PathBuf::from(&registered.path), remote);
+        Ok((registered.project_id, registered.path))
     }
 
     fn discard_project_provisioning(&mut self, request_id: &str, project_id: &str) -> Result<bool> {
@@ -1179,6 +1668,25 @@ fn expand_tilde(p: &str) -> PathBuf {
     PathBuf::from(p)
 }
 
+/// What this daemon tells the server it can do.
+///
+/// `project_instances_v1` only in [`ClaimMode::Instances`]: a daemon whose
+/// machine id is configured shares that id with every host on its home, so
+/// the server could not tell its instances apart.
+fn daemon_capabilities(claim_mode: ClaimMode) -> Vec<String> {
+    let mut capabilities = vec![
+        shared::PROJECT_POLICY_CAPABILITY.to_string(),
+        shared::PANE_HOST_CLEANUP_ACK_CAPABILITY.to_string(),
+        shared::SHARED_PROJECT_PROVISIONING_CAPABILITY.to_string(),
+        shared::LOCAL_PROJECT_REGISTRATION_CAPABILITY.to_string(),
+        shared::OMP_JOB_WORKER_CAPABILITY.to_string(),
+    ];
+    if claim_mode == ClaimMode::Instances {
+        capabilities.push(shared::PROJECT_INSTANCES_CAPABILITY.to_string());
+    }
+    capabilities
+}
+
 pub async fn run(
     server_url: &str,
     token: &str,
@@ -1215,6 +1723,10 @@ pub async fn run(
         deepseek_backend: deepseek_backend_info_from_config(&config),
         last_seen: None,
     };
+    // From the same setting the machine id came from: a configured id is
+    // shared with every host on this home, so instances could not be told
+    // apart by it.
+    let claim_mode = ClaimMode::for_configured_machine_id(config.daemon.machine_id.as_deref());
 
     let registry = crate::project::project_registry_path()
         .map(|p| p.display().to_string())
@@ -1224,6 +1736,12 @@ pub async fn run(
         machine_id,
         registry
     );
+    if claim_mode == ClaimMode::Exclusive {
+        tracing::info!(
+            "daemon.machine_id is set in config.toml, so this host runs each project alone \
+             and does not run instances beside other machines"
+        );
+    }
 
     let shutdown = Arc::new(AtomicBool::new(false));
     {
@@ -1253,16 +1771,15 @@ pub async fn run(
         ),
     }
 
-    let mut state = DaemonState::new(machine_info);
+    let mut state = DaemonState::new(machine_info, claim_mode);
     state.refresh_projects();
-    // Adopt anything already running here before serving any request, so a
-    // restart or self-upgrade never leaves a window where our projects look
-    // unclaimed to peers.
+    // Read the checkouts' remotes in the background now, so the first
+    // heartbeats are likely to carry them.
+    state.refresh_git_remotes();
     // Before anything starts here: an older instance's projects are separate
     // processes this one cannot supervise, and two owners of one project is
     // the failure this whole change exists to remove.
     state.retire_process_per_project_leftovers();
-    state.reconcile_running_claims();
 
     // Projects ask to be replaced here; only this loop holds the table that
     // can do it.
@@ -1271,23 +1788,39 @@ pub async fn run(
     // Start again what this instance was running before it replaced itself.
     // Pane hosts are separate processes and survived the `exec`, so a prompt
     // resume lands inside their adoption grace and the terminal agents carry
-    // straight on.
+    // straight on. The claims survived the `exec` too, and each start below
+    // takes its project's back under this same pid.
     for project in take_resume_manifest() {
         let project_id = project.project_id.clone();
         if let Err(err) = state.restore_project_from_resume(&project) {
             tracing::warn!(project_id, %err, "could not restore project path after replacement");
             continue;
         }
-        if let Err(err) = state.start_project(&project_id, server_url, token, &restart_tx) {
-            tracing::warn!(project_id, %err, "could not resume project after replacement");
-        } else {
-            tracing::info!(project_id, "resumed project after replacement");
+        match state.start_project(&project_id, server_url, token, &restart_tx) {
+            Ok(StartOutcome::Started | StartOutcome::AlreadyRunning) => {
+                tracing::info!(project_id, "resumed project after replacement");
+            }
+            Ok(StartOutcome::Refused(reason)) => {
+                tracing::warn!(project_id, %reason, "could not resume project after replacement");
+            }
+            Err(err) => {
+                tracing::warn!(project_id, %err, "could not resume project after replacement");
+            }
         }
     }
+    // Claims now match what runs here, before any request is served, so a
+    // restart or self-upgrade never leaves a window where our instances look
+    // stopped to peers.
+    state.reconcile_running_claims();
 
     let mut reconnect_delay = INITIAL_RECONNECT_DELAY;
 
     while !shutdown.load(Ordering::SeqCst) {
+        // Projects keep running while the server is unreachable, so their
+        // claims have to stay fresh between connection attempts too, not only
+        // on a connected heartbeat.
+        let _ = crate::daemon_registry::publish_self(&registry_dir, machine_id, VERSION);
+        state.reconcile_running_claims();
         state.reap_exited_processes();
         state.refresh_projects();
 
@@ -1352,13 +1885,7 @@ async fn run_connection(
         token: token.to_string(),
         machine: state.machine_info.clone(),
         projects: state.snapshot_projects(),
-        capabilities: vec![
-            shared::PROJECT_POLICY_CAPABILITY.to_string(),
-            shared::PANE_HOST_CLEANUP_ACK_CAPABILITY.to_string(),
-            shared::SHARED_PROJECT_PROVISIONING_CAPABILITY.to_string(),
-            shared::LOCAL_PROJECT_REGISTRATION_CAPABILITY.to_string(),
-            shared::OMP_JOB_WORKER_CAPABILITY.to_string(),
-        ],
+        capabilities: daemon_capabilities(state.claim_mode),
     };
     ws_sender
         .send(Message::Text(serde_json::to_string(&register)?.into()))
@@ -1425,12 +1952,6 @@ async fn run_connection(
             return Ok(());
         }
 
-        // Keep our record and our project claims fresh. If these age past
-        // STALE_AFTER_SECS a peer will conclude this host died and take over
-        // projects we are actively running.
-        let _ = crate::daemon_registry::publish_self(&registry_dir, self_machine_id, VERSION);
-        crate::daemon_registry::refresh_own_claims(&registry_dir);
-
         tokio::select! {
             Some(report) = async {
                 match jobs.as_mut() {
@@ -1475,20 +1996,37 @@ async fn run_connection(
                 }
                 // Reached only when the replacement failed, or on a platform
                 // that cannot `exec`. Restarting the one project still clears
-                // whatever made the user ask, so it beats doing nothing.
+                // whatever made the user ask, so it beats doing nothing. Its
+                // task kept the claims for the replacement, so this start
+                // finds them still its own.
                 state.stop_running_project(&project_id).await;
-                if let Err(err) = state.start_project(&project_id, server_url, token, restart_tx) {
-                    tracing::warn!(project_id, %err, "could not restart project");
-                } else {
-                    tracing::info!(project_id, "restarted project");
+                match state.start_project(&project_id, server_url, token, restart_tx) {
+                    Ok(StartOutcome::Started | StartOutcome::AlreadyRunning) => {
+                        tracing::info!(project_id, "restarted project");
+                    }
+                    Ok(StartOutcome::Refused(reason)) => {
+                        tracing::warn!(project_id, %reason, "could not restart project");
+                    }
+                    Err(err) => {
+                        tracing::warn!(project_id, %err, "could not restart project");
+                    }
                 }
             }
             _ = usage_refresh.tick() => {
                 refresh_usage_limits_cache().await;
             }
             _ = heartbeat.tick() => {
+                // Keep our record and our instances' claims fresh. If these
+                // age past STALE_AFTER_SECS, peers conclude this host died or
+                // that its instances stopped. Once per tick: this used to run
+                // on every wake of the loop, rewriting the shared files for
+                // each message received.
+                let _ = crate::daemon_registry::publish_self(&registry_dir, self_machine_id, VERSION);
+                state.reconcile_running_claims();
+
                 state.reap_exited_processes();
                 state.refresh_projects();
+                state.refresh_git_remotes();
 
                 let heartbeat_msg = DaemonToServer::Heartbeat {
                     projects: state.snapshot_projects(),
@@ -1521,35 +2059,23 @@ async fn run_connection(
                             ServerToDaemon::StartProjectCli {
                                 project_id,
                                 policy,
-                                // Servers correlate starts only with daemons
-                                // advertising `project_instances_v1`, which
-                                // this one does not yet, so nothing waits on a
-                                // `ProjectRuntimeStarted` from it.
-                                request_id: _,
+                                request_id,
                             } => {
-                                let Some(policy) = policy else {
-                                    tracing::warn!(
-                                        "Refusing to start project {} without authoritative cluster policy",
-                                        project_id
-                                    );
-                                    continue;
-                                };
-                                if policy.project_suspended {
-                                    tracing::warn!(
-                                        "Refusing to start suspended project {} (policy version {})",
-                                        project_id,
-                                        policy.version
-                                    );
-                                    continue;
+                                // Every outcome, refusals included, comes back
+                                // through here: a server waiting on a
+                                // correlated start hears exactly once.
+                                for reply in state.handle_start_request(
+                                    project_id,
+                                    policy,
+                                    request_id,
+                                    server_url,
+                                    token,
+                                    restart_tx,
+                                ) {
+                                    ws_sender
+                                        .send(Message::Text(serde_json::to_string(&reply)?.into()))
+                                        .await?;
                                 }
-                                if let Err(err) = state.start_project(&project_id, server_url, token, restart_tx) {
-                                    tracing::warn!("Failed to start project {}: {}", project_id, err);
-                                }
-                                let update = DaemonToServer::Heartbeat {
-                                    projects: state.snapshot_projects(),
-                                };
-                                let text = serde_json::to_string(&update)?;
-                                ws_sender.send(Message::Text(text.into())).await?;
                             }
                             ServerToDaemon::StopProjectCli { project_id, request_id } => {
                                 let stop_result = state.stop_project(&project_id).await;
@@ -1603,16 +2129,42 @@ async fn run_connection(
                             ServerToDaemon::CreateProjectInstance {
                                 git_remote,
                                 instance_name,
+                                clone_url,
+                                base_path,
+                                request_id,
+                                project_id,
+                                provisioning_mode,
+                                join_existing: true,
+                                ..
+                            } => {
+                                // Another checkout of an existing project. Like
+                                // a new instance's, the clone runs inline on the
+                                // message loop. The inventory goes out before
+                                // the acknowledgement; see `handle_join_instance`.
+                                for reply in state.handle_join_instance(
+                                    &git_remote,
+                                    &instance_name,
+                                    clone_url.as_deref(),
+                                    base_path.as_deref(),
+                                    request_id,
+                                    project_id.as_deref(),
+                                    provisioning_mode,
+                                ) {
+                                    ws_sender
+                                        .send(Message::Text(serde_json::to_string(&reply)?.into()))
+                                        .await?;
+                                }
+                            }
+                            ServerToDaemon::CreateProjectInstance {
+                                git_remote,
+                                instance_name,
                                 branch,
                                 clone_url,
                                 base_path,
                                 request_id,
                                 project_id,
                                 provisioning_mode,
-                                // Joining an existing project is sent only to
-                                // daemons advertising `project_instances_v1`,
-                                // which this one does not yet.
-                                join_existing: _,
+                                join_existing: false,
                             } => {
                                 // NOTE: clone runs inline on the message loop; a
                                 // very large clone briefly delays heartbeats.
@@ -1967,15 +2519,18 @@ mod local_registration_tests {
     use super::*;
 
     fn state() -> DaemonState {
-        DaemonState::new(MachineInfo {
-            machine_id: Uuid::new_v4(),
-            hostname: "local-registration-test".into(),
-            os: "linux".into(),
-            arch: "x86_64".into(),
-            daemon_version: None,
-            deepseek_backend: None,
-            last_seen: None,
-        })
+        DaemonState::new(
+            MachineInfo {
+                machine_id: Uuid::new_v4(),
+                hostname: "local-registration-test".into(),
+                os: "linux".into(),
+                arch: "x86_64".into(),
+                daemon_version: None,
+                deepseek_backend: None,
+                last_seen: None,
+            },
+            ClaimMode::Instances,
+        )
     }
 
     #[test]
@@ -2074,6 +2629,7 @@ mod local_registration_tests {
 #[cfg(test)]
 mod requested_restart_tests {
     use super::{DaemonState, ProjectEntry, RunningProject};
+    use crate::daemon_registry::ClaimMode;
     use std::path::PathBuf;
     use std::sync::atomic::AtomicBool;
     use std::sync::Arc;
@@ -2134,7 +2690,7 @@ mod requested_restart_tests {
     /// user presses "Reboot CLI" and it is the one project that never returns.
     #[tokio::test]
     async fn the_project_that_asked_to_restart_is_still_resumed() {
-        let mut state = DaemonState::new(machine());
+        let mut state = DaemonState::new(machine(), ClaimMode::Instances);
         entry(&mut state, "requester", finished_task().await);
         entry(&mut state, "bystander", long_running_task());
 
@@ -2164,7 +2720,7 @@ mod requested_restart_tests {
     /// replacement would start it once per entry.
     #[tokio::test]
     async fn a_still_running_requester_is_not_duplicated() {
-        let mut state = DaemonState::new(machine());
+        let mut state = DaemonState::new(machine(), ClaimMode::Instances);
         entry(&mut state, "requester", long_running_task());
 
         let resume = state.resume_projects_after_requested_restart("requester");
@@ -2176,7 +2732,7 @@ mod requested_restart_tests {
     /// one: the replacement would have no path to start it from.
     #[tokio::test]
     async fn an_unknown_project_is_not_invented() {
-        let state = DaemonState::new(machine());
+        let state = DaemonState::new(machine(), ClaimMode::Instances);
         assert!(state
             .resume_projects_after_requested_restart("never-heard-of-it")
             .is_empty());
@@ -2186,7 +2742,7 @@ mod requested_restart_tests {
     /// is scoped to the requester, not a blanket "resume everything".
     #[tokio::test]
     async fn an_unrelated_finished_project_is_still_not_resumed() {
-        let mut state = DaemonState::new(machine());
+        let mut state = DaemonState::new(machine(), ClaimMode::Instances);
         entry(&mut state, "requester", long_running_task());
         entry(&mut state, "stopped-on-its-own", finished_task().await);
 
@@ -2274,5 +2830,1021 @@ mod resume_tests {
         assert!(!should_forget_project(false, true, false));
         assert!(!should_forget_project(false, false, true));
         assert!(should_forget_project(false, false, false));
+    }
+}
+
+#[cfg(test)]
+mod instance_tests {
+    use super::*;
+    use crate::config::test_config::ConfigDirGuard;
+    use crate::mode::dual_pane::ProjectOutcome;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    /// How the stand-in for the project runtime ends.
+    #[derive(Clone, Copy, Debug)]
+    enum Ending {
+        WhenStopped,
+        Completed,
+        Stopped,
+        Failed,
+        RebootRequested,
+        Panics,
+    }
+
+    fn launcher(ending: Ending) -> ProjectLauncher {
+        Arc::new(move |launch: ProjectLaunch| {
+            Box::pin(async move {
+                match ending {
+                    Ending::WhenStopped => {
+                        while !launch.shutdown.load(Ordering::SeqCst) {
+                            tokio::time::sleep(Duration::from_millis(5)).await;
+                        }
+                        Ok(ProjectOutcome::Completed)
+                    }
+                    Ending::Completed => Ok(ProjectOutcome::Completed),
+                    Ending::Stopped => Ok(ProjectOutcome::Stopped("session rejected".into())),
+                    Ending::Failed => Err(anyhow::anyhow!("could not reach the server")),
+                    Ending::RebootRequested => Ok(ProjectOutcome::RebootRequested),
+                    Ending::Panics => panic!("a project fell over"),
+                }
+            })
+        })
+    }
+
+    fn now_secs() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+    }
+
+    struct Harness {
+        state: DaemonState,
+        restart_tx: RestartRequests,
+        restart_rx: tokio::sync::mpsc::UnboundedReceiver<String>,
+        projects: tempfile::TempDir,
+        // This test's config directory, which holds the claims, and the
+        // thread's redirect to it, for as long as the harness lives.
+        config: ConfigDirGuard,
+    }
+
+    fn harness(mode: ClaimMode, ending: Ending) -> Harness {
+        let config = crate::config::test_config::isolated_config_dir();
+        let mut state = DaemonState::new(
+            MachineInfo {
+                machine_id: Uuid::new_v4(),
+                hostname: "instance-test".into(),
+                os: "linux".into(),
+                arch: "x86_64".into(),
+                daemon_version: None,
+                deepseek_backend: None,
+                last_seen: None,
+            },
+            mode,
+        );
+        assert_eq!(
+            state.registry_dir,
+            config.path(),
+            "claims stay in the test's directory"
+        );
+        state.launcher = launcher(ending);
+        let (restart_tx, restart_rx) = tokio::sync::mpsc::unbounded_channel();
+        Harness {
+            state,
+            restart_tx,
+            restart_rx,
+            projects: tempfile::tempdir().unwrap(),
+            config,
+        }
+    }
+
+    impl Harness {
+        fn machine(&self) -> Uuid {
+            self.state.machine_info.machine_id
+        }
+
+        fn add_project(&mut self, project_id: &str) -> PathBuf {
+            let path = self.projects.path().join(project_id);
+            self.state.projects.insert(
+                project_id.to_string(),
+                ProjectEntry {
+                    name: None,
+                    path: path.clone(),
+                    last_error: None,
+                },
+            );
+            path
+        }
+
+        fn start(&mut self, project_id: &str) -> StartOutcome {
+            self.state
+                .start_project(project_id, "ws://127.0.0.1:9", "token", &self.restart_tx)
+                .unwrap()
+        }
+
+        fn request_start(
+            &mut self,
+            project_id: &str,
+            policy: Option<EffectiveProjectPolicy>,
+            request_id: Option<Uuid>,
+        ) -> Vec<DaemonToServer> {
+            self.state.handle_start_request(
+                project_id.to_string(),
+                policy,
+                request_id,
+                "ws://127.0.0.1:9",
+                "token",
+                &self.restart_tx,
+            )
+        }
+
+        fn guard_path(&self, project_id: &str) -> PathBuf {
+            self.config
+                .path()
+                .join("claims")
+                .join(format!("{project_id}.json"))
+        }
+
+        fn instance_path(&self, project_id: &str, machine: Uuid) -> PathBuf {
+            self.config
+                .path()
+                .join("claims")
+                .join(project_id)
+                .join(format!("{machine}.json"))
+        }
+
+        fn read(&self, path: &Path) -> serde_json::Value {
+            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap()
+        }
+
+        /// Wait for a project's task to end on its own.
+        async fn wait_until_ended(&self, project_id: &str) {
+            let handle = &self.state.running[project_id].handle;
+            for _ in 0..400 {
+                if handle.is_finished() {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            panic!("{project_id}'s task did not end");
+        }
+    }
+
+    /// A claim another host wrote, in the on-disk shape every daemon reads.
+    fn write_foreign_claim(path: &Path, host: &str, machine: Uuid, heartbeat: u64, marked: bool) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut claim = serde_json::json!({
+            "project_id": "p",
+            "project_path": "/elsewhere/p",
+            "hostname": host,
+            "machine_id": machine,
+            "pid": 4242,
+            "claimed_at": heartbeat,
+            "heartbeat": heartbeat,
+        });
+        if marked {
+            claim["instances"] = serde_json::json!(true);
+        }
+        std::fs::write(path, serde_json::to_vec(&claim).unwrap()).unwrap();
+    }
+
+    /// The project runtime's own process, as `/proc` shows an
+    /// `apas --headless -d <path>` run started outside the daemon.
+    struct ExternalHeadlessRun(std::process::Child);
+
+    impl ExternalHeadlessRun {
+        fn start(path: &Path) -> Self {
+            use std::os::unix::process::CommandExt;
+            let child = Command::new("sh")
+                .arg0("apas")
+                .args(["-c", "sleep 30; true", "--headless", "-d"])
+                .arg(path)
+                .process_group(0)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("start a stand-in headless run");
+            Self(child)
+        }
+    }
+
+    impl Drop for ExternalHeadlessRun {
+        fn drop(&mut self) {
+            // The shell and its `sleep` share the group it leads.
+            unsafe {
+                libc::kill(-(self.0.id() as i32), libc::SIGKILL);
+            }
+            let _ = self.0.wait();
+        }
+    }
+
+    fn outcome_of(replies: &[DaemonToServer]) -> Option<(Uuid, String, bool, Option<String>)> {
+        let mut outcomes = replies.iter().filter_map(|reply| match reply {
+            DaemonToServer::ProjectRuntimeStarted {
+                request_id,
+                project_id,
+                success,
+                error,
+            } => Some((*request_id, project_id.clone(), *success, error.clone())),
+            _ => None,
+        });
+        let outcome = outcomes.next();
+        assert!(
+            outcomes.next().is_none(),
+            "one outcome per request: {replies:?}"
+        );
+        outcome
+    }
+
+    fn inventory_entry(replies: &[DaemonToServer], project_id: &str) -> MachineProjectInfo {
+        match replies.first() {
+            Some(DaemonToServer::Heartbeat { projects }) => projects
+                .iter()
+                .find(|project| project.project_id == project_id)
+                .cloned()
+                .expect("the project is in the inventory"),
+            other => panic!("the inventory goes first, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_started_instance_holds_its_claims_and_stopping_it_releases_them() {
+        let mut h = harness(ClaimMode::Instances, Ending::WhenStopped);
+        h.add_project("proj-stop");
+        assert_eq!(h.start("proj-stop"), StartOutcome::Started);
+
+        // Claimed before the runtime ran, so its own adoption check sees it.
+        let own = h.read(&h.instance_path("proj-stop", h.machine()));
+        assert_eq!(
+            own["hostname"],
+            serde_json::json!(crate::daemon_registry::hostname())
+        );
+        let guard = h.read(&h.guard_path("proj-stop"));
+        assert_eq!(guard["instances"], serde_json::json!(true));
+        assert_eq!(h.start("proj-stop"), StartOutcome::AlreadyRunning);
+
+        h.state.stop_project("proj-stop").await.unwrap();
+        assert!(!h.instance_path("proj-stop", h.machine()).exists());
+        assert!(
+            !h.guard_path("proj-stop").exists(),
+            "stopped here, startable elsewhere at once"
+        );
+    }
+
+    /// Every way a task can end without being asked to releases its claims.
+    /// They used to be kept, and refreshed, for as long as the daemon ran.
+    #[tokio::test]
+    async fn an_instance_that_ends_on_its_own_releases_its_claims() {
+        for ending in [
+            Ending::Completed,
+            Ending::Stopped,
+            Ending::Failed,
+            Ending::Panics,
+        ] {
+            let mut h = harness(ClaimMode::Instances, ending);
+            h.add_project("proj-end");
+            assert_eq!(h.start("proj-end"), StartOutcome::Started, "{ending:?}");
+            h.wait_until_ended("proj-end").await;
+            assert!(
+                !h.instance_path("proj-end", h.machine()).exists(),
+                "{ending:?}"
+            );
+            assert!(!h.guard_path("proj-end").exists(), "{ending:?}");
+            // Nothing stops it starting again.
+            assert_eq!(h.start("proj-end"), StartOutcome::Started, "{ending:?}");
+        }
+    }
+
+    /// A project asking for the daemon to be replaced keeps its claims: the
+    /// replacement resumes it under the same pid, and releasing first would
+    /// show peers an unclaimed project for the length of the update.
+    #[tokio::test]
+    async fn an_instance_asking_for_a_replacement_keeps_its_claims() {
+        let mut h = harness(ClaimMode::Instances, Ending::RebootRequested);
+        h.add_project("proj-reboot");
+        assert_eq!(h.start("proj-reboot"), StartOutcome::Started);
+        assert_eq!(h.restart_rx.recv().await.as_deref(), Some("proj-reboot"));
+        h.wait_until_ended("proj-reboot").await;
+        assert!(h.instance_path("proj-reboot", h.machine()).exists());
+        assert!(h.guard_path("proj-reboot").exists());
+
+        // When the replacement fails the daemon restarts just this project,
+        // which finds the claims still its own.
+        h.state.launcher = launcher(Ending::WhenStopped);
+        assert!(h.state.stop_running_project("proj-reboot").await);
+        assert_eq!(h.start("proj-reboot"), StartOutcome::Started);
+        assert!(h.instance_path("proj-reboot", h.machine()).exists());
+    }
+
+    /// The daemon's own shutdown stops each project the same way, so the
+    /// claims go with them.
+    #[tokio::test]
+    async fn shutting_the_daemon_down_releases_every_instance() {
+        let mut h = harness(ClaimMode::Instances, Ending::WhenStopped);
+        for project_id in ["proj-a", "proj-b"] {
+            h.add_project(project_id);
+            assert_eq!(h.start(project_id), StartOutcome::Started);
+        }
+        for project_id in h.state.running_project_ids() {
+            assert!(h.state.stop_running_project(&project_id).await);
+        }
+        for project_id in ["proj-a", "proj-b"] {
+            assert!(!h.instance_path(project_id, h.machine()).exists());
+            assert!(!h.guard_path(project_id).exists());
+        }
+    }
+
+    /// Only what runs here is kept alive; a stopped project's leftover claim
+    /// is left to lapse.
+    #[tokio::test]
+    async fn the_heartbeat_refreshes_only_running_instances() {
+        let mut h = harness(ClaimMode::Instances, Ending::WhenStopped);
+        h.add_project("proj-live");
+        h.add_project("proj-idle");
+        assert_eq!(h.start("proj-live"), StartOutcome::Started);
+        let me = crate::daemon_registry::hostname();
+        let old = now_secs() - 60;
+        write_foreign_claim(
+            &h.instance_path("proj-live", h.machine()),
+            &me,
+            h.machine(),
+            old,
+            true,
+        );
+        write_foreign_claim(
+            &h.instance_path("proj-idle", h.machine()),
+            &me,
+            h.machine(),
+            old,
+            true,
+        );
+
+        h.state.reconcile_running_claims();
+        let live = h.read(&h.instance_path("proj-live", h.machine()));
+        assert!(live["heartbeat"].as_u64().unwrap() >= old + 60);
+        assert_eq!(live["pid"], serde_json::json!(std::process::id()));
+        let idle = h.read(&h.instance_path("proj-idle", h.machine()));
+        assert_eq!(idle["heartbeat"], serde_json::json!(old));
+    }
+
+    /// Joining is the point: another machine running the project is no
+    /// reason to refuse, and its guard stays with it.
+    #[tokio::test]
+    async fn a_capable_daemon_starts_beside_another_machines_instance() {
+        let mut h = harness(ClaimMode::Instances, Ending::WhenStopped);
+        h.add_project("proj-shared");
+        let peer = Uuid::new_v4();
+        let now = now_secs();
+        write_foreign_claim(
+            &h.instance_path("proj-shared", peer),
+            "peer.invalid",
+            peer,
+            now,
+            true,
+        );
+        write_foreign_claim(
+            &h.guard_path("proj-shared"),
+            "peer.invalid",
+            peer,
+            now,
+            true,
+        );
+
+        let replies = h.request_start(
+            "proj-shared",
+            Some(EffectiveProjectPolicy::default()),
+            Some(Uuid::new_v4()),
+        );
+        let (_, _, success, error) = outcome_of(&replies).unwrap();
+        assert!(success, "{error:?}");
+        assert!(inventory_entry(&replies, "proj-shared").is_running);
+        assert!(h.instance_path("proj-shared", h.machine()).exists());
+        assert_eq!(
+            h.read(&h.guard_path("proj-shared"))["hostname"],
+            serde_json::json!("peer.invalid")
+        );
+    }
+
+    /// `ProjectRuntimeStarted` answers every correlated request exactly once,
+    /// after the inventory, on every path a start can take.
+    #[tokio::test]
+    async fn every_start_outcome_is_reported_once_after_the_inventory() {
+        let policy = || Some(EffectiveProjectPolicy::default());
+
+        // Refusals: each also becomes the project's last_error, which the
+        // inventory sent first already carries.
+        let refusals: Vec<(
+            &str,
+            Box<dyn Fn(&mut Harness) -> Option<EffectiveProjectPolicy>>,
+        )> = vec![
+            ("cluster policy", Box::new(|_| None)),
+            (
+                "suspended",
+                Box::new(|_| {
+                    Some(EffectiveProjectPolicy {
+                        project_suspended: true,
+                        ..EffectiveProjectPolicy::default()
+                    })
+                }),
+            ),
+            (
+                "reboot older-peer.invalid to update it",
+                Box::new(|h| {
+                    let guard = h.guard_path("proj");
+                    write_foreign_claim(
+                        &guard,
+                        "older-peer.invalid",
+                        Uuid::new_v4(),
+                        now_secs(),
+                        false,
+                    );
+                    Some(EffectiveProjectPolicy::default())
+                }),
+            ),
+        ];
+        for (expected, setup) in refusals {
+            let mut h = harness(ClaimMode::Instances, Ending::WhenStopped);
+            h.add_project("proj");
+            let policy = setup(&mut h);
+            let request_id = Uuid::new_v4();
+            let replies = h.request_start("proj", policy, Some(request_id));
+            let (id, project_id, success, error) = outcome_of(&replies).unwrap();
+            assert_eq!(
+                (id, project_id.as_str(), success),
+                (request_id, "proj", false)
+            );
+            let error = error.unwrap();
+            assert!(error.contains(expected), "{expected}: {error}");
+            let entry = inventory_entry(&replies, "proj");
+            assert_eq!(entry.last_error.as_deref(), Some(error.as_str()));
+            assert!(!entry.is_running);
+            assert!(h.state.running.is_empty());
+            assert!(!h.instance_path("proj", h.machine()).exists(), "{expected}");
+        }
+
+        // An external `--headless` run already owns the project here.
+        let mut h = harness(ClaimMode::Instances, Ending::WhenStopped);
+        let path = h.add_project("proj");
+        let _external = ExternalHeadlessRun::start(&path);
+        let replies = h.request_start("proj", policy(), Some(Uuid::new_v4()));
+        let (_, _, success, error) = outcome_of(&replies).unwrap();
+        assert!(!success);
+        assert!(error.unwrap().contains("--headless"));
+        assert!(h.state.running.is_empty());
+        assert!(
+            !h.instance_path("proj", h.machine()).exists(),
+            "a standalone run takes no claim, and none is made for it"
+        );
+
+        // A project this daemon does not know.
+        let mut h = harness(ClaimMode::Instances, Ending::WhenStopped);
+        let replies = h.request_start("proj-unknown", policy(), Some(Uuid::new_v4()));
+        let (_, _, success, error) = outcome_of(&replies).unwrap();
+        assert!(!success);
+        assert!(error.unwrap().contains("Unknown project id"));
+
+        // Started, then asked again while running: both succeed.
+        let mut h = harness(ClaimMode::Instances, Ending::WhenStopped);
+        h.add_project("proj");
+        for _ in 0..2 {
+            let replies = h.request_start("proj", policy(), Some(Uuid::new_v4()));
+            let (_, _, success, error) = outcome_of(&replies).unwrap();
+            assert!(success, "{error:?}");
+            assert_eq!(error, None);
+            let entry = inventory_entry(&replies, "proj");
+            assert!(entry.is_running);
+            assert_eq!(entry.last_error, None);
+        }
+        assert_eq!(h.state.running.len(), 1);
+
+        // A start nobody correlated asks for no report.
+        let mut h = harness(ClaimMode::Instances, Ending::WhenStopped);
+        h.add_project("proj");
+        let replies = h.request_start("proj", policy(), None);
+        assert_eq!(replies.len(), 1);
+        assert!(outcome_of(&replies).is_none());
+        assert!(inventory_entry(&replies, "proj").is_running);
+    }
+
+    /// A successful start clears an earlier refusal from `last_error`.
+    #[tokio::test]
+    async fn a_successful_start_clears_an_earlier_refusal() {
+        let mut h = harness(ClaimMode::Instances, Ending::WhenStopped);
+        h.add_project("proj");
+        let replies = h.request_start("proj", None, None);
+        assert!(inventory_entry(&replies, "proj").last_error.is_some());
+        let replies = h.request_start("proj", Some(EffectiveProjectPolicy::default()), None);
+        assert_eq!(inventory_entry(&replies, "proj").last_error, None);
+    }
+
+    /// A host whose machine id is configured shares it with every host on its
+    /// home: it runs projects alone, says so to the server, and refuses to
+    /// start beside a capable instance elsewhere.
+    #[tokio::test]
+    async fn a_configured_machine_id_runs_projects_alone() {
+        let configured = Some("6ba7b811-9dad-11d1-80b4-00c04fd430c8");
+        assert_eq!(
+            ClaimMode::for_configured_machine_id(configured),
+            ClaimMode::Exclusive
+        );
+        assert!(!daemon_capabilities(ClaimMode::Exclusive)
+            .contains(&shared::PROJECT_INSTANCES_CAPABILITY.to_string()));
+        let capable = daemon_capabilities(ClaimMode::for_configured_machine_id(None));
+        assert!(capable.contains(&shared::PROJECT_INSTANCES_CAPABILITY.to_string()));
+        assert_eq!(
+            capable.len(),
+            daemon_capabilities(ClaimMode::Exclusive).len() + 1,
+            "nothing else differs"
+        );
+
+        let mut h = harness(ClaimMode::Exclusive, Ending::WhenStopped);
+        h.add_project("proj");
+        let peer = Uuid::new_v4();
+        write_foreign_claim(
+            &h.guard_path("proj"),
+            "peer.invalid",
+            peer,
+            now_secs(),
+            true,
+        );
+        let replies = h.request_start(
+            "proj",
+            Some(EffectiveProjectPolicy::default()),
+            Some(Uuid::new_v4()),
+        );
+        let (_, _, success, error) = outcome_of(&replies).unwrap();
+        assert!(!success);
+        assert!(error
+            .unwrap()
+            .contains("config.toml sets daemon.machine_id"));
+
+        // Alone, it holds the guard unmarked, exactly as before instances.
+        std::fs::remove_file(h.guard_path("proj")).unwrap();
+        assert_eq!(h.start("proj"), StartOutcome::Started);
+        let guard = h.read(&h.guard_path("proj"));
+        assert!(guard.get("instances").is_none(), "{guard}");
+        assert!(!h.config.path().join("claims").join("proj").exists());
+    }
+
+    fn git(args: &[&str]) {
+        let status = Command::new("git")
+            .args(args)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {args:?}");
+    }
+
+    fn checkout_with_origin(dir: &Path, origin: &str) {
+        let path = dir.to_str().unwrap();
+        git(&["init", "-q", path]);
+        git(&["-C", path, "remote", "add", "origin", origin]);
+    }
+
+    /// A read that never returns must not hold up the inventory: it reports
+    /// nothing for that checkout until the read completes, and no second read
+    /// piles up behind the first.
+    #[tokio::test]
+    async fn a_slow_git_read_never_holds_up_the_inventory() {
+        let (release, wait) = std::sync::mpsc::channel::<()>();
+        let wait = Mutex::new(wait);
+        let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = reads.clone();
+        let remotes = GitRemotes::with_reader(Arc::new(move |_path: &Path| {
+            counter.fetch_add(1, Ordering::SeqCst);
+            let _ = wait.lock().unwrap().recv();
+            Some("github.com/owner/repo".to_string())
+        }));
+        let path = PathBuf::from("/checkouts/repo");
+        let read = remotes.refresh(vec![path.clone()]).expect("a read starts");
+        assert_eq!(
+            remotes.get(&path),
+            None,
+            "nothing known yet, and nothing waited for"
+        );
+        assert!(
+            remotes.refresh(vec![path.clone()]).is_none(),
+            "one read at a time"
+        );
+
+        release.send(()).unwrap();
+        read.await.unwrap();
+        assert_eq!(remotes.get(&path).as_deref(), Some("github.com/owner/repo"));
+        assert!(
+            remotes.refresh(vec![path.clone()]).is_none(),
+            "still current"
+        );
+        assert_eq!(reads.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn old_remotes_are_read_again_and_unregistered_checkouts_forgotten() {
+        let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = reads.clone();
+        let mut remotes = GitRemotes::with_reader(Arc::new(move |path: &Path| {
+            let n = counter.fetch_add(1, Ordering::SeqCst);
+            Some(format!(
+                "github.com/owner/{}-{n}",
+                path.file_name()?.to_str()?
+            ))
+        }));
+        remotes.max_age = Duration::ZERO;
+        let (a, b) = (PathBuf::from("/c/a"), PathBuf::from("/c/b"));
+        remotes
+            .refresh(vec![a.clone(), b.clone()])
+            .unwrap()
+            .await
+            .unwrap();
+        assert!(remotes.get(&a).is_some() && remotes.get(&b).is_some());
+
+        remotes.refresh(vec![a.clone()]).unwrap().await.unwrap();
+        assert_eq!(remotes.get(&b), None, "no longer registered");
+        assert_eq!(reads.load(Ordering::SeqCst), 3, "a read again once old");
+    }
+
+    /// End to end with a real checkout: the inventory carries the canonical
+    /// remote that `SessionStart` would, so a project that has never run still
+    /// files under its repository.
+    #[test]
+    fn the_inventory_reports_each_checkouts_canonical_remote() {
+        crate::project::test_support::with_isolated_config(|| {
+            let runtime = tokio::runtime::Runtime::new().unwrap();
+            runtime.block_on(async {
+                let mut h = harness(ClaimMode::Instances, Ending::WhenStopped);
+                let path = h.add_project("proj");
+                std::fs::create_dir_all(&path).unwrap();
+                checkout_with_origin(&path, "git@github.com:Owner/Repo.git");
+                h.add_project("not-a-checkout");
+
+                let before = h.state.snapshot_projects();
+                assert!(before.iter().all(|project| project.git_remote.is_none()));
+                h.state.refresh_git_remotes().unwrap().await.unwrap();
+                let after = h.state.snapshot_projects();
+                let remote = |id: &str| {
+                    after
+                        .iter()
+                        .find(|project| project.project_id == id)
+                        .unwrap()
+                        .git_remote
+                        .clone()
+                };
+                assert_eq!(remote("proj").as_deref(), Some("github.com/owner/repo"));
+                assert_eq!(remote("not-a-checkout"), None);
+            });
+        });
+    }
+
+    /// Registering a folder answers with its remote straight away, rather
+    /// than after the next background read.
+    #[test]
+    fn a_registered_checkout_reports_its_remote_at_once() {
+        crate::project::test_support::with_isolated_config(|| {
+            let runtime = tokio::runtime::Runtime::new().unwrap();
+            runtime.block_on(async {
+                let dir = tempfile::tempdir().unwrap();
+                checkout_with_origin(dir.path(), "https://github.com/Owner/Repo.git");
+                let mut h = harness(ClaimMode::Instances, Ending::WhenStopped);
+                let (project, inventory) = h
+                    .state
+                    .register_local_project(dir.path().to_str().unwrap().to_string())
+                    .await
+                    .unwrap();
+                assert_eq!(project.git_remote.as_deref(), Some("github.com/owner/repo"));
+                assert_eq!(
+                    inventory[0].git_remote.as_deref(),
+                    Some("github.com/owner/repo")
+                );
+            });
+        });
+    }
+}
+
+#[cfg(test)]
+mod join_tests {
+    use super::*;
+
+    /// Run `git` in `dir` without the user's configuration, and return what it
+    /// printed.
+    fn git(dir: &Path, args: &[&str]) -> String {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args([
+                "-c",
+                "user.name=apas-test",
+                "-c",
+                "user.email=test@apas.invalid",
+            ])
+            .args(args)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .output()
+            .expect("run git");
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).expect("utf-8")
+    }
+
+    /// A repository to clone from, with one commit on `main`, plus whatever
+    /// `extra` commits beside it.
+    fn origin(root: &Path, extra: &[(&str, &[u8])]) -> PathBuf {
+        let origin = root.join("origin");
+        std::fs::create_dir_all(&origin).expect("origin dir");
+        git(&origin, &["init", "-q", "-b", "main"]);
+        std::fs::write(origin.join("README"), b"hello").expect("write");
+        for (path, bytes) in extra {
+            let path = origin.join(path);
+            std::fs::create_dir_all(path.parent().expect("parent")).expect("dir");
+            std::fs::write(path, bytes).expect("write");
+        }
+        git(&origin, &["add", "-A"]);
+        git(&origin, &["commit", "-q", "-m", "first"]);
+        origin
+    }
+
+    fn state(mode: ClaimMode) -> DaemonState {
+        DaemonState::new(
+            MachineInfo {
+                machine_id: Uuid::new_v4(),
+                hostname: "join-test".into(),
+                os: "linux".into(),
+                arch: "x86_64".into(),
+                daemon_version: None,
+                deepseek_backend: None,
+                last_seen: None,
+            },
+            mode,
+        )
+    }
+
+    /// Ask `state` to join `project_id` with a clone of `origin` named `repo`
+    /// under `base`.
+    fn join(
+        state: &mut DaemonState,
+        origin: &Path,
+        base: &Path,
+        project_id: Option<&str>,
+        mode: ProjectProvisioningMode,
+    ) -> Vec<DaemonToServer> {
+        state.handle_join_instance(
+            "github.com/owner/repo",
+            "repo",
+            Some(origin.to_str().expect("utf-8")),
+            Some(base.to_str().expect("utf-8")),
+            Some("join-request".to_string()),
+            project_id,
+            mode,
+        )
+    }
+
+    /// The inventory and, after it, the acknowledgement, as (inventory,
+    /// project_id, path, error).
+    fn acknowledgement(
+        replies: &[DaemonToServer],
+    ) -> (
+        &[MachineProjectInfo],
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    ) {
+        match replies {
+            [DaemonToServer::Heartbeat { projects }, DaemonToServer::ProjectInstanceCreated {
+                request_id,
+                project_id,
+                path,
+                error,
+            }] => {
+                assert_eq!(request_id.as_deref(), Some("join-request"));
+                (projects, project_id.clone(), path.clone(), error.clone())
+            }
+            other => panic!("the inventory, then the acknowledgement: {other:?}"),
+        }
+    }
+
+    /// The checkout takes the project's identity with no panes, is registered
+    /// and listed with its remote before the acknowledgement, keeps the
+    /// branch it was cloned on, and is not started.
+    #[test]
+    fn a_join_clones_registers_and_lists_the_checkout_before_acknowledging() {
+        crate::project::test_support::with_isolated_config(|| {
+            let root = tempfile::tempdir().expect("temp dir");
+            let origin = origin(root.path(), &[]);
+            let base = root.path().join("projects");
+            let mut state = state(ClaimMode::Instances);
+            let project = Uuid::new_v4();
+
+            let replies = join(
+                &mut state,
+                &origin,
+                &base,
+                Some(&project.to_string()),
+                ProjectProvisioningMode::TrustedOwner,
+            );
+            let (inventory, project_id, path, error) = acknowledgement(&replies);
+            assert_eq!(error, None);
+            assert_eq!(project_id, Some(project.to_string()));
+            let path = PathBuf::from(path.expect("path"));
+            assert_eq!(
+                path,
+                std::fs::canonicalize(base.join("repo")).expect("checkout")
+            );
+
+            let listed = inventory
+                .iter()
+                .find(|entry| entry.project_id == project.to_string())
+                .expect("the inventory sent first lists the checkout");
+            assert_eq!(listed.path, path.to_str().expect("utf-8"));
+            assert!(!listed.is_running);
+            assert!(listed.git_remote.is_some());
+            assert_eq!(
+                listed.git_remote,
+                crate::worktree::normalized_git_remote(&path)
+            );
+
+            let metadata =
+                crate::project_instances::read_project_metadata(&path).expect("metadata");
+            assert_eq!(metadata.id, project);
+            assert!(metadata.panes.is_empty());
+            let registered = crate::project::list_registered_projects().expect("registry");
+            assert_eq!(registered.len(), 1);
+            assert_eq!(registered[0].project_id, project.to_string());
+            assert_eq!(registered[0].path, path.to_str().expect("utf-8"));
+
+            assert_eq!(
+                git(&path, &["branch", "--format=%(refname:short)"]).trim(),
+                "main",
+                "no branch of its own"
+            );
+            assert!(state.running.is_empty(), "registered, not started");
+        });
+    }
+
+    /// A repository that commits a `.apas` must not hand the checkout that
+    /// file's identity or panes.
+    #[test]
+    fn a_join_replaces_a_committed_metadata_file() {
+        crate::project::test_support::with_isolated_config(|| {
+            let root = tempfile::tempdir().expect("temp dir");
+            let committed = serde_json::json!({
+                "id": Uuid::new_v4(), "name": "committed", "created_at": "2026-01-01T00:00:00Z",
+                "panes": [{
+                    "pane_id": 3, "provider": "codex", "mode": "interactive",
+                    "session_id": Uuid::new_v4(),
+                }],
+            });
+            let committed = serde_json::to_vec_pretty(&committed).expect("json");
+            let origin = origin(root.path(), &[(".apas", &committed)]);
+            let mut state = state(ClaimMode::Instances);
+            let project = Uuid::new_v4();
+
+            let replies = join(
+                &mut state,
+                &origin,
+                &root.path().join("projects"),
+                Some(&project.to_string()),
+                ProjectProvisioningMode::TrustedOwner,
+            );
+            let (_, _, path, error) = acknowledgement(&replies);
+            assert_eq!(error, None);
+            let metadata =
+                crate::project_instances::read_project_metadata(Path::new(&path.expect("path")))
+                    .expect("metadata");
+            assert_eq!(metadata.id, project);
+            assert!(metadata.panes.is_empty());
+        });
+    }
+
+    /// A join that fails before registration removes its clone, as a new
+    /// instance's does, and registers nothing.
+    #[test]
+    fn a_join_that_fails_before_registration_leaves_nothing_behind() {
+        crate::project::test_support::with_isolated_config(|| {
+            let root = tempfile::tempdir().expect("temp dir");
+            let base = root.path().join("projects");
+            let mut state = state(ClaimMode::Instances);
+            let project = Uuid::new_v4().to_string();
+
+            // The clone fails.
+            let replies = join(
+                &mut state,
+                &root.path().join("no-such-repository"),
+                &base,
+                Some(&project),
+                ProjectProvisioningMode::TrustedOwner,
+            );
+            let (_, project_id, path, error) = acknowledgement(&replies);
+            assert!(error.is_some());
+            assert_eq!((project_id, path), (None, None));
+            assert!(!base.join("repo").exists());
+
+            // The clone succeeds, but the checkout's metadata cannot be written:
+            // the repository commits a directory where `.apas` goes.
+            let origin = origin(root.path(), &[(".apas/keep", b"")]);
+            let replies = join(
+                &mut state,
+                &origin,
+                &base,
+                Some(&project),
+                ProjectProvisioningMode::TrustedOwner,
+            );
+            let (inventory, _, _, error) = acknowledgement(&replies);
+            assert!(error.is_some());
+            assert!(!base.join("repo").exists(), "the partial clone is removed");
+            assert!(inventory.is_empty());
+            assert!(crate::project::list_registered_projects()
+                .expect("registry")
+                .is_empty());
+        });
+    }
+
+    /// A registry holds one folder per project, and on a home shared between
+    /// machines the project's checkout is already in reach: start it there.
+    #[test]
+    fn a_join_is_refused_for_a_project_this_machine_already_has() {
+        crate::project::test_support::with_isolated_config(|| {
+            let root = tempfile::tempdir().expect("temp dir");
+            let existing = root.path().join("existing");
+            std::fs::create_dir_all(&existing).expect("existing checkout");
+            let (registered, _) =
+                crate::project::register_local_project(existing.to_str().expect("utf-8"))
+                    .expect("register");
+            let origin = origin(root.path(), &[]);
+            let base = root.path().join("projects");
+            let mut state = state(ClaimMode::Instances);
+
+            let replies = join(
+                &mut state,
+                &origin,
+                &base,
+                Some(&registered.project_id),
+                ProjectProvisioningMode::TrustedOwner,
+            );
+            let (_, _, _, error) = acknowledgement(&replies);
+            let error = error.expect("refused");
+            assert!(error.contains(&registered.path), "{error}");
+            assert!(!base.exists(), "refused before cloning");
+            assert_eq!(
+                crate::project::list_registered_projects()
+                    .expect("registry")
+                    .len(),
+                1
+            );
+        });
+    }
+
+    /// Joining is for the owner's own machines, on a daemon that runs
+    /// instances, and names a valid project.
+    #[test]
+    fn only_a_capable_owner_join_naming_a_project_clones_anything() {
+        crate::project::test_support::with_isolated_config(|| {
+            let root = tempfile::tempdir().expect("temp dir");
+            let origin = origin(root.path(), &[]);
+            let base = root.path().join("projects");
+            let project = Uuid::new_v4().to_string();
+            let refusals = [
+                (
+                    ClaimMode::Instances,
+                    Some(project.as_str()),
+                    ProjectProvisioningMode::PublicGithub,
+                    "owner",
+                ),
+                (
+                    ClaimMode::Exclusive,
+                    Some(project.as_str()),
+                    ProjectProvisioningMode::TrustedOwner,
+                    "daemon.machine_id",
+                ),
+                (
+                    ClaimMode::Instances,
+                    None,
+                    ProjectProvisioningMode::TrustedOwner,
+                    "names no project",
+                ),
+                (
+                    ClaimMode::Instances,
+                    Some("not-a-project-id"),
+                    ProjectProvisioningMode::TrustedOwner,
+                    "not a valid id",
+                ),
+            ];
+            for (mode, project_id, provisioning, expected) in refusals {
+                let mut state = state(mode);
+                let replies = join(&mut state, &origin, &base, project_id, provisioning);
+                let (_, _, _, error) = acknowledgement(&replies);
+                let error = error.expect("refused");
+                assert!(error.contains(expected), "{expected}: {error}");
+                assert!(!base.exists(), "{expected}: nothing cloned");
+            }
+            assert!(crate::project::list_registered_projects()
+                .expect("registry")
+                .is_empty());
+        });
     }
 }

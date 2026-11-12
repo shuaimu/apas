@@ -1,7 +1,7 @@
 use crate::{
     config::SummaryConfig,
     db::Database,
-    session::SessionManager,
+    session::{instances::PaneOwner, SessionManager},
     storage::{FileStorage, PaneWorkSummaryDocument, StoredMessage},
 };
 use chrono::{DateTime, Duration, TimeZone, Utc};
@@ -555,7 +555,7 @@ impl PaneWorkSummaryService {
             .filter(|summary| summary.pane_id == pane_id)
             .collect::<Vec<_>>();
         summaries.sort_by(|left, right| right.window_start.cmp(&left.window_start));
-        Ok((summaries, self.availability_for(session_id)))
+        Ok((summaries, self.availability_for(session_id, pane_id)))
     }
 
     #[cfg(test)]
@@ -584,14 +584,21 @@ impl PaneWorkSummaryService {
             .max(FLOOR_BYTES)
     }
 
-    fn availability_for(&self, session_id: Uuid) -> PaneWorkSummaryAvailability {
+    /// Whether summaries can be generated for one pane. That depends on the
+    /// CLI of the instance that runs the pane, since each machine's instance
+    /// can be a different version; a pane whose machine is not running has
+    /// none, as a session without a CLI never had.
+    fn availability_for(&self, session_id: Uuid, pane_id: u32) -> PaneWorkSummaryAvailability {
         if !self.config.enabled {
             return PaneWorkSummaryAvailability::SummarizerDisabled;
         }
-        if !self
-            .sessions
-            .session_supports_capability(&session_id, PANE_WORK_SUMMARY_CAPABILITY)
-        {
+        let supported = match self.sessions.pane_owner(&session_id, pane_id) {
+            PaneOwner::Instance(owner) => self
+                .sessions
+                .cli_supports_capability(&owner.cli_id, PANE_WORK_SUMMARY_CAPABILITY),
+            PaneOwner::NotRunning { .. } | PaneOwner::NoInstance => false,
+        };
+        if !supported {
             return PaneWorkSummaryAvailability::CliUpdateRequired;
         }
         self.availability
@@ -895,17 +902,24 @@ impl PaneWorkSummaryService {
                         let Some(task) = runtime.queued.pop_front() else {
                             break;
                         };
-                        let session = self.sessions.get_session(&task.job.session_id);
-                        let cli_id = session.and_then(|session| session.cli_client_id);
-                        let Some(cli_id) = cli_id else {
-                            runtime.queued.push_back(task);
-                            continue;
+                        // The summary runs under the pane host's own summary
+                        // configuration, so it goes to the instance that owns
+                        // the pane; while that machine is not running, the job
+                        // waits as it does with no CLI at all.
+                        let cli_id = match self
+                            .sessions
+                            .pane_owner(&task.job.session_id, task.job.pane_id)
+                        {
+                            PaneOwner::Instance(owner) => owner.cli_id,
+                            PaneOwner::NotRunning { .. } | PaneOwner::NoInstance => {
+                                runtime.queued.push_back(task);
+                                continue;
+                            }
                         };
                         if runtime.busy_clis.contains(&cli_id)
-                            || !self.sessions.session_supports_capability(
-                                &task.job.session_id,
-                                PANE_WORK_SUMMARY_CAPABILITY,
-                            )
+                            || !self
+                                .sessions
+                                .cli_supports_capability(&cli_id, PANE_WORK_SUMMARY_CAPABILITY)
                         {
                             runtime.queued.push_back(task);
                             continue;
@@ -1205,7 +1219,8 @@ impl PaneWorkSummaryService {
                             session_id: task.job.session_id,
                             pane_id: task.job.pane_id,
                             summary: summary.clone(),
-                            availability: self.availability_for(task.job.session_id),
+                            availability: self
+                                .availability_for(task.job.session_id, task.job.pane_id),
                         },
                     )
                     .await;
@@ -2243,6 +2258,100 @@ mod service_tests {
         assert_eq!(
             refreshed.summaries[0].status,
             PaneWorkSummaryStatus::Generating
+        );
+    }
+
+    /// A pane's summary runs under its own host's summary configuration, so
+    /// the job goes to the instance that runs the pane rather than the
+    /// primary, and whether summaries are available for a pane depends on
+    /// that instance's CLI.
+    #[tokio::test]
+    async fn a_summary_job_goes_to_the_instance_that_runs_the_pane() {
+        let (service, db, storage, sessions) = test_service().await;
+        let owner = Uuid::new_v4();
+        let session_id = Uuid::new_v4();
+        add_user_and_session(&db, owner, session_id).await;
+        let attach = |capabilities: &[&str], machine_id: Uuid, host: &str| {
+            let cli_id = Uuid::new_v4();
+            let (cli_tx, cli_rx) = mpsc::channel(8);
+            sessions.register_cli(cli_id, owner, cli_tx, Some("test".to_string()));
+            sessions.set_cli_capabilities(
+                cli_id,
+                capabilities
+                    .iter()
+                    .map(|capability| capability.to_string())
+                    .collect(),
+            );
+            assert!(matches!(
+                sessions.attach_cli_instance(
+                    session_id,
+                    cli_id,
+                    Some(machine_id),
+                    Some(format!("/work/{host}")),
+                    Some(host.to_string()),
+                ),
+                crate::session::AttachOutcome::Attached { .. }
+            ));
+            cli_rx
+        };
+        let (m5, m6) = (Uuid::new_v4(), Uuid::new_v4());
+        // The primary's CLI cannot summarize; the secondary's can.
+        let mut primary_rx = attach(&[shared::PROJECT_INSTANCES_CAPABILITY], m5, "zoo-005");
+        let mut secondary_rx = attach(
+            &[
+                shared::PROJECT_INSTANCES_CAPABILITY,
+                PANE_WORK_SUMMARY_CAPABILITY,
+            ],
+            m6,
+            "zoo-006",
+        );
+        let pane = |pane_id: u32, machine_id: Uuid, host: &str| {
+            let mut pane = shared::PaneConfig::defaults().remove(0);
+            pane.pane_id = pane_id;
+            pane.machine_id = Some(machine_id);
+            pane.hostname = Some(host.to_string());
+            pane
+        };
+        sessions.set_session_panes(
+            &session_id,
+            vec![pane(3, m5, "zoo-005"), pane(7, m6, "zoo-006")],
+        );
+        storage
+            .append_message(
+                &session_id,
+                &StoredMessage {
+                    id: "source-7".to_string(),
+                    role: "assistant".to_string(),
+                    content: "Moved the parser onto the streaming reader and ran its tests."
+                        .to_string(),
+                    message_type: "text".to_string(),
+                    created_at: (Utc::now() - Duration::hours(4)).to_rfc3339(),
+                    pane_type: Some("7".to_string()),
+                },
+            )
+            .await
+            .unwrap();
+
+        let (_, on_secondary) = service.list_for_pane(session_id, 7).await.unwrap();
+        let (_, on_primary) = service.list_for_pane(session_id, 3).await.unwrap();
+        assert_eq!(on_secondary, PaneWorkSummaryAvailability::Available);
+        assert_eq!(on_primary, PaneWorkSummaryAvailability::CliUpdateRequired);
+
+        service
+            .reconcile_completed_for_pane(session_id, 7)
+            .await
+            .unwrap();
+        let job = tokio::time::timeout(std::time::Duration::from_secs(5), secondary_rx.recv())
+            .await
+            .expect("the secondary's CLI receives the job")
+            .unwrap();
+        let ServerToCli::GeneratePaneWorkSummary { job } = job else {
+            panic!("expected a summary job")
+        };
+        assert_eq!(job.pane_id, 7);
+        assert!(
+            primary_rx.try_recv().is_err(),
+            "the primary runs none of pane 7"
         );
     }
 

@@ -8,12 +8,264 @@ use axum::{
 use base64::Engine as _;
 use futures::{SinkExt, StreamExt};
 use shared::{CliToServer, PaneConfig, PaneType, ServerToCli, ServerToWeb, TerminalLifecycle};
+use std::collections::HashSet;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
 use crate::routes::auth::verify_token;
+use crate::session::{AttachOutcome, InboundPaneVerdict, InstanceDetach, SessionLeave};
 use crate::state::AppState;
+
+/// Which attached instance may send an inbound CLI message, by the session
+/// and pane it is about. A session can have one instance per machine, each
+/// owning the panes tagged with its machine, so "a CLI of this session" no
+/// longer vouches for every pane. Every variant is classified by
+/// [`inbound_scope`], which has no wildcard arm.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InboundScope {
+    /// About the connection, not a session: registration, heartbeats,
+    /// per-CLI usage limits, and summary results, which the summary service
+    /// matches to the exact CLI it asked.
+    Connection,
+    /// `SessionStart`: the attach itself, which the admission rules decide.
+    Attach,
+    /// Session-level reports any attached instance may send: its own roster
+    /// (merged per machine), lifecycle reports, the legacy policy snapshot,
+    /// `SessionEnd`, and output that names no pane.
+    Session(Uuid),
+    /// Legacy single-valued project state that every instance rebroadcasts.
+    /// Only the primary's copy is used, so two instances cannot make it flap.
+    Primary(Uuid),
+    /// One pane's output, state or status: accepted only from the instance
+    /// that owns the pane.
+    Pane(Uuid, u32),
+}
+
+fn inbound_scope(message: &CliToServer) -> InboundScope {
+    use InboundScope::{Attach, Connection, Pane, Primary, Session};
+    // Older CLIs name the legacy panes by type rather than id.
+    let pane_or_session =
+        |session_id: &Uuid, pane_id: &Option<u32>, pane_type: &Option<PaneType>| {
+            let legacy = pane_type.map(|pane_type| PaneConfig::pane_id_from_legacy(&pane_type));
+            match pane_id.or(legacy) {
+                Some(pane_id) => Pane(*session_id, pane_id),
+                None => Session(*session_id),
+            }
+        };
+    match message {
+        CliToServer::Register { .. }
+        | CliToServer::Heartbeat
+        | CliToServer::UsageLimits { .. }
+        | CliToServer::PaneWorkSummaryResult { .. } => Connection,
+        CliToServer::SessionStart { .. } => Attach,
+        CliToServer::Output {
+            session_id,
+            pane_type,
+            pane_id,
+            ..
+        }
+        | CliToServer::StreamMessage {
+            session_id,
+            pane_type,
+            pane_id,
+            ..
+        }
+        | CliToServer::UserInput {
+            session_id,
+            pane_type,
+            pane_id,
+            ..
+        } => pane_or_session(session_id, pane_id, pane_type),
+        CliToServer::PaneStatus {
+            session_id,
+            pane_type,
+            pane_id,
+            ..
+        } => Pane(
+            *session_id,
+            pane_id.unwrap_or_else(|| PaneConfig::pane_id_from_legacy(pane_type)),
+        ),
+        // The legacy deadloop report names no pane, but it is the deadloop
+        // pane's, as `ServerToCli::PauseDeadloop` is.
+        CliToServer::DeadloopStatus { session_id, .. } => {
+            Pane(*session_id, shared::PANE_ID_DEADLOOP)
+        }
+        CliToServer::PanePaused {
+            session_id,
+            pane_id,
+            ..
+        }
+        | CliToServer::PlanReviewRequest {
+            session_id,
+            pane_id,
+            ..
+        }
+        | CliToServer::PaneDiff {
+            session_id,
+            pane_id,
+            ..
+        }
+        | CliToServer::PrCreated {
+            session_id,
+            pane_id,
+            ..
+        }
+        | CliToServer::TerminalOutput {
+            session_id,
+            pane_id,
+            ..
+        }
+        | CliToServer::TerminalExited {
+            session_id,
+            pane_id,
+            ..
+        }
+        | CliToServer::TerminalState {
+            session_id,
+            pane_id,
+            ..
+        }
+        | CliToServer::OmpQuestionAnswerResult {
+            session_id,
+            pane_id,
+            ..
+        } => Pane(*session_id, *pane_id),
+        CliToServer::SessionEnd { session_id, .. }
+        | CliToServer::PaneList { session_id, .. }
+        | CliToServer::ProjectPolicySnapshot { session_id, .. }
+        | CliToServer::CliLifecycleInventory { session_id, .. }
+        | CliToServer::CliLifecycleStatus { session_id, .. } => Session(*session_id),
+        CliToServer::ProjectFlagsChanged { session_id, .. } => Primary(*session_id),
+    }
+}
+
+/// Whether to handle an inbound message from `cli_id`, by its
+/// [`InboundScope`]. A refused message is dropped with a warning, once per
+/// session and pane for each connection: a replaced CLI can keep streaming
+/// terminal frames, and one line per frame would drown the log.
+fn admit_inbound(
+    state: &AppState,
+    cli_id: Uuid,
+    message: &CliToServer,
+    warned: &mut HashSet<(Uuid, Option<u32>)>,
+) -> bool {
+    let (session_id, pane_id, refusal) = match inbound_scope(message) {
+        InboundScope::Connection | InboundScope::Attach => return true,
+        InboundScope::Primary(session_id) => {
+            // Every instance rebroadcasts these; only the primary's copy is
+            // the session's, so the rest are expected and dropped quietly.
+            return state
+                .sessions
+                .primary_instance(&session_id)
+                .is_some_and(|primary| primary.cli_id == cli_id);
+        }
+        InboundScope::Session(session_id) => {
+            if state.sessions.instance_for_cli(&session_id, &cli_id).is_some() {
+                return true;
+            }
+            (session_id, None, "it runs no instance of the session".to_string())
+        }
+        InboundScope::Pane(session_id, pane_id) => {
+            match state.sessions.inbound_pane_verdict(&session_id, &cli_id, pane_id) {
+                InboundPaneVerdict::Accept => return true,
+                InboundPaneVerdict::NotAttached => (
+                    session_id,
+                    Some(pane_id),
+                    "it runs no instance of the session".to_string(),
+                ),
+                InboundPaneVerdict::Foreign { owner_hostname } => (
+                    session_id,
+                    Some(pane_id),
+                    format!(
+                        "the pane belongs to the instance on {}",
+                        owner_hostname.as_deref().unwrap_or("another machine")
+                    ),
+                ),
+            }
+        }
+    };
+    if warned.insert((session_id, pane_id)) {
+        // Serialized only for this first report, never per streamed frame.
+        let kind = serde_json::to_value(message)
+            .ok()
+            .and_then(|value| value.get("type").and_then(|kind| kind.as_str()).map(str::to_string))
+            .unwrap_or_default();
+        tracing::warn!(
+            %cli_id,
+            %session_id,
+            ?pane_id,
+            kind,
+            "dropping a CLI message: {refusal}"
+        );
+    } else {
+        tracing::debug!(%cli_id, %session_id, ?pane_id, "dropping a CLI message: {refusal}");
+    }
+    false
+}
+
+/// Load `panes.json` into the session's roster before an instance's report
+/// merges into it. After a server restart the cached roster is empty, and a
+/// capable instance's report merged into nothing would drop every stopped
+/// machine's tabs. A failed read leaves the roster as it is.
+async fn ensure_pane_roster_loaded(state: &AppState, session_id: &Uuid) {
+    if state.sessions.pane_roster_seeded(session_id) {
+        return;
+    }
+    match state.storage.load_pane_roster(session_id).await {
+        Ok(Some(stored)) => {
+            state.sessions.hydrate_pane_roster(session_id, stored);
+        }
+        // Never saved: there are no stopped tabs to keep, and the roster
+        // stays unknown until an instance reports one.
+        Ok(None) => {}
+        Err(error) => tracing::warn!(
+            %session_id,
+            %error,
+            "failed to load the persisted pane roster; merging into the cached one"
+        ),
+    }
+}
+
+/// Persist the session's current roster, tags and attributed hosts
+/// included, so stopped instances' tabs survive a server restart.
+async fn persist_pane_roster(state: &AppState, session_id: &Uuid) {
+    if let Err(error) = state
+        .storage
+        .save_pane_roster_latest(session_id, || state.sessions.pane_roster_snapshot(session_id))
+        .await
+    {
+        tracing::warn!("Failed to persist pane list for session {}: {}", session_id, error);
+    }
+}
+
+/// Move the session's database row after an instance left: inactive when it
+/// was the last, else to the new primary when the primary left. Both writes
+/// apply only while the row still names the departing CLI, so a reconnect
+/// that already rewrote the row is never undone.
+async fn persist_instance_detach(state: &AppState, detach: &InstanceDetach) {
+    let session_id = detach.session_id.to_string();
+    let departing = detach.instance.cli_id.to_string();
+    let result = match &detach.primary {
+        None => state.db.clear_session_cli(&session_id, &departing).await,
+        Some(primary) if detach.was_primary => {
+            state
+                .db
+                .hand_over_session_primary(
+                    &session_id,
+                    &departing,
+                    &primary.cli_id.to_string(),
+                    primary.working_dir.as_deref(),
+                    primary.hostname.as_deref(),
+                )
+                .await
+        }
+        Some(_) => return,
+    };
+    if let Err(error) = result {
+        tracing::error!(%session_id, %error, "Failed to update the session after an instance left");
+    }
+}
 
 async fn route_lifecycle_to_authorized_web(
     state: &AppState,
@@ -469,6 +721,9 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
         tracing::error!("Failed to upsert cli_client: {}", e);
     }
 
+    // (session, pane) pairs whose refused messages were already logged.
+    let mut refused_inbound: HashSet<(Uuid, Option<u32>)> = HashSet::new();
+
     // Track last activity for timeout detection
     let mut last_activity = Instant::now();
     let mut ping_interval = tokio::time::interval(PING_INTERVAL);
@@ -513,6 +768,14 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             break;
                         }
                         let parsed: Result<CliToServer, _> = serde_json::from_str(&text);
+                        // A CLI speaks only for the sessions it runs an instance of, and
+                        // for a pane only when its instance owns it. A replaced or
+                        // rejected connection, or another machine's instance, is dropped.
+                        if let Ok(message) = &parsed {
+                            if !admit_inbound(&state, cli_id, message, &mut refused_inbound) {
+                                continue;
+                            }
+                        }
                         match parsed {
                             Ok(CliToServer::SessionStart {
                                 session_id,
@@ -560,11 +823,15 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                         .await;
                                     continue;
                                 }
+                                // The host the session last recorded, read before this start can
+                                // overwrite it: panes persisted before panes carried hosts ran there.
+                                let mut recorded_host = None;
                                 // Reject if this session_id is already owned by a different user
                                 // (typically caused by .apas files copied/shared between users).
                                 if let Ok(Some(existing)) =
                                     state.db.get_session(&session_id.to_string()).await
                                 {
+                                    recorded_host = existing.hostname.clone();
                                     if existing.user_id != user_id.to_string() {
                                         let owner_email = state
                                             .db
@@ -599,104 +866,113 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                     }
                                 }
 
-                                // CLI is starting a local session (hybrid mode)
-                                state.sessions.create_cli_session(
+                                // Attach this machine's instance. A CLI that cannot run beside the
+                                // instance already attached is refused with the host that runs it.
+                                let (primary, replaced) = match state.sessions.attach_cli_instance(
                                     session_id,
                                     cli_id,
+                                    machine_id,
                                     working_dir.clone(),
                                     hostname.clone(),
-                                );
-                                state
-                                    .sessions
-                                    .set_session_project(session_id, project_id.to_string());
-                                state.sessions.set_session_machine(session_id, machine_id);
-
-                                // Cache initial pane list if provided, preserving persisted labels/order.
-                                // `None` means the CLI did not supply one; `Some([])` is a project
-                                // that genuinely has no panes, and discarding it left the server
-                                // serving the roster from before the last pane was closed.
-                                if let Some(pane_list) = &panes {
-                                    {
-                                        let mut normalized_panes = pane_list.clone();
-                                        // Recover custom labels/order from persisted file
-                                        if let Ok(stored) = state.storage.load_pane_list(&session_id).await {
-                                            if !stored.is_empty() {
-                                                let label_map: std::collections::HashMap<u32, String> = stored
-                                                    .iter()
-                                                    .filter_map(|p| p.label.as_ref().map(|l| (p.pane_id, l.clone())))
-                                                    .collect();
-                                                for pane in &mut normalized_panes {
-                                                    if let Some(label) = label_map.get(&pane.pane_id) {
-                                                        pane.label = Some(label.clone());
-                                                    }
-                                                }
-                                                // Reorder to match persisted order; new panes appended
-                                                let existing_order: Vec<u32> = stored.iter().map(|p| p.pane_id).collect();
-                                                let mut reordered: Vec<shared::PaneConfig> = Vec::new();
-                                                for &id in &existing_order {
-                                                    if let Some(p) = normalized_panes.iter().find(|p| p.pane_id == id) {
-                                                        reordered.push(p.clone());
-                                                    }
-                                                }
-                                                for p in &normalized_panes {
-                                                    if !existing_order.contains(&p.pane_id) {
-                                                        reordered.push(p.clone());
-                                                    }
-                                                }
-                                                if reordered.len() == normalized_panes.len() {
-                                                    normalized_panes = reordered;
-                                                }
-                                            }
-                                        }
+                                ) {
+                                    AttachOutcome::Attached { primary, replaced } => {
+                                        (primary, replaced)
+                                    }
+                                    AttachOutcome::Rejected { reason } => {
+                                        tracing::warn!(
+                                            "Rejecting SessionStart from CLI {} (user {}, session {}): {}",
+                                            cli_id,
+                                            user_id,
+                                            session_id,
+                                            reason
+                                        );
                                         state
                                             .sessions
-                                            .set_session_panes(&session_id, normalized_panes.clone());
-                                        if let Err(e) = state
-                                            .storage
-                                            .save_pane_list(&session_id, &normalized_panes)
-                                            .await
-                                        {
-                                            tracing::warn!(
-                                                "Failed to persist initial pane list for session {}: {}",
-                                                session_id,
-                                                e
-                                            );
-                                        }
-                                        // Forward to any already-attached web clients
-                                        state
-                                            .sessions
-                                            .route_to_web(
-                                                &session_id,
-                                                ServerToWeb::PaneList {
+                                            .send_to_cli(
+                                                &cli_id,
+                                                ServerToCli::SessionRejected {
                                                     session_id,
-                                                    panes: normalized_panes,
+                                                    reason,
                                                 },
                                             )
                                             .await;
+                                        continue;
+                                    }
+                                };
+                                // The project behind a session is single-valued: the primary sets it,
+                                // and a later instance only fills it in if it is somehow missing.
+                                if primary
+                                    || state.sessions.project_for_session(&session_id).is_none()
+                                {
+                                    state
+                                        .sessions
+                                        .set_session_project(session_id, project_id.to_string());
+                                }
+
+                                // Merge this instance's roster into the project's, after loading the
+                                // persisted one so other machines' stopped tabs survive a server
+                                // restart. `None` means the CLI did not supply one and changes nothing;
+                                // `Some([])` is an instance that genuinely has no panes, and discarding
+                                // it left the server serving the roster from before its last pane was
+                                // closed.
+                                ensure_pane_roster_loaded(&state, &session_id).await;
+                                let stamped = recorded_host.as_deref().is_some_and(|host| {
+                                    state.sessions.stamp_untagged_pane_hosts(&session_id, host)
+                                });
+                                let reported: Option<HashSet<u32>> = panes
+                                    .as_ref()
+                                    .map(|panes| panes.iter().map(|pane| pane.pane_id).collect());
+                                let merged = panes.and_then(|panes| {
+                                    state.sessions.merge_instance_roster(&session_id, &cli_id, panes)
+                                });
+                                // Reserved ids this instance now lists are in the roster.
+                                if let (Some(_), Some(reported)) = (&merged, &reported) {
+                                    state.sessions.clear_reported_pane_reservations(
+                                        &session_id,
+                                        &cli_id,
+                                        reported,
+                                    );
+                                }
+                                if merged.is_some() || stamped {
+                                    persist_pane_roster(&state, &session_id).await;
+                                    // Forward to any already-attached web clients
+                                    let panes = merged.unwrap_or_else(|| {
+                                        state.sessions.get_session_panes(&session_id)
+                                    });
+                                    state
+                                        .sessions
+                                        .route_to_web(
+                                            &session_id,
+                                            ServerToWeb::PaneList { session_id, panes },
+                                        )
+                                        .await;
+                                }
+
+                                // The session's database row describes its primary instance. Another
+                                // machine's instance must not rewrite its host or directory, or move
+                                // shares keyed by them.
+                                if primary {
+                                    let session = crate::db::Session {
+                                        id: session_id.to_string(),
+                                        user_id: user_id.to_string(),
+                                        cli_client_id: Some(cli_id.to_string()),
+                                        working_dir: working_dir.clone(),
+                                        hostname: hostname.clone(),
+                                        status: "active".to_string(),
+                                        created_at: None,
+                                        updated_at: None,
+                                        is_paused: false,
+                                        project_id: Some(project_id.to_string()),
+                                        git_remote,
+                                        git_remote_url,
+                                    };
+                                    if let Err(e) = state.db.create_session(&session).await {
+                                        tracing::error!("Failed to persist session to database: {}", e);
                                     }
                                 }
 
-                                // Persist session to database
-                                let session = crate::db::Session {
-                                    id: session_id.to_string(),
-                                    user_id: user_id.to_string(),
-                                    cli_client_id: Some(cli_id.to_string()),
-                                    working_dir,
-                                    hostname,
-                                    status: "active".to_string(),
-                                    created_at: None,
-                                    updated_at: None,
-                                    is_paused: false,
-                                    project_id: Some(project_id.to_string()),
-                                    git_remote,
-                                    git_remote_url,
-                                };
-                                if let Err(e) = state.db.create_session(&session).await {
-                                    tracing::error!("Failed to persist session to database: {}", e);
-                                }
-
-                                if state.sessions.session_supports_capability(
-                                    &session_id,
+                                if state.sessions.cli_supports_capability(
+                                    &cli_id,
                                     shared::PROJECT_POLICY_CAPABILITY,
                                 ) {
                                     match state
@@ -726,16 +1002,22 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
 
                                 // If this project got a regenerated session ID, carry over history
                                 // from the latest prior project session into this new session ID.
-                                match state
-                                    .db
-                                    .get_latest_project_session_id(
-                                        &user_id.to_string(),
-                                        session.working_dir.as_deref(),
-                                        session.hostname.as_deref(),
-                                        &session_id.to_string(),
-                                    )
-                                    .await
-                                {
+                                // Keyed by the primary's host and directory like the row above, so a
+                                // joining checkout never seeds the session from its own old project.
+                                let previous_session = if primary {
+                                    state
+                                        .db
+                                        .get_latest_project_session_id(
+                                            &user_id.to_string(),
+                                            working_dir.as_deref(),
+                                            hostname.as_deref(),
+                                            &session_id.to_string(),
+                                        )
+                                        .await
+                                } else {
+                                    Ok(None)
+                                };
+                                match previous_session {
                                     Ok(Some(previous_sid)) => {
                                         match Uuid::parse_str(&previous_sid) {
                                             Ok(previous_uuid) => {
@@ -791,7 +1073,21 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                     },
                                 ).await;
 
-                                tracing::info!("CLI {} started local session {}", cli_id, session_id);
+                                // New panes waiting for this machine's instance can go to it now.
+                                // Not sooner: its CLI refuses a new pane until it holds the
+                                // project's policy, which was sent above.
+                                if let Some(machine_id) = machine_id {
+                                    state.sessions.instance_started(session_id, machine_id, cli_id);
+                                }
+
+                                tracing::info!(
+                                    "CLI {} started local session {} (machine {:?}, primary {}, replaced {:?})",
+                                    cli_id,
+                                    session_id,
+                                    machine_id,
+                                    primary,
+                                    replaced
+                                );
                             }
                             Ok(CliToServer::Output {
                                 session_id,
@@ -1059,6 +1355,22 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                 else {
                                     continue;
                                 };
+                                // While another machine still runs the project, only this
+                                // instance leaves; the session ends with its last instance.
+                                match state.sessions.leave_session(&session_id, &cli_id) {
+                                    SessionLeave::Detached(detach) => {
+                                        persist_instance_detach(&state, &detach).await;
+                                        tracing::info!(
+                                            "Instance {} left session {}: {}",
+                                            cli_id,
+                                            session_id,
+                                            reason
+                                        );
+                                        continue;
+                                    }
+                                    SessionLeave::NotAttached => continue,
+                                    SessionLeave::Last => {}
+                                }
                                 // Update session status in database
                                 let _ = state.db.update_session_status(&session_id.to_string(), "ended").await;
 
@@ -1280,7 +1592,8 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                 else {
                                     continue;
                                 };
-                                if let Some(current) = state.sessions.reconcile_terminal_state(
+                                if let Some(current) = state.sessions.reconcile_terminal_state_from(
+                                    Some(cli_id),
                                     &session_id,
                                     pane_id,
                                     instance_id,
@@ -1328,16 +1641,24 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                 else {
                                     continue;
                                 };
-                                state.sessions.set_lifecycle_inventory(session_id, inventory.clone());
+                                // Each instance has its own hosting capability and panes,
+                                // so the inventory is kept and relayed per machine.
+                                let machine_id = state
+                                    .sessions
+                                    .instance_for_cli(&session_id, &cli_id)
+                                    .and_then(|instance| instance.machine_id);
+                                state.sessions.set_lifecycle_inventory(
+                                    session_id,
+                                    machine_id,
+                                    inventory.clone(),
+                                );
                                 route_lifecycle_to_authorized_web(
                                     &state,
                                     session_id,
                                     ServerToWeb::CliLifecycleInventory {
                                         session_id,
                                         inventory,
-                                        // One instance per session until sessions
-                                        // hold per-machine attachments.
-                                        machine_id: None,
+                                        machine_id,
                                     },
                                 )
                                 .await;
@@ -1356,14 +1677,21 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                 else {
                                     continue;
                                 };
-                                let Some(status) = state.sessions.update_lifecycle_request(
-                                    request_id,
-                                    session_id,
-                                    operation,
-                                    phase,
-                                    message,
-                                    inventory,
-                                ) else {
+                                let machine_id = state
+                                    .sessions
+                                    .instance_for_cli(&session_id, &cli_id)
+                                    .and_then(|instance| instance.machine_id);
+                                let Some(status) =
+                                    state.sessions.update_lifecycle_request_from_instance(
+                                        request_id,
+                                        session_id,
+                                        machine_id,
+                                        operation,
+                                        phase,
+                                        message,
+                                        inventory,
+                                    )
+                                else {
                                     tracing::warn!(%session_id, %request_id, ?operation, ?phase, "ignored unknown or mismatched CLI lifecycle status");
                                     continue;
                                 };
@@ -1538,69 +1866,33 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                     tracing::warn!(%notification_error, %session_id, pane_id, "failed to enqueue pull-request notification");
                                 }
                             }
-                            Ok(CliToServer::PaneList { session_id, mut panes }) => {
+                            Ok(CliToServer::PaneList { session_id, panes }) => {
                                 let Ok((_project_id, _operation_guard)) = state
                                     .active_session_operation(&session_id.to_string())
                                     .await
                                 else {
                                     continue;
                                 };
-                                // A web pane reboot is represented internally by the CLI as a
-                                // close followed by an add. Hide that implementation detail so
-                                // the pane neither flashes out of the UI nor loses its position.
-                                panes = state
-                                    .sessions
-                                    .reconcile_pane_reboots(&session_id, panes);
-                                // Cache pane list and forward to attached web clients
                                 tracing::info!("CLI {} sent pane list for session {}: {} panes", cli_id, session_id, panes.len());
-                                // Preserve web-side custom labels and order from cache or persisted file
-                                let mut existing = state.sessions.get_session_panes(&session_id);
-                                if existing.is_empty() {
-                                    // After server restart the in-memory cache is empty;
-                                    // fall back to the persisted panes.json to recover labels/order.
-                                    if let Ok(stored) = state.storage.load_pane_list(&session_id).await {
-                                        if !stored.is_empty() {
-                                            existing = stored;
-                                        }
-                                    }
-                                }
-                                if !existing.is_empty() {
-                                    let label_map: std::collections::HashMap<u32, String> = existing
-                                        .iter()
-                                        .filter_map(|p| p.label.as_ref().map(|l| (p.pane_id, l.clone())))
-                                        .collect();
-                                    for pane in &mut panes {
-                                        if let Some(label) = label_map.get(&pane.pane_id) {
-                                            pane.label = Some(label.clone());
-                                        }
-                                    }
-                                    // Reorder to match existing cached order; new panes appended at end
-                                    let existing_order: Vec<u32> = existing.iter().map(|p| p.pane_id).collect();
-                                    let new_ids: std::collections::HashSet<u32> = panes.iter().map(|p| p.pane_id).collect();
-                                    let mut reordered: Vec<shared::PaneConfig> = Vec::new();
-                                    for &id in &existing_order {
-                                        if let Some(p) = panes.iter().find(|p| p.pane_id == id) {
-                                            reordered.push(p.clone());
-                                        }
-                                    }
-                                    for p in &panes {
-                                        if !existing_order.contains(&p.pane_id) {
-                                            reordered.push(p.clone());
-                                        }
-                                    }
-                                    // Only apply reorder if all incoming panes are accounted for
-                                    if reordered.len() == panes.len() {
-                                        panes = reordered;
-                                    }
-                                }
-                                state.sessions.set_session_panes(&session_id, panes.clone());
-                                if let Err(e) = state.storage.save_pane_list(&session_id, &panes).await {
-                                    tracing::warn!(
-                                        "Failed to persist pane list for session {}: {}",
-                                        session_id,
-                                        e
-                                    );
-                                }
+                                // Merge this instance's panes into the project roster: it
+                                // replaces only its own, keeps every other machine's, and
+                                // keeps web-side labels and order. A pane mid-reboot (a close
+                                // followed by an add on the CLI) keeps its place.
+                                ensure_pane_roster_loaded(&state, &session_id).await;
+                                let reported: HashSet<u32> =
+                                    panes.iter().map(|pane| pane.pane_id).collect();
+                                let Some(panes) =
+                                    state.sessions.merge_instance_roster(&session_id, &cli_id, panes)
+                                else {
+                                    continue;
+                                };
+                                // Reserved ids this instance now lists are in the roster.
+                                state.sessions.clear_reported_pane_reservations(
+                                    &session_id,
+                                    &cli_id,
+                                    &reported,
+                                );
+                                persist_pane_roster(&state, &session_id).await;
                                 let web_msg = ServerToWeb::PaneList {
                                     session_id,
                                     panes,
@@ -1625,14 +1917,12 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                 pending,
                                 error,
                             }) => {
-                                if state.sessions.get_session(&session_id)
-                                    .is_some_and(|session| session.cli_client_id == Some(cli_id))
-                                {
-                                    state.sessions.finish_omp_answer(
-                                        session_id, pane_id, cli_id, &tool_use_id, &request_id,
-                                        crate::session::OmpAnswerReceipt { accepted, pending, error },
-                                    );
-                                }
+                                // Only the pane's instance gets this far, and the waiter
+                                // also names the connection the answer was sent to.
+                                state.sessions.finish_omp_answer(
+                                    session_id, pane_id, cli_id, &tool_use_id, &request_id,
+                                    crate::session::OmpAnswerReceipt { accepted, pending, error },
+                                );
                             }
                             Ok(CliToServer::ProjectPolicySnapshot {
                                 session_id,
@@ -1689,10 +1979,11 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                             })
                                             .map(|pane| pane.pane_id)
                                             .collect();
+                                        // Policy is the project's, so every instance holds it.
                                         state
                                             .sessions
-                                            .send_to_cli(
-                                                &cli_id,
+                                            .route_to_cli(
+                                                &session_id,
                                                 ServerToCli::ProjectPolicy {
                                                     session_id,
                                                     policy: policy.clone(),
@@ -1754,38 +2045,15 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
         }
     }
 
-    // Cleanup - mark all sessions for this CLI as inactive and clear cli_client_id
-    let session_ids = state.sessions.get_cli_session_ids(&cli_id);
-    for session_id in &session_ids {
-        if let Err(e) = state.db.clear_session_cli(&session_id.to_string()).await {
-            tracing::error!(
-                "Failed to clear session {} cli_client_id: {}",
-                session_id,
-                e
-            );
-        }
-        // Transport loss does not prove that this APAS process or its PTYs
-        // ended. Retain their bounded presentation and expose the uncertainty
-        // until the reconnect state report reconciles each process instance.
-        for (pane_id, terminal) in state
-            .sessions
-            .mark_session_terminals_disconnected(session_id)
-        {
-            state
-                .sessions
-                .route_to_web(
-                    session_id,
-                    ServerToWeb::TerminalState {
-                        session_id: *session_id,
-                        pane_id,
-                        instance_id: terminal.instance_id,
-                        lifecycle: terminal.lifecycle,
-                        status: terminal.status,
-                        runtime: terminal.runtime,
-                    },
-                )
-                .await;
-        }
+    // Cleanup - detach this CLI's instances. Only their own terminals become
+    // disconnected and only their statuses clear; a session goes inactive
+    // only when its last instance leaves, and otherwise its row moves to the
+    // next primary. Transport loss does not prove that this APAS process or
+    // its PTYs ended, so their presentation is retained until a reconnect
+    // reconciles each process instance.
+    let detached = state.sessions.detach_cli_instances(&cli_id);
+    for detach in &detached {
+        persist_instance_detach(&state, detach).await;
     }
 
     state.sessions.unregister_cli(&cli_id);
@@ -1794,9 +2062,10 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
         .update_cli_client_status(&cli_id.to_string(), "offline")
         .await;
     tracing::info!(
-        "CLI client disconnected: {} (marked {} sessions as inactive)",
+        "CLI client disconnected: {} (left {} sessions, {} now inactive)",
         cli_id,
-        session_ids.len()
+        detached.len(),
+        detached.iter().filter(|detach| detach.primary.is_none()).count()
     );
 }
 
@@ -2096,5 +2365,822 @@ mod pane_status_tests {
         );
         assert!(recorded_tool_result_id(&question).is_none());
         assert!(ask_user_question_id(&answer).is_none());
+    }
+}
+
+#[cfg(test)]
+mod instance_tests {
+    use super::{inbound_scope, InboundScope};
+    use crate::state::AppState;
+    use futures::{SinkExt, StreamExt};
+    use jsonwebtoken::{encode, EncodingKey, Header};
+    use serde_json::json;
+    use shared::{
+        CliLifecycleInventory, CliLifecycleOperation, CliLifecyclePhase, CliToServer,
+        PaneConfig, PaneType, Provider, ServerToCli, ServerToWeb, TerminalLifecycle,
+        UsageLimits, PANE_ID_DEADLOOP, PANE_ID_INTERACTIVE, PROJECT_INSTANCES_CAPABILITY,
+    };
+    use std::collections::BTreeSet;
+    use std::time::Duration;
+    use tokio::sync::mpsc;
+    use tokio_tungstenite::{connect_async, tungstenite::Message};
+    use uuid::Uuid;
+
+    const HOST_A: &str = "zoo-005";
+    const HOST_B: &str = "zoo-006";
+    const SECRET: &str = "project-instances-test-secret";
+
+    type CliSocket = tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >;
+
+    /// Every `CliToServer` wire tag, as serde lists them when it meets an
+    /// unknown one, so the list cannot drift from the enum.
+    fn every_cli_to_server_tag() -> BTreeSet<String> {
+        let error = serde_json::from_str::<CliToServer>(r#"{"type":"__no_such_message__"}"#)
+            .unwrap_err()
+            .to_string();
+        let expected = error
+            .split("expected one of")
+            .nth(1)
+            .expect("serde lists the variants it expected");
+        expected
+            .split('`')
+            .skip(1)
+            .step_by(2)
+            .map(str::to_string)
+            .collect()
+    }
+
+    fn wire_tag(message: &CliToServer) -> String {
+        serde_json::to_value(message).unwrap()["type"]
+            .as_str()
+            .expect("internally tagged message")
+            .to_string()
+    }
+
+    /// One example of every inbound message with the instance it must come
+    /// from. The table is the reviewed classification.
+    fn classification(s: Uuid) -> Vec<(CliToServer, InboundScope)> {
+        use InboundScope::{Attach, Connection, Pane, Primary, Session};
+        let assistant = shared::ClaudeStreamMessage::Assistant {
+            message: shared::ClaudeAssistantMessage {
+                content: Vec::new(),
+                model: String::new(),
+                extra: serde_json::Value::Null,
+            },
+            session_id: "provider-session".to_string(),
+            extra: serde_json::Value::Null,
+        };
+        vec![
+            (
+                CliToServer::Register {
+                    token: "token".into(),
+                    version: None,
+                    capabilities: Vec::new(),
+                },
+                Connection,
+            ),
+            (CliToServer::Heartbeat, Connection),
+            (
+                CliToServer::UsageLimits {
+                    provider: Provider::Claude,
+                    limits: UsageLimits {
+                        five_hour: None,
+                        seven_day: None,
+                        fetched_at: None,
+                        usage_limited: None,
+                    },
+                },
+                Connection,
+            ),
+            (
+                CliToServer::PaneWorkSummaryResult {
+                    result: serde_json::from_value(json!({
+                        "job_id": Uuid::new_v4(),
+                        "session_id": s,
+                        "pane_id": 9,
+                        "window_start": "2026-11-11T00:00:00Z",
+                        "source_digest": "digest",
+                    }))
+                    .unwrap(),
+                },
+                Connection,
+            ),
+            (
+                CliToServer::SessionStart {
+                    session_id: s,
+                    project_id: None,
+                    machine_id: None,
+                    working_dir: None,
+                    hostname: None,
+                    git_remote: None,
+                    git_remote_url: None,
+                    pane_type: None,
+                    panes: None,
+                },
+                Attach,
+            ),
+            (
+                CliToServer::Output {
+                    session_id: s,
+                    data: "out".into(),
+                    output_type: Default::default(),
+                    pane_type: None,
+                    pane_id: Some(7),
+                },
+                Pane(s, 7),
+            ),
+            (
+                CliToServer::StreamMessage {
+                    session_id: s,
+                    message: assistant,
+                    pane_type: Some(PaneType::Deadloop),
+                    pane_id: None,
+                },
+                Pane(s, PANE_ID_DEADLOOP),
+            ),
+            (
+                CliToServer::UserInput {
+                    session_id: s,
+                    text: "hi".into(),
+                    pane_type: None,
+                    pane_id: None,
+                },
+                Session(s),
+            ),
+            (
+                CliToServer::SessionEnd {
+                    session_id: s,
+                    reason: "done".into(),
+                },
+                Session(s),
+            ),
+            (
+                CliToServer::DeadloopStatus {
+                    session_id: s,
+                    is_paused: true,
+                },
+                Pane(s, PANE_ID_DEADLOOP),
+            ),
+            (
+                CliToServer::PanePaused {
+                    session_id: s,
+                    pane_id: 4,
+                    is_paused: true,
+                },
+                Pane(s, 4),
+            ),
+            (
+                CliToServer::PaneStatus {
+                    session_id: s,
+                    pane_type: PaneType::Interactive,
+                    pane_id: None,
+                    status: None,
+                },
+                Pane(s, PANE_ID_INTERACTIVE),
+            ),
+            (
+                CliToServer::PaneList {
+                    session_id: s,
+                    panes: Vec::new(),
+                },
+                Session(s),
+            ),
+            (
+                CliToServer::PlanReviewRequest {
+                    session_id: s,
+                    pane_id: 4,
+                    tool_use_id: "toolu_1".into(),
+                    tool_name: "Write".into(),
+                    input: json!({}),
+                },
+                Pane(s, 4),
+            ),
+            (
+                CliToServer::PaneDiff {
+                    session_id: s,
+                    pane_id: 4,
+                    branch: None,
+                    base: None,
+                    diff: None,
+                    error: None,
+                },
+                Pane(s, 4),
+            ),
+            (
+                CliToServer::PrCreated {
+                    session_id: s,
+                    pane_id: 4,
+                    url: None,
+                    error: None,
+                },
+                Pane(s, 4),
+            ),
+            (
+                CliToServer::ProjectFlagsChanged {
+                    session_id: s,
+                    auto_approve_todos: false,
+                    auto_merge_prs: false,
+                    team_enabled: false,
+                    disallowed_tab_types: Vec::new(),
+                },
+                Primary(s),
+            ),
+            (
+                CliToServer::ProjectPolicySnapshot {
+                    session_id: s,
+                    team_enabled: false,
+                    disallowed_tab_types: Vec::new(),
+                },
+                Session(s),
+            ),
+            (
+                CliToServer::TerminalOutput {
+                    session_id: s,
+                    pane_id: 4,
+                    instance_id: None,
+                    data_b64: "eA==".into(),
+                    seq: 0,
+                },
+                Pane(s, 4),
+            ),
+            (
+                CliToServer::TerminalExited {
+                    session_id: s,
+                    pane_id: 4,
+                    instance_id: None,
+                    status: None,
+                },
+                Pane(s, 4),
+            ),
+            (
+                CliToServer::TerminalState {
+                    session_id: s,
+                    pane_id: 4,
+                    instance_id: None,
+                    lifecycle: TerminalLifecycle::Running,
+                    status: None,
+                    runtime: None,
+                },
+                Pane(s, 4),
+            ),
+            (
+                CliToServer::CliLifecycleInventory {
+                    session_id: s,
+                    inventory: CliLifecycleInventory::default(),
+                },
+                Session(s),
+            ),
+            (
+                CliToServer::CliLifecycleStatus {
+                    session_id: s,
+                    request_id: Uuid::new_v4(),
+                    operation: CliLifecycleOperation::RebootCli,
+                    phase: CliLifecyclePhase::Accepted,
+                    message: None,
+                    inventory: None,
+                },
+                Session(s),
+            ),
+            (
+                CliToServer::OmpQuestionAnswerResult {
+                    session_id: s,
+                    pane_id: 4,
+                    tool_use_id: "omp:1".into(),
+                    request_id: "answer-1".into(),
+                    accepted: true,
+                    pending: false,
+                    error: None,
+                },
+                Pane(s, 4),
+            ),
+        ]
+    }
+
+    /// `inbound_scope` has no wildcard arm, so a new message does not
+    /// compile unclassified; this pins each classification and fails until
+    /// a new message also has a row here.
+    #[test]
+    fn every_inbound_message_has_a_pinned_scope() {
+        let session = Uuid::new_v4();
+        let table = classification(session);
+        let covered: BTreeSet<String> = table.iter().map(|(message, _)| wire_tag(message)).collect();
+        assert_eq!(covered, every_cli_to_server_tag());
+        for (message, expected) in &table {
+            assert_eq!(inbound_scope(message), *expected, "{}", wire_tag(message));
+        }
+        // A pane named by id wins over the legacy type; output that names
+        // neither belongs to the session.
+        let named = CliToServer::Output {
+            session_id: session,
+            data: String::new(),
+            output_type: Default::default(),
+            pane_type: Some(PaneType::Deadloop),
+            pane_id: Some(9),
+        };
+        assert_eq!(inbound_scope(&named), InboundScope::Pane(session, 9));
+        let unnamed = CliToServer::StreamMessage {
+            session_id: session,
+            message: shared::ClaudeStreamMessage::Assistant {
+                message: shared::ClaudeAssistantMessage {
+                    content: Vec::new(),
+                    model: String::new(),
+                    extra: serde_json::Value::Null,
+                },
+                session_id: String::new(),
+                extra: serde_json::Value::Null,
+            },
+            pane_type: None,
+            pane_id: None,
+        };
+        assert_eq!(inbound_scope(&unnamed), InboundScope::Session(session));
+    }
+
+    struct Harness {
+        state: AppState,
+        url: String,
+        user_id: Uuid,
+        token: String,
+        server: tokio::task::JoinHandle<()>,
+        dir: std::path::PathBuf,
+    }
+
+    impl Drop for Harness {
+        fn drop(&mut self) {
+            self.server.abort();
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    async fn harness() -> Harness {
+        let dir = std::env::temp_dir().join(format!("apas-ws-cli-instances-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("apas.db");
+        let db = crate::db::Database::new(&db_path.to_string_lossy())
+            .await
+            .unwrap();
+        db.run_migrations().await.unwrap();
+        let user_id = Uuid::new_v4();
+        db.create_user(&crate::db::User {
+            id: user_id.to_string(),
+            email: format!("{user_id}@example.test"),
+            password_hash: "unused".to_string(),
+            created_at: None,
+            cluster_role: "user".to_string(),
+            account_status: "active".to_string(),
+        })
+        .await
+        .unwrap();
+        let mut config = crate::config::Config::default();
+        config.database.path = db_path.to_string_lossy().into_owned();
+        config.auth.jwt_secret = SECRET.to_string();
+        let state = AppState::new(db, config);
+        let token = encode(
+            &Header::default(),
+            &crate::routes::auth::Claims {
+                sub: user_id.to_string(),
+                exp: (chrono::Utc::now() + chrono::Duration::hours(1)).timestamp() as usize,
+                device_session_id: None,
+                token_kind: None,
+                credential_version: None,
+            },
+            &EncodingKey::from_secret(SECRET.as_bytes()),
+        )
+        .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let router = crate::routes::create_router(state.clone());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        Harness {
+            state,
+            url: format!("ws://{address}/ws/cli"),
+            user_id,
+            token,
+            server,
+            dir,
+        }
+    }
+
+    async fn send(socket: &mut CliSocket, message: CliToServer) {
+        socket
+            .send(Message::Text(serde_json::to_string(&message).unwrap()))
+            .await
+            .unwrap();
+    }
+
+    async fn receive(socket: &mut CliSocket, matches: impl Fn(&ServerToCli) -> bool) -> ServerToCli {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let frame = socket.next().await.unwrap().unwrap();
+                let Message::Text(text) = frame else { continue };
+                let message = serde_json::from_str::<ServerToCli>(&text).unwrap();
+                if matches(&message) {
+                    return message;
+                }
+            }
+        })
+        .await
+        .expect("timed out waiting for the server")
+    }
+
+    /// A registered CLI connection; `capable` advertises project instances.
+    async fn connect_cli(harness: &Harness, capable: bool) -> (CliSocket, Uuid) {
+        let (mut socket, _) = connect_async(&harness.url).await.unwrap();
+        let mut capabilities = vec![shared::PROJECT_POLICY_CAPABILITY.to_string()];
+        if capable {
+            capabilities.push(PROJECT_INSTANCES_CAPABILITY.to_string());
+        }
+        send(
+            &mut socket,
+            CliToServer::Register {
+                token: harness.token.clone(),
+                version: Some("26.11.0".to_string()),
+                capabilities,
+            },
+        )
+        .await;
+        match receive(&mut socket, |message| matches!(message, ServerToCli::Registered { .. })).await
+        {
+            ServerToCli::Registered { cli_id } => (socket, cli_id),
+            other => panic!("expected registration, got {other:?}"),
+        }
+    }
+
+    fn pane(pane_id: u32) -> PaneConfig {
+        let mut pane = PaneConfig::defaults().remove(0);
+        pane.pane_id = pane_id;
+        pane.kind = shared::PaneKind::Terminal;
+        pane
+    }
+
+    fn session_start(
+        session_id: Uuid,
+        machine_id: Uuid,
+        host: &str,
+        panes: Option<Vec<PaneConfig>>,
+    ) -> CliToServer {
+        CliToServer::SessionStart {
+            session_id,
+            project_id: Some(session_id),
+            machine_id: Some(machine_id),
+            working_dir: Some(format!("/work/{host}")),
+            hostname: Some(host.to_string()),
+            git_remote: None,
+            git_remote_url: None,
+            pane_type: None,
+            panes,
+        }
+    }
+
+    /// Start an instance and wait for the server to finish its start, which
+    /// ends by sending the project's policy.
+    async fn start(socket: &mut CliSocket, message: CliToServer) {
+        send(socket, message).await;
+        receive(socket, |message| matches!(message, ServerToCli::ProjectPolicy { .. })).await;
+    }
+
+    async fn eventually(what: &str, mut condition: impl FnMut() -> bool) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !condition() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("timed out waiting until {what}"));
+    }
+
+    async fn db_row(harness: &Harness, session_id: Uuid) -> crate::db::Session {
+        harness
+            .state
+            .db
+            .get_session(&session_id.to_string())
+            .await
+            .unwrap()
+            .expect("session row")
+    }
+
+    async fn eventually_row(
+        harness: &Harness,
+        session_id: Uuid,
+        what: &str,
+        condition: impl Fn(&crate::db::Session) -> bool,
+    ) -> crate::db::Session {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let row = db_row(harness, session_id).await;
+            if condition(&row) {
+                return row;
+            }
+            assert!(tokio::time::Instant::now() < deadline, "timed out waiting until {what}: {row:?}");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// An in-memory web viewer of `session_id`, signed in as the owner.
+    fn viewer(harness: &Harness, session_id: Uuid) -> mpsc::Receiver<ServerToWeb> {
+        let connection_id = Uuid::new_v4();
+        let (tx, rx) = mpsc::channel(256);
+        harness.state.sessions.register_web(connection_id, tx);
+        harness.state.sessions.set_web_user(connection_id, harness.user_id);
+        assert!(harness
+            .state
+            .sessions
+            .attach_web_to_session(&session_id, connection_id, None));
+        rx
+    }
+
+    async fn receive_web(
+        rx: &mut mpsc::Receiver<ServerToWeb>,
+        matches: impl Fn(&ServerToWeb) -> bool,
+    ) -> (ServerToWeb, Vec<ServerToWeb>) {
+        let mut before = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let message = rx.recv().await.expect("web sender closed");
+                if matches(&message) {
+                    return (message, before);
+                }
+                before.push(message);
+            }
+        })
+        .await
+        .expect("timed out waiting for a web message")
+    }
+
+    fn terminal_output(session_id: Uuid, pane_id: u32) -> CliToServer {
+        CliToServer::TerminalOutput {
+            session_id,
+            pane_id,
+            instance_id: None,
+            data_b64: "eA==".into(),
+            seq: 0,
+        }
+    }
+
+    /// Two machines' instances share the project's session. The session row
+    /// stays the primary's, another machine's pane traffic is refused, and a
+    /// departing primary hands the row to the remaining instance until the
+    /// last one leaves.
+    #[tokio::test]
+    async fn two_machines_share_one_session_and_only_the_primary_writes_its_row() {
+        let harness = harness().await;
+        let session = Uuid::new_v4();
+        let (m5, m6) = (Uuid::new_v4(), Uuid::new_v4());
+        let (mut a, a_id) = connect_cli(&harness, true).await;
+        let (mut b, b_id) = connect_cli(&harness, true).await;
+        start(&mut a, session_start(session, m5, HOST_A, Some(vec![pane(3)]))).await;
+        start(&mut b, session_start(session, m6, HOST_B, Some(vec![pane(4)]))).await;
+
+        let sessions = &harness.state.sessions;
+        assert_eq!(
+            sessions
+                .session_attachments(&session)
+                .iter()
+                .map(|instance| instance.cli_id)
+                .collect::<Vec<_>>(),
+            vec![a_id, b_id]
+        );
+        let row = db_row(&harness, session).await;
+        assert_eq!(row.hostname.as_deref(), Some(HOST_A), "a second machine must not rewrite the row");
+        assert_eq!(row.working_dir.as_deref(), Some("/work/zoo-005"));
+        assert_eq!(row.cli_client_id, Some(a_id.to_string()));
+        let roster = sessions.get_session_panes(&session);
+        assert_eq!(
+            roster
+                .iter()
+                .map(|pane| (pane.pane_id, pane.machine_id))
+                .collect::<Vec<_>>(),
+            vec![(3, Some(m5)), (4, Some(m6))]
+        );
+        let persisted = harness
+            .state
+            .storage
+            .load_pane_roster(&session)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(persisted[1].hostname.as_deref(), Some(HOST_B), "tags are persisted");
+
+        // Terminal output for zoo-005's pane from zoo-006 is dropped; its own
+        // pane's output, sent after it on the same socket, gets through.
+        let mut web = viewer(&harness, session);
+        send(&mut b, terminal_output(session, 3)).await;
+        send(&mut b, terminal_output(session, 4)).await;
+        let (_, before) = receive_web(&mut web, |message| {
+            matches!(message, ServerToWeb::TerminalOutput { pane_id: 4, .. })
+        })
+        .await;
+        assert!(
+            !before
+                .iter()
+                .any(|message| matches!(message, ServerToWeb::TerminalOutput { pane_id: 3, .. })),
+            "{before:?}"
+        );
+        assert!(sessions.terminal_snapshot(&session, 3).is_none());
+
+        // The primary leaves: the row moves to the remaining instance.
+        a.close(None).await.unwrap();
+        let row = eventually_row(&harness, session, "the row moves to zoo-006", |row| {
+            row.cli_client_id.as_deref() == Some(b_id.to_string().as_str())
+        })
+        .await;
+        assert_eq!(row.hostname.as_deref(), Some(HOST_B));
+        assert_eq!(row.working_dir.as_deref(), Some("/work/zoo-006"));
+        assert_eq!(row.status, "active");
+        assert!(sessions.is_session_active(&session));
+        assert_eq!(
+            sessions.get_session_panes(&session).len(),
+            2,
+            "the departed machine's tabs stay listed"
+        );
+
+        b.close(None).await.unwrap();
+        let row = eventually_row(&harness, session, "the session goes inactive", |row| {
+            row.status == "inactive"
+        })
+        .await;
+        assert_eq!(row.cli_client_id, None);
+        eventually("no instance is attached", || !sessions.is_session_active(&session)).await;
+    }
+
+    /// An older CLI is turned away while another machine runs the project,
+    /// and nothing it sends afterwards reaches the session.
+    #[tokio::test]
+    async fn an_older_cli_is_turned_away_and_ignored() {
+        let harness = harness().await;
+        let session = Uuid::new_v4();
+        let (mut a, a_id) = connect_cli(&harness, true).await;
+        let (mut older, _) = connect_cli(&harness, false).await;
+        start(&mut a, session_start(session, Uuid::new_v4(), HOST_A, Some(vec![pane(3)]))).await;
+
+        send(&mut older, session_start(session, Uuid::new_v4(), HOST_B, Some(vec![pane(9)]))).await;
+        match receive(&mut older, |message| matches!(message, ServerToCli::SessionRejected { .. }))
+            .await
+        {
+            ServerToCli::SessionRejected { session_id, reason } => {
+                assert_eq!(session_id, session);
+                assert!(reason.contains(HOST_A), "{reason}");
+            }
+            other => panic!("expected a rejection, got {other:?}"),
+        }
+        let mut web = viewer(&harness, session);
+        send(&mut older, CliToServer::PaneList {
+            session_id: session,
+            panes: vec![pane(9)],
+        })
+        .await;
+        send(&mut older, terminal_output(session, 3)).await;
+        send(&mut a, terminal_output(session, 3)).await;
+        let (_, before) = receive_web(&mut web, |message| {
+            matches!(message, ServerToWeb::TerminalOutput { pane_id: 3, .. })
+        })
+        .await;
+        assert!(before.iter().all(|message| !matches!(message, ServerToWeb::PaneList { .. })));
+        let row = db_row(&harness, session).await;
+        assert_eq!(row.cli_client_id, Some(a_id.to_string()));
+        assert_eq!(row.hostname.as_deref(), Some(HOST_A));
+        assert_eq!(
+            harness
+                .state
+                .sessions
+                .get_session_panes(&session)
+                .iter()
+                .map(|pane| pane.pane_id)
+                .collect::<Vec<_>>(),
+            vec![3]
+        );
+    }
+
+    /// A start without a roster changes nothing, an empty one removes only
+    /// that machine's tabs, inventories name their machine, and only the
+    /// primary's copy of the legacy flags is relayed.
+    #[tokio::test]
+    async fn instance_reports_stay_scoped_to_their_machine() {
+        let harness = harness().await;
+        let session = Uuid::new_v4();
+        let (m5, m6) = (Uuid::new_v4(), Uuid::new_v4());
+        let (mut a, _) = connect_cli(&harness, true).await;
+        let (mut b, _) = connect_cli(&harness, true).await;
+        start(&mut a, session_start(session, m5, HOST_A, Some(vec![pane(3)]))).await;
+        start(&mut b, session_start(session, m6, HOST_B, None)).await;
+        let sessions = &harness.state.sessions;
+        assert_eq!(sessions.get_session_panes(&session).len(), 1, "None changes nothing");
+
+        let mut web = viewer(&harness, session);
+        send(&mut b, CliToServer::PaneList {
+            session_id: session,
+            panes: vec![pane(4)],
+        })
+        .await;
+        let (list, _) =
+            receive_web(&mut web, |message| matches!(message, ServerToWeb::PaneList { .. })).await;
+        let ServerToWeb::PaneList { panes, .. } = list else { unreachable!() };
+        assert_eq!(panes.iter().map(|pane| pane.pane_id).collect::<Vec<_>>(), vec![3, 4]);
+        send(&mut b, CliToServer::PaneList {
+            session_id: session,
+            panes: Vec::new(),
+        })
+        .await;
+        let (list, _) =
+            receive_web(&mut web, |message| matches!(message, ServerToWeb::PaneList { .. })).await;
+        let ServerToWeb::PaneList { panes, .. } = list else { unreachable!() };
+        assert_eq!(
+            panes.iter().map(|pane| pane.pane_id).collect::<Vec<_>>(),
+            vec![3],
+            "Some([]) removes only zoo-006's tabs"
+        );
+
+        // zoo-006's copy of the legacy flags is not the session's; its
+        // inventory, sent after it on the same socket, is relayed by machine.
+        send(&mut b, CliToServer::ProjectFlagsChanged {
+            session_id: session,
+            auto_approve_todos: false,
+            auto_merge_prs: false,
+            team_enabled: false,
+            disallowed_tab_types: Vec::new(),
+        })
+        .await;
+        send(&mut b, CliToServer::CliLifecycleInventory {
+            session_id: session,
+            inventory: CliLifecycleInventory {
+                persistent_terminal_hosting: true,
+                panes: Vec::new(),
+            },
+        })
+        .await;
+        let (inventory, before) = receive_web(&mut web, |message| {
+            matches!(message, ServerToWeb::CliLifecycleInventory { .. })
+        })
+        .await;
+        assert!(matches!(
+            inventory,
+            ServerToWeb::CliLifecycleInventory { machine_id: Some(machine), .. } if machine == m6
+        ));
+        assert!(
+            !before
+                .iter()
+                .any(|message| matches!(message, ServerToWeb::ProjectFlagsChanged { .. })),
+            "{before:?}"
+        );
+        assert_eq!(
+            sessions
+                .attached_lifecycle_inventories(&session)
+                .iter()
+                .map(|(machine, _)| *machine)
+                .collect::<Vec<_>>(),
+            vec![Some(m6)]
+        );
+        send(&mut a, CliToServer::ProjectFlagsChanged {
+            session_id: session,
+            auto_approve_todos: true,
+            auto_merge_prs: false,
+            team_enabled: false,
+            disallowed_tab_types: Vec::new(),
+        })
+        .await;
+        let (flags, _) = receive_web(&mut web, |message| {
+            matches!(message, ServerToWeb::ProjectFlagsChanged { .. })
+        })
+        .await;
+        assert!(matches!(
+            flags,
+            ServerToWeb::ProjectFlagsChanged {
+                auto_approve_todos: true,
+                ..
+            }
+        ));
+    }
+
+    /// `SessionEnd` from one machine's instance detaches only it; the
+    /// session ends with its last instance.
+    #[tokio::test]
+    async fn ending_one_instance_leaves_the_session_running_elsewhere() {
+        let harness = harness().await;
+        let session = Uuid::new_v4();
+        let (mut a, _) = connect_cli(&harness, true).await;
+        let (mut b, b_id) = connect_cli(&harness, true).await;
+        start(&mut a, session_start(session, Uuid::new_v4(), HOST_A, Some(Vec::new()))).await;
+        start(&mut b, session_start(session, Uuid::new_v4(), HOST_B, Some(Vec::new()))).await;
+
+        send(&mut a, CliToServer::SessionEnd {
+            session_id: session,
+            reason: "stopped on zoo-005".into(),
+        })
+        .await;
+        let row = eventually_row(&harness, session, "the row moves to zoo-006", |row| {
+            row.cli_client_id.as_deref() == Some(b_id.to_string().as_str())
+        })
+        .await;
+        assert_eq!(row.status, "active", "the project still runs on zoo-006");
+
+        send(&mut b, CliToServer::SessionEnd {
+            session_id: session,
+            reason: "stopped on zoo-006".into(),
+        })
+        .await;
+        eventually_row(&harness, session, "the session ends", |row| row.status == "ended").await;
     }
 }

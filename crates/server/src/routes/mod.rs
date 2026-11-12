@@ -18,6 +18,7 @@ mod local_projects;
 mod mobile;
 pub(crate) mod mobile_auth;
 mod mobile_notifications;
+mod project_join;
 pub(crate) mod projects;
 pub(crate) mod share;
 pub mod system_admin;
@@ -212,6 +213,9 @@ pub fn create_router(state: AppState) -> Router {
             get(projects::deletion_status),
         )
         .route("/projects/:project_id/usage", get(cluster::project_usage))
+        // `apas register` asks which of the caller's projects a checkout's
+        // repository belongs to before registering it.
+        .route("/projects/by-remote", get(project_join::projects_by_remote))
         // Session sharing routes
         .route("/share/generate", post(share::generate_code))
         .route("/share/redeem", post(share::redeem_code))
@@ -1591,6 +1595,18 @@ mod mobile_websocket_load_tests {
             )
         })
         .await;
+        // The attach asks the CLI for a fresh roster only after its database
+        // reads. Wait for that request itself: a quiet moment on the channel
+        // can come before it on a loaded machine, and then it would be taken
+        // for a retransmitted input reaching the CLI.
+        receive_cli(&mut cli_rx, |message| {
+            matches!(
+                message,
+                shared::ServerToCli::RequestPaneList { session_id: target }
+                    if *target == session_id
+            )
+        })
+        .await;
         while tokio::time::timeout(std::time::Duration::from_millis(20), cli_rx.recv())
             .await
             .is_ok()
@@ -1735,6 +1751,18 @@ mod mobile_websocket_load_tests {
             )
         })
         .await;
+        // The attach asks the CLI for a fresh roster only after its database
+        // reads. Wait for that request itself: a quiet moment on the channel
+        // can come before it on a loaded machine, and then it would be taken
+        // for a retransmitted input reaching the CLI.
+        receive_cli(&mut cli_rx, |message| {
+            matches!(
+                message,
+                shared::ServerToCli::RequestPaneList { session_id: target }
+                    if *target == session_id
+            )
+        })
+        .await;
         while tokio::time::timeout(std::time::Duration::from_millis(20), cli_rx.recv())
             .await
             .is_ok()
@@ -1786,5 +1814,289 @@ mod mobile_websocket_load_tests {
         mobile.close(None).await.unwrap();
         browser.close(None).await.unwrap();
         server.abort();
+    }
+}
+
+/// The project-instances frame over a real web socket: negotiated only with a
+/// client that asks, sent right after attaching, sent again on every change
+/// with the viewer's own access to each instance, and never sent to a client
+/// that did not ask. The session list names every instance either way.
+#[cfg(test)]
+mod project_instances_socket_tests {
+    use super::*;
+    use futures::{SinkExt, StreamExt};
+    use jsonwebtoken::{encode, EncodingKey, Header};
+    use tokio::sync::mpsc;
+    use tokio_tungstenite::{connect_async, tungstenite::Message};
+    use uuid::Uuid;
+
+    type ClientSocket = tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >;
+
+    const SECRET: &str = "project-instances-web-secret";
+
+    async fn send(socket: &mut ClientSocket, message: shared::WebToServer) {
+        socket
+            .send(Message::Text(serde_json::to_string(&message).unwrap()))
+            .await
+            .unwrap();
+    }
+
+    /// Every frame up to and including the first that `last` accepts.
+    async fn receive_until(
+        socket: &mut ClientSocket,
+        last: impl Fn(&shared::ServerToWeb) -> bool,
+    ) -> Vec<shared::ServerToWeb> {
+        let mut received = Vec::new();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let frame = socket.next().await.unwrap().unwrap();
+                let Message::Text(text) = frame else { continue };
+                let message = serde_json::from_str::<shared::ServerToWeb>(&text).unwrap();
+                let done = last(&message);
+                received.push(message);
+                if done {
+                    return;
+                }
+            }
+        })
+        .await
+        .expect("timed out waiting for the server");
+        received
+    }
+
+    async fn connect(url: &str, token: &str, capabilities: &[&str]) -> (ClientSocket, Vec<String>) {
+        let (mut socket, _) = connect_async(url).await.unwrap();
+        send(
+            &mut socket,
+            shared::WebToServer::Authenticate {
+                token: token.to_string(),
+                capabilities: capabilities
+                    .iter()
+                    .map(|capability| capability.to_string())
+                    .collect(),
+                client_kind: None,
+                app_version: None,
+                protocol_version: None,
+            },
+        )
+        .await;
+        let frames = receive_until(&mut socket, |message| {
+            matches!(message, shared::ServerToWeb::Authenticated { .. })
+        })
+        .await;
+        let Some(shared::ServerToWeb::Authenticated {
+            negotiated_capabilities,
+            ..
+        }) = frames.last().cloned()
+        else {
+            unreachable!()
+        };
+        (socket, negotiated_capabilities)
+    }
+
+    fn instance_sets(
+        frames: &[shared::ServerToWeb],
+    ) -> Vec<Vec<(Option<Uuid>, bool, Option<bool>)>> {
+        frames
+            .iter()
+            .filter_map(|message| match message {
+                shared::ServerToWeb::SessionInstances { instances, .. } => Some(
+                    instances
+                        .iter()
+                        .map(|instance| {
+                            (
+                                instance.machine_id,
+                                instance.primary,
+                                instance.runtime_access,
+                            )
+                        })
+                        .collect(),
+                ),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn only_web_clients_that_ask_are_sent_project_instances() {
+        let dir = std::env::temp_dir().join(format!("apas-instances-socket-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("apas.db");
+        let db = crate::db::Database::new(&db_path.to_string_lossy())
+            .await
+            .unwrap();
+        db.run_migrations().await.unwrap();
+        let owner = Uuid::new_v4();
+        db.create_user(&crate::db::User {
+            id: owner.to_string(),
+            email: "instances-socket@example.test".to_string(),
+            password_hash: "unused".to_string(),
+            created_at: None,
+            cluster_role: "user".to_string(),
+            account_status: "active".to_string(),
+        })
+        .await
+        .unwrap();
+        let session_id = Uuid::new_v4();
+        db.authorize_project_registration(&session_id.to_string(), &owner.to_string())
+            .await
+            .unwrap();
+        db.create_session(&crate::db::Session {
+            id: session_id.to_string(),
+            user_id: owner.to_string(),
+            cli_client_id: None,
+            working_dir: Some("/work/zoo-005".to_string()),
+            hostname: Some("zoo-005".to_string()),
+            status: "active".to_string(),
+            created_at: None,
+            updated_at: None,
+            is_paused: false,
+            project_id: Some(session_id.to_string()),
+            git_remote: None,
+            git_remote_url: None,
+        })
+        .await
+        .unwrap();
+        let mut config = crate::config::Config::default();
+        config.database.path = db_path.to_string_lossy().into_owned();
+        config.auth.jwt_secret = SECRET.to_string();
+        let state = AppState::new(db, config);
+        state
+            .sessions
+            .set_session_project(session_id, session_id.to_string());
+        let (m5, m6) = (Uuid::new_v4(), Uuid::new_v4());
+        let mut clis = Vec::new();
+        let attach = |machine_id: Uuid, host: &str| {
+            let cli_id = Uuid::new_v4();
+            let (cli_tx, cli_rx) = mpsc::channel::<shared::ServerToCli>(64);
+            state.sessions.register_cli(cli_id, owner, cli_tx, None);
+            state
+                .sessions
+                .set_cli_capabilities(cli_id, vec![shared::PROJECT_INSTANCES_CAPABILITY.into()]);
+            assert!(matches!(
+                state.sessions.attach_cli_instance(
+                    session_id,
+                    cli_id,
+                    Some(machine_id),
+                    Some(format!("/work/{host}")),
+                    Some(host.to_string()),
+                ),
+                crate::session::AttachOutcome::Attached { .. }
+            ));
+            cli_rx
+        };
+        clis.push(attach(m5, "zoo-005"));
+
+        let token = encode(
+            &Header::default(),
+            &auth::Claims {
+                sub: owner.to_string(),
+                exp: (chrono::Utc::now() + chrono::Duration::hours(1)).timestamp() as usize,
+                device_session_id: None,
+                token_kind: None,
+                credential_version: None,
+            },
+            &EncodingKey::from_secret(SECRET.as_bytes()),
+        )
+        .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let router = create_router(state.clone());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        let url = format!("ws://{address}/ws/web");
+
+        let (mut capable, negotiated) =
+            connect(&url, &token, &[shared::PROJECT_INSTANCES_CAPABILITY]).await;
+        assert!(negotiated
+            .iter()
+            .any(|c| c == shared::PROJECT_INSTANCES_CAPABILITY));
+        let (mut older, negotiated) = connect(&url, &token, &[]).await;
+        assert!(negotiated.is_empty(), "{negotiated:?}");
+
+        // Right after `SessionAttached`, with this viewer's access filled in.
+        send(
+            &mut capable,
+            shared::WebToServer::AttachSession { session_id },
+        )
+        .await;
+        let frames = receive_until(&mut capable, |message| {
+            matches!(message, shared::ServerToWeb::SessionMessages { .. })
+        })
+        .await;
+        let attached = frames
+            .iter()
+            .position(|message| matches!(message, shared::ServerToWeb::SessionAttached { .. }))
+            .expect("attached");
+        assert!(matches!(
+            &frames[attached + 1],
+            shared::ServerToWeb::SessionInstances { session_id: sid, .. } if *sid == session_id
+        ));
+        assert_eq!(
+            instance_sets(&frames),
+            vec![vec![(Some(m5), true, Some(true))]]
+        );
+        send(
+            &mut older,
+            shared::WebToServer::AttachSession { session_id },
+        )
+        .await;
+        let frames = receive_until(&mut older, |message| {
+            matches!(message, shared::ServerToWeb::SessionMessages { .. })
+        })
+        .await;
+        assert!(instance_sets(&frames).is_empty());
+
+        // A second machine's instance attaching is broadcast to the viewer
+        // that asked, with its access evaluated on the way out.
+        clis.push(attach(m6, "zoo-006"));
+        let frames = receive_until(&mut capable, |message| {
+            matches!(message, shared::ServerToWeb::SessionInstances { .. })
+        })
+        .await;
+        assert_eq!(
+            instance_sets(&frames),
+            vec![vec![
+                (Some(m5), true, Some(true)),
+                (Some(m6), false, Some(true))
+            ]]
+        );
+        send(&mut older, shared::WebToServer::Heartbeat).await;
+        let frames = receive_until(&mut older, |message| {
+            matches!(message, shared::ServerToWeb::Heartbeat)
+        })
+        .await;
+        assert!(instance_sets(&frames).is_empty(), "{frames:?}");
+
+        // The session list names both instances for either client.
+        for socket in [&mut capable, &mut older] {
+            send(socket, shared::WebToServer::ListSessions).await;
+            let frames = receive_until(socket, |message| {
+                matches!(message, shared::ServerToWeb::Sessions { .. })
+            })
+            .await;
+            let Some(shared::ServerToWeb::Sessions { sessions }) = frames.last() else {
+                unreachable!()
+            };
+            let listed = sessions
+                .iter()
+                .find(|session| session.id == session_id)
+                .expect("the project is listed");
+            assert_eq!(
+                listed
+                    .instances
+                    .iter()
+                    .map(|instance| (instance.machine_id, instance.runtime_access))
+                    .collect::<Vec<_>>(),
+                vec![(Some(m5), Some(true)), (Some(m6), Some(true))]
+            );
+        }
+
+        server.abort();
+        drop(clis);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

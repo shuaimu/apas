@@ -179,6 +179,18 @@ impl Project {
     }
 }
 
+/// Where one account stands with one project when a checkout would join it:
+/// another machine's checkout taking the project's identity, as `apas
+/// register` and clone-to-join do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProjectJoinStanding {
+    /// The account owns the project or its cluster hosts it.
+    pub owned_or_hosted: bool,
+    pub lifecycle: ProjectLifecycle,
+    /// The server holds a session, and so history, for the project.
+    pub has_session: bool,
+}
+
 #[derive(Debug, Clone, FromRow, Serialize)]
 pub struct ProjectMember {
     pub project_id: String,

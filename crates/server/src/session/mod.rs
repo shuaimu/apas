@@ -10,14 +10,20 @@ use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
 
+pub mod instances;
 mod local_projects;
+pub mod pane_launches;
+pub use instances::{
+    AttachOutcome, CliRouteOutcome, InboundPaneVerdict, InstanceAttachment, InstanceDetach,
+    SessionLeave,
+};
 pub(crate) use local_projects::PendingLocalProjectRegistration;
 
-fn normalize_machine_hostname(raw: &str) -> String {
+pub(crate) fn normalize_machine_hostname(raw: &str) -> String {
     raw.trim().to_ascii_lowercase()
 }
 
-fn normalize_project_path(raw: &str) -> String {
+pub(crate) fn normalize_project_path(raw: &str) -> String {
     let trimmed = raw.trim();
     if trimmed == "/" {
         return "/".to_string();
@@ -151,8 +157,11 @@ pub struct SessionManager {
     /// server restart never manufactures a reboot/reconnect success.
     lifecycle_requests: DashMap<Uuid, LifecycleRequestState>,
     lifecycle_request_order: Mutex<VecDeque<Uuid>>,
-    /// Latest connected-CLI preservation inventory per session.
-    lifecycle_inventories: DashMap<Uuid, shared::CliLifecycleInventory>,
+    /// Latest preservation inventory per session and instance machine, the
+    /// most recently reported last. Each instance has its own hosting
+    /// capability and panes, so one inventory per session would flip to
+    /// whichever instance reported last.
+    lifecycle_inventories: DashMap<Uuid, Vec<(Option<Uuid>, shared::CliLifecycleInventory)>>,
     /// A pane reboot is implemented by the CLI as a close followed by an add.
     /// Keep the logical pane (and its web-defined position) present while that
     /// short replacement is in flight so clients never observe the internal
@@ -163,12 +172,25 @@ pub struct SessionManager {
     /// persisted: these are ANSI byte streams, not chat records, and writing
     /// them to `messages.jsonl` would corrupt the message store.
     terminal_states: DashMap<(Uuid, u32), TerminalStateEntry>,
+    /// Machines' instances being started for the new panes waiting on them.
+    /// Never taken while a `sessions` guard is held: it reads `sessions`
+    /// itself.
+    instance_starts: Mutex<pane_launches::InstanceStarts>,
+    pane_launch_timing: Mutex<pane_launches::PaneLaunchTiming>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PendingDecision {
     pub pane_id: Option<u32>,
     pub kind: shared::MutationKind,
+}
+
+/// [`SessionManager::forget_machine_panes`] refused: an attached instance
+/// still runs the machine's tabs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForgetRefused {
+    /// The host of that instance.
+    pub hostname: Option<String>,
 }
 
 struct OmpAnswerWaiter {
@@ -218,6 +240,10 @@ pub struct LifecycleRequestState {
     pub phase: shared::CliLifecyclePhase,
     pub message: Option<String>,
     pub inventory: Option<shared::CliLifecycleInventory>,
+    /// The instance the request is for: the machine it was sent to when the
+    /// sender recorded one, else the machine of the first instance that
+    /// reported progress. `None` for an instance that reported no machine.
+    pub machine_id: Option<Uuid>,
     pub created_at: Instant,
     pub updated_at: Instant,
 }
@@ -231,7 +257,7 @@ impl LifecycleRequestState {
             phase: self.phase,
             message: self.message.clone(),
             inventory: self.inventory.clone(),
-            machine_id: None,
+            machine_id: self.machine_id,
         }
     }
 }
@@ -273,6 +299,10 @@ pub struct TerminalStateEntry {
     lifecycle: TerminalLifecycle,
     status: Option<String>,
     runtime: Option<shared::TerminalRuntimeReconciliation>,
+    /// The CLI whose state report this entry last accepted. A disconnect
+    /// marks only the departing instance's terminals, including one whose
+    /// pane its roster report has not listed yet.
+    reporter: Option<Uuid>,
 }
 
 /// Immutable terminal state returned to attach handlers and lifecycle fans.
@@ -321,6 +351,8 @@ const TERMINAL_SCROLLBACK_MAX_BYTES: usize = 256 * 1024;
 pub struct SessionState {
     pub session_id: Uuid,
     pub user_id: Uuid,
+    /// The primary instance's CLI, kept in step with `instances` for readers
+    /// that predate several instances.
     pub cli_client_id: Option<Uuid>,
     /// All web clients currently viewing this session
     pub web_connection_ids: Vec<Uuid>,
@@ -339,13 +371,76 @@ pub struct SessionState {
     /// Replayed to newly-attaching web clients so a hard-refresh doesn't
     /// leave the Project goal textbox empty until the next file change.
     pub project_goal: Option<String>,
-    /// Working directory of the CLI session
+    /// Working directory of the primary instance
     pub working_dir: Option<String>,
-    /// Hostname of the CLI session
+    /// Hostname of the primary instance
     pub hostname: Option<String>,
-    /// Stable daemon identity for hosted projects. Standalone and older CLIs
-    /// leave this absent.
+    /// Stable daemon identity of the primary instance. Standalone and older
+    /// CLIs leave this absent.
     pub machine_id: Option<Uuid>,
+    /// The project instances attached to this session, earliest first, at
+    /// most one per machine. The first is the primary: it supplies the
+    /// single-valued fields above and receives every control that names no
+    /// machine.
+    pub instances: Vec<InstanceAttachment>,
+    /// `panes` holds the project's roster: seeded from `panes.json`, reported
+    /// by an instance, or set by a web change. Until then an empty `panes`
+    /// only means "not loaded", and merging one instance's report into it
+    /// would drop every other machine's tabs.
+    pub roster_seeded: bool,
+    /// Ids handed to new panes that their instance has not reported yet. New
+    /// ids are allocated against these as well as `panes`, under this
+    /// session's lock, so concurrent adds never draw the same id.
+    pub pane_reservations: HashMap<u32, pane_launches::PaneIdReservation>,
+}
+
+impl SessionState {
+    fn empty(session_id: Uuid, user_id: Uuid) -> Self {
+        Self {
+            session_id,
+            user_id,
+            cli_client_id: None,
+            web_connection_ids: Vec::new(),
+            is_paused: false,
+            panes: Vec::new(),
+            pane_statuses: HashMap::new(),
+            pane_idle_since: HashMap::new(),
+            project_goal: None,
+            working_dir: None,
+            hostname: None,
+            machine_id: None,
+            instances: Vec::new(),
+            roster_seeded: false,
+            pane_reservations: HashMap::new(),
+        }
+    }
+
+    /// Replace the whole roster, dropping the statuses of panes that are gone
+    /// and starting new idle panes' idle time now.
+    fn replace_roster(&mut self, panes: Vec<PaneConfig>) {
+        let observed_at = chrono::Utc::now().to_rfc3339();
+        let pane_ids = panes
+            .iter()
+            .map(|pane| pane.pane_id)
+            .collect::<HashSet<_>>();
+        self.pane_idle_since
+            .retain(|pane_id, _| pane_ids.contains(pane_id));
+        // Drop status for panes that are gone. A closed pane's cached
+        // "Working…" otherwise outlives it, so a project whose last pane
+        // was closed keeps reporting work in project lists, waiting-agent
+        // lists and pane summaries with no pane to attribute it to.
+        self.pane_statuses
+            .retain(|pane_id, _| pane_ids.contains(pane_id));
+        for pane in &panes {
+            if !self.pane_statuses.contains_key(&pane.pane_id) {
+                self.pane_idle_since
+                    .entry(pane.pane_id)
+                    .or_insert_with(|| observed_at.clone());
+            }
+        }
+        self.panes = panes;
+        self.roster_seeded = true;
+    }
 }
 
 impl SessionManager {
@@ -383,6 +478,8 @@ impl SessionManager {
             lifecycle_inventories: DashMap::new(),
             pending_pane_reboots: DashMap::new(),
             terminal_states: DashMap::new(),
+            instance_starts: Mutex::new(Default::default()),
+            pane_launch_timing: Mutex::new(Default::default()),
         }
     }
 
@@ -427,11 +524,38 @@ impl SessionManager {
         true
     }
 
-    /// Apply an authoritative CLI state report. A running report for a new
-    /// instance replaces the old presentation. Non-running reports for a
-    /// different instance are stale by definition and are ignored.
+    /// [`Self::reconcile_terminal_state_from`] for a report whose connection
+    /// does not matter.
+    #[cfg(test)]
     pub fn reconcile_terminal_state(
         &self,
+        session_id: &Uuid,
+        pane_id: u32,
+        instance_id: Option<Uuid>,
+        lifecycle: TerminalLifecycle,
+        status: Option<String>,
+        runtime: Option<shared::TerminalRuntimeReconciliation>,
+    ) -> Option<TerminalSnapshotState> {
+        self.reconcile_terminal_state_from(
+            None,
+            session_id,
+            pane_id,
+            instance_id,
+            lifecycle,
+            status,
+            runtime,
+        )
+    }
+
+    /// Apply an authoritative CLI state report. A running report for a new
+    /// instance replaces the old presentation. Non-running reports for a
+    /// different instance are stale by definition and are ignored. The
+    /// reporting connection is remembered, so that its disconnect marks this
+    /// terminal even before its roster report lists the pane.
+    #[allow(clippy::too_many_arguments)]
+    pub fn reconcile_terminal_state_from(
+        &self,
+        reporter: Option<Uuid>,
         session_id: &Uuid,
         pane_id: u32,
         instance_id: Option<Uuid>,
@@ -467,6 +591,7 @@ impl SessionManager {
         entry.lifecycle = lifecycle;
         entry.status = status;
         entry.runtime = runtime;
+        entry.reporter = reporter;
         Some(entry.snapshot())
     }
 
@@ -511,16 +636,22 @@ impl SessionManager {
         self.terminal_states.remove(&(*session_id, pane_id));
     }
 
-    /// Mark currently-running terminals as transport-disconnected while
-    /// retaining presentation. Unknown and exited entries are not rewritten.
-    pub fn mark_session_terminals_disconnected(
+    /// Mark the session's currently-running terminals that `select` picks
+    /// (by pane and the CLI that last reported the terminal's state) as
+    /// transport-disconnected while retaining presentation. Unknown and
+    /// exited entries are not rewritten.
+    pub fn mark_terminals_disconnected(
         &self,
         session_id: &Uuid,
+        select: impl Fn(u32, Option<Uuid>) -> bool,
     ) -> Vec<(u32, TerminalSnapshotState)> {
         let mut changed = Vec::new();
         for mut item in self.terminal_states.iter_mut() {
             let ((sid, pane_id), entry) = item.pair_mut();
-            if sid == session_id && entry.lifecycle == TerminalLifecycle::Running {
+            if sid == session_id
+                && entry.lifecycle == TerminalLifecycle::Running
+                && select(*pane_id, entry.reporter)
+            {
                 entry.lifecycle = TerminalLifecycle::Disconnected;
                 entry.status = None;
                 changed.push((*pane_id, entry.snapshot()));
@@ -816,6 +947,11 @@ impl SessionManager {
     }
 
     pub fn unregister_cli(&self, cli_id: &Uuid) {
+        // Detach the CLI's instances while its owner is still known, so the
+        // machine lists hear that its projects stopped. A connection that a
+        // same-machine reconnect replaced is no longer attached and detaches
+        // nothing.
+        self.detach_cli_instances(cli_id);
         self.cli_senders.remove(cli_id);
         let owner = self.cli_users.remove(cli_id).map(|(_, uid)| uid);
         self.cli_versions.remove(cli_id);
@@ -831,25 +967,7 @@ impl SessionManager {
         for key in keys_to_remove {
             self.cli_usage_limits.remove(&key);
         }
-        let mut disconnected_sessions = Vec::new();
-        if let Some((_, session_ids)) = self.cli_sessions.remove(cli_id) {
-            for session_id in session_ids {
-                if let Some(mut session) = self.sessions.get_mut(&session_id) {
-                    // Only clear if this CLI is still the active one for this session.
-                    // A new CLI may have already taken over (reconnect scenario).
-                    if session.cli_client_id == Some(*cli_id) {
-                        session.cli_client_id = None;
-                        // Drop any cached "thinking"/status — the producer is gone,
-                        // otherwise the next web attach would replay a stale indicator.
-                        session.pane_statuses.clear();
-                        disconnected_sessions.push(session_id);
-                    }
-                }
-            }
-        }
-        for session_id in disconnected_sessions {
-            self.broadcast_session_presence(&session_id, false);
-        }
+        self.cli_sessions.remove(cli_id);
         tracing::info!("CLI client unregistered: {}", cli_id);
         // Broadcast updated client list to all web clients
         self.broadcast_cli_clients_update();
@@ -863,12 +981,8 @@ impl SessionManager {
         self.session_projects.insert(session_id, project_id);
     }
 
-    pub fn set_session_machine(&self, session_id: Uuid, machine_id: Option<Uuid>) {
-        if let Some(mut session) = self.sessions.get_mut(&session_id) {
-            session.machine_id = machine_id;
-        }
-    }
-
+    /// The primary instance's machine, which the session's runtime access
+    /// has always been evaluated against.
     pub fn session_machine_id(&self, session_id: &Uuid) -> Option<Uuid> {
         let session = self.sessions.get(session_id)?;
         if let Some(machine_id) = session.machine_id {
@@ -952,14 +1066,39 @@ impl SessionManager {
                     .then_some(session.session_id)
             })
             .collect::<Vec<_>>();
+        // A viewer may stay attached while any of the session's instances runs
+        // on a machine they may still use, which is the rule attaching
+        // applies; controls for the other instances' tabs are refused one by
+        // one. An instance that reported no machine is the session's only one,
+        // and the legacy inference names its machine.
         let denied_sessions = hosted_sessions
-            .into_iter()
+            .iter()
             .filter(|session_id| {
-                !self
-                    .session_machine_id(session_id)
-                    .is_some_and(|machine_id| allowed_machine_ids.contains(&machine_id))
+                !self.session_attachments(session_id).iter().any(|instance| {
+                    instance
+                        .machine_id
+                        .or_else(|| self.session_machine_id(session_id))
+                        .is_some_and(|machine_id| allowed_machine_ids.contains(&machine_id))
+                })
             })
+            .copied()
             .collect::<HashSet<_>>();
+        // Where the viewer stays, the instance set is sent again so that each
+        // instance's access for them is evaluated afresh on its way out.
+        for session_id in hosted_sessions
+            .iter()
+            .filter(|session_id| !denied_sessions.contains(session_id))
+        {
+            let viewing = self.sessions.get(session_id).is_some_and(|session| {
+                session
+                    .web_connection_ids
+                    .iter()
+                    .any(|connection_id| viewer_connections.contains(connection_id))
+            });
+            if viewing {
+                self.broadcast_session_instances(session_id);
+            }
+        }
         let mut affected_sessions = Vec::new();
         let mut affected_connections = HashSet::new();
         for mut session in self.sessions.iter_mut() {
@@ -1008,18 +1147,57 @@ impl SessionManager {
             .is_some_and(|capabilities| capabilities.contains(capability))
     }
 
+    /// Record the inventory the instance on `machine_id` reported (`None` for
+    /// an instance that reported no machine).
     pub fn set_lifecycle_inventory(
         &self,
         session_id: Uuid,
+        machine_id: Option<Uuid>,
         inventory: shared::CliLifecycleInventory,
     ) {
-        self.lifecycle_inventories.insert(session_id, inventory);
+        let mut inventories = self.lifecycle_inventories.entry(session_id).or_default();
+        inventories.retain(|(machine, _)| *machine != machine_id);
+        inventories.push((machine_id, inventory));
     }
 
+    /// One inventory per attached instance that has reported one, primary
+    /// first, each with its machine: what a viewer attaching now is replayed.
+    pub fn attached_lifecycle_inventories(
+        &self,
+        session_id: &Uuid,
+    ) -> Vec<(Option<Uuid>, shared::CliLifecycleInventory)> {
+        let machines: Vec<Option<Uuid>> = self
+            .session_attachments(session_id)
+            .iter()
+            .map(|instance| instance.machine_id)
+            .collect();
+        let Some(inventories) = self.lifecycle_inventories.get(session_id) else {
+            return Vec::new();
+        };
+        machines
+            .into_iter()
+            .filter_map(|machine_id| {
+                inventories
+                    .iter()
+                    .find(|(machine, _)| *machine == machine_id)
+                    .cloned()
+            })
+            .collect()
+    }
+
+    /// The single inventory older readers expect: the first attached
+    /// instance's that has reported, which is the primary's once it has, and
+    /// with no instance attached the latest one reported, as a session with
+    /// one instance always had.
     pub fn lifecycle_inventory(&self, session_id: &Uuid) -> Option<shared::CliLifecycleInventory> {
-        self.lifecycle_inventories
-            .get(session_id)
-            .map(|inventory| inventory.clone())
+        self.attached_lifecycle_inventories(session_id)
+            .into_iter()
+            .next()
+            .map(|(_, inventory)| inventory)
+            .or_else(|| {
+                let inventories = self.lifecycle_inventories.get(session_id)?;
+                inventories.last().map(|(_, inventory)| inventory.clone())
+            })
     }
 
     pub fn claim_lifecycle_request(
@@ -1051,6 +1229,7 @@ impl SessionManager {
             phase: shared::CliLifecyclePhase::Accepted,
             message: None,
             inventory: self.lifecycle_inventory(&session_id),
+            machine_id: None,
             created_at: Instant::now(),
             updated_at: Instant::now(),
         };
@@ -1093,6 +1272,53 @@ impl SessionManager {
         }
         state.updated_at = Instant::now();
         Some(state.clone())
+    }
+
+    /// [`Self::update_lifecycle_request`] for progress an instance reported.
+    /// A request bound to one machine accepts progress only from that
+    /// machine's instance; an unbound one is bound to the first that reports,
+    /// so the status viewers receive names it.
+    #[allow(clippy::too_many_arguments)]
+    pub fn update_lifecycle_request_from_instance(
+        &self,
+        request_id: Uuid,
+        session_id: Uuid,
+        machine_id: Option<Uuid>,
+        operation: shared::CliLifecycleOperation,
+        phase: shared::CliLifecyclePhase,
+        message: Option<String>,
+        inventory: Option<shared::CliLifecycleInventory>,
+    ) -> Option<LifecycleRequestState> {
+        {
+            let mut state = self.lifecycle_requests.get_mut(&request_id)?;
+            if state.session_id != session_id || state.operation != operation {
+                return None;
+            }
+            match state.machine_id {
+                Some(bound) if Some(bound) != machine_id => return None,
+                Some(_) => {}
+                None => state.machine_id = machine_id,
+            }
+        }
+        self.update_lifecycle_request(request_id, session_id, operation, phase, message, inventory)
+    }
+
+    /// Bind a request just claimed to the instance it is sent to: the
+    /// machine (`None` for an instance that reported none, which leaves the
+    /// request to bind to its first reporter) and that instance's inventory.
+    /// The claim recorded the primary's inventory, which a request for
+    /// another machine must not carry, so the inventory is replaced even when
+    /// the target has reported none.
+    pub fn bind_lifecycle_request(
+        &self,
+        request_id: Uuid,
+        machine_id: Option<Uuid>,
+        inventory: Option<shared::CliLifecycleInventory>,
+    ) {
+        if let Some(mut state) = self.lifecycle_requests.get_mut(&request_id) {
+            state.machine_id = machine_id;
+            state.inventory = inventory;
+        }
     }
 
     pub fn timeout_lifecycle_request(&self, request_id: Uuid) -> Option<LifecycleRequestState> {
@@ -1161,6 +1387,27 @@ impl SessionManager {
             .filter(|entry| entry.value().as_str() == project_id)
             .map(|entry| *entry.key())
             .find(|session_id| self.is_session_active(session_id))
+    }
+
+    /// The sessions known to belong to `project_id`: its own id, which every
+    /// CLI uses as the session id, and any session in memory mapped to it.
+    pub fn project_session_ids(&self, project_id: &str) -> Vec<Uuid> {
+        let mut session_ids: Vec<Uuid> = Uuid::parse_str(project_id).into_iter().collect();
+        for entry in self.session_projects.iter() {
+            if entry.value().as_str() == project_id && !session_ids.contains(entry.key()) {
+                session_ids.push(*entry.key());
+            }
+        }
+        session_ids
+    }
+
+    /// Machines whose daemon inventory lists `project_id`, connected or not.
+    pub fn machines_listing_project(&self, project_id: &str) -> Vec<Uuid> {
+        self.machine_projects
+            .iter()
+            .filter(|entry| entry.iter().any(|project| project.project_id == project_id))
+            .map(|entry| *entry.key())
+            .collect()
     }
 
     /// Best-effort immediate revocation after account suspension. Persistent
@@ -1266,25 +1513,27 @@ impl SessionManager {
 
         for session_id in session_ids {
             self.clear_lifecycle_for_session_user(session_id, *user_id);
-            let mut revoked_cli = None;
+            let mut instance_clis = Vec::new();
             if let Some(mut session) = self.sessions.get_mut(&session_id) {
                 let before = session.web_connection_ids.len();
                 session
                     .web_connection_ids
                     .retain(|connection_id| !web_ids.contains(connection_id));
                 affected += before - session.web_connection_ids.len();
-                if let Some(cli_id) = session.cli_client_id {
-                    if self
-                        .cli_users
-                        .get(&cli_id)
-                        .is_some_and(|owner| owner.value() == user_id)
-                    {
-                        session.cli_client_id = None;
-                        revoked_cli = Some(cli_id);
-                    }
-                }
+                instance_clis = session
+                    .instances
+                    .iter()
+                    .map(|instance| instance.cli_id)
+                    .collect();
             }
-            if let Some(cli_id) = revoked_cli {
+            // Every instance the revoked account runs is rejected on its own
+            // connection, not only the primary.
+            let revoked_clis = instance_clis.into_iter().filter(|cli_id| {
+                self.cli_users
+                    .get(cli_id)
+                    .is_some_and(|owner| owner.value() == user_id)
+            });
+            for cli_id in revoked_clis.collect::<Vec<_>>() {
                 let _ = self
                     .send_to_cli(
                         &cli_id,
@@ -1294,11 +1543,13 @@ impl SessionManager {
                         },
                     )
                     .await;
-                if let Some(mut sessions) = self.cli_sessions.get_mut(&cli_id) {
-                    sessions.retain(|tracked| *tracked != session_id);
-                    if sessions.is_empty() {
-                        revoked_cli_ids.insert(cli_id);
-                    }
+                self.detach_cli_instance(&session_id, &cli_id);
+                if self
+                    .cli_sessions
+                    .get(&cli_id)
+                    .is_none_or(|sessions| sessions.is_empty())
+                {
+                    revoked_cli_ids.insert(cli_id);
                 }
                 affected += 1;
             }
@@ -1335,6 +1586,9 @@ impl SessionManager {
         projects: Vec<MachineProjectInfo>,
     ) {
         self.fail_local_project_requests_for_machine(&machine_id);
+        // A new connection replaces the old one, which will not answer a
+        // start sent on it.
+        self.fail_instance_starts_for_machine(&machine_id);
         self.daemon_capabilities.remove(&machine_id);
         let existing_deepseek = self
             .machine_infos
@@ -1364,6 +1618,7 @@ impl SessionManager {
         self.daemon_senders.remove(machine_id);
         self.daemon_capabilities.remove(machine_id);
         self.fail_local_project_requests_for_machine(machine_id);
+        self.fail_instance_starts_for_machine(machine_id);
         // Keep machine metadata/project snapshot to avoid UI flicker during transient daemon reconnects.
         if let Some(mut machine) = self.machine_infos.get_mut(machine_id) {
             machine.last_seen = Some(chrono::Utc::now().to_rfc3339());
@@ -1572,16 +1827,23 @@ impl SessionManager {
         project_id: &str,
         reason: String,
     ) -> usize {
-        let affected_sessions = self
+        let project_sessions = self
             .session_projects
             .iter()
             .filter(|entry| entry.value().as_str() == project_id)
-            .filter_map(|entry| {
-                let session_id = *entry.key();
+            .map(|entry| *entry.key())
+            .collect::<Vec<_>>();
+        let affected_sessions = project_sessions
+            .into_iter()
+            .filter_map(|session_id| {
                 self.sessions.get(&session_id).map(|session| {
                     (
                         session_id,
-                        session.cli_client_id,
+                        session
+                            .instances
+                            .iter()
+                            .map(|instance| instance.cli_id)
+                            .collect::<Vec<_>>(),
                         session.web_connection_ids.clone(),
                     )
                 })
@@ -1589,7 +1851,7 @@ impl SessionManager {
             .collect::<Vec<_>>();
         let mut cli_ids = HashSet::new();
         let mut sent = 0;
-        for (session_id, cli_id, web_ids) in &affected_sessions {
+        for (session_id, instance_clis, web_ids) in &affected_sessions {
             self.lifecycle_inventories.remove(session_id);
             let lifecycle_ids: Vec<Uuid> = self
                 .lifecycle_requests
@@ -1600,7 +1862,9 @@ impl SessionManager {
             for request_id in lifecycle_ids {
                 self.lifecycle_requests.remove(&request_id);
             }
-            if let Some(cli_id) = cli_id {
+            // Every instance is rejected on its own connection; stopping the
+            // project's runtime stops it on every machine.
+            for cli_id in instance_clis {
                 if self
                     .send_to_cli(
                         cli_id,
@@ -1840,7 +2104,8 @@ impl SessionManager {
     }
 
     pub fn get_machines_for_user(&self, user_id: &Uuid) -> Vec<MachineWithProjects> {
-        self.machine_infos
+        let owned: Vec<(Uuid, MachineInfo)> = self
+            .machine_infos
             .iter()
             .filter(|entry| {
                 self.daemon_users
@@ -1848,7 +2113,17 @@ impl SessionManager {
                     .map(|owner| *owner == *user_id)
                     .unwrap_or(false)
             })
-            .map(|entry| self.build_machine_with_projects(*entry.key(), entry.value()))
+            .map(|entry| (*entry.key(), entry.value().clone()))
+            .collect();
+        if owned.is_empty() {
+            return Vec::new();
+        }
+        let running = self.running_instances();
+        owned
+            .into_iter()
+            .map(|(machine_id, machine)| {
+                self.build_machine_with_projects(machine_id, &machine, &running)
+            })
             .collect()
     }
 
@@ -1862,6 +2137,7 @@ impl SessionManager {
         &self,
         machine_id: Uuid,
         machine: &MachineInfo,
+        running: &[instances::RunningInstance],
     ) -> MachineWithProjects {
         let mut projects = self
             .machine_projects
@@ -1870,28 +2146,20 @@ impl SessionManager {
             .unwrap_or_default();
         self.apply_project_machine_preferences(&machine_id, &mut projects);
 
-        // Enrich is_running from active CLI sessions on the same host
-        for session_entry in self.sessions.iter() {
-            let session = session_entry.value();
-            if session.cli_client_id.is_none() {
-                continue;
-            }
-            let (Some(hostname), Some(working_dir)) = (&session.hostname, &session.working_dir)
-            else {
-                continue;
-            };
-            if normalize_machine_hostname(hostname) != normalize_machine_hostname(&machine.hostname)
+        // Enrich is_running from every attached instance on this machine, not
+        // only each session's primary.
+        for project in &mut projects {
+            if !project.is_running
+                && running
+                    .iter()
+                    .any(|instance| instance.runs(&machine_id, &machine.hostname, project))
             {
-                continue;
-            }
-            let active_dir = normalize_project_path(working_dir);
-            for project in &mut projects {
-                if !project.is_running && normalize_project_path(&project.path) == active_dir {
-                    project.is_running = true;
-                }
+                project.is_running = true;
             }
         }
 
+        let (daemon_connected, project_instances_available) =
+            self.machine_instance_support(&machine_id);
         MachineWithProjects {
             machine: machine.clone(),
             projects,
@@ -1908,8 +2176,8 @@ impl SessionManager {
                     &machine_id,
                     shared::LOCAL_PROJECT_REGISTRATION_CAPABILITY,
                 ),
-            project_instances_available: false,
-            daemon_connected: false,
+            project_instances_available,
+            daemon_connected,
         }
     }
 
@@ -1922,19 +2190,15 @@ impl SessionManager {
             return Vec::new();
         }
 
-        // Collect working dirs of active CLI sessions grouped by hostname.
+        // Collect working dirs of every attached instance grouped by hostname.
         let mut active_dirs_by_host: HashMap<String, HashSet<String>> = HashMap::new();
-        for session_entry in self.sessions.iter() {
-            let session = session_entry.value();
-            if session.cli_client_id.is_some() {
-                if let (Some(hostname), Some(working_dir)) =
-                    (&session.hostname, &session.working_dir)
-                {
-                    active_dirs_by_host
-                        .entry(normalize_machine_hostname(hostname))
-                        .or_default()
-                        .insert(normalize_project_path(working_dir));
-                }
+        for instance in self.running_instances() {
+            if let (Some(hostname), Some(working_dir)) = (&instance.hostname, &instance.working_dir)
+            {
+                active_dirs_by_host
+                    .entry(normalize_machine_hostname(hostname))
+                    .or_default()
+                    .insert(normalize_project_path(working_dir));
             }
         }
 
@@ -1975,6 +2239,8 @@ impl SessionManager {
                 if projects.is_empty() {
                     None
                 } else {
+                    let (daemon_connected, project_instances_available) =
+                        self.machine_instance_support(&machine_id);
                     Some(MachineWithProjects {
                         machine,
                         projects,
@@ -1984,8 +2250,8 @@ impl SessionManager {
                         cluster_access: shared::MachineClusterAccess::Member,
                         shared_provisioning_available: false,
                         local_project_registration_available: false,
-                        project_instances_available: false,
-                        daemon_connected: false,
+                        project_instances_available,
+                        daemon_connected,
                     })
                 }
             })
@@ -2008,6 +2274,8 @@ impl SessionManager {
                     .unwrap_or_default();
                 projects.retain(|project| project_ids.contains(&project.project_id));
                 self.apply_project_machine_preferences(machine_id, &mut projects);
+                let (daemon_connected, project_instances_available) =
+                    self.machine_instance_support(machine_id);
                 Some(MachineWithProjects {
                     machine,
                     projects,
@@ -2020,8 +2288,8 @@ impl SessionManager {
                         shared::SHARED_PROJECT_PROVISIONING_CAPABILITY,
                     ),
                     local_project_registration_available: false,
-                    project_instances_available: false,
-                    daemon_connected: false,
+                    project_instances_available,
+                    daemon_connected,
                 })
             })
             .collect()
@@ -2131,39 +2399,37 @@ impl SessionManager {
 
     // Session management
     pub fn create_session(&self, session_id: Uuid, user_id: Uuid, web_connection_id: Uuid) {
-        let state = SessionState {
-            session_id,
-            user_id,
-            cli_client_id: None,
-            web_connection_ids: vec![web_connection_id],
-            is_paused: false,
-            panes: Vec::new(),
-            pane_statuses: HashMap::new(),
-            pane_idle_since: HashMap::new(),
-            project_goal: None,
-            working_dir: None,
-            hostname: None,
-            machine_id: None,
-        };
+        let mut state = SessionState::empty(session_id, user_id);
+        state.web_connection_ids.push(web_connection_id);
         self.sessions.insert(session_id, state);
         tracing::info!("Session created: {}", session_id);
     }
 
+    /// The legacy web-started session: attach `cli_id` as an instance that
+    /// reported no machine. It takes the place of another such CLI, as it
+    /// always did, but never of a capable instance, which nothing shows to be
+    /// on the same machine.
     pub fn assign_cli_to_session(&self, session_id: &Uuid, cli_id: Uuid) -> bool {
-        if let Some(mut session) = self.sessions.get_mut(session_id) {
-            session.cli_client_id = Some(cli_id);
-            // Track this session for the CLI
-            if let Some(mut sessions) = self.cli_sessions.get_mut(&cli_id) {
-                sessions.push(*session_id);
-            }
-            tracing::info!("CLI {} assigned to session {}", cli_id, session_id);
-            return true;
+        if !self.sessions.contains_key(session_id) {
+            return false;
         }
-        false
+        match self.attach_instance_state(*session_id, cli_id, None, None, None) {
+            AttachOutcome::Attached { .. } => {
+                tracing::info!("CLI {} assigned to session {}", cli_id, session_id);
+                self.broadcast_session_instances(session_id);
+                true
+            }
+            AttachOutcome::Rejected { reason } => {
+                tracing::warn!("CLI {} not assigned to session {}: {}", cli_id, session_id, reason);
+                false
+            }
+        }
     }
 
-    /// Create or update a CLI-initiated session (hybrid mode)
-    /// Preserves web connections if session already exists (for reconnection)
+    /// Attach a CLI that reported no machine, the way every CLI attached
+    /// before project instances. Real `SessionStart`s go through
+    /// [`Self::attach_cli_instance`], which also takes the machine.
+    #[cfg(test)]
     pub fn create_cli_session(
         &self,
         session_id: Uuid,
@@ -2171,66 +2437,11 @@ impl SessionManager {
         working_dir: Option<String>,
         hostname: Option<String>,
     ) {
-        // Check if session already exists (preserve web connections)
-        if let Some(mut existing) = self.sessions.get_mut(&session_id) {
-            let old_cli_id = existing.cli_client_id;
-            existing.cli_client_id = Some(cli_id);
-            existing.working_dir = working_dir;
-            existing.hostname = hostname;
-            // Drop the RefMut before accessing cli_sessions to avoid potential deadlock
-            let web_viewers = existing.web_connection_ids.len();
-            drop(existing);
-
-            // Remove session from old CLI's tracking to prevent stale unregister_cli
-            // from clearing the new CLI's association
-            if let Some(old_id) = old_cli_id {
-                if old_id != cli_id {
-                    if let Some(mut old_sessions) = self.cli_sessions.get_mut(&old_id) {
-                        old_sessions.retain(|s| *s != session_id);
-                    }
-                }
-            }
-
-            tracing::info!(
-                "CLI session {} updated: cli {:?} -> {} (web viewers: {})",
-                session_id,
-                old_cli_id,
-                cli_id,
-                web_viewers,
-            );
-        } else {
-            let state = SessionState {
-                session_id,
-                user_id: Uuid::nil(), // No user for CLI-initiated sessions
-                cli_client_id: Some(cli_id),
-                web_connection_ids: Vec::new(),
-                is_paused: false,
-                panes: Vec::new(),
-                pane_statuses: HashMap::new(),
-                pane_idle_since: HashMap::new(),
-                project_goal: None,
-                working_dir,
-                hostname,
-                machine_id: None,
-            };
-            self.sessions.insert(session_id, state);
-            tracing::info!("CLI session created: {} (cli: {})", session_id, cli_id);
+        if let AttachOutcome::Rejected { reason } =
+            self.attach_cli_instance(session_id, cli_id, None, working_dir, hostname)
+        {
+            tracing::warn!("CLI {} not attached to session {}: {}", cli_id, session_id, reason);
         }
-
-        // Track this session for the CLI
-        if let Some(mut sessions) = self.cli_sessions.get_mut(&cli_id) {
-            if !sessions.contains(&session_id) {
-                sessions.push(session_id);
-            }
-        }
-
-        // Broadcast machines update (is_running depends on active sessions)
-        if let Some(user_id) = self.cli_users.get(&cli_id).map(|e| *e) {
-            self.broadcast_machines_update_for_user(&user_id);
-        }
-        self.broadcast_session_presence(&session_id, true);
-        // Broadcast updated client list to all web clients (shows active session)
-        self.broadcast_cli_clients_update();
     }
 
     fn broadcast_session_presence(&self, session_id: &Uuid, has_active_cli: bool) {
@@ -2252,6 +2463,13 @@ impl SessionManager {
 
     /// Attach a web client to an existing session (to observe CLI output)
     /// If the session doesn't exist in memory, creates it (for reconnection scenarios)
+    ///
+    /// `cli_client_id` is ignored. Callers pass the CLI the session's database
+    /// row names, at best the primary instance's, and re-pointing the session
+    /// at it on every attach would hand the primary's role, and every control
+    /// that names no machine, to whatever connection the row last recorded.
+    /// The session's attached instances are the authority; a CLI attaches
+    /// only through its own `SessionStart`.
     pub fn attach_web_to_session(
         &self,
         session_id: &Uuid,
@@ -2270,10 +2488,6 @@ impl SessionManager {
             if !session.web_connection_ids.contains(&web_connection_id) {
                 session.web_connection_ids.push(web_connection_id);
             }
-            // Update CLI client ID if provided (for reconnection)
-            if let Some(cli_id) = cli_client_id {
-                session.cli_client_id = Some(cli_id);
-            }
             tracing::info!(
                 "Web client {} attached to session {} (total viewers: {})",
                 web_connection_id,
@@ -2285,35 +2499,13 @@ impl SessionManager {
 
         // Session not in memory - create it (happens after server restart or reconnection)
         tracing::info!(
-            "Creating session {} in memory for web attach (cli: {:?})",
+            "Creating session {} in memory for web attach (recorded cli: {:?})",
             session_id,
             cli_client_id
         );
-        let state = SessionState {
-            session_id: *session_id,
-            user_id: Uuid::nil(), // Will be updated when needed
-            cli_client_id,
-            web_connection_ids: vec![web_connection_id],
-            is_paused: false,
-            panes: Vec::new(),
-            pane_statuses: HashMap::new(),
-            pane_idle_since: HashMap::new(),
-            project_goal: None,
-            working_dir: None,
-            hostname: None,
-            machine_id: None,
-        };
+        let mut state = SessionState::empty(*session_id, Uuid::nil());
+        state.web_connection_ids.push(web_connection_id);
         self.sessions.insert(*session_id, state);
-
-        // If we have a CLI ID, track this session for the CLI
-        if let Some(cli_id) = cli_client_id {
-            if let Some(mut sessions) = self.cli_sessions.get_mut(&cli_id) {
-                if !sessions.contains(session_id) {
-                    sessions.push(*session_id);
-                }
-            }
-        }
-
         true
     }
 
@@ -2358,25 +2550,26 @@ impl SessionManager {
             working_dir: s.working_dir.clone(),
             hostname: s.hostname.clone(),
             machine_id: s.machine_id,
+            instances: s.instances.clone(),
+            roster_seeded: s.roster_seeded,
+            pane_reservations: s.pane_reservations.clone(),
         })
     }
 
     /// Cache the latest `project_goal.md` content for this session so we can
     /// replay it to newly-attaching web clients. Called from the CLI's
 
-    /// Check if a session has an active CLI client connected
+    /// Check if a session has an active CLI client connected: one of its
+    /// attached instances whose connection is live and for which this is the
+    /// CLI's current session.
     pub fn is_session_active(&self, session_id: &Uuid) -> bool {
-        // Check if any connected CLI client has this session as their active session
-        for entry in self.cli_sessions.iter() {
-            let cli_id = entry.key();
-            let sessions = entry.value();
-            let is_connected = self.cli_senders.contains_key(cli_id);
-            // Check if this CLI has the session and is still connected
-            if sessions.last() == Some(session_id) && is_connected {
-                return true;
-            }
-        }
-        false
+        self.session_attachments(session_id).iter().any(|instance| {
+            self.cli_senders.contains_key(&instance.cli_id)
+                && self
+                    .cli_sessions
+                    .get(&instance.cli_id)
+                    .is_some_and(|sessions| sessions.last() == Some(session_id))
+        })
     }
 
     /// Update the pause state for a session
@@ -2399,34 +2592,99 @@ impl SessionManager {
         self.sessions.contains_key(session_id)
     }
 
-    /// Cache pane configurations for a session (from CLI PaneList)
+    /// Replace the whole cached roster, as a web edit of labels or order
+    /// does with the roster it read. An instance's own roster report goes
+    /// through [`Self::merge_instance_roster`] instead, which replaces only
+    /// that instance's panes.
     pub fn set_session_panes(&self, session_id: &Uuid, panes: Vec<PaneConfig>) {
         if let Some(mut session) = self.sessions.get_mut(session_id) {
-            let observed_at = chrono::Utc::now().to_rfc3339();
-            let pane_ids = panes
-                .iter()
-                .map(|pane| pane.pane_id)
-                .collect::<HashSet<_>>();
-            session
-                .pane_idle_since
-                .retain(|pane_id, _| pane_ids.contains(pane_id));
-            // Drop status for panes that are gone. A closed pane's cached
-            // "Working…" otherwise outlives it, so a project whose last pane
-            // was closed keeps reporting work in project lists, waiting-agent
-            // lists and pane summaries with no pane to attribute it to.
-            session
-                .pane_statuses
-                .retain(|pane_id, _| pane_ids.contains(pane_id));
-            for pane in &panes {
-                if !session.pane_statuses.contains_key(&pane.pane_id) {
-                    session
-                        .pane_idle_since
-                        .entry(pane.pane_id)
-                        .or_insert_with(|| observed_at.clone());
-                }
-            }
-            session.panes = panes;
+            session.replace_roster(panes);
         }
+    }
+
+    /// The cached roster, or `None` when the session is not in memory, so a
+    /// save never recreates a deleted session's directory with an empty one.
+    pub fn pane_roster_snapshot(&self, session_id: &Uuid) -> Option<Vec<PaneConfig>> {
+        self.sessions
+            .get(session_id)
+            .map(|session| session.panes.clone())
+    }
+
+    /// Drop a machine that will not come back from the roster: the panes
+    /// tagged `machine_id`, and the untagged panes attributed to `hostname`,
+    /// its host. Returns the removed pane ids.
+    ///
+    /// Refused while that machine runs an instance, which is authoritative
+    /// for its own panes and would report them again. So is an instance
+    /// without the capability on that host, which may be that machine under
+    /// an older CLI: it reports its panes untagged, attributed to its host. A
+    /// capable instance on another machine of the same name does not count,
+    /// since it reports its own panes tagged. The check and the removal share
+    /// the session's lock, so an instance attaching meanwhile cannot have its
+    /// fresh report erased.
+    ///
+    /// A roster that is not loaded is left alone rather than saved as empty.
+    /// Statuses, idle times, retained terminals, in-flight reboots and
+    /// pending decisions of the removed panes go with them, since ids are
+    /// reused for new panes.
+    pub fn forget_machine_panes(
+        &self,
+        session_id: &Uuid,
+        machine_id: Uuid,
+        hostname: Option<&str>,
+    ) -> Result<Vec<u32>, ForgetRefused> {
+        let host = hostname
+            .map(normalize_machine_hostname)
+            .filter(|host| !host.is_empty());
+        let on_host = |candidate: Option<&str>| {
+            host.as_deref().is_some_and(|host| {
+                candidate.is_some_and(|candidate| normalize_machine_hostname(candidate) == host)
+            })
+        };
+        let removed = {
+            let Some(mut session) = self.sessions.get_mut(session_id) else {
+                return Ok(Vec::new());
+            };
+            if let Some(running) = session.instances.iter().find(|instance| {
+                instance.machine_id == Some(machine_id)
+                    || (!instance.capable && on_host(instance.hostname.as_deref()))
+            }) {
+                return Err(ForgetRefused {
+                    hostname: running.hostname.clone(),
+                });
+            }
+            if !session.roster_seeded {
+                return Ok(Vec::new());
+            }
+            let (removed, kept): (Vec<PaneConfig>, Vec<PaneConfig>) = session
+                .panes
+                .iter()
+                .cloned()
+                .partition(|pane| match pane.machine_id {
+                    Some(owner) => owner == machine_id,
+                    None => on_host(pane.hostname.as_deref()),
+                });
+            if removed.is_empty() {
+                return Ok(Vec::new());
+            }
+            session.replace_roster(kept);
+            removed
+                .into_iter()
+                .map(|pane| pane.pane_id)
+                .collect::<Vec<_>>()
+        };
+        for pane_id in &removed {
+            self.terminal_states.remove(&(*session_id, *pane_id));
+            self.pending_pane_reboots.remove(&(*session_id, *pane_id));
+        }
+        self.pending_decisions
+            .retain(|(decision_session, _), decision| {
+                decision_session != session_id
+                    || !decision
+                        .pane_id
+                        .is_some_and(|pane_id| removed.contains(&pane_id))
+            });
+        Ok(removed)
     }
 
     /// Get cached pane configurations for a session
@@ -2467,73 +2725,6 @@ impl SessionManager {
     /// the pane before the replacement arrives.
     pub fn cancel_pane_reboot(&self, session_id: &Uuid, pane_id: u32) {
         self.pending_pane_reboots.remove(&(*session_id, pane_id));
-    }
-
-    /// Reconcile a raw CLI pane list with any web-initiated reboots in flight.
-    /// Missing rebooting panes are represented by their snapshot; replacement
-    /// panes are moved back into the same slot and finish the transition.
-    pub fn reconcile_pane_reboots(
-        &self,
-        session_id: &Uuid,
-        mut panes: Vec<PaneConfig>,
-    ) -> Vec<PaneConfig> {
-        let existing_order = self
-            .sessions
-            .get(session_id)
-            .map(|session| {
-                session
-                    .panes
-                    .iter()
-                    .map(|pane| pane.pane_id)
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
-        let now = Instant::now();
-        let mut pending = self
-            .pending_pane_reboots
-            .iter()
-            .filter(|entry| entry.key().0 == *session_id)
-            .map(|entry| (*entry.key(), entry.value().clone()))
-            .collect::<Vec<_>>();
-        pending.sort_by_key(|(_, reboot)| reboot.original_index);
-
-        let mut restored = Vec::with_capacity(pending.len());
-        let mut completed = Vec::new();
-        for (key, reboot) in pending {
-            if now.duration_since(reboot.registered_at) > PENDING_PANE_REBOOT_TTL {
-                self.pending_pane_reboots.remove(&key);
-                continue;
-            }
-            let pane = if let Some(position) = panes
-                .iter()
-                .position(|pane| pane.pane_id == reboot.pane.pane_id)
-            {
-                completed.push(key);
-                panes.remove(position)
-            } else {
-                reboot.pane
-            };
-            restored.push((reboot.original_index, pane));
-        }
-
-        for (original_index, pane) in restored {
-            panes.insert(original_index.min(panes.len()), pane);
-        }
-        for key in completed {
-            self.pending_pane_reboots.remove(&key);
-        }
-
-        // The CLI's rebuilt list can use a different order from the web's
-        // cached custom order. Reapply the whole known order, not just the
-        // rebooted pane's numeric index, and append genuinely new panes.
-        let mut reordered = Vec::with_capacity(panes.len());
-        for pane_id in existing_order {
-            if let Some(position) = panes.iter().position(|pane| pane.pane_id == pane_id) {
-                reordered.push(panes.remove(position));
-            }
-        }
-        reordered.extend(panes);
-        reordered
     }
 
     /// Cache the latest pane status so it can be replayed when a web client
@@ -2613,27 +2804,40 @@ impl SessionManager {
         }
     }
 
+    /// Route a message to the session's instance(s) by its scope; see
+    /// [`Self::route_to_cli_by_scope`]. True when at least one instance took
+    /// it.
     pub async fn route_to_cli(&self, session_id: &Uuid, msg: ServerToCli) -> bool {
-        if let Some(session) = self.sessions.get(session_id) {
-            if let Some(cli_id) = session.cli_client_id {
-                let cli_exists = self.cli_senders.contains_key(&cli_id);
-                tracing::debug!(
-                    "route_to_cli: session {} -> cli {} (cli exists in senders: {})",
-                    session_id,
-                    cli_id,
-                    cli_exists
-                );
-                return self.send_to_cli(&cli_id, msg).await;
-            } else {
-                tracing::warn!("route_to_cli: session {} has no cli_client_id", session_id);
+        let outcome = self.route_to_cli_by_scope(session_id, msg).await;
+        match &outcome {
+            CliRouteOutcome::Delivered(_) => {}
+            CliRouteOutcome::MachineNotRunning {
+                machine_id,
+                hostname,
+            } => tracing::warn!(
+                %session_id,
+                ?machine_id,
+                host = hostname.as_deref().unwrap_or("unknown"),
+                "route_to_cli: the target machine is not running this project"
+            ),
+            CliRouteOutcome::NoInstance => {
+                tracing::warn!("route_to_cli: session {} has no attached instance", session_id)
             }
-        } else {
-            tracing::warn!("route_to_cli: session {} not found in memory", session_id);
+            CliRouteOutcome::Undelivered => tracing::warn!(
+                "route_to_cli: session {} instance did not take the message",
+                session_id
+            ),
         }
-        false
+        outcome.delivered()
     }
 
     pub async fn route_to_web(&self, session_id: &Uuid, msg: ServerToWeb) -> bool {
+        self.route_to_web_now(session_id, msg)
+    }
+
+    /// [`Self::route_to_web`] for callers that are not async. It never waits:
+    /// every send is a `try_send`.
+    pub(crate) fn route_to_web_now(&self, session_id: &Uuid, msg: ServerToWeb) -> bool {
         if let Some(session) = self.sessions.get(session_id) {
             if session.web_connection_ids.is_empty() {
                 tracing::debug!("No web clients attached to session {}", session_id);
@@ -3015,18 +3219,22 @@ mod tests {
     fn pane_reboot_never_removes_or_reorders_the_logical_pane() {
         let mgr = SessionManager::new();
         let sid = Uuid::new_v4();
-        mgr.create_session(sid, Uuid::new_v4(), Uuid::new_v4());
+        let cli = Uuid::new_v4();
+        let (cli_tx, _cli_rx) = mpsc::channel(4);
+        mgr.register_cli(cli, Uuid::new_v4(), cli_tx, None);
+        mgr.create_cli_session(sid, cli, None, Some("host-a".to_string()));
         let original = vec![
             test_pane_config(30),
             test_pane_config(10),
             test_pane_config(20),
         ];
         let old_runtime_session = original[1].session_id;
-        mgr.set_session_panes(&sid, original);
+        mgr.merge_instance_roster(&sid, &cli, original).unwrap();
 
         assert!(mgr.begin_pane_reboot(&sid, 10));
-        let during_close =
-            mgr.reconcile_pane_reboots(&sid, vec![test_pane_config(20), test_pane_config(30)]);
+        let during_close = mgr
+            .merge_instance_roster(&sid, &cli, vec![test_pane_config(20), test_pane_config(30)])
+            .unwrap();
         assert_eq!(
             during_close
                 .iter()
@@ -3036,15 +3244,17 @@ mod tests {
             "the transient close must keep the pane in its custom-order slot"
         );
         assert_eq!(during_close[1].session_id, old_runtime_session);
-        mgr.set_session_panes(&sid, during_close);
 
         let mut replacement = test_pane_config(10);
         replacement.label = None;
         let replacement_runtime_session = replacement.session_id;
-        let after_add = mgr.reconcile_pane_reboots(
-            &sid,
-            vec![replacement, test_pane_config(20), test_pane_config(30)],
-        );
+        let after_add = mgr
+            .merge_instance_roster(
+                &sid,
+                &cli,
+                vec![replacement, test_pane_config(20), test_pane_config(30)],
+            )
+            .unwrap();
         assert_eq!(
             after_add
                 .iter()
@@ -3068,12 +3278,18 @@ mod tests {
     fn cancelling_pane_reboot_allows_an_intentional_remove() {
         let mgr = SessionManager::new();
         let sid = Uuid::new_v4();
-        mgr.create_session(sid, Uuid::new_v4(), Uuid::new_v4());
-        mgr.set_session_panes(&sid, vec![test_pane_config(1), test_pane_config(2)]);
+        let cli = Uuid::new_v4();
+        let (cli_tx, _cli_rx) = mpsc::channel(4);
+        mgr.register_cli(cli, Uuid::new_v4(), cli_tx, None);
+        mgr.create_cli_session(sid, cli, None, None);
+        mgr.merge_instance_roster(&sid, &cli, vec![test_pane_config(1), test_pane_config(2)])
+            .unwrap();
 
         assert!(mgr.begin_pane_reboot(&sid, 1));
         mgr.cancel_pane_reboot(&sid, 1);
-        let panes = mgr.reconcile_pane_reboots(&sid, vec![test_pane_config(2)]);
+        let panes = mgr
+            .merge_instance_roster(&sid, &cli, vec![test_pane_config(2)])
+            .unwrap();
         assert_eq!(
             panes.iter().map(|pane| pane.pane_id).collect::<Vec<_>>(),
             vec![2]
@@ -3383,8 +3599,10 @@ mod tests {
         let web_id = Uuid::new_v4();
         let (cli_tx, _cli_rx) = mpsc::channel(2);
         mgr.register_cli(cli_id, cluster_owner, cli_tx, None);
-        mgr.create_cli_session(session_id, cli_id, None, None);
-        mgr.set_session_machine(session_id, Some(blocked_machine));
+        assert!(matches!(
+            mgr.attach_cli_instance(session_id, cli_id, Some(blocked_machine), None, None),
+            AttachOutcome::Attached { primary: true, .. }
+        ));
         let (web_tx, mut web_rx) = mpsc::channel(2);
         mgr.register_web(web_id, web_tx);
         mgr.set_web_user(web_id, member);
@@ -3693,7 +3911,7 @@ mod tests {
         sessions.append_terminal_output(&dead, 2, Some(exited_instance), b"y", 0);
         sessions.append_terminal_output(&alive, 1, None, b"z", 0);
 
-        let changed = sessions.mark_session_terminals_disconnected(&dead);
+        let changed = sessions.mark_terminals_disconnected(&dead, |_, _| true);
         assert_eq!(changed.len(), 1);
         assert_eq!(changed[0].0, 1);
 
@@ -3721,7 +3939,7 @@ mod tests {
             None,
         );
         sessions.append_terminal_output(&sid, 2, Some(instance), b"before", 0);
-        sessions.mark_session_terminals_disconnected(&sid);
+        sessions.mark_terminals_disconnected(&sid, |_, _| true);
 
         let reconciled = sessions
             .reconcile_terminal_state(
@@ -3797,7 +4015,7 @@ mod tests {
         assert!(snapshot.bytes.is_empty());
         assert_eq!(snapshot.lifecycle, TerminalLifecycle::Exited);
         assert_eq!(snapshot.status.as_deref(), Some("status 1"));
-        assert_eq!(sessions.mark_session_terminals_disconnected(&sid).len(), 0);
+        assert_eq!(sessions.mark_terminals_disconnected(&sid, |_, _| true).len(), 0);
         assert_eq!(
             sessions.terminal_snapshot(&sid, 9).unwrap().lifecycle,
             TerminalLifecycle::Exited

@@ -17,6 +17,7 @@ use crate::{
     routes::{
         auth::require_active_claims, authz::require_active_user, mobile_auth::claims_from_headers,
     },
+    session::pane_launches::{native_task_pane_id, InstanceStartOutcome, InstanceStartWait},
     state::AppState,
 };
 
@@ -78,10 +79,26 @@ fn project_name(session: &SessionInfo) -> Option<String> {
         .map(ToString::to_string)
 }
 
+/// `info` with every attached instance of its project, each with whether
+/// `viewer` may use it. Older native builds never receive the instance-set
+/// frame, so this list is how they learn every host a project runs on.
+async fn with_instances(
+    state: &AppState,
+    mut info: SessionInfo,
+    viewer: Option<Uuid>,
+) -> SessionInfo {
+    info.instances = match viewer {
+        Some(viewer) => super::ws_web::viewer_session_instances(state, &info.id, &viewer).await,
+        None => state.sessions.session_instances(&info.id),
+    };
+    info
+}
+
 async fn accessible_sessions(
     state: &AppState,
     user_id: &str,
 ) -> Result<Vec<MobileSessionSummary>, AppError> {
+    let viewer = Uuid::parse_str(user_id).ok();
     let mut summaries = Vec::new();
     for session in state.db.get_sessions_for_user(user_id).await? {
         let last_user_input_at = state.db.get_session_last_user_input_at(&session.id).await?;
@@ -89,7 +106,7 @@ async fn accessible_sessions(
             .updated_at
             .clone()
             .or_else(|| session.created_at.clone());
-        let info = session_info(state, session, false, None);
+        let info = with_instances(state, session_info(state, session, false, None), viewer).await;
         let attention_count = info
             .panes
             .iter()
@@ -110,7 +127,12 @@ async fn accessible_sessions(
             .updated_at
             .clone()
             .or_else(|| session.created_at.clone());
-        let info = session_info(state, session, true, Some(owner_email));
+        let info = with_instances(
+            state,
+            session_info(state, session, true, Some(owner_email)),
+            viewer,
+        )
+        .await;
         let attention_count = info
             .panes
             .iter()
@@ -248,6 +270,167 @@ fn completed_launch(
     })
 }
 
+/// The answer to a launch that is still starting. The request stays pending,
+/// and a retry with the same request id carries on where this one stopped.
+const STILL_STARTING: &str =
+    "The project runtime is still starting; retry this same submission shortly";
+const MACHINE_WENT_OFFLINE: &str = "The selected machine went offline; reconnect it and retry";
+
+/// Record that the launch failed, so every retry of it gets the same
+/// answer, and return that answer.
+async fn fail_task_launch(
+    state: &AppState,
+    request: &MobileTaskLaunchRequest,
+    user_id: &str,
+    message: impl Into<String>,
+) -> AppError {
+    let message = message.into();
+    match state
+        .db
+        .fail_mobile_task_launch(&request.request_id.to_string(), user_id, &message)
+        .await
+    {
+        Ok(()) => AppError::Conflict(message),
+        Err(error) => error.into(),
+    }
+}
+
+/// The chosen machine's instance of the project, for a launch on a project
+/// an instance that can share it runs, or will run. One registered there but
+/// not running is started, as a web `AddPane` naming that machine starts it.
+/// Machines that cannot run an instance beside the others fail the launch.
+/// `Err` is the HTTP answer: a failure recorded on the request, or a
+/// still-starting conflict that a retry of the same request continues.
+async fn task_launch_instance(
+    state: &AppState,
+    user_id: &str,
+    request: &MobileTaskLaunchRequest,
+    session_id: Uuid,
+) -> Result<crate::session::InstanceAttachment, AppError> {
+    let machine_id = request.machine_id;
+    let (wait, start_policy) = if state
+        .sessions
+        .instance_on_machine(&session_id, &machine_id)
+        .is_some()
+    {
+        // Wait only for a start of it the server has not finished: before
+        // then its CLI holds no policy and would refuse the task.
+        let wait = state
+            .sessions
+            .wait_for_instance_start(session_id, machine_id, None);
+        (wait, None)
+    } else {
+        if !state.sessions.is_daemon_connected(&machine_id) {
+            return Err(fail_task_launch(state, request, user_id, MACHINE_WENT_OFFLINE).await);
+        }
+        let host = state
+            .sessions
+            .machine_hostname(&machine_id)
+            .unwrap_or_else(|| "the selected machine".to_string());
+        // Every instance runs under the account the session belongs to, and
+        // another account's instance is refused when it starts.
+        if let (Some(row), Some(owner)) = (
+            state.db.get_session(&session_id.to_string()).await?,
+            state.sessions.daemon_owner(&machine_id),
+        ) {
+            if row.user_id != owner.to_string() {
+                return Err(fail_task_launch(
+                    state,
+                    request,
+                    user_id,
+                    format!(
+                        "{host} is in another account's cluster, so it cannot run an instance of this project"
+                    ),
+                )
+                .await);
+            }
+        }
+        if !state
+            .sessions
+            .daemon_supports_capability(&machine_id, shared::PROJECT_INSTANCES_CAPABILITY)
+        {
+            return Err(fail_task_launch(
+                state,
+                request,
+                user_id,
+                format!(
+                    "{host} runs an older APAS that cannot run this project beside other machines. Reboot {host} to update it."
+                ),
+            )
+            .await);
+        }
+        let policy = state
+            .db
+            .get_effective_project_policy(&request.project_id)
+            .await?;
+        let wait =
+            state
+                .sessions
+                .wait_for_instance_start(session_id, machine_id, Some(&request.project_id));
+        (wait, Some(policy))
+    };
+    // A request dropped from here on, because its client went away, must not
+    // leave its wait behind.
+    let _withdraw = match &wait {
+        InstanceStartWait::Waiting { waiter, .. } => Some(state.sessions.withdraw_on_drop(*waiter)),
+        InstanceStartWait::Ready => None,
+    };
+    if let (
+        InstanceStartWait::Waiting {
+            start: Some(start_request),
+            ..
+        },
+        Some(policy),
+    ) = (&wait, start_policy)
+    {
+        if !state
+            .sessions
+            .send_to_daemon(
+                &machine_id,
+                ServerToDaemon::StartProjectCli {
+                    project_id: request.project_id.clone(),
+                    policy: Some(policy),
+                    request_id: Some(*start_request),
+                },
+            )
+            .await
+        {
+            state
+                .sessions
+                .fail_instance_start(session_id, machine_id, *start_request);
+            return Err(fail_task_launch(state, request, user_id, MACHINE_WENT_OFFLINE).await);
+        }
+    }
+    if let InstanceStartWait::Waiting {
+        waiter, outcome, ..
+    } = wait
+    {
+        // The window a launch always had to find its project running.
+        let window = state
+            .sessions
+            .instance_start_timeout()
+            .min(Duration::from_secs(15));
+        match state
+            .sessions
+            .await_instance_start(waiter, outcome, window)
+            .await
+        {
+            Some(InstanceStartOutcome::Started) => {}
+            Some(InstanceStartOutcome::Refused(reason)) => {
+                return Err(fail_task_launch(state, request, user_id, reason).await)
+            }
+            Some(InstanceStartOutcome::DaemonGone) => {
+                return Err(fail_task_launch(state, request, user_id, MACHINE_WENT_OFFLINE).await)
+            }
+            None => return Err(AppError::Conflict(STILL_STARTING.to_string())),
+        }
+    }
+    state
+        .sessions
+        .instance_on_machine(&session_id, &machine_id)
+        .ok_or_else(|| AppError::Conflict(STILL_STARTING.to_string()))
+}
+
 pub async fn launch_task(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -345,79 +528,105 @@ pub async fn launch_task(
         )));
     }
 
-    let mut session_id = state
+    // Until an instance that can share the project with other machines runs
+    // it, the chosen machine keeps its original meaning: start the project
+    // there when nothing runs it, otherwise add the task to the running
+    // session. Once one does, the task runs on the chosen machine's instance,
+    // started first when the project is registered there but not running, and
+    // the launch fails rather than land on another machine. A project nothing
+    // runs is started on a chosen machine whose daemon can share it the same
+    // way, since the instance that attaches there is one that can.
+    let running = state
         .sessions
         .active_session_for_project(&request.project_id);
-    if session_id.is_none() {
-        let policy = state
-            .db
-            .get_effective_project_policy(&request.project_id)
-            .await?;
-        if !state
-            .sessions
-            .send_to_daemon(
-                &request.machine_id,
-                ServerToDaemon::StartProjectCli {
-                    project_id: request.project_id.clone(),
-                    policy: Some(policy),
-                    request_id: None,
-                },
-            )
-            .await
+    let shared_start = match running {
+        None if state.sessions.daemon_supports_capability(
+            &request.machine_id,
+            shared::PROJECT_INSTANCES_CAPABILITY,
+        ) =>
         {
-            let message = "The selected machine went offline; reconnect it and retry";
-            state
-                .db
-                .fail_mobile_task_launch(&request.request_id.to_string(), &user.id, message)
-                .await?;
-            return Err(AppError::Conflict(message.to_string()));
+            Uuid::parse_str(&request.project_id).ok()
         }
-        for _ in 0..60 {
-            tokio::time::sleep(Duration::from_millis(250)).await;
-            session_id = state
-                .sessions
-                .active_session_for_project(&request.project_id);
-            if session_id.is_some() {
-                break;
-            }
-        }
-    }
-    let Some(session_id) = session_id else {
-        // Keep the retained operation pending. A retry with the same request
-        // id continues waiting for the idempotent daemon start.
-        return Err(AppError::Conflict(
-            "The project runtime is still starting; retry this same submission shortly".to_string(),
-        ));
+        _ => None,
     };
-    let supports_mobile_launch = state
-        .sessions
-        .session_supports_capability(&session_id, shared::MOBILE_TASK_LAUNCH_CAPABILITY);
-    let supports_opencode_terminal = state
-        .sessions
-        .session_supports_capability(&session_id, shared::OPENCODE_TERMINAL_CAPABILITY);
-    let supports_pi_terminal = state
-        .sessions
-        .session_supports_capability(&session_id, shared::PI_TERMINAL_CAPABILITY);
-    let supports_omp_terminal = state
-        .sessions
-        .session_supports_capability(&session_id, shared::OMP_TERMINAL_CAPABILITY);
+    let session_id = match running.or(shared_start) {
+        Some(session_id) => session_id,
+        None => {
+            let policy = state
+                .db
+                .get_effective_project_policy(&request.project_id)
+                .await?;
+            if !state
+                .sessions
+                .send_to_daemon(
+                    &request.machine_id,
+                    ServerToDaemon::StartProjectCli {
+                        project_id: request.project_id.clone(),
+                        policy: Some(policy),
+                        request_id: None,
+                    },
+                )
+                .await
+            {
+                return Err(
+                    fail_task_launch(&state, &request, &user.id, MACHINE_WENT_OFFLINE).await,
+                );
+            }
+            let mut session_id = None;
+            for _ in 0..60 {
+                tokio::time::sleep(Duration::from_millis(250)).await;
+                session_id = state
+                    .sessions
+                    .active_session_for_project(&request.project_id);
+                if session_id.is_some() {
+                    break;
+                }
+            }
+            // Keep the retained operation pending. A retry with the same
+            // request id continues waiting for the idempotent daemon start.
+            session_id.ok_or_else(|| AppError::Conflict(STILL_STARTING.to_string()))?
+        }
+    };
+    let instance = if shared_start.is_some()
+        || state
+            .sessions
+            .session_attachments(&session_id)
+            .iter()
+            .any(|instance| instance.capable)
+    {
+        Some(task_launch_instance(&state, &user.id, &request, session_id).await?)
+    } else {
+        None
+    };
+    // What the CLI that receives the task supports: the chosen machine's
+    // instance's, or the running session's primary's.
+    let supports = |capability: &str| match &instance {
+        Some(instance) => state
+            .sessions
+            .cli_supports_capability(&instance.cli_id, capability),
+        None => state
+            .sessions
+            .session_supports_capability(&session_id, capability),
+    };
     if let Some(message) = mobile_launch_capability_error(
         profile.provider,
-        supports_mobile_launch,
-        supports_opencode_terminal,
-        supports_pi_terminal,
-        supports_omp_terminal,
+        supports(shared::MOBILE_TASK_LAUNCH_CAPABILITY),
+        supports(shared::OPENCODE_TERMINAL_CAPABILITY),
+        supports(shared::PI_TERMINAL_CAPABILITY),
+        supports(shared::OMP_TERMINAL_CAPABILITY),
     ) {
-        state
-            .db
-            .fail_mobile_task_launch(&request.request_id.to_string(), &user.id, message)
-            .await?;
-        return Err(AppError::Conflict(message.to_string()));
+        return Err(fail_task_launch(&state, &request, &user.id, message).await);
     }
 
-    let pane_id = 10_000 + (request.request_id.as_u128() % 1_000_000) as u32;
+    let pane_id = native_task_pane_id(request.request_id);
     let existing = state.sessions.get_session_panes(&session_id);
     if !existing.iter().any(|pane| pane.pane_id == pane_id) {
+        // An instance that can share the project owns the panes tagged with
+        // its machine; an older CLI owns the whole roster, untagged.
+        let tag = instance
+            .as_ref()
+            .filter(|instance| instance.capable)
+            .and_then(|instance| instance.machine_id);
         let pane_config = PaneConfig {
             pane_id,
             provider: profile.provider,
@@ -438,22 +647,26 @@ pub async fn launch_task(
             plan_review_mode: PlanReviewMode::default(),
             manual_mode: false,
             managed: false,
-            machine_id: None,
-            hostname: None,
+            machine_id: tag,
+            hostname: tag.and(instance.as_ref().and_then(|instance| instance.hostname.clone())),
         };
-        if !state
-            .sessions
-            .route_to_cli(
-                &session_id,
-                ServerToCli::AddPane {
-                    session_id,
-                    pane_config: pane_config.clone(),
-                    isolated_worktree: false,
-                    initial_input: Some(instruction.to_string()),
-                },
-            )
-            .await
-        {
+        state.sessions.reserve_pane_id(&session_id, pane_id, tag);
+        let add = ServerToCli::AddPane {
+            session_id,
+            pane_config,
+            isolated_worktree: false,
+            initial_input: Some(instruction.to_string()),
+        };
+        let delivered = match &instance {
+            Some(instance) => state
+                .sessions
+                .route_to_cli_on_machine(&session_id, instance.machine_id, add)
+                .await
+                .delivered(),
+            None => state.sessions.route_to_cli(&session_id, add).await,
+        };
+        if !delivered {
+            state.sessions.release_pane_id(&session_id, pane_id);
             return Err(AppError::Conflict(
                 "The project runtime disconnected before task creation; retry this same submission"
                     .to_string(),
@@ -666,6 +879,127 @@ mod tests {
         assert!(
             mobile_launch_capability_error(shared::Provider::Opencode, true, true, false, true).is_none()
         );
+    }
+
+    /// A native build that never receives the instance-set frame still learns
+    /// from bootstrap every host a project runs on, whether it may use each,
+    /// and the machine of each tab.
+    #[tokio::test]
+    async fn bootstrap_lists_every_instance_and_each_panes_machine() {
+        let dir = std::env::temp_dir().join(format!("apas-mobile-instances-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = Database::new(&dir.join("apas.db").to_string_lossy())
+            .await
+            .unwrap();
+        db.run_migrations().await.unwrap();
+        let owner = Uuid::new_v4();
+        db.create_user(&User {
+            id: owner.to_string(),
+            email: "instances@example.test".to_string(),
+            password_hash: "hash".to_string(),
+            created_at: None,
+            cluster_role: "user".to_string(),
+            account_status: "active".to_string(),
+        })
+        .await
+        .unwrap();
+        let session_id = Uuid::new_v4();
+        db.authorize_project_registration(&session_id.to_string(), &owner.to_string())
+            .await
+            .unwrap();
+        db.create_session(&Session {
+            id: session_id.to_string(),
+            user_id: owner.to_string(),
+            cli_client_id: None,
+            working_dir: Some("/work/zoo-005".to_string()),
+            hostname: Some("zoo-005".to_string()),
+            status: "active".to_string(),
+            created_at: None,
+            updated_at: None,
+            is_paused: false,
+            project_id: Some(session_id.to_string()),
+            git_remote: None,
+            git_remote_url: None,
+        })
+        .await
+        .unwrap();
+        let mut config = Config::default();
+        config.database.path = dir.join("apas.db").to_string_lossy().to_string();
+        let state = AppState::new(db, config);
+        let (m5, m6) = (Uuid::new_v4(), Uuid::new_v4());
+        let mut clis = Vec::new();
+        for (machine_id, host) in [(m5, "zoo-005"), (m6, "zoo-006")] {
+            let cli_id = Uuid::new_v4();
+            let (cli_tx, cli_rx) = tokio::sync::mpsc::channel(4);
+            state.sessions.register_cli(cli_id, owner, cli_tx, None);
+            state
+                .sessions
+                .set_cli_capabilities(cli_id, vec![shared::PROJECT_INSTANCES_CAPABILITY.into()]);
+            assert!(matches!(
+                state.sessions.attach_cli_instance(
+                    session_id,
+                    cli_id,
+                    Some(machine_id),
+                    Some(format!("/work/{host}")),
+                    Some(host.to_string()),
+                ),
+                crate::session::AttachOutcome::Attached { .. }
+            ));
+            clis.push(cli_rx);
+        }
+        let tagged = |pane_id: u32, machine_id: Option<Uuid>, host: &str| {
+            let mut pane = test_pane(pane_id, "tab");
+            pane.machine_id = machine_id;
+            pane.hostname = Some(host.to_string());
+            pane
+        };
+        state.sessions.set_session_panes(
+            &session_id,
+            vec![
+                tagged(3, Some(m5), "zoo-005"),
+                tagged(4, Some(m6), "zoo-006"),
+                tagged(5, None, "zoo-006"),
+            ],
+        );
+
+        let Json(response) = bootstrap(State(state.clone()), headers(&state, &owner.to_string()))
+            .await
+            .unwrap();
+        let session = &response
+            .sessions
+            .iter()
+            .find(|summary| summary.session.id == session_id)
+            .expect("the project is listed")
+            .session;
+        assert_eq!(
+            session
+                .instances
+                .iter()
+                .map(|instance| (
+                    instance.machine_id,
+                    instance.hostname.as_str(),
+                    instance.primary,
+                    instance.runtime_access
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                (Some(m5), "zoo-005", true, Some(true)),
+                (Some(m6), "zoo-006", false, Some(true)),
+            ]
+        );
+        assert_eq!(
+            session
+                .panes
+                .iter()
+                .map(|pane| (pane.pane_id, pane.machine_id, pane.hostname.as_deref()))
+                .collect::<Vec<_>>(),
+            vec![
+                (3, Some(m5), Some("zoo-005")),
+                (4, Some(m6), Some("zoo-006")),
+                (5, None, Some("zoo-006")),
+            ]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
@@ -894,5 +1228,379 @@ mod tests {
             response.sessions[1].session.panes.is_empty(),
             "a session with no pane roster reports none, not phantom panes"
         );
+    }
+
+    // Native task launches aimed at a machine: today's meaning until an
+    // instance that can share the project runs it, the chosen machine's
+    // instance afterwards.
+
+    const HOST_A: &str = "zoo-005";
+    const HOST_B: &str = "zoo-006";
+    const CAPABLE_CLI: &[&str] = &[
+        shared::PROJECT_INSTANCES_CAPABILITY,
+        shared::PROJECT_POLICY_CAPABILITY,
+        shared::MOBILE_TASK_LAUNCH_CAPABILITY,
+    ];
+    const OLDER_CLI: &[&str] = &[
+        shared::PROJECT_POLICY_CAPABILITY,
+        shared::MOBILE_TASK_LAUNCH_CAPABILITY,
+    ];
+    const CAPABLE_DAEMON: &[&str] = &[
+        shared::PROJECT_INSTANCES_CAPABILITY,
+        shared::PROJECT_POLICY_CAPABILITY,
+    ];
+
+    /// A project its owner launches tasks in from a phone.
+    struct NativeProject {
+        state: AppState,
+        owner: Uuid,
+        session: Uuid,
+        headers: HeaderMap,
+        dir: std::path::PathBuf,
+    }
+
+    impl Drop for NativeProject {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    /// What one instance's CLI was sent as new panes, with their first
+    /// instruction.
+    type AddedPanes = std::sync::Arc<std::sync::Mutex<Vec<(PaneConfig, Option<String>)>>>;
+
+    async fn native_project() -> NativeProject {
+        let dir = std::env::temp_dir().join(format!("apas-native-launch-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("apas.db").to_string_lossy().to_string();
+        let db = Database::new(&db_path).await.unwrap();
+        db.run_migrations().await.unwrap();
+        let owner = Uuid::new_v4();
+        db.create_user(&User {
+            id: owner.to_string(),
+            email: format!("{owner}@example.test"),
+            password_hash: "hash".to_string(),
+            created_at: None,
+            cluster_role: "user".to_string(),
+            account_status: "active".to_string(),
+        })
+        .await
+        .unwrap();
+        let session = Uuid::new_v4();
+        db.authorize_project_registration(&session.to_string(), &owner.to_string())
+            .await
+            .unwrap();
+        db.create_session(&Session {
+            id: session.to_string(),
+            user_id: owner.to_string(),
+            cli_client_id: None,
+            working_dir: Some(format!("/work/{HOST_A}")),
+            hostname: Some(HOST_A.to_string()),
+            status: "active".to_string(),
+            created_at: None,
+            updated_at: None,
+            is_paused: false,
+            project_id: Some(session.to_string()),
+            git_remote: None,
+            git_remote_url: None,
+        })
+        .await
+        .unwrap();
+        let device = Uuid::new_v4().to_string();
+        db.create_mobile_device_session(
+            &device,
+            &owner.to_string(),
+            &format!("installation-{device}"),
+            "ios",
+            Some("Phone"),
+            "0.1.0",
+            "refresh-hash",
+            &(chrono::Utc::now() + chrono::Duration::days(30)).to_rfc3339(),
+        )
+        .await
+        .unwrap();
+        let mut config = Config::default();
+        config.database.path = db_path;
+        config.mobile.features.coding_mutations = true;
+        let state = AppState::new(db, config);
+        state
+            .sessions
+            .set_session_project(session, session.to_string());
+        let (token, _) = crate::routes::auth::generate_mobile_access_token(
+            &owner.to_string(),
+            &device,
+            &state.config.auth,
+        )
+        .unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {token}")).unwrap(),
+        );
+        NativeProject {
+            state,
+            owner,
+            session,
+            headers,
+            dir,
+        }
+    }
+
+    impl NativeProject {
+        /// A connected daemon whose inventory lists the project.
+        fn daemon(
+            &self,
+            machine_id: Uuid,
+            host: &str,
+            capabilities: &[&str],
+        ) -> tokio::sync::mpsc::Receiver<ServerToDaemon> {
+            let (tx, rx) = tokio::sync::mpsc::channel(16);
+            self.state.sessions.register_daemon(
+                machine_id,
+                self.owner,
+                tx,
+                shared::MachineInfo {
+                    machine_id,
+                    hostname: host.to_string(),
+                    os: "linux".to_string(),
+                    arch: "x86_64".to_string(),
+                    daemon_version: None,
+                    deepseek_backend: None,
+                    last_seen: None,
+                },
+                vec![shared::MachineProjectInfo {
+                    project_id: self.session.to_string(),
+                    name: None,
+                    path: format!("/work/{host}"),
+                    preferred_machine_id: None,
+                    is_running: false,
+                    pid: None,
+                    memory_kb: None,
+                    last_error: None,
+                    git_remote: None,
+                }],
+            );
+            self.state.sessions.set_daemon_capabilities(
+                machine_id,
+                capabilities.iter().map(|capability| capability.to_string()).collect(),
+            );
+            rx
+        }
+
+        /// A running instance of the project on `machine_id`, whose start the
+        /// server has finished and whose CLI reports each new pane it is
+        /// sent, as a real one does.
+        fn instance(&self, machine_id: Uuid, host: &str, capabilities: &[&str]) -> AddedPanes {
+            let (cli_id, added) = instance_reporting_its_panes(
+                &self.state,
+                self.session,
+                machine_id,
+                host,
+                capabilities,
+            );
+            self.state
+                .sessions
+                .instance_started(self.session, machine_id, cli_id);
+            added
+        }
+
+        fn launch(&self, machine_id: Uuid, request_id: Uuid) -> MobileTaskLaunchRequest {
+            MobileTaskLaunchRequest {
+                request_id,
+                machine_id,
+                project_id: self.session.to_string(),
+                instruction: "Make the flaky upload test deterministic".to_string(),
+                profile_key: "terminal:claude:official:default".to_string(),
+            }
+        }
+
+        async fn submit(
+            &self,
+            request: MobileTaskLaunchRequest,
+        ) -> Result<MobileTaskLaunchResponse, AppError> {
+            launch_task(
+                State(self.state.clone()),
+                self.headers.clone(),
+                Json(request),
+            )
+            .await
+            .map(|Json(response)| response)
+        }
+    }
+
+    fn instance_reporting_its_panes(
+        state: &AppState,
+        session: Uuid,
+        machine_id: Uuid,
+        host: &str,
+        capabilities: &[&str],
+    ) -> (Uuid, AddedPanes) {
+        let cli_id = Uuid::new_v4();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+        state.sessions.register_cli(cli_id, Uuid::new_v4(), tx, None);
+        state.sessions.set_cli_capabilities(
+            cli_id,
+            capabilities.iter().map(|capability| capability.to_string()).collect(),
+        );
+        assert!(matches!(
+            state.sessions.attach_cli_instance(
+                session,
+                cli_id,
+                Some(machine_id),
+                Some(format!("/work/{host}")),
+                Some(host.to_string()),
+            ),
+            crate::session::AttachOutcome::Attached { .. }
+        ));
+        let added: AddedPanes = Default::default();
+        let sessions = state.sessions.clone();
+        let record = added.clone();
+        tokio::spawn(async move {
+            while let Some(message) = rx.recv().await {
+                if let ServerToCli::AddPane {
+                    pane_config,
+                    initial_input,
+                    ..
+                } = message
+                {
+                    let roster = {
+                        let mut added = record.lock().unwrap();
+                        added.push((pane_config, initial_input));
+                        added.iter().map(|(pane, _)| pane.clone()).collect()
+                    };
+                    sessions.merge_instance_roster(&session, &cli_id, roster);
+                }
+            }
+        });
+        (cli_id, added)
+    }
+
+    fn conflict(result: Result<MobileTaskLaunchResponse, AppError>) -> String {
+        match result {
+            Err(AppError::Conflict(message)) => message,
+            other => panic!("expected a conflict, got {other:?}"),
+        }
+    }
+
+    /// Until an instance that can share the project runs it, a task picked
+    /// by machine is added to the running session, as it always was.
+    #[tokio::test]
+    async fn before_a_sharing_instance_runs_the_project_a_task_joins_the_running_session() {
+        let p = native_project().await;
+        let m5 = Uuid::new_v4();
+        let m6 = Uuid::new_v4();
+        let on_zoo_005 = p.instance(m5, HOST_A, OLDER_CLI);
+        let mut zoo_006 = p.daemon(m6, HOST_B, CAPABLE_DAEMON);
+        let request_id = Uuid::new_v4();
+
+        let response = p.submit(p.launch(m6, request_id)).await.unwrap();
+
+        assert_eq!(response.pane_id, Some(native_task_pane_id(request_id)));
+        assert_eq!(response.session_id, p.session);
+        let added = on_zoo_005.lock().unwrap().clone();
+        assert_eq!(added.len(), 1);
+        assert_eq!(added[0].0.machine_id, None, "an older CLI's panes stay untagged");
+        assert_eq!(
+            added[0].1.as_deref(),
+            Some("Make the flaky upload test deterministic")
+        );
+        assert!(zoo_006.try_recv().is_err(), "nothing is started on zoo-006");
+    }
+
+    /// Once one does, a task for a machine where the project is registered
+    /// but stopped starts that machine's instance and runs there, tagged for
+    /// it. A retry of the same launch replays its result.
+    #[tokio::test]
+    async fn a_task_for_a_stopped_machine_starts_its_instance_and_runs_there() {
+        let p = native_project().await;
+        let m5 = Uuid::new_v4();
+        let m6 = Uuid::new_v4();
+        let on_zoo_005 = p.instance(m5, HOST_A, CAPABLE_CLI);
+        let mut zoo_006 = p.daemon(m6, HOST_B, CAPABLE_DAEMON);
+        // zoo-006's daemon starts the project when asked, and its instance
+        // finishes its start.
+        let state = p.state.clone();
+        let session = p.session;
+        let started = tokio::spawn(async move {
+            let Some(ServerToDaemon::StartProjectCli {
+                project_id,
+                request_id: Some(request_id),
+                ..
+            }) = zoo_006.recv().await
+            else {
+                panic!("expected a correlated start")
+            };
+            state
+                .sessions
+                .instance_start_result(m6, request_id, &project_id, true, None);
+            let (cli_id, added) =
+                instance_reporting_its_panes(&state, session, m6, HOST_B, CAPABLE_CLI);
+            state.sessions.instance_started(session, m6, cli_id);
+            added
+        });
+        let request_id = Uuid::new_v4();
+
+        let response = p.submit(p.launch(m6, request_id)).await.unwrap();
+
+        let on_zoo_006 = started.await.unwrap();
+        let added = on_zoo_006.lock().unwrap().clone();
+        assert_eq!(added.len(), 1);
+        assert_eq!(added[0].0.pane_id, native_task_pane_id(request_id));
+        assert_eq!(added[0].0.machine_id, Some(m6));
+        assert!(added[0].1.is_some());
+        assert!(on_zoo_005.lock().unwrap().is_empty(), "never on zoo-005");
+        assert_eq!(response.pane_id, Some(native_task_pane_id(request_id)));
+        let replayed = p.submit(p.launch(m6, request_id)).await.unwrap();
+        assert_eq!(replayed.pane_id, response.pane_id);
+        assert_eq!(on_zoo_006.lock().unwrap().len(), 1, "a retry creates nothing");
+    }
+
+    /// A machine whose daemon cannot run an instance beside the others fails
+    /// the launch with the reason, for every retry, and the task runs nowhere.
+    #[tokio::test]
+    async fn a_task_fails_rather_than_run_on_another_machine() {
+        let p = native_project().await;
+        let m5 = Uuid::new_v4();
+        let m6 = Uuid::new_v4();
+        let on_zoo_005 = p.instance(m5, HOST_A, CAPABLE_CLI);
+        let mut zoo_006 = p.daemon(m6, HOST_B, &[shared::PROJECT_POLICY_CAPABILITY]);
+        let request_id = Uuid::new_v4();
+
+        let refusal = conflict(p.submit(p.launch(m6, request_id)).await);
+        assert!(refusal.ends_with("Reboot zoo-006 to update it."), "{refusal}");
+        assert_eq!(conflict(p.submit(p.launch(m6, request_id)).await), refusal);
+        assert!(on_zoo_005.lock().unwrap().is_empty());
+        assert!(zoo_006.try_recv().is_err());
+    }
+
+    /// A start that has not finished within the launch's window leaves the
+    /// launch pending; retrying it once the instance runs creates the task
+    /// there.
+    #[tokio::test]
+    async fn a_task_still_starting_is_finished_by_its_retry() {
+        let p = native_project().await;
+        p.state.sessions.set_pane_launch_timing(
+            crate::session::pane_launches::PANE_ID_RESERVATION_TTL,
+            Duration::from_millis(200),
+        );
+        let m5 = Uuid::new_v4();
+        let m6 = Uuid::new_v4();
+        let _zoo_005 = p.instance(m5, HOST_A, CAPABLE_CLI);
+        let mut zoo_006 = p.daemon(m6, HOST_B, CAPABLE_DAEMON);
+        let request_id = Uuid::new_v4();
+
+        assert_eq!(conflict(p.submit(p.launch(m6, request_id)).await), STILL_STARTING);
+        assert!(matches!(
+            zoo_006.try_recv(),
+            Ok(ServerToDaemon::StartProjectCli {
+                request_id: Some(_),
+                ..
+            })
+        ));
+        let on_zoo_006 = p.instance(m6, HOST_B, CAPABLE_CLI);
+
+        let response = p.submit(p.launch(m6, request_id)).await.unwrap();
+        assert_eq!(response.pane_id, Some(native_task_pane_id(request_id)));
+        assert_eq!(on_zoo_006.lock().unwrap()[0].0.machine_id, Some(m6));
     }
 }

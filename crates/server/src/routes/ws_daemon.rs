@@ -510,16 +510,26 @@ async fn apply_registered_daemon_message(
             success,
             error,
         } => {
-            // Answers only a start that carried a request id, and this server
-            // sends none yet, so nothing is waiting on it.
-            tracing::debug!(
+            tracing::info!(
                 %machine_id,
                 %request_id,
                 %project_id,
                 success,
                 error = error.as_deref().unwrap_or(""),
-                "ignoring uncorrelated project-runtime start result"
+                "daemon project-runtime start completed"
             );
+            // A start sent for new panes waiting on this machine. A refusal
+            // fails them; a success leaves them waiting for the instance's
+            // `SessionStart`, since only that makes it able to take a pane.
+            if !state.sessions.instance_start_result(
+                *machine_id,
+                request_id,
+                &project_id,
+                success,
+                error,
+            ) {
+                tracing::debug!(%machine_id, %request_id, "no new pane is waiting on this start");
+            }
         }
     }
 }
@@ -1040,5 +1050,61 @@ mod tests {
             } if discarded_request == request_id && discarded_project == project_id
         ));
         assert!(state.db.get_project(&project_id).await.unwrap().is_none());
+    }
+
+    /// The daemon's answer to a correlated start reaches the new panes
+    /// waiting on it. Success only says the runtime started, so they keep
+    /// waiting for the instance itself; a refusal fails them with its reason.
+    #[tokio::test]
+    async fn a_start_result_reaches_the_panes_waiting_on_it() {
+        use crate::session::pane_launches::{InstanceStartOutcome, InstanceStartWait};
+
+        let state = test_state().await;
+        let machine_id = Uuid::new_v4();
+        let session_id = Uuid::new_v4();
+        let project_id = session_id.to_string();
+        let InstanceStartWait::Waiting {
+            waiter,
+            start: Some(request_id),
+            mut outcome,
+        } = state
+            .sessions
+            .wait_for_instance_start(session_id, machine_id, Some(&project_id))
+        else {
+            panic!("expected a new start")
+        };
+        let answer = |success: bool, error: Option<&str>| DaemonToServer::ProjectRuntimeStarted {
+            request_id,
+            project_id: project_id.clone(),
+            success,
+            error: error.map(str::to_string),
+        };
+
+        apply_registered_daemon_message(&state, &machine_id, answer(true, None)).await;
+        assert!(
+            matches!(
+                outcome.try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+            ),
+            "a started runtime is not yet an attached instance"
+        );
+        // Another machine's daemon cannot answer this start.
+        apply_registered_daemon_message(&state, &Uuid::new_v4(), answer(false, Some("not mine")))
+            .await;
+        apply_registered_daemon_message(
+            &state,
+            &machine_id,
+            answer(false, Some("Another host holds this project's claim")),
+        )
+        .await;
+        assert_eq!(
+            state
+                .sessions
+                .await_instance_start(waiter, outcome, std::time::Duration::from_secs(1))
+                .await,
+            Some(InstanceStartOutcome::Refused(
+                "Another host holds this project's claim".to_string()
+            ))
+        );
     }
 }

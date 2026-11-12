@@ -1621,6 +1621,96 @@ impl Database {
         .await?)
     }
 
+    /// The projects `user_id` owns or hosts (as [`Self::project_in_user_cluster`]
+    /// decides hosting) with a session that recorded one of `git_remotes`,
+    /// leaving out projects being deleted. Remotes compare exactly: sessions
+    /// record the canonical `host/owner/repo` form the CLI computes, and the
+    /// caller passes the spellings of that form it accepts.
+    pub async fn owned_or_hosted_projects_with_session_remote(
+        &self,
+        user_id: &str,
+        git_remotes: &[&str],
+    ) -> Result<Vec<String>> {
+        if git_remotes.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut query = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
+            "SELECT DISTINCT p.id, p.lifecycle_status \
+             FROM sessions s \
+             JOIN projects p ON p.id = COALESCE(s.project_id, s.id) \
+             WHERE s.git_remote IN (",
+        );
+        {
+            let mut remotes = query.separated(", ");
+            for git_remote in git_remotes {
+                remotes.push_bind(git_remote.to_string());
+            }
+        }
+        query
+            .push(") AND (p.owner_user_id = ")
+            .push_bind(user_id.to_string())
+            .push(
+                " OR EXISTS (SELECT 1 FROM project_cluster_placements pcp \
+                 JOIN users u ON u.id = pcp.cluster_owner_user_id \
+                 WHERE pcp.project_id = p.id AND u.account_status = 'active' \
+                 AND pcp.cluster_owner_user_id = ",
+            )
+            .push_bind(user_id.to_string())
+            .push(")) ORDER BY p.id");
+        let rows = query
+            .build_query_as::<(String, String)>()
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(rows
+            .into_iter()
+            .filter(|(_, lifecycle)| {
+                ProjectLifecycle::parse(lifecycle) != ProjectLifecycle::Deleting
+            })
+            .map(|(project_id, _)| project_id)
+            .collect())
+    }
+
+    /// Where `user_id` stands with `project_id` when a checkout would join it,
+    /// or `None` when the server has no such project. Ownership counts as
+    /// well as hosting: an owner may run the project, and its first start
+    /// places it in the owner's cluster.
+    pub async fn project_join_standing(
+        &self,
+        project_id: &str,
+        user_id: &str,
+    ) -> Result<Option<ProjectJoinStanding>> {
+        let row = sqlx::query_as::<_, (String, i64, i64)>(
+            r#"
+            SELECT p.lifecycle_status,
+                   CASE WHEN p.owner_user_id = ? OR EXISTS (
+                       SELECT 1 FROM project_cluster_placements pcp
+                       JOIN users u ON u.id = pcp.cluster_owner_user_id
+                       WHERE pcp.project_id = p.id
+                         AND pcp.cluster_owner_user_id = ?
+                         AND u.account_status = 'active'
+                   ) THEN 1 ELSE 0 END,
+                   CASE WHEN EXISTS (
+                       SELECT 1 FROM sessions s
+                       WHERE s.project_id = p.id OR (s.project_id IS NULL AND s.id = p.id)
+                   ) THEN 1 ELSE 0 END
+            FROM projects p
+            WHERE p.id = ?
+            "#,
+        )
+        .bind(user_id)
+        .bind(user_id)
+        .bind(project_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(
+            |(lifecycle, owned_or_hosted, has_session)| ProjectJoinStanding {
+                owned_or_hosted: owned_or_hosted != 0,
+                lifecycle: ProjectLifecycle::parse(&lifecycle),
+                has_session: has_session != 0,
+            },
+        ))
+    }
+
     pub async fn get_system_admin_credential(&self) -> Result<Option<SystemAdminCredential>> {
         Ok(sqlx::query_as::<_, SystemAdminCredential>(
             "SELECT username, password_hash, credential_version, bootstrap_pending, updated_at FROM system_admin_credential WHERE id = 1",
@@ -4470,13 +4560,46 @@ impl Database {
         .flatten())
     }
 
-    /// Mark session as inactive and clear cli_client_id (CLI disconnected)
-    pub async fn clear_session_cli(&self, id: &str) -> Result<()> {
-        sqlx::query("UPDATE sessions SET status = 'inactive', cli_client_id = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ?")
-            .bind(id)
-            .execute(&self.pool)
-            .await?;
-        Ok(())
+    /// Mark session as inactive and clear cli_client_id: its last instance,
+    /// `cli_client_id`, disconnected. Applies only while the row still names
+    /// that CLI, so a disconnect that lands after a reconnect has rewritten
+    /// the row cannot mark the running session inactive. Returns whether the
+    /// row changed.
+    pub async fn clear_session_cli(&self, id: &str, cli_client_id: &str) -> Result<bool> {
+        let result = sqlx::query(
+            "UPDATE sessions SET status = 'inactive', cli_client_id = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND cli_client_id = ?",
+        )
+        .bind(id)
+        .bind(cli_client_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// Point the session row at its new primary instance after the primary,
+    /// `from_cli`, left while another machine's instance still runs the
+    /// project. Only the single-valued description moves: status, shares,
+    /// project and remote stay as they are. Applies only while the row still
+    /// names `from_cli`. Returns whether the row changed.
+    pub async fn hand_over_session_primary(
+        &self,
+        id: &str,
+        from_cli: &str,
+        to_cli: &str,
+        working_dir: Option<&str>,
+        hostname: Option<&str>,
+    ) -> Result<bool> {
+        let result = sqlx::query(
+            "UPDATE sessions SET cli_client_id = ?, working_dir = ?, hostname = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND cli_client_id = ?",
+        )
+        .bind(to_cli)
+        .bind(working_dir)
+        .bind(hostname)
+        .bind(id)
+        .bind(from_cli)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() > 0)
     }
 
     pub async fn update_session_paused(&self, id: &str, is_paused: bool) -> Result<()> {

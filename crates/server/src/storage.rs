@@ -168,6 +168,10 @@ pub struct FileStorage {
     /// GC's atomic rename — the append handle would land on the orphaned
     /// pre-rename inode and the message would silently vanish.
     session_locks: Arc<StdMutex<HashMap<Uuid, Arc<AsyncMutex<()>>>>>,
+    /// Per-session locks serializing `panes.json` writes. Several instances
+    /// of one project report rosters concurrently; without this an older
+    /// roster's write could land after a newer one's.
+    roster_locks: Arc<StdMutex<HashMap<Uuid, Arc<AsyncMutex<()>>>>>,
     /// Size ceiling for one session's log, and the size a trim leaves behind.
     /// Fields rather than constants so tests can exercise the trim without
     /// writing a quarter of a gigabyte.
@@ -189,6 +193,7 @@ impl FileStorage {
         Self {
             base_path: base_path.as_ref().to_path_buf(),
             session_locks: Arc::new(StdMutex::new(HashMap::new())),
+            roster_locks: Arc::new(StdMutex::new(HashMap::new())),
             max_session_bytes: SESSION_MESSAGES_MAX_BYTES,
             trim_session_to_bytes: SESSION_MESSAGES_TRIM_TO_BYTES,
         }
@@ -341,17 +346,66 @@ impl FileStorage {
         Ok(())
     }
 
-    /// Persist pane configurations for a session so inactive sessions can restore tabs after restart
-    pub async fn save_pane_list(
+    fn roster_lock(&self, session_id: &Uuid) -> Arc<AsyncMutex<()>> {
+        let mut locks = self.roster_locks.lock().expect("roster_locks poisoned");
+        locks
+            .entry(*session_id)
+            .or_insert_with(|| Arc::new(AsyncMutex::new(())))
+            .clone()
+    }
+
+    /// Replace `panes.json` atomically, so a reader never sees half a roster.
+    /// Caller must hold the session's roster lock.
+    async fn write_pane_roster(
         &self,
         session_id: &Uuid,
         panes: &[shared::PaneConfig],
     ) -> Result<()> {
         self.ensure_session_dir(session_id).await?;
         let file_path = self.panes_file(session_id);
+        let tmp_path = session_gc_temp_path(&file_path);
         let json = serde_json::to_vec(panes)?;
-        fs::write(file_path, json).await?;
+        if let Err(error) = fs::write(&tmp_path, json).await {
+            let _ = fs::remove_file(&tmp_path).await;
+            return Err(error.into());
+        }
+        if let Err(error) = fs::rename(&tmp_path, &file_path).await {
+            let _ = fs::remove_file(&tmp_path).await;
+            return Err(error.into());
+        }
         Ok(())
+    }
+
+    /// Persist pane configurations for a session so inactive sessions can
+    /// restore tabs after restart. Each pane keeps its machine tag and
+    /// attributed host, so a stopped instance's tabs come back with their host.
+    pub async fn save_pane_list(
+        &self,
+        session_id: &Uuid,
+        panes: &[shared::PaneConfig],
+    ) -> Result<()> {
+        let lock = self.roster_lock(session_id);
+        let _guard = lock.lock().await;
+        self.write_pane_roster(session_id, panes).await
+    }
+
+    /// Persist the roster `snapshot` returns at the moment of writing. The
+    /// snapshot is taken under the roster lock, so when instances report
+    /// concurrently the last write holds the latest roster rather than
+    /// whichever report's copy happened to finish last. `None` writes nothing
+    /// and returns false: the session is gone, and writing would recreate its
+    /// directory.
+    pub async fn save_pane_roster_latest<F>(&self, session_id: &Uuid, snapshot: F) -> Result<bool>
+    where
+        F: FnOnce() -> Option<Vec<shared::PaneConfig>>,
+    {
+        let lock = self.roster_lock(session_id);
+        let _guard = lock.lock().await;
+        let Some(panes) = snapshot() else {
+            return Ok(false);
+        };
+        self.write_pane_roster(session_id, &panes).await?;
+        Ok(true)
     }
 
     /// Load persisted pane configurations for a session
@@ -511,22 +565,32 @@ impl FileStorage {
         for session_id in ordered {
             let lock = self.session_lock(&session_id);
             let guard = lock.lock().await;
+            // A roster write already past its snapshot would otherwise
+            // recreate the directory after it is removed.
+            let roster_lock = self.roster_lock(&session_id);
+            let roster_guard = roster_lock.lock().await;
             match fs::remove_dir_all(self.session_dir(&session_id)).await {
                 Ok(()) => {}
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(error) => return Err(error.into()),
             }
+            drop(roster_guard);
             drop(guard);
 
             // Remove only the same lock and only when no append/GC caller has
             // already cloned it. A waiter retains its Arc and keeps the lock
             // alive even if a future session reuses this UUID.
-            let mut locks = self.session_locks.lock().expect("session_locks poisoned");
-            if locks
-                .get(&session_id)
-                .is_some_and(|stored| Arc::ptr_eq(stored, &lock) && Arc::strong_count(stored) == 2)
-            {
-                locks.remove(&session_id);
+            for (locks, lock) in [
+                (&self.session_locks, &lock),
+                (&self.roster_locks, &roster_lock),
+            ] {
+                let mut locks = locks.lock().expect("storage locks poisoned");
+                if locks
+                    .get(&session_id)
+                    .is_some_and(|stored| Arc::ptr_eq(stored, lock) && Arc::strong_count(stored) == 2)
+                {
+                    locks.remove(&session_id);
+                }
             }
         }
         Ok(())

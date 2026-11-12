@@ -23,7 +23,8 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc as tokio_mpsc;
 use uuid::Uuid;
 
-use crate::project::{get_or_create_project, save_project};
+use crate::project::ProjectMetadata;
+use crate::project_instances::{InstanceIdentity, PaneOwner};
 use crate::terminal_pane::{terminal_binary_for, TerminalPanes, TerminalRuntimeHandle};
 use crate::transcript::{PiTranscriptReader, TranscriptActivity};
 use crate::tui::{PaneOutput, TuiCommand, TuiEvent};
@@ -142,25 +143,53 @@ fn truncate_str_at_char_boundary(s: &str, max_bytes: usize) -> &str {
 /// Persist only owner-operable workflow settings. Cluster-governed team and
 /// launch-profile fields remain untouched even when an older server sends the
 /// legacy combined message.
+///
+/// Every instance of the project receives the update, and on a shared home
+/// they write the same file, so this changes only these two fields on a fresh
+/// read under the project lock. The echo reports the other fields as the file
+/// holds them, not as this runtime last saw them.
 fn update_project_operations(
-    project_dir: &Path,
-    session_id: Uuid,
+    store: &ProjectStore,
     auto_approve_todos: bool,
     auto_merge_prs: bool,
 ) -> Result<CliToServer> {
-    let mut meta = get_or_create_project(project_dir)?;
-    meta.auto_approve_todos = auto_approve_todos;
-    meta.auto_merge_prs = auto_merge_prs;
-    let team_enabled = meta.team_enabled;
-    let disallowed_tab_types = meta.disallowed_tab_types.clone();
-    save_project(project_dir, &meta)?;
+    let (team_enabled, disallowed_tab_types) = store.update_settings(|meta| {
+        meta.auto_approve_todos = auto_approve_todos;
+        meta.auto_merge_prs = auto_merge_prs;
+        (meta.team_enabled, meta.disallowed_tab_types.clone())
+    })?;
     Ok(CliToServer::ProjectFlagsChanged {
-        session_id,
+        session_id: store.project_id,
         auto_approve_todos,
         auto_merge_prs,
         team_enabled,
         disallowed_tab_types,
     })
+}
+
+/// One tick of the flag rebroadcast: the project's settings as `.apas` holds
+/// them now, or as last read when it cannot be read.
+fn project_flags_message(store: &ProjectStore) -> CliToServer {
+    let meta = store.read();
+    CliToServer::ProjectFlagsChanged {
+        session_id: store.project_id,
+        auto_approve_todos: meta.auto_approve_todos,
+        auto_merge_prs: meta.auto_merge_prs,
+        team_enabled: meta.team_enabled,
+        disallowed_tab_types: meta.disallowed_tab_types,
+    }
+}
+
+/// The settings snapshot sent after every (re)connect, which the server takes
+/// as migration input only while no authoritative override exists. Read like
+/// the flag rebroadcast: never by regenerating the file.
+fn project_policy_snapshot(store: &ProjectStore) -> CliToServer {
+    let meta = store.read();
+    CliToServer::ProjectPolicySnapshot {
+        session_id: store.project_id,
+        team_enabled: meta.team_enabled,
+        disallowed_tab_types: meta.disallowed_tab_types,
+    }
 }
 
 /// Whether this project permits creating a tab of the given kind + provider.
@@ -250,17 +279,18 @@ fn remember_verified_codex_session(
 #[allow(clippy::too_many_arguments)]
 fn announce_and_persist_panes(
     server_tx: &tokio_mpsc::Sender<CliToServer>,
-    session_id: Uuid,
-    working_dir: &str,
+    store: &ProjectStore,
     pane_metas: &PaneMetas,
     input_channels: &InputChannels,
     pane_sessions: &Arc<Mutex<HashMap<u32, Uuid>>>,
     pane_pauses: &PanePauses,
     pane_stop_requests: &PaneStopRequests,
 ) {
+    let session_id = store.project_id;
     let _ = server_tx.blocking_send(CliToServer::PaneList {
         session_id,
         panes: build_pane_list(
+            &store.owner,
             pane_metas,
             input_channels,
             session_id,
@@ -270,7 +300,7 @@ fn announce_and_persist_panes(
         ),
     });
     save_pane_configs(
-        working_dir,
+        store,
         pane_sessions,
         pane_metas,
         pane_pauses,
@@ -939,6 +969,29 @@ impl ClaudeWatchState {
     fn switch_floor(&self) -> std::time::SystemTime {
         self.mtime.unwrap_or(self.started)
     }
+}
+
+/// The conversations a Claude pane's session-switch search must never follow:
+/// those of every other pane this runtime runs, and of every pane `.apas`
+/// records for any machine.
+///
+/// On a shared home the instances of one project on several machines share
+/// the transcript store as well as the working directory, so another
+/// machine's pane writes its transcript beside this pane's. Excluding only
+/// this runtime's panes let an idle pane, or a new one whose own file did not
+/// exist yet, adopt a conversation running on another host. The pane's own
+/// conversation stays a candidate, so switching back to it is followed.
+fn claude_switch_exclusions(
+    own_conversation: Uuid,
+    running: impl IntoIterator<Item = Uuid>,
+    recorded: &[shared::PaneConfig],
+) -> HashSet<String> {
+    running
+        .into_iter()
+        .chain(recorded.iter().map(|pane| pane.session_id))
+        .filter(|conversation| *conversation != own_conversation)
+        .map(|conversation| conversation.to_string())
+        .collect()
 }
 
 fn default_pane_label(pane_id: u32, model: Option<&str>) -> String {
@@ -2042,6 +2095,101 @@ fn restored_pane_mode_and_pause(
     (mode, is_paused)
 }
 
+/// One pane as a starting runtime restores it.
+type RestoredTab = (
+    u32,
+    Uuid,
+    String,
+    shared::PaneMode,
+    Provider,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<u64>,
+    bool,
+    Option<String>,         // worktree_path from .apas (Phase 1.1)
+    Option<String>,         // role from .apas (Phase 2.1)
+    Option<String>,         // goal from .apas (Phase 2.1)
+    Option<String>,         // backstory from .apas (Phase 2.1)
+    shared::PlanReviewMode, // plan_review_mode from .apas (Phase 3.2)
+    bool,                   // manual_mode from .apas (v3.2)
+    bool,                   // managed from .apas (v3.5)
+    shared::PaneKind,       // Agent vs pty-hosted Terminal
+);
+
+/// The tabs a runtime restores from `panes`, in pane id order.
+fn restored_tabs(panes: &[shared::PaneConfig], legacy_deadloop_paused: bool) -> Vec<RestoredTab> {
+    let mut tabs: Vec<RestoredTab> = panes
+        .iter()
+        .map(|pane| {
+            let (mode, is_paused) = restored_pane_mode_and_pause(pane, legacy_deadloop_paused);
+            let label =
+                pane_label_or_default(pane.label.as_deref(), pane.pane_id, pane.model.as_deref());
+
+            (
+                pane.pane_id,
+                pane.session_id,
+                label,
+                mode,
+                pane.provider,
+                pane.prompt.clone(),
+                pane.model.clone(),
+                normalize_effort_level(pane.effort.as_deref()),
+                pane.min_iteration_interval_minutes,
+                is_paused,
+                pane.worktree_path.clone(),
+                pane.role.clone(),
+                pane.goal.clone(),
+                pane.backstory.clone(),
+                pane.plan_review_mode,
+                pane.manual_mode,
+                pane.managed,
+                pane.kind,
+            )
+        })
+        .collect();
+    tabs.sort_by_key(|(pane_id, ..)| *pane_id);
+    tabs
+}
+
+/// What a project runtime starts with.
+struct RuntimeStart {
+    /// `.apas` as opened: the project-level fields and every machine's panes.
+    metadata: ProjectMetadata,
+    /// The panes this runtime restores, which are only the ones it owns.
+    tabs: Vec<RestoredTab>,
+    /// Which of those are terminal panes, for pane-host reconciliation.
+    terminal_panes: HashSet<u32>,
+}
+
+/// Open the project in `working_dir` for `owner` and take its panes.
+///
+/// An instance restores only the panes tagged with its machine, after
+/// adopting the untagged ones when no other machine runs the project. A pane
+/// tagged for another machine is never restored, even while that machine is
+/// stopped: its process, terminal and history belong there. A runtime without
+/// the capability restores every pane, as a CLI from before instances does.
+fn open_runtime(working_dir: &Path, owner: &PaneOwner) -> Result<RuntimeStart> {
+    let start = crate::project_instances::open_instance(working_dir, owner)?;
+    tracing::info!(
+        restoring = ?start.panes.iter().map(|pane| pane.pane_id).collect::<Vec<_>>(),
+        adopted = ?start.adopted,
+        others = start.metadata.panes.len().saturating_sub(start.panes.len()),
+        "opened project panes for this machine"
+    );
+    let terminal_panes = start
+        .panes
+        .iter()
+        .filter_map(|pane| pane.kind.is_terminal().then_some(pane.pane_id))
+        .collect();
+    let tabs = restored_tabs(&start.panes, start.metadata.is_paused);
+    Ok(RuntimeStart {
+        metadata: start.metadata,
+        tabs,
+        terminal_panes,
+    })
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ManagedBuiltInPromptKind {
     Manager,
@@ -2563,17 +2711,21 @@ fn route_web_input_to_pane(
 /// exits, and `--attach` renders a running project from its own process. What
 /// remains is the body every project has always had, minus the terminal UI
 /// that only the removed foreground path used.
+///
+/// `machine_id` is this host's, resolved as the daemon resolves its own, so a
+/// standalone run owns and reports its panes as the machine it is.
 pub async fn run_headless(
     server_url: &str,
     token: &str,
     working_dir: &Path,
+    machine_id: Uuid,
 ) -> Result<ProjectOutcome> {
     run_inner(
         server_url,
         token,
         working_dir,
         Arc::new(AtomicBool::new(false)),
-        None,
+        machine_id,
     )
     .await
 }
@@ -2592,7 +2744,7 @@ pub async fn run_project(
     shutdown: Arc<AtomicBool>,
     machine_id: Uuid,
 ) -> Result<ProjectOutcome> {
-    run_inner(server_url, token, working_dir, shutdown, Some(machine_id)).await
+    run_inner(server_url, token, working_dir, shutdown, machine_id).await
 }
 
 async fn run_inner(
@@ -2600,9 +2752,13 @@ async fn run_inner(
     token: &str,
     working_dir: &Path,
     shutdown: Arc<AtomicBool>,
-    machine_id: Option<Uuid>,
+    machine_id: Uuid,
 ) -> Result<ProjectOutcome> {
     let config = crate::config::Config::load().unwrap_or_default();
+    // Which machine this run is and whether it may run beside other machines'
+    // instances of the project, which decides the panes it owns in `.apas`.
+    // Taken from the same setting the daemon decided its claim mode from.
+    let instance = crate::project_instances::InstanceIdentity::new(machine_id, &config.daemon);
     // Resolve binary paths to absolute paths at startup (while PATH is correct).
     // Systemd-run environments may have a minimal PATH that misses nvm/cargo bins.
     let claude_path = resolve_binary_path(&config.local.claude_path);
@@ -2612,22 +2768,29 @@ async fn run_inner(
     let omp_path = resolve_binary_path(&config.local.omp_path);
     let cursor_agent_path = resolve_binary_path(&config.local.cursor_agent_path);
 
-    // Load or create project metadata
-    let mut metadata = get_or_create_project(working_dir)?;
+    // Open `.apas` and take this machine's panes: its own, plus the untagged
+    // ones when no other machine runs the project. Nothing here regenerates a
+    // file that does not parse; the project fails to start instead.
+    let owner = instance.owner();
+    let RuntimeStart {
+        metadata,
+        tabs: tabs_to_restore,
+        terminal_panes: configured_terminal_panes,
+    } = open_runtime(working_dir, &owner)?;
     let session_id = metadata.id;
     let reboot_handoff = load_reboot_handoff(session_id);
     // `None` means the authoritative server policy has not arrived yet and
     // launch-like mutations fail closed. Existing processes may keep running
     // and will be reported as noncompliant rather than terminated.
     let project_policy: ProjectPolicyState = Arc::new(Mutex::new(None));
+    // From here on `.apas` is read without ever being regenerated, and
+    // written only by locked merges that leave other machines' panes alone,
+    // nearly all of it through this handle.
+    let store = ProjectStore::new(working_dir, owner, metadata);
 
-    save_project(working_dir, &metadata)?;
-
-    let configured_terminal_panes = metadata
-        .panes
-        .iter()
-        .filter_map(|pane| pane.kind.is_terminal().then_some(pane.pane_id))
-        .collect::<std::collections::HashSet<_>>();
+    // Against the terminal panes this runtime restores, which are this
+    // machine's only: a pane host left on this host for any other pane has
+    // nothing here that would ever adopt it.
     match crate::pane_host::reconcile_project_hosts(session_id, &configured_terminal_panes) {
         Ok(removed) if removed > 0 => {
             tracing::info!(removed, "removed unrostered pane-host runtimes")
@@ -2641,58 +2804,6 @@ async fn run_inner(
     let working_dir_str = working_dir.to_string_lossy().to_string();
     let server_url = server_url.to_string();
     let token = token.to_string();
-
-    // Build startup pane list from persisted metadata.
-    let mut tabs_to_restore: Vec<(
-        u32,
-        Uuid,
-        String,
-        shared::PaneMode,
-        Provider,
-        Option<String>,
-        Option<String>,
-        Option<String>,
-        Option<u64>,
-        bool,
-        Option<String>,         // worktree_path from .apas (Phase 1.1)
-        Option<String>,         // role from .apas (Phase 2.1)
-        Option<String>,         // goal from .apas (Phase 2.1)
-        Option<String>,         // backstory from .apas (Phase 2.1)
-        shared::PlanReviewMode, // plan_review_mode from .apas (Phase 3.2)
-        bool,                   // manual_mode from .apas (v3.2)
-        bool,                   // managed from .apas (v3.5)
-        shared::PaneKind,       // Agent vs pty-hosted Terminal
-    )> = metadata
-        .panes
-        .iter()
-        .map(|pane| {
-            let (mode, is_paused) = restored_pane_mode_and_pause(pane, metadata.is_paused);
-            let label =
-                pane_label_or_default(pane.label.as_deref(), pane.pane_id, pane.model.as_deref());
-
-            (
-                pane.pane_id,
-                pane.session_id,
-                label,
-                mode,
-                pane.provider,
-                pane.prompt.clone(),
-                pane.model.clone(),
-                normalize_effort_level(pane.effort.as_deref()),
-                pane.min_iteration_interval_minutes,
-                is_paused,
-                pane.worktree_path.clone(),
-                pane.role.clone(),
-                pane.goal.clone(),
-                pane.backstory.clone(),
-                pane.plan_review_mode,
-                pane.manual_mode,
-                pane.managed,
-                pane.kind,
-            )
-        })
-        .collect();
-    tabs_to_restore.sort_by_key(|(pane_id, ..)| *pane_id);
 
     // Channel for sending to server
     let (server_tx, server_rx) = tokio_mpsc::channel::<CliToServer>(256);
@@ -2959,7 +3070,7 @@ async fn run_inner(
     let sessions_for_handler = pane_sessions.clone();
     let pauses_for_handler = pane_pauses.clone();
     let stops_for_handler = pane_stop_requests.clone();
-    let working_dir_for_handler = working_dir_str.clone();
+    let store_for_handler = store.clone();
     ctrlc::set_handler(move || {
         shutdown_for_handler.store(true, Ordering::SeqCst);
         // Persist the roster before tearing anything down. Ctrl+C is how a CLI
@@ -2968,11 +3079,11 @@ async fn run_inner(
         // created under an older build vanished on restart.
         //
         // The ctrlc crate runs this on a dedicated thread, not in an
-        // async-signal context, so file I/O here is fine. `save_project`
-        // writes via temp+rename, so racing the normal exit path at worst
-        // means last-writer-wins on identical content.
+        // async-signal context, so file I/O here is fine. The save is a
+        // locked merge, so racing the normal exit path at worst writes the
+        // same panes twice.
         save_pane_configs(
-            &working_dir_for_handler,
+            &store_for_handler,
             &sessions_for_handler,
             &metas_for_handler,
             &pauses_for_handler,
@@ -3009,6 +3120,8 @@ async fn run_inner(
         let event_tx_for_server = event_tx.clone();
         let project_policy_for_server = project_policy.clone();
         let connection_generation_for_server = server_connection_generation.clone();
+        let instance = instance.clone();
+        let store = store.clone();
         tokio::spawn(async move {
             run_server_connection(
                 &server_url,
@@ -3029,7 +3142,8 @@ async fn run_inner(
                 status_tx,
                 event_tx_for_server,
                 project_policy_for_server,
-                machine_id,
+                instance,
+                store,
                 connection_generation_for_server,
                 reboot_handoff,
             )
@@ -3299,6 +3413,7 @@ async fn run_inner(
         let default_prompt_for_events = default_prompt.clone();
         let file_watcher_for_events = file_watcher.clone();
         let project_policy_for_events = project_policy.clone();
+        let store_for_events = store.clone();
         thread::spawn(move || {
             handle_tui_events(
                 event_rx,
@@ -3324,6 +3439,7 @@ async fn run_inner(
                 &default_prompt_for_events,
                 file_watcher_for_events,
                 project_policy_for_events,
+                store_for_events,
             )
         })
     };
@@ -3377,22 +3493,19 @@ async fn run_inner(
     // so the web's Overview toggles hydrate on attach and survive a
     // server restart that wiped the in-memory cache. Cheap: .apas is
     // a few KB and only one message per 5s per active CLI.
+    //
+    // The read never regenerates the file. It used to go through
+    // `get_or_create_project`, which deletes a `.apas` it cannot parse and
+    // starts an empty one: every five seconds, a chance to turn a moment's
+    // bad read into a lost project, and on a shared home every other
+    // machine's panes with it. A failed read rebroadcasts the last good copy.
     {
         let server_tx_for_flags = server_tx.clone();
         let shutdown_for_flags = shutdown.clone();
-        let working_dir_for_flags = working_dir_str.clone();
+        let store_for_flags = store.clone();
         thread::spawn(move || {
-            let project = std::path::PathBuf::from(working_dir_for_flags);
             while !shutdown_for_flags.load(Ordering::SeqCst) {
-                if let Ok(meta) = crate::project::get_or_create_project(&project) {
-                    let _ = server_tx_for_flags.blocking_send(CliToServer::ProjectFlagsChanged {
-                        session_id,
-                        auto_approve_todos: meta.auto_approve_todos,
-                        auto_merge_prs: meta.auto_merge_prs,
-                        team_enabled: meta.team_enabled,
-                        disallowed_tab_types: meta.disallowed_tab_types.clone(),
-                    });
-                }
+                let _ = server_tx_for_flags.blocking_send(project_flags_message(&store_for_flags));
                 thread::sleep(Duration::from_secs(5));
             }
         });
@@ -3415,7 +3528,7 @@ async fn run_inner(
         let terminal_questions_for_turns = terminal_questions.clone();
         let shutdown_for_turns = shutdown.clone();
         let project_for_turns = std::path::PathBuf::from(working_dir_str.clone());
-        let working_dir_for_turns = working_dir_str.clone();
+        let store_for_turns = store.clone();
         let metas_for_turns = pane_metas.clone();
         let sessions_for_turns = pane_sessions.clone();
         let input_channels_for_turns = input_channels.clone();
@@ -3547,6 +3660,7 @@ async fn run_inner(
                     }
                 }
 
+                let mut recorded_panes: Option<Vec<shared::PaneConfig>> = None;
                 for (pane_id, provider, mut conv_id, worktree_path, process_group_id, lifecycle) in
                     panes
                 {
@@ -3776,17 +3890,16 @@ async fn run_inner(
                                 watch.idle_polls += 1;
                             }
                             if watch.idle_polls >= CLAUDE_SWITCH_IDLE_POLLS {
-                                let excluded: HashSet<String> = sessions_for_turns
+                                // Read `.apas` at most once per poll, and only
+                                // when some pane needs it: it names the panes
+                                // of every machine sharing this directory.
+                                let recorded = recorded_panes
+                                    .get_or_insert_with(|| store_for_turns.read().panes);
+                                let running: Vec<Uuid> = sessions_for_turns
                                     .lock()
-                                    .ok()
-                                    .map(|sessions| {
-                                        sessions
-                                            .iter()
-                                            .filter(|(other_pane_id, _)| **other_pane_id != pane_id)
-                                            .map(|(_, other_conv_id)| other_conv_id.to_string())
-                                            .collect()
-                                    })
+                                    .map(|sessions| sessions.values().copied().collect())
                                     .unwrap_or_default();
+                                let excluded = claude_switch_exclusions(conv_id, running, recorded);
                                 if let Some(next) = crate::transcript::find_claude_switch_candidate(
                                     &watch.path,
                                     watch.switch_floor(),
@@ -3919,8 +4032,7 @@ async fn run_inner(
                             conv_id = verified_session_id;
                             announce_and_persist_panes(
                                 &server_tx_for_turns,
-                                session_id,
-                                &working_dir_for_turns,
+                                &store_for_turns,
                                 &metas_for_turns,
                                 &input_channels_for_turns,
                                 &sessions_for_turns,
@@ -4112,7 +4224,7 @@ async fn run_inner(
     // Saving first also means we capture the state the user left, not whatever
     // the teardown leaves behind.
     save_pane_configs(
-        &working_dir_str,
+        &store,
         &pane_sessions,
         &pane_metas,
         &pane_pauses,
@@ -4196,137 +4308,321 @@ fn spawn_centralized_input_router(
     });
 }
 
-/// Persist current pane configs (including dynamic tabs) to the .apas file
+/// Run blocking `.apas` I/O without stalling the async runtime.
+///
+/// A write can wait up to ten seconds for the project lock while another
+/// instance holds it, and the resident instance runs every project on one
+/// runtime. On a worker of the multi-threaded runtime this hands the worker's
+/// other tasks to another thread first. Elsewhere it simply runs: a plain
+/// thread may block, and a current-thread runtime, which only tests use, does
+/// not allow handing off.
+fn off_runtime<R>(work: impl FnOnce() -> R) -> R {
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(work)
+        }
+        _ => work(),
+    }
+}
+
+/// This runtime's access to its project's `.apas`.
+///
+/// Instances of one project on several machines can share the file, so every
+/// write goes through the locked merges in `project_instances`: a pane save
+/// replaces only the panes `owner` owns, and a settings write changes only
+/// its own fields, each on a fresh read. A save used to rewrite the whole file
+/// from this runtime's copy, erasing whatever another machine had saved since.
+///
+/// Reads never create, delete or regenerate the file. One that fails, or
+/// finds another project's file, is logged once and answered from the copy
+/// last read successfully: a regenerated file would have been an empty
+/// project and, on a shared home, would have erased every machine's panes.
+#[derive(Clone)]
+struct ProjectStore {
+    dir: PathBuf,
+    /// The project's id, which is also its session id.
+    project_id: Uuid,
+    owner: PaneOwner,
+    last_read: Arc<Mutex<LastRead>>,
+}
+
+struct LastRead {
+    metadata: ProjectMetadata,
+    /// The read failure last logged, so a file that stays unreadable is
+    /// reported once rather than on every poll.
+    error: Option<String>,
+}
+
+impl ProjectStore {
+    /// `metadata` is the file as the runtime opened it, and the copy reads
+    /// fall back to until one succeeds.
+    fn new(dir: &Path, owner: PaneOwner, metadata: ProjectMetadata) -> Self {
+        Self {
+            dir: dir.to_path_buf(),
+            project_id: metadata.id,
+            owner,
+            last_read: Arc::new(Mutex::new(LastRead {
+                metadata,
+                error: None,
+            })),
+        }
+    }
+
+    fn cached(&self) -> std::sync::MutexGuard<'_, LastRead> {
+        self.last_read
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// `.apas` as it is now, or the copy last read when it cannot be read,
+    /// does not parse, or belongs to another project.
+    fn read(&self) -> ProjectMetadata {
+        let read = off_runtime(|| crate::project_instances::read_project_metadata(&self.dir))
+            .and_then(|metadata| {
+                anyhow::ensure!(
+                    metadata.id == self.project_id,
+                    "the file now belongs to project {}",
+                    metadata.id
+                );
+                Ok(metadata)
+            });
+        let mut last = self.cached();
+        match read {
+            Ok(metadata) => {
+                if last.error.take().is_some() {
+                    tracing::info!(dir = %self.dir.display(), "project metadata is readable again");
+                }
+                last.metadata = metadata.clone();
+                metadata
+            }
+            Err(error) => {
+                let error = format!("{error:#}");
+                if last.error.as_deref() != Some(error.as_str()) {
+                    tracing::warn!(
+                        dir = %self.dir.display(),
+                        %error,
+                        "could not read project metadata; using the copy last read, and leaving the file as it is"
+                    );
+                    last.error = Some(error);
+                }
+                last.metadata.clone()
+            }
+        }
+    }
+
+    /// Save `panes`, the complete list this runtime owns. Only those entries
+    /// change: every other machine's panes, and the project-level fields,
+    /// stay as the file has them.
+    fn save_panes(&self, panes: &[shared::PaneConfig]) -> Result<()> {
+        let saved = off_runtime(|| {
+            crate::project_instances::save_instance_panes(
+                &self.dir,
+                self.project_id,
+                &self.owner,
+                panes,
+            )
+        })?;
+        let mut last = self.cached();
+        last.metadata = saved;
+        last.error = None;
+        Ok(())
+    }
+
+    /// Change project-level fields on a fresh read, writing only what
+    /// `update` changes. `update` runs under the project lock.
+    fn update_settings<R>(&self, update: impl FnOnce(&mut ProjectMetadata) -> R) -> Result<R> {
+        off_runtime(|| {
+            crate::project_instances::update_project_settings(&self.dir, self.project_id, update)
+        })
+    }
+
+    /// Remove the entries tagged with `machine_id`, returning their ids.
+    fn forget_machine(&self, machine_id: Uuid) -> Result<Vec<u32>> {
+        off_runtime(|| {
+            crate::project_instances::forget_machine_panes(&self.dir, self.project_id, machine_id)
+        })
+    }
+}
+
+/// Persist this runtime's pane configs (including dynamic tabs) to `.apas`.
+///
+/// These are the panes this runtime owns, and the save replaces only those:
+/// see [`ProjectStore::save_panes`]. A save that fails, for instance because
+/// the file no longer parses, is logged and leaves the file untouched; the
+/// next save tries again.
 fn save_pane_configs(
-    working_dir: &str,
+    store: &ProjectStore,
     pane_sessions: &Arc<Mutex<HashMap<u32, Uuid>>>,
     pane_metas: &PaneMetas,
     pane_pauses: &PanePauses,
     pane_stop_requests: &PaneStopRequests,
 ) {
-    if let Ok(mut metadata) = get_or_create_project(Path::new(working_dir)) {
-        let pane_sessions = pane_sessions.lock().unwrap().clone();
-        let pane_metas = pane_metas.lock().unwrap().clone();
-        let paused: HashMap<u32, bool> = pane_pauses
-            .lock()
-            .unwrap()
-            .iter()
-            .map(|(&pane_id, flag)| (pane_id, flag.load(Ordering::SeqCst)))
-            .collect();
-        let stop_requested: HashMap<u32, bool> = pane_stop_requests
-            .lock()
-            .unwrap()
-            .iter()
-            .map(|(&pane_id, flag)| (pane_id, flag.load(Ordering::SeqCst)))
-            .collect();
+    let pane_sessions = pane_sessions.lock().unwrap().clone();
+    let pane_metas = pane_metas.lock().unwrap().clone();
+    let paused: HashMap<u32, bool> = pane_pauses
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(&pane_id, flag)| (pane_id, flag.load(Ordering::SeqCst)))
+        .collect();
+    let stop_requested: HashMap<u32, bool> = pane_stop_requests
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(&pane_id, flag)| (pane_id, flag.load(Ordering::SeqCst)))
+        .collect();
 
-        // Rebuild panes list from pane_sessions and pane_metas
-        let mut panes: Vec<shared::PaneConfig> = pane_sessions
-            .iter()
-            .map(|(&pane_id, &claude_sid)| {
-                let (mode, provider, label, prompt, model, effort, min_iteration_interval_minutes) =
-                    if let Some(meta) = pane_metas.get(&pane_id) {
-                        (
-                            meta.mode.clone(),
-                            meta.provider.clone(),
-                            meta.label.clone(),
-                            meta.prompt.clone(),
-                            meta.model.clone(),
-                            meta.effort.clone(),
-                            meta.min_iteration_interval_minutes,
-                        )
-                    } else if pane_id == shared::PANE_ID_DEADLOOP {
-                        (
-                            shared::PaneMode::Deadloop,
-                            Provider::Claude,
-                            default_pane_label(pane_id, None),
-                            None,
-                            None,
-                            None,
-                            Some(DEFAULT_MIN_ITERATION_INTERVAL_MINUTES),
-                        )
-                    } else {
-                        (
-                            shared::PaneMode::Interactive,
-                            Provider::Claude,
-                            default_pane_label(pane_id, None),
-                            None,
-                            None,
-                            None,
-                            None,
-                        )
-                    };
-                let (
-                    worktree_path,
-                    role,
-                    goal,
-                    backstory,
-                    plan_review_mode,
-                    manual_mode,
-                    managed,
-                    kind,
-                ) = pane_metas
-                    .get(&pane_id)
-                    .map(|p| {
-                        (
-                            p.worktree_path.clone(),
-                            p.role.clone(),
-                            p.goal.clone(),
-                            p.backstory.clone(),
-                            p.plan_review_mode,
-                            p.manual_mode,
-                            p.managed,
-                            p.kind,
-                        )
-                    })
-                    .unwrap_or((
+    // Rebuild panes list from pane_sessions and pane_metas
+    let mut panes: Vec<shared::PaneConfig> = pane_sessions
+        .iter()
+        .map(|(&pane_id, &claude_sid)| {
+            let (mode, provider, label, prompt, model, effort, min_iteration_interval_minutes) =
+                if let Some(meta) = pane_metas.get(&pane_id) {
+                    (
+                        meta.mode.clone(),
+                        meta.provider.clone(),
+                        meta.label.clone(),
+                        meta.prompt.clone(),
+                        meta.model.clone(),
+                        meta.effort.clone(),
+                        meta.min_iteration_interval_minutes,
+                    )
+                } else if pane_id == shared::PANE_ID_DEADLOOP {
+                    (
+                        shared::PaneMode::Deadloop,
+                        Provider::Claude,
+                        default_pane_label(pane_id, None),
+                        None,
+                        None,
+                        None,
+                        Some(DEFAULT_MIN_ITERATION_INTERVAL_MINUTES),
+                    )
+                } else {
+                    (
+                        shared::PaneMode::Interactive,
+                        Provider::Claude,
+                        default_pane_label(pane_id, None),
                         None,
                         None,
                         None,
                         None,
-                        shared::PlanReviewMode::default(),
-                        false,
-                        false,
-                        shared::PaneKind::Agent,
-                    ));
-                shared::PaneConfig {
+                    )
+                };
+            let (
+                worktree_path,
+                role,
+                goal,
+                backstory,
+                plan_review_mode,
+                manual_mode,
+                managed,
+                kind,
+            ) = pane_metas
+                .get(&pane_id)
+                .map(|p| {
+                    (
+                        p.worktree_path.clone(),
+                        p.role.clone(),
+                        p.goal.clone(),
+                        p.backstory.clone(),
+                        p.plan_review_mode,
+                        p.manual_mode,
+                        p.managed,
+                        p.kind,
+                    )
+                })
+                .unwrap_or((
+                    None,
+                    None,
+                    None,
+                    None,
+                    shared::PlanReviewMode::default(),
+                    false,
+                    false,
+                    shared::PaneKind::Agent,
+                ));
+            shared::PaneConfig {
+                pane_id,
+                provider,
+                mode,
+                kind,
+                session_id: claude_sid,
+                is_paused: paused.get(&pane_id).copied().unwrap_or(false),
+                stop_requested: stop_requested.get(&pane_id).copied().unwrap_or(false),
+                prompt,
+                min_iteration_interval_minutes,
+                label: Some(pane_label_or_default(
+                    Some(&label),
                     pane_id,
-                    provider,
-                    mode,
-                    kind,
-                    session_id: claude_sid,
-                    is_paused: paused.get(&pane_id).copied().unwrap_or(false),
-                    stop_requested: stop_requested.get(&pane_id).copied().unwrap_or(false),
-                    prompt,
-                    min_iteration_interval_minutes,
-                    label: Some(pane_label_or_default(
-                        Some(&label),
-                        pane_id,
-                        model.as_deref(),
-                    )),
-                    model,
-                    effort,
-                    worktree_path,
-                    role,
-                    goal,
-                    backstory,
-                    plan_review_mode,
-                    manual_mode,
-                    managed,
-                    machine_id: None,
-                    hostname: None,
-                }
-            })
-            .collect();
-        panes.sort_by_key(|p| p.pane_id);
-        metadata.is_paused = panes
-            .iter()
-            .find(|pane| pane.pane_id == shared::PANE_ID_DEADLOOP)
-            .map(|pane| pane.is_paused)
-            .unwrap_or(false);
-        metadata.panes = panes;
-        let _ = save_project(Path::new(working_dir), &metadata);
+                    model.as_deref(),
+                )),
+                model,
+                effort,
+                worktree_path,
+                role,
+                goal,
+                backstory,
+                plan_review_mode,
+                manual_mode,
+                managed,
+                // The save tags each pane as this owner's.
+                machine_id: None,
+                hostname: None,
+            }
+        })
+        .collect();
+    panes.sort_by_key(|p| p.pane_id);
+    // The legacy project-level `is_paused` follows pane 1's pause; the
+    // merge sets it from this owner's pane 1 and leaves it to whichever
+    // machine runs that pane otherwise.
+    if let Err(error) = store.save_panes(&panes) {
+        tracing::warn!(%error, "could not save this machine's panes to .apas");
     }
+}
+
+/// Keep the legacy project-level `is_paused` in step with pane 1's pause, as
+/// the web's legacy deadloop controls always have; a restore ORs it into pane
+/// 1. Only the runtime that runs pane 1 writes it: on any other machine's
+/// instance it would pause, on its next start, a pane this runtime does not
+/// own.
+fn persist_legacy_deadloop_pause(store: &ProjectStore, pane_metas: &PaneMetas, paused: bool) {
+    let runs_deadloop_pane = pane_metas
+        .lock()
+        .is_ok_and(|metas| metas.contains_key(&shared::PANE_ID_DEADLOOP));
+    if !runs_deadloop_pane {
+        tracing::warn!(
+            "not recording a legacy deadloop pause for pane 1, which this runtime does not run"
+        );
+        return;
+    }
+    if let Err(error) = store.update_settings(|metadata| metadata.is_paused = paused) {
+        tracing::warn!(%error, "could not record the legacy deadloop pause in .apas");
+    }
+}
+
+/// Every pane id a tab created here must avoid: this runtime's panes, and
+/// every pane `.apas` records for any machine (see [`local_pane_id`]).
+fn local_pane_ids_in_use(store: &ProjectStore, pane_metas: &PaneMetas) -> HashSet<u32> {
+    let mut in_use: HashSet<u32> = store.read().panes.iter().map(|pane| pane.pane_id).collect();
+    if let Ok(metas) = pane_metas.lock() {
+        in_use.extend(metas.keys().copied());
+    }
+    in_use
+}
+
+/// An id for a tab this runtime creates itself, the local "+", rather than
+/// one the server allocated. Drawn from the range the server allocates from,
+/// 3..=1002, never one in `in_use`. `None` when every id there is taken.
+///
+/// `in_use` must hold every pane `.apas` records for any machine, not only
+/// this runtime's: instances on a shared home save into one file, and the
+/// server tells panes apart only by id, so reusing another machine's id would
+/// give the project two tabs it cannot tell apart.
+fn local_pane_id(in_use: &HashSet<u32>) -> Option<u32> {
+    let start = (Uuid::new_v4().as_u128() % 1000) as u32;
+    (0..1000u32)
+        .map(|offset| 3 + (start + offset) % 1000)
+        .find(|pane_id| !in_use.contains(pane_id))
 }
 
 /// Handle TUI events (AddTab, CloseTab) in a background thread
@@ -4354,6 +4650,7 @@ fn handle_tui_events(
     default_prompt: &str,
     file_watcher: Arc<crate::file_watcher::ProjectFileWatcher>,
     project_policy: ProjectPolicyState,
+    store: ProjectStore,
 ) {
     let mut pending_omp_reboots = HashMap::new();
     while !shutdown.load(Ordering::SeqCst) {
@@ -4452,17 +4749,16 @@ fn handle_tui_events(
                 // pty registration, announcements, and persistence stay in
                 // one implementation. The id skips in-use panes the same way
                 // the server does, so a fast double-tap cannot clobber a live
-                // pane's entry in pane_metas.
-                let pane_id = {
-                    let metas = pane_metas.lock().unwrap();
-                    let mut pane_id = 3 + (Uuid::new_v4().as_u128() % 1000) as u32;
-                    for _ in 0..100 {
-                        if !metas.contains_key(&pane_id) {
-                            break;
-                        }
-                        pane_id = 3 + (Uuid::new_v4().as_u128() % 1000) as u32;
-                    }
-                    pane_id
+                // pane's entry in pane_metas, and skips every pane `.apas`
+                // records for another machine too.
+                let Some(pane_id) = local_pane_id(&local_pane_ids_in_use(&store, &pane_metas))
+                else {
+                    tracing::warn!("local tab refused: every pane id is in use");
+                    let _ = output_tx.send(PaneOutput {
+                        text: "[New tab refused — this project has no free pane id]".to_string(),
+                        pane_id: shared::PANE_ID_DEADLOOP,
+                    });
+                    continue;
                 };
                 let _ = event_tx.send(TuiEvent::AddTabWithConfig {
                     pane_id,
@@ -4641,8 +4937,7 @@ fn handle_tui_events(
                     // the list is correct; it was simply never sent.
                     announce_and_persist_panes(
                         &server_tx,
-                        session_id,
-                        working_dir,
+                        &store,
                         &pane_metas,
                         &input_channels,
                         &pane_sessions,
@@ -4851,8 +5146,7 @@ fn handle_tui_events(
 
                 announce_and_persist_panes(
                     &server_tx,
-                    session_id,
-                    working_dir,
+                    &store,
                     &pane_metas,
                     &input_channels,
                     &pane_sessions,
@@ -4940,8 +5234,7 @@ fn handle_tui_events(
 
                 announce_and_persist_panes(
                     &server_tx,
-                    session_id,
-                    working_dir,
+                    &store,
                     &pane_metas,
                     &input_channels,
                     &pane_sessions,
@@ -5226,6 +5519,7 @@ fn handle_tui_events(
                 let _ = server_tx.blocking_send(CliToServer::PaneList {
                     session_id,
                     panes: build_pane_list(
+                        &store.owner,
                         &pane_metas,
                         &input_channels,
                         session_id,
@@ -5236,7 +5530,7 @@ fn handle_tui_events(
                 });
 
                 save_pane_configs(
-                    working_dir,
+                    &store,
                     &pane_sessions,
                     &pane_metas,
                     &pane_pauses,
@@ -5370,6 +5664,7 @@ fn handle_tui_events(
                     let _ = server_tx.blocking_send(CliToServer::PaneList {
                         session_id,
                         panes: build_pane_list(
+                            &store.owner,
                             &pane_metas,
                             &input_channels,
                             session_id,
@@ -5382,7 +5677,7 @@ fn handle_tui_events(
                     // Persist stop_requested immediately so a crash/restart before
                     // FinalizeStopBot does not resurrect bot mode.
                     save_pane_configs(
-                        working_dir,
+                        &store,
                         &pane_sessions,
                         &pane_metas,
                         &pane_pauses,
@@ -5699,6 +5994,7 @@ fn handle_tui_events(
                 let _ = server_tx.blocking_send(CliToServer::PaneList {
                     session_id,
                     panes: build_pane_list(
+                        &store.owner,
                         &pane_metas,
                         &input_channels,
                         session_id,
@@ -5709,7 +6005,7 @@ fn handle_tui_events(
                 });
 
                 save_pane_configs(
-                    working_dir,
+                    &store,
                     &pane_sessions,
                     &pane_metas,
                     &pane_pauses,
@@ -5722,8 +6018,17 @@ fn handle_tui_events(
     }
 }
 
-/// Build a PaneConfig list from pane metadata and input channels
+/// Build a PaneConfig list from pane metadata and input channels: the panes
+/// this runtime reports to the server, in `SessionStart.panes` and
+/// `PaneList`, which are exactly the ones it runs, tagged by `owner`.
+///
+/// An instance tags every pane with its machine and host and never reports
+/// another machine's, so its report replaces only its own panes in the
+/// project's roster; an empty list means it has none. A runtime without the
+/// capability reports its panes untagged, as a CLI from before instances
+/// does, and the server keeps them adoptable.
 fn build_pane_list(
+    owner: &PaneOwner,
     pane_metas: &PaneMetas,
     input_channels: &InputChannels,
     session_id: Uuid,
@@ -5808,6 +6113,9 @@ fn build_pane_list(
         }
     }
 
+    for pane in &mut panes {
+        owner.tag(pane);
+    }
     panes.sort_by_key(|p| p.pane_id);
     panes
 }
@@ -6472,11 +6780,12 @@ mod tests {
         stop_retired_panes, terminal_state_reports, truncate_str_at_char_boundary,
         update_project_operations, DeadloopWatchdogDecision, DeadloopWatchdogState, InputChannels,
         PaneInputRouteResult, PaneMeta, PaneMetas, PanePauses, PaneStopRequests,
-        PendingAskQuestion, ASK_USER_QUESTION_AUTO_CANCEL_STATUS, CODEX_SQLITE_HOME_ENV,
-        DEEPSEEK_DEFAULT_MODEL,
+        PendingAskQuestion, ProjectStore, ASK_USER_QUESTION_AUTO_CANCEL_STATUS,
+        CODEX_SQLITE_HOME_ENV, DEEPSEEK_DEFAULT_MODEL,
     };
     use crate::conversation::{TurnAnswer, TurnQuestion, TurnRecord};
-    use crate::project::{get_or_create_project, save_project};
+    use crate::project::{get_or_create_project, save_project, ProjectMetadata};
+    use crate::project_instances::{read_project_metadata, PaneOwner};
     use crate::terminal_pane::TerminalPanes;
     use crate::tui::{PaneOutput, TuiEvent};
     use base64::Engine as _;
@@ -6947,6 +7256,33 @@ mod tests {
             manual_mode: true,
             managed,
         }
+    }
+
+    /// A capable instance on a made-up machine.
+    fn instance_owner(host: &str) -> PaneOwner {
+        PaneOwner::Instance {
+            machine_id: Uuid::new_v4(),
+            hostname: Some(host.to_string()),
+        }
+    }
+
+    /// The store a runtime has for a project in `dir` with no `.apas` yet; the
+    /// first save creates the file with this project's id.
+    fn new_project_store(dir: &Path, owner: PaneOwner) -> ProjectStore {
+        ProjectStore::new(
+            dir,
+            owner,
+            ProjectMetadata::with_id_and_name(Uuid::new_v4(), Some("demo".to_string())),
+        )
+    }
+
+    /// The store a runtime has for the project already in `dir`.
+    fn existing_project_store(dir: &Path, owner: PaneOwner) -> ProjectStore {
+        ProjectStore::new(
+            dir,
+            owner,
+            read_project_metadata(dir).expect("project metadata"),
+        )
     }
 
     #[test]
@@ -8355,12 +8691,11 @@ mod tests {
 
     #[test]
     fn save_pane_configs_persists_pause_flags_and_legacy_deadloop_pause() {
-        // `save_project` registers into `config_dir()/projects.json`; without
-        // this the write lands in whatever config dir another test's env vars
-        // currently point at.
+        // The project lock lives in `config_dir()/locks`; without this the
+        // lock lands in whatever config dir another test points at.
         let _config = crate::config::test_config::isolated_config_dir();
         let dir = tempfile::tempdir().expect("temp project dir");
-        let working_dir = dir.path().to_string_lossy().to_string();
+        let store = new_project_store(dir.path(), instance_owner("zoo-005"));
         let pane_metas: PaneMetas = Arc::new(Mutex::new(HashMap::new()));
         let pane_sessions = Arc::new(Mutex::new(HashMap::new()));
         let pane_pauses: PanePauses = Arc::new(Mutex::new(HashMap::new()));
@@ -8389,14 +8724,14 @@ mod tests {
         }
 
         save_pane_configs(
-            &working_dir,
+            &store,
             &pane_sessions,
             &pane_metas,
             &pane_pauses,
             &pane_stop_requests,
         );
 
-        let metadata = get_or_create_project(dir.path()).expect("metadata should reload");
+        let metadata = read_project_metadata(dir.path()).expect("metadata should reload");
         assert!(metadata.is_paused);
         assert!(
             metadata
@@ -8427,14 +8762,14 @@ mod tests {
                 .store(false, Ordering::SeqCst);
         }
         save_pane_configs(
-            &working_dir,
+            &store,
             &pane_sessions,
             &pane_metas,
             &pane_pauses,
             &pane_stop_requests,
         );
 
-        let metadata = get_or_create_project(dir.path()).expect("metadata should reload");
+        let metadata = read_project_metadata(dir.path()).expect("metadata should reload");
         assert!(!metadata.is_paused);
         assert!(metadata.panes.iter().all(|pane| !pane.is_paused));
     }
@@ -8443,8 +8778,9 @@ mod tests {
     fn verified_codex_identity_is_compared_persisted_and_announced() {
         let _config = crate::config::test_config::isolated_config_dir();
         let dir = tempfile::tempdir().expect("temp project dir");
-        let working_dir = dir.path().to_string_lossy().to_string();
         let project_id = get_or_create_project(dir.path()).unwrap().id;
+        let owner = instance_owner("zoo-005");
+        let store = existing_project_store(dir.path(), owner.clone());
         let pane_id = 42;
         let provisional = Uuid::parse_str("11111111-2222-4333-8444-555555555555").unwrap();
         let verified = Uuid::parse_str("aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee").unwrap();
@@ -8473,8 +8809,7 @@ mod tests {
         let (server_tx, mut server_rx) = tokio_mpsc::channel(1);
         announce_and_persist_panes(
             &server_tx,
-            project_id,
-            &working_dir,
+            &store,
             &pane_metas,
             &input_channels,
             &pane_sessions,
@@ -8487,12 +8822,18 @@ mod tests {
                 assert_eq!(session_id, project_id);
                 assert_eq!(panes.len(), 1);
                 assert_eq!(panes[0].session_id, verified);
+                assert_eq!(
+                    panes[0].machine_id,
+                    owner.machine_id(),
+                    "announced as this machine's"
+                );
             }
             other => panic!("expected pane list, got {other:?}"),
         }
-        let saved = get_or_create_project(dir.path()).expect("saved pane roster");
+        let saved = read_project_metadata(dir.path()).expect("saved pane roster");
         assert_eq!(saved.panes.len(), 1);
         assert_eq!(saved.panes[0].session_id, verified);
+        assert_eq!(saved.panes[0].machine_id, owner.machine_id());
     }
 
     #[test]
@@ -8530,9 +8871,9 @@ mod tests {
         let original_pane = metadata.panes[0].clone();
         save_project(dir.path(), &metadata).expect("seed metadata");
 
-        let session_id = Uuid::new_v4();
-        let echo = update_project_operations(dir.path(), session_id, true, false)
-            .expect("flags should persist");
+        let store = existing_project_store(dir.path(), instance_owner("zoo-005"));
+        let session_id = metadata.id;
+        let echo = update_project_operations(&store, true, false).expect("flags should persist");
 
         match echo {
             CliToServer::ProjectFlagsChanged {
@@ -8551,7 +8892,7 @@ mod tests {
             other => panic!("unexpected echo message: {other:?}"),
         }
 
-        let reloaded = get_or_create_project(dir.path()).expect("metadata should reload");
+        let reloaded = read_project_metadata(dir.path()).expect("metadata should reload");
         assert!(reloaded.auto_approve_todos);
         assert!(!reloaded.auto_merge_prs);
         assert!(reloaded.team_enabled);
@@ -9616,7 +9957,7 @@ mod tests {
         // restored pane comes back as a terminal rather than an agent.
         let _config = crate::config::test_config::isolated_config_dir();
         let dir = tempfile::tempdir().expect("temp project dir");
-        let working_dir = dir.path().to_string_lossy().to_string();
+        let store = new_project_store(dir.path(), PaneOwner::Sole);
         let pane_metas: PaneMetas = Arc::new(Mutex::new(HashMap::new()));
         let pane_sessions = Arc::new(Mutex::new(HashMap::new()));
         let pane_pauses: PanePauses = Arc::new(Mutex::new(HashMap::new()));
@@ -9642,14 +9983,14 @@ mod tests {
         }
 
         save_pane_configs(
-            &working_dir,
+            &store,
             &pane_sessions,
             &pane_metas,
             &pane_pauses,
             &pane_stop_requests,
         );
 
-        let metadata = get_or_create_project(dir.path()).expect("metadata should reload");
+        let metadata = read_project_metadata(dir.path()).expect("metadata should reload");
         let terminal = metadata
             .panes
             .iter()
@@ -10301,9 +10642,10 @@ mod tests {
         meta.disallowed_tab_types = vec!["terminal:codex".to_string()];
         save_project(dir.path(), &meta).expect("legacy policy");
 
-        let echo = update_project_operations(dir.path(), Uuid::new_v4(), true, true)
-            .expect("update workflow operations");
-        let after = get_or_create_project(dir.path()).expect("reload project");
+        let store = existing_project_store(dir.path(), PaneOwner::Sole);
+        let echo =
+            update_project_operations(&store, true, true).expect("update workflow operations");
+        let after = read_project_metadata(dir.path()).expect("reload project");
         assert!(after.team_enabled);
         assert_eq!(after.disallowed_tab_types, vec!["terminal:codex"]);
         assert!(matches!(
@@ -10503,6 +10845,553 @@ mod tests {
             child.try_wait().is_ok(),
             "child must be reaped, not left a zombie"
         );
+    }
+
+    // --- instances of one project on several machines ----------------------
+
+    /// A `.apas` in `dir` holding `metadata`, written the way any CLI writes it.
+    fn write_metadata(dir: &Path, metadata: &ProjectMetadata) {
+        std::fs::write(
+            crate::project::get_apas_path(dir),
+            serde_json::to_string_pretty(metadata).unwrap(),
+        )
+        .unwrap();
+    }
+
+    /// A `.apas` in `dir` holding `panes`.
+    fn write_project(dir: &Path, panes: Vec<shared::PaneConfig>) -> ProjectMetadata {
+        let mut metadata =
+            ProjectMetadata::with_id_and_name(Uuid::new_v4(), Some("demo".to_string()));
+        metadata.panes = panes;
+        write_metadata(dir, &metadata);
+        metadata
+    }
+
+    /// A pane as `.apas` records it, tagged for `machine` when given.
+    fn recorded_pane(
+        pane_id: u32,
+        kind: shared::PaneKind,
+        machine: Option<(Uuid, &str)>,
+    ) -> shared::PaneConfig {
+        shared::PaneConfig {
+            pane_id,
+            provider: Provider::Claude,
+            mode: shared::PaneMode::Interactive,
+            kind,
+            session_id: Uuid::new_v4(),
+            is_paused: false,
+            stop_requested: false,
+            prompt: None,
+            min_iteration_interval_minutes: None,
+            label: Some(format!("Tab {pane_id}")),
+            model: None,
+            effort: None,
+            worktree_path: None,
+            role: None,
+            goal: None,
+            backstory: None,
+            plan_review_mode: shared::PlanReviewMode::default(),
+            manual_mode: false,
+            managed: false,
+            machine_id: machine.map(|(machine_id, _)| machine_id),
+            hostname: machine.map(|(_, host)| host.to_string()),
+        }
+    }
+
+    fn machine(machine_id: Uuid, host: &str) -> PaneOwner {
+        PaneOwner::Instance {
+            machine_id,
+            hostname: Some(host.to_string()),
+        }
+    }
+
+    fn ids_of(panes: &[shared::PaneConfig]) -> Vec<u32> {
+        panes.iter().map(|pane| pane.pane_id).collect()
+    }
+
+    fn on_disk(dir: &Path) -> ProjectMetadata {
+        read_project_metadata(dir).expect("project metadata")
+    }
+
+    #[test]
+    fn a_starting_instance_restores_only_its_own_panes_after_adopting_untagged_ones() {
+        // Opening registers the project, so the registry and the home it
+        // migrates from are isolated too.
+        crate::project::test_support::with_isolated_config(|| {
+            use shared::PaneKind::{Agent, Terminal};
+            let (zoo5, zoo6) = (Uuid::new_v4(), Uuid::new_v4());
+            let dir = tempfile::tempdir().unwrap();
+            write_project(
+                dir.path(),
+                vec![
+                    recorded_pane(3, Terminal, Some((zoo5, "zoo-005"))),
+                    recorded_pane(4, Terminal, Some((zoo6, "zoo-006"))),
+                    recorded_pane(5, Terminal, None),
+                    recorded_pane(6, Agent, Some((zoo5, "zoo-005"))),
+                ],
+            );
+
+            let start = super::open_runtime(dir.path(), &machine(zoo5, "zoo-005")).unwrap();
+
+            // No other machine runs the project, so zoo-005 adopts the untagged
+            // pane. zoo-006's pane is never restored here, though nothing runs
+            // it: its process, terminal and history are on zoo-006.
+            let restored: Vec<u32> = start.tabs.iter().map(|(pane_id, ..)| *pane_id).collect();
+            assert_eq!(restored, vec![3, 5, 6]);
+            assert_eq!(start.terminal_panes, HashSet::from([3, 5]));
+            assert_eq!(
+                start.metadata.panes.len(),
+                4,
+                "the file keeps every machine's panes"
+            );
+            let disk = on_disk(dir.path());
+            assert_eq!(
+                disk.get_pane(5).unwrap().machine_id,
+                Some(zoo5),
+                "adopted on disk"
+            );
+            assert_eq!(disk.get_pane(4).unwrap().machine_id, Some(zoo6));
+        });
+    }
+
+    #[test]
+    fn a_second_machine_leaves_untagged_panes_to_the_one_running_them() {
+        crate::project::test_support::with_isolated_config(|| {
+            let (zoo5, zoo6) = (Uuid::new_v4(), Uuid::new_v4());
+            let dir = tempfile::tempdir().unwrap();
+            let metadata = write_project(
+                dir.path(),
+                vec![
+                    recorded_pane(3, shared::PaneKind::Terminal, None),
+                    recorded_pane(4, shared::PaneKind::Terminal, None),
+                ],
+            );
+            // zoo-005's daemon claimed the project before running it.
+            crate::daemon_registry::claim_project(
+                &crate::config::Config::config_dir().unwrap(),
+                &metadata.id.to_string(),
+                &dir.path().display().to_string(),
+                zoo5,
+                crate::daemon_registry::ClaimMode::Instances,
+            )
+            .unwrap();
+
+            let start = super::open_runtime(dir.path(), &machine(zoo6, "zoo-006")).unwrap();
+
+            assert!(start.tabs.is_empty(), "zoo-006 starts with no panes");
+            assert!(start.terminal_panes.is_empty());
+            assert!(on_disk(dir.path())
+                .panes
+                .iter()
+                .all(|pane| pane.machine_id.is_none()));
+        });
+    }
+
+    #[test]
+    fn a_runtime_without_instances_restores_every_pane_as_before() {
+        crate::project::test_support::with_isolated_config(|| {
+            let zoo6 = Uuid::new_v4();
+            let dir = tempfile::tempdir().unwrap();
+            write_project(
+                dir.path(),
+                vec![
+                    recorded_pane(3, shared::PaneKind::Terminal, None),
+                    recorded_pane(4, shared::PaneKind::Terminal, Some((zoo6, "zoo-006"))),
+                ],
+            );
+
+            let start = super::open_runtime(dir.path(), &PaneOwner::Sole).unwrap();
+
+            let restored: Vec<u32> = start.tabs.iter().map(|(pane_id, ..)| *pane_id).collect();
+            assert_eq!(restored, vec![3, 4]);
+            assert_eq!(start.terminal_panes, HashSet::from([3, 4]));
+        });
+    }
+
+    #[test]
+    fn a_runtime_reports_its_own_panes_tagged_and_an_empty_roster_as_empty() {
+        let pane_metas: PaneMetas = Arc::new(Mutex::new(HashMap::new()));
+        let pane_sessions = Arc::new(Mutex::new(HashMap::new()));
+        let input_channels: InputChannels = Arc::new(Mutex::new(HashMap::new()));
+        let pane_pauses: PanePauses = Arc::new(Mutex::new(HashMap::new()));
+        let pane_stop_requests: PaneStopRequests = Arc::new(Mutex::new(HashMap::new()));
+        let session_id = Uuid::new_v4();
+        let report = |owner: &PaneOwner| {
+            build_pane_list(
+                owner,
+                &pane_metas,
+                &input_channels,
+                session_id,
+                &pane_sessions,
+                &pane_pauses,
+                &pane_stop_requests,
+            )
+        };
+        let instance = super::InstanceIdentity {
+            machine_id: Uuid::new_v4(),
+            hostname: Some("zoo-006".to_string()),
+            capable: true,
+        };
+
+        // An instance with no panes says so, rather than saying nothing.
+        match super::session_start_message(
+            session_id,
+            &instance,
+            "/work",
+            None,
+            None,
+            report(&instance.owner()),
+        ) {
+            CliToServer::SessionStart {
+                machine_id,
+                hostname,
+                panes,
+                ..
+            } => {
+                assert_eq!(machine_id, Some(instance.machine_id));
+                assert_eq!(hostname.as_deref(), Some("zoo-006"));
+                assert_eq!(panes.map(|panes| panes.len()), Some(0));
+            }
+            other => panic!("expected a session start, got {other:?}"),
+        }
+
+        for pane_id in [9, 7] {
+            pane_metas.lock().unwrap().insert(
+                pane_id,
+                test_pane_meta(Provider::Codex, false, None, Arc::new(Mutex::new(None))),
+            );
+            pane_sessions
+                .lock()
+                .unwrap()
+                .insert(pane_id, Uuid::new_v4());
+        }
+        let tagged = report(&instance.owner());
+        assert_eq!(ids_of(&tagged), vec![7, 9]);
+        assert!(tagged
+            .iter()
+            .all(|pane| pane.machine_id == Some(instance.machine_id)
+                && pane.hostname.as_deref() == Some("zoo-006")));
+
+        // Without the capability the roster goes up untagged, as from a CLI
+        // that predates instances.
+        let untagged = report(&PaneOwner::Sole);
+        assert_eq!(ids_of(&untagged), vec![7, 9]);
+        assert!(untagged
+            .iter()
+            .all(|pane| pane.machine_id.is_none() && pane.hostname.is_none()));
+    }
+
+    #[test]
+    fn only_a_capable_instance_advertises_project_instances() {
+        let instances = shared::PROJECT_INSTANCES_CAPABILITY.to_string();
+        let capable =
+            super::InstanceIdentity::new(Uuid::new_v4(), &crate::config::DaemonConfig::default());
+        assert!(super::cli_capabilities(&capable, false, false).contains(&instances));
+
+        // A machine id set in the shared config.toml would make every host on
+        // the home report the same machine.
+        let pinned = crate::config::DaemonConfig {
+            machine_id: Some(Uuid::new_v4().to_string()),
+            ..crate::config::DaemonConfig::default()
+        };
+        let incapable = super::InstanceIdentity::new(pinned.resolved_machine_id(), &pinned);
+        let capabilities = super::cli_capabilities(&incapable, true, true);
+        assert!(!capabilities.contains(&instances));
+        assert!(capabilities.contains(&shared::PANE_WORK_SUMMARY_CAPABILITY.to_string()));
+        assert!(capabilities.contains(&shared::PERSISTENT_TERMINAL_HOST_CAPABILITY.to_string()));
+    }
+
+    #[test]
+    fn forgetting_a_machine_removes_only_the_entries_tagged_with_it() {
+        let _config = crate::config::test_config::isolated_config_dir();
+        use shared::PaneKind::Terminal;
+        let (zoo5, zoo6, laptop) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        let dir = tempfile::tempdir().unwrap();
+        write_project(
+            dir.path(),
+            vec![
+                recorded_pane(3, Terminal, Some((zoo5, "zoo-005"))),
+                recorded_pane(4, Terminal, Some((zoo6, "zoo-006"))),
+                recorded_pane(5, Terminal, Some((zoo6, "zoo-006"))),
+                // The CLI keys on the tag: an untagged pane last run on
+                // zoo-006 stays, and comes back if an instance adopts it.
+                recorded_pane(6, Terminal, None),
+                recorded_pane(7, Terminal, Some((laptop, "laptop"))),
+            ],
+        );
+        let instance = super::InstanceIdentity {
+            machine_id: zoo5,
+            hostname: Some("zoo-005".to_string()),
+            capable: true,
+        };
+        let store = existing_project_store(dir.path(), instance.owner());
+
+        assert_eq!(
+            super::forget_machine_panes_here(&store, &instance, zoo6),
+            vec![4, 5]
+        );
+        assert_eq!(ids_of(&on_disk(dir.path()).panes), vec![3, 6, 7]);
+        assert_eq!(
+            ids_of(&store.cached().metadata.panes),
+            vec![3, 6, 7],
+            "what this runtime reads next no longer lists them"
+        );
+
+        // This machine runs the project; its panes are its own to keep.
+        assert!(super::forget_machine_panes_here(&store, &instance, zoo5).is_empty());
+        assert_eq!(ids_of(&on_disk(dir.path()).panes), vec![3, 6, 7]);
+
+        // A runtime without the capability owns every pane in the file, so it
+        // leaves even another machine's entries where they are.
+        let sole = super::InstanceIdentity {
+            machine_id: zoo6,
+            hostname: Some("zoo-006".to_string()),
+            capable: false,
+        };
+        let sole_store = existing_project_store(dir.path(), sole.owner());
+        assert!(super::forget_machine_panes_here(&sole_store, &sole, laptop).is_empty());
+        assert_eq!(ids_of(&on_disk(dir.path()).panes), vec![3, 6, 7]);
+    }
+
+    #[test]
+    fn the_periodic_read_keeps_the_last_good_copy_and_never_rewrites_the_file() {
+        let _config = crate::config::test_config::isolated_config_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let path = crate::project::get_apas_path(dir.path());
+        let mut metadata = ProjectMetadata::with_id_and_name(Uuid::new_v4(), None);
+        metadata.auto_approve_todos = true;
+        metadata.disallowed_tab_types = vec!["terminal:codex".to_string()];
+        write_metadata(dir.path(), &metadata);
+        let store = existing_project_store(dir.path(), instance_owner("zoo-005"));
+        let flags = |store: &ProjectStore| match super::project_flags_message(store) {
+            CliToServer::ProjectFlagsChanged {
+                session_id,
+                auto_approve_todos,
+                auto_merge_prs,
+                disallowed_tab_types,
+                ..
+            } => (
+                session_id,
+                auto_approve_todos,
+                auto_merge_prs,
+                disallowed_tab_types,
+            ),
+            other => panic!("expected project flags, got {other:?}"),
+        };
+        let codex_denied = vec!["terminal:codex".to_string()];
+
+        // A file that stops parsing is reported and left exactly as it is:
+        // regenerating it would erase every machine's panes on a shared home.
+        let corrupt = b"{\"id\": \"not finished".to_vec();
+        std::fs::write(&path, &corrupt).unwrap();
+        for _ in 0..3 {
+            assert_eq!(
+                flags(&store),
+                (metadata.id, true, false, codex_denied.clone())
+            );
+        }
+        match super::project_policy_snapshot(&store) {
+            CliToServer::ProjectPolicySnapshot {
+                session_id,
+                disallowed_tab_types,
+                ..
+            } => {
+                assert_eq!(session_id, metadata.id);
+                assert_eq!(disallowed_tab_types, codex_denied);
+            }
+            other => panic!("expected a policy snapshot, got {other:?}"),
+        }
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            corrupt,
+            "not deleted or regenerated"
+        );
+
+        // Gone for a moment: still the last good copy, and nothing recreated.
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(
+            flags(&store),
+            (metadata.id, true, false, codex_denied.clone())
+        );
+        assert!(!path.exists());
+
+        // Readable again: the file as it now is.
+        metadata.auto_approve_todos = false;
+        write_metadata(dir.path(), &metadata);
+        assert_eq!(
+            flags(&store),
+            (metadata.id, false, false, codex_denied.clone())
+        );
+
+        // Another project's file is not this project's settings.
+        let mut other = ProjectMetadata::with_id_and_name(Uuid::new_v4(), None);
+        other.auto_merge_prs = true;
+        write_metadata(dir.path(), &other);
+        assert_eq!(flags(&store), (metadata.id, false, false, codex_denied));
+    }
+
+    #[test]
+    fn a_claude_pane_never_follows_a_transcript_written_by_another_machines_pane() {
+        let _config = crate::config::test_config::isolated_config_dir();
+        use shared::PaneKind::Terminal;
+        let (zoo5, zoo6) = (Uuid::new_v4(), Uuid::new_v4());
+        let project = tempfile::tempdir().unwrap();
+        let own = recorded_pane(3, Terminal, Some((zoo5, "zoo-005")));
+        let elsewhere = recorded_pane(4, Terminal, Some((zoo6, "zoo-006")));
+        let untagged = recorded_pane(5, Terminal, None);
+        write_project(
+            project.path(),
+            vec![own.clone(), elsewhere.clone(), untagged.clone()],
+        );
+        let store = existing_project_store(project.path(), machine(zoo5, "zoo-005"));
+
+        // The transcript store both machines share through the home, all in
+        // one working directory's slug.
+        let transcripts = tempfile::tempdir().unwrap();
+        let written_at = |name: String, seconds: u64| {
+            let path = transcripts.path().join(name);
+            std::fs::write(&path, "{}").unwrap();
+            std::fs::File::options()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_modified(std::time::UNIX_EPOCH + Duration::from_secs(seconds))
+                .unwrap();
+            path
+        };
+        let watched = written_at(format!("{}.jsonl", own.session_id), 1_000);
+        let floor = std::fs::metadata(&watched).unwrap().modified().unwrap();
+        let stranger = written_at("stranger.jsonl".to_string(), 2_000);
+        let from_zoo6 = written_at(format!("{}.jsonl", elsewhere.session_id), 3_000);
+
+        // This runtime runs only pane 3. Excluding only its own panes, as the
+        // search did, follows zoo-006's newer conversation into this pane.
+        let own_only = super::claude_switch_exclusions(own.session_id, [own.session_id], &[]);
+        assert_eq!(
+            crate::transcript::find_claude_switch_candidate(&watched, floor, &own_only),
+            Some(from_zoo6),
+        );
+
+        // Every pane `.apas` records is excluded, whichever machine runs it or
+        // whether any does, so only a conversation no pane owns is followed.
+        written_at(format!("{}.jsonl", untagged.session_id), 3_500);
+        let excluded =
+            super::claude_switch_exclusions(own.session_id, [own.session_id], &store.read().panes);
+        assert_eq!(
+            crate::transcript::find_claude_switch_candidate(&watched, floor, &excluded),
+            Some(stranger.clone()),
+        );
+
+        // The pane's own conversation stays a candidate: after following a
+        // switch away, switching back to it is followed too.
+        written_at(format!("{}.jsonl", own.session_id), 4_000);
+        let away_floor = std::fs::metadata(&stranger).unwrap().modified().unwrap();
+        assert_eq!(
+            crate::transcript::find_claude_switch_candidate(&stranger, away_floor, &excluded),
+            Some(watched),
+        );
+    }
+
+    #[test]
+    fn a_local_tab_id_avoids_every_pane_any_machine_recorded() {
+        let _config = crate::config::test_config::isolated_config_dir();
+        let zoo6 = Uuid::new_v4();
+        let dir = tempfile::tempdir().unwrap();
+        // zoo-006 has saved panes with almost every id into the shared file.
+        write_project(
+            dir.path(),
+            (3..=1000)
+                .map(|pane_id| {
+                    recorded_pane(pane_id, shared::PaneKind::Terminal, Some((zoo6, "zoo-006")))
+                })
+                .collect(),
+        );
+        let store = existing_project_store(dir.path(), instance_owner("zoo-005"));
+        let pane_metas: PaneMetas = Arc::new(Mutex::new(HashMap::from([(
+            1001,
+            test_pane_meta(Provider::Claude, false, None, Arc::new(Mutex::new(None))),
+        )])));
+
+        let mut in_use = super::local_pane_ids_in_use(&store, &pane_metas);
+        assert_eq!(super::local_pane_id(&in_use), Some(1002));
+        in_use.insert(1002);
+        assert_eq!(super::local_pane_id(&in_use), None, "no id is reused");
+    }
+
+    #[test]
+    fn saves_run_from_plain_threads_and_from_either_runtime() {
+        // Saves happen on plain threads (the TUI events, the transcript
+        // watcher, Ctrl+C) and inside the server connection's async loop,
+        // where waiting for the project lock must not stall the runtime.
+        let config = crate::config::test_config::isolated_config_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let store = new_project_store(dir.path(), instance_owner("zoo-005"));
+        let one_pane =
+            |pane_id: u32| vec![recorded_pane(pane_id, shared::PaneKind::Terminal, None)];
+
+        store.save_panes(&one_pane(3)).unwrap();
+        assert_eq!(ids_of(&on_disk(dir.path()).panes), vec![3]);
+
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(async { store.save_panes(&one_pane(4)) })
+            .unwrap();
+        assert_eq!(ids_of(&on_disk(dir.path()).panes), vec![4]);
+
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .build()
+            .unwrap();
+        let worker_store = store.clone();
+        let config_dir = config.path().to_path_buf();
+        runtime
+            .block_on(async move {
+                tokio::spawn(async move {
+                    crate::config::test_config::with_config_dir(&config_dir, || {
+                        worker_store.save_panes(&one_pane(5))
+                    })
+                })
+                .await
+            })
+            .unwrap()
+            .unwrap();
+        let disk = on_disk(dir.path());
+        assert_eq!(ids_of(&disk.panes), vec![5]);
+        assert_eq!(disk.panes[0].hostname.as_deref(), Some("zoo-005"));
+    }
+
+    #[test]
+    fn only_the_runtime_that_runs_pane_one_records_the_legacy_deadloop_pause() {
+        let _config = crate::config::test_config::isolated_config_dir();
+        let (zoo5, zoo6) = (Uuid::new_v4(), Uuid::new_v4());
+        let dir = tempfile::tempdir().unwrap();
+        write_project(
+            dir.path(),
+            vec![recorded_pane(
+                shared::PANE_ID_DEADLOOP,
+                shared::PaneKind::Agent,
+                Some((zoo6, "zoo-006")),
+            )],
+        );
+        let deadloop_pane = || -> PaneMetas {
+            Arc::new(Mutex::new(HashMap::from([(
+                shared::PANE_ID_DEADLOOP,
+                test_pane_meta(Provider::Claude, false, None, Arc::new(Mutex::new(None))),
+            )])))
+        };
+
+        // zoo-005 runs no pane 1; the flag would pause zoo-006's on restart.
+        let elsewhere = existing_project_store(dir.path(), machine(zoo5, "zoo-005"));
+        let no_panes: PaneMetas = Arc::new(Mutex::new(HashMap::new()));
+        super::persist_legacy_deadloop_pause(&elsewhere, &no_panes, true);
+        assert!(!on_disk(dir.path()).is_paused);
+
+        let owner = existing_project_store(dir.path(), machine(zoo6, "zoo-006"));
+        super::persist_legacy_deadloop_pause(&owner, &deadloop_pane(), true);
+        assert!(on_disk(dir.path()).is_paused);
+        super::persist_legacy_deadloop_pause(&owner, &deadloop_pane(), false);
+        assert!(!on_disk(dir.path()).is_paused);
     }
 }
 
@@ -11246,16 +12135,20 @@ fn run_deadloop_session_inner(
                         // Persist the fresh id straight into .apas so a
                         // CLI reboot doesn't fall back to the dead one.
                         // We don't have the full pane_metas / pane_pauses
-                        // Arcs in this scope, so go through the project
-                        // module directly: read .apas, mutate the matching
-                        // pane's session_id, write back.
-                        let project_dir = std::path::Path::new(working_dir);
-                        if let Ok(mut metadata) = crate::project::get_or_create_project(project_dir)
-                        {
-                            if let Some(pane) = metadata.get_pane_mut(pane_id) {
-                                pane.session_id = claude_session_id;
-                                let _ = crate::project::save_project(project_dir, &metadata);
-                            }
+                        // Arcs in this scope, so change just this pane's
+                        // session_id under the project lock, leaving every
+                        // other pane and field as the file has them.
+                        if let Err(error) = crate::project_instances::update_pane(
+                            std::path::Path::new(working_dir),
+                            session_id,
+                            pane_id,
+                            |pane| pane.session_id = claude_session_id,
+                        ) {
+                            tracing::warn!(
+                                pane_id,
+                                %error,
+                                "could not record the fresh Codex session id in .apas"
+                            );
                         }
                         let _ = output_tx.send(PaneOutput {
                             text: format!(
@@ -13636,6 +14529,103 @@ pub enum ProjectOutcome {
 /// else.
 pub type ProjectStopReason = Arc<Mutex<Option<String>>>;
 
+/// What this runtime tells the server it can do when it registers.
+///
+/// `PROJECT_INSTANCES_CAPABILITY` only from a capable instance, which tags
+/// and saves only its own panes. A runtime without it reports its whole roster
+/// untagged and assumes it is the project's only one, so the server must not
+/// attach it beside another machine's instance.
+fn cli_capabilities(
+    instance: &InstanceIdentity,
+    pane_summaries: bool,
+    persistent_terminal_hosts: bool,
+) -> Vec<String> {
+    let mut capabilities = vec![
+        shared::PROJECT_POLICY_CAPABILITY.to_string(),
+        shared::MOBILE_TASK_LAUNCH_CAPABILITY.to_string(),
+        shared::OPENCODE_TERMINAL_CAPABILITY.to_string(),
+        shared::PI_TERMINAL_CAPABILITY.to_string(),
+        shared::OMP_TERMINAL_CAPABILITY.to_string(),
+        shared::OMP_QUESTION_CAPABILITY.to_string(),
+        shared::CLI_LIFECYCLE_CAPABILITY.to_string(),
+    ];
+    if pane_summaries {
+        capabilities.push(shared::PANE_WORK_SUMMARY_CAPABILITY.to_string());
+    }
+    if persistent_terminal_hosts {
+        capabilities.push(shared::PERSISTENT_TERMINAL_HOST_CAPABILITY.to_string());
+    }
+    if instance.capable {
+        capabilities.push(shared::PROJECT_INSTANCES_CAPABILITY.to_string());
+    }
+    capabilities
+}
+
+/// The `SessionStart` that attaches this runtime to the project's session.
+///
+/// `panes` is this runtime's own roster, as [`build_pane_list`] reports it,
+/// and is sent even when empty: `Some([])` tells the server this machine has
+/// no panes, where `None` would leave the roster as it was.
+fn session_start_message(
+    session_id: Uuid,
+    instance: &InstanceIdentity,
+    working_dir: &str,
+    git_remote: Option<String>,
+    git_remote_url: Option<String>,
+    panes: Vec<shared::PaneConfig>,
+) -> CliToServer {
+    CliToServer::SessionStart {
+        session_id,
+        // session_id is `metadata.id` from .apas, which is the project id.
+        project_id: Some(session_id),
+        machine_id: Some(instance.machine_id),
+        working_dir: Some(working_dir.to_string()),
+        hostname: instance.hostname.clone(),
+        git_remote,
+        git_remote_url,
+        pane_type: None,
+        panes: Some(panes),
+    }
+}
+
+/// `ForgetMachinePanes`: drop `machine_id`'s panes from `.apas`, so no
+/// instance sharing the file restores them, and refresh the copy this
+/// runtime reads. Returns the pane ids removed.
+///
+/// Only an instance acts on it. A runtime without the capability owns every
+/// pane in the file, including any a machine had tagged before it restored
+/// them, and saves them back untagged; removing the tagged entries would only
+/// drop panes it runs until its next save. A forget naming this machine is
+/// ignored too: the server refuses one for a machine that runs the project,
+/// and this machine's panes are its own to keep. This runtime's own panes
+/// never change, so there is nothing to report back.
+fn forget_machine_panes_here(
+    store: &ProjectStore,
+    instance: &InstanceIdentity,
+    machine_id: Uuid,
+) -> Vec<u32> {
+    if !instance.capable {
+        tracing::info!(%machine_id, "ignoring a forget: this runtime owns every pane in .apas");
+        return Vec::new();
+    }
+    if machine_id == instance.machine_id {
+        tracing::warn!(%machine_id, "ignoring a forget for this machine, which runs the project");
+        return Vec::new();
+    }
+    match store.forget_machine(machine_id) {
+        Ok(forgotten) => {
+            tracing::info!(%machine_id, ?forgotten, "forgot another machine's panes in .apas");
+            // The copy this runtime reads still lists them.
+            store.read();
+            forgotten
+        }
+        Err(error) => {
+            tracing::warn!(%machine_id, %error, "could not forget another machine's panes in .apas");
+            Vec::new()
+        }
+    }
+}
+
 /// Run server connection, reconnecting automatically with bounded backoff.
 async fn run_server_connection(
     server_url: &str,
@@ -13659,7 +14649,8 @@ async fn run_server_connection(
     status_tx: mpsc::Sender<PaneOutput>,
     tui_event_tx: mpsc::Sender<TuiEvent>,
     project_policy: ProjectPolicyState,
-    machine_id: Option<Uuid>,
+    instance: InstanceIdentity,
+    store: ProjectStore,
     server_connection_generation: Arc<AtomicU64>,
     mut reboot_handoff: Option<(std::path::PathBuf, crate::pane_host::RebootHandoffMarker)>,
 ) -> Result<()> {
@@ -13712,21 +14703,11 @@ async fn run_server_connection(
                 let (mut ws_sender, mut ws_receiver) = ws_stream.split();
 
                 // Register
-                let mut capabilities = vec![
-                    shared::PROJECT_POLICY_CAPABILITY.to_string(),
-                    shared::MOBILE_TASK_LAUNCH_CAPABILITY.to_string(),
-                    shared::OPENCODE_TERMINAL_CAPABILITY.to_string(),
-                    shared::PI_TERMINAL_CAPABILITY.to_string(),
-                    shared::OMP_TERMINAL_CAPABILITY.to_string(),
-                    shared::OMP_QUESTION_CAPABILITY.to_string(),
-                    shared::CLI_LIFECYCLE_CAPABILITY.to_string(),
-                ];
-                if summary_runner.is_some() {
-                    capabilities.push(shared::PANE_WORK_SUMMARY_CAPABILITY.to_string());
-                }
-                if crate::pane_host::persistent_hosting_available() {
-                    capabilities.push(shared::PERSISTENT_TERMINAL_HOST_CAPABILITY.to_string());
-                }
+                let capabilities = cli_capabilities(
+                    &instance,
+                    summary_runner.is_some(),
+                    crate::pane_host::persistent_hosting_available(),
+                );
                 let register_msg = CliToServer::Register {
                     token: token.to_string(),
                     version: Some(env!("APAS_VERSION").to_string()),
@@ -13829,8 +14810,8 @@ async fn run_server_connection(
                 }
 
                 // Send session start with pane list
-                let hostname = hostname::get().ok().and_then(|h| h.into_string().ok());
                 let pane_list = build_pane_list(
+                    &store.owner,
                     &pane_metas,
                     &input_channels,
                     session_id,
@@ -13839,18 +14820,14 @@ async fn run_server_connection(
                     &pane_stop_requests,
                 );
 
-                let session_start = CliToServer::SessionStart {
+                let session_start = session_start_message(
                     session_id,
-                    // session_id is `metadata.id` from .apas, which is the project id.
-                    project_id: Some(session_id),
-                    machine_id,
-                    working_dir: Some(working_dir.to_string()),
-                    hostname,
-                    git_remote: git_remote.clone(),
-                    git_remote_url: git_remote_url.clone(),
-                    pane_type: None,
-                    panes: Some(pane_list.clone()),
-                };
+                    &instance,
+                    working_dir,
+                    git_remote.clone(),
+                    git_remote_url.clone(),
+                    pane_list.clone(),
+                );
                 let msg_text = match serde_json::to_string(&session_start) {
                     Ok(t) => t,
                     Err(e) => {
@@ -13878,15 +14855,8 @@ async fn run_server_connection(
                 // One-time migration input. The server accepts the first
                 // snapshot only when no authoritative override exists and
                 // returns the effective policy separately.
-                if let Ok(meta) = get_or_create_project(Path::new(working_dir)) {
-                    let snapshot = CliToServer::ProjectPolicySnapshot {
-                        session_id,
-                        team_enabled: meta.team_enabled,
-                        disallowed_tab_types: meta.disallowed_tab_types,
-                    };
-                    if let Ok(text) = serde_json::to_string(&snapshot) {
-                        let _ = ws_sender.send(Message::Text(text.into())).await;
-                    }
+                if let Ok(text) = serde_json::to_string(&project_policy_snapshot(&store)) {
+                    let _ = ws_sender.send(Message::Text(text.into())).await;
                 }
 
                 // Send PaneList separately too
@@ -14021,7 +14991,7 @@ async fn run_server_connection(
                                         "CLI reboot preparation completed"
                                     );
                                     save_pane_configs(
-                                        working_dir,
+                                        &store,
                                         &pane_sessions,
                                         &pane_metas,
                                         &pane_pauses,
@@ -14222,7 +15192,7 @@ async fn run_server_connection(
                                                 );
                                                 if !retired.is_empty() {
                                                     save_pane_configs(
-                                                        working_dir,
+                                                        &store,
                                                         &pane_sessions,
                                                         &pane_metas,
                                                         &pane_pauses,
@@ -14486,10 +15456,7 @@ async fn run_server_connection(
                                                     text: "[Pause command received from web]".to_string(),
                                                     pane_id: shared::PANE_ID_DEADLOOP,
                                                 });
-                                                if let Ok(mut metadata) = get_or_create_project(std::path::Path::new(working_dir)) {
-                                                    metadata.is_paused = true;
-                                                    let _ = save_project(std::path::Path::new(working_dir), &metadata);
-                                                }
+                                                persist_legacy_deadloop_pause(&store, &pane_metas, true);
                                                 let status_msg = CliToServer::DeadloopStatus { session_id, is_paused: true };
                                                 let msg_text = serde_json::to_string(&status_msg).unwrap_or_default();
                                                 let _ = ws_sender.send(Message::Text(msg_text.into())).await;
@@ -14527,10 +15494,7 @@ async fn run_server_connection(
                                                     text: "[Resume command received from web]".to_string(),
                                                     pane_id: shared::PANE_ID_DEADLOOP,
                                                 });
-                                                if let Ok(mut metadata) = get_or_create_project(std::path::Path::new(working_dir)) {
-                                                    metadata.is_paused = false;
-                                                    let _ = save_project(std::path::Path::new(working_dir), &metadata);
-                                                }
+                                                persist_legacy_deadloop_pause(&store, &pane_metas, false);
                                                 let status_msg = CliToServer::DeadloopStatus { session_id, is_paused: false };
                                                 let msg_text = serde_json::to_string(&status_msg).unwrap_or_default();
                                                 let _ = ws_sender.send(Message::Text(msg_text.into())).await;
@@ -14551,7 +15515,7 @@ async fn run_server_connection(
                                                 // Persist so a CLI reboot restores this pane as paused
                                                 // — without this, managed workers would respawn on boot.
                                                 save_pane_configs(
-                                                    working_dir,
+                                                    &store,
                                                     &pane_sessions,
                                                     &pane_metas,
                                                     &pane_pauses,
@@ -14564,12 +15528,7 @@ async fn run_server_connection(
                                                 // keep the legacy `metadata.is_paused` flag in sync since
                                                 // the boot path ORs it with `pane.is_paused` for pane 1.
                                                 if target_pane == shared::PANE_ID_DEADLOOP {
-                                                    if let Ok(mut metadata) = get_or_create_project(std::path::Path::new(working_dir)) {
-                                                        if !metadata.is_paused {
-                                                            metadata.is_paused = true;
-                                                            let _ = save_project(std::path::Path::new(working_dir), &metadata);
-                                                        }
-                                                    }
+                                                    persist_legacy_deadloop_pause(&store, &pane_metas, true);
                                                     let status_msg = CliToServer::DeadloopStatus { session_id, is_paused: true };
                                                     let msg_text = serde_json::to_string(&status_msg).unwrap_or_default();
                                                     let _ = ws_sender.send(Message::Text(msg_text.into())).await;
@@ -14619,7 +15578,7 @@ async fn run_server_connection(
                                                     pane_id: target_pane,
                                                 });
                                                 save_pane_configs(
-                                                    working_dir,
+                                                    &store,
                                                     &pane_sessions,
                                                     &pane_metas,
                                                     &pane_pauses,
@@ -14631,12 +15590,7 @@ async fn run_server_connection(
                                                 // Legacy compat: clear `metadata.is_paused` and emit
                                                 // DeadloopStatus when pane 1 resumes.
                                                 if target_pane == shared::PANE_ID_DEADLOOP {
-                                                    if let Ok(mut metadata) = get_or_create_project(std::path::Path::new(working_dir)) {
-                                                        if metadata.is_paused {
-                                                            metadata.is_paused = false;
-                                                            let _ = save_project(std::path::Path::new(working_dir), &metadata);
-                                                        }
-                                                    }
+                                                    persist_legacy_deadloop_pause(&store, &pane_metas, false);
                                                     let status_msg = CliToServer::DeadloopStatus { session_id, is_paused: false };
                                                     let msg_text = serde_json::to_string(&status_msg).unwrap_or_default();
                                                     let _ = ws_sender.send(Message::Text(msg_text.into())).await;
@@ -14699,6 +15653,22 @@ async fn run_server_connection(
                                                     )
                                                     .await;
                                                     continue;
+                                                }
+                                                // The server routes a new pane to the instance on
+                                                // the machine it names, so another machine here is
+                                                // a routing fault. The pane is still created where
+                                                // it was delivered, and saved and reported as this
+                                                // machine's, which is what the server records.
+                                                if let (Some(named), Some(own)) =
+                                                    (pane_config.machine_id, store.owner.machine_id())
+                                                {
+                                                    if named != own {
+                                                        tracing::warn!(
+                                                            pane_id = pane_config.pane_id,
+                                                            named_machine = %named,
+                                                            "AddPane names another machine; creating the pane on this one"
+                                                        );
+                                                    }
                                                 }
                                                 if pane_metas
                                                     .lock()
@@ -14965,6 +15935,11 @@ async fn run_server_connection(
                                                     }
                                                 });
                                             }
+                                            ServerToCli::ForgetMachinePanes { session_id: forget_session, machine_id } => {
+                                                if forget_session == session_id {
+                                                    forget_machine_panes_here(&store, &instance, machine_id);
+                                                }
+                                            }
                                             ServerToCli::RemovePane { session_id: _, pane_id: remove_id, cleanup_action } => {
                                                 invalidate_omp_reboot_generation(&pane_metas, remove_id);
                                                 // Kill the pty first if this is a terminal pane.
@@ -15054,6 +16029,7 @@ async fn run_server_connection(
                                                 // reconnects and each pane clears it with
                                                 // status:None when its next turn ends.
                                                 let reboot_panes = build_pane_list(
+                                                    &store.owner,
                                                     &pane_metas,
                                                     &input_channels,
                                                     session_id,
@@ -15121,7 +16097,7 @@ async fn run_server_connection(
                                                 tracing::info!(%request_id, "preparing CLI replacement while pane controllers remain attached");
                                             }
                                             ServerToCli::RequestPaneList { .. } => {
-                                                let panes = build_pane_list(&pane_metas, &input_channels, session_id,
+                                                let panes = build_pane_list(&store.owner, &pane_metas, &input_channels, session_id,
                                                     &pane_sessions, &pane_pauses, &pane_stop_requests);
                                                 let msg = serde_json::to_string(&CliToServer::PaneList {
                                                     session_id, panes }).unwrap_or_default();
@@ -15238,7 +16214,7 @@ async fn run_server_connection(
                                                     }
                                                 };
                                                 save_pane_configs(
-                                                    working_dir,
+                                                    &store,
                                                     &pane_sessions,
                                                     &pane_metas,
                                                     &pane_pauses,
@@ -15465,7 +16441,7 @@ async fn run_server_connection(
                                                         }
                                                     }
                                                     save_pane_configs(
-                                                        working_dir,
+                                                        &store,
                                                         &pane_sessions,
                                                         &pane_metas,
                                                         &pane_pauses,
@@ -15476,6 +16452,7 @@ async fn run_server_connection(
                                                     let pane_list_msg = CliToServer::PaneList {
                                                         session_id,
                                                         panes: build_pane_list(
+                                                            &store.owner,
                                                             &pane_metas,
                                                             &input_channels,
                                                             session_id,
@@ -15653,7 +16630,7 @@ async fn run_server_connection(
 
                                                 // Persist to .apas + broadcast the fresh PaneList.
                                                 save_pane_configs(
-                                                    &working_dir,
+                                                    &store,
                                                     &pane_sessions,
                                                     &pane_metas,
                                                     &pane_pauses,
@@ -15662,6 +16639,7 @@ async fn run_server_connection(
                                                 let pane_list_msg = CliToServer::PaneList {
                                                     session_id,
                                                     panes: build_pane_list(
+                                                        &store.owner,
                                                         &pane_metas,
                                                         &input_channels,
                                                         session_id,
@@ -15932,7 +16910,7 @@ async fn run_server_connection(
                                                 };
                                                 if updated {
                                                     save_pane_configs(
-                                                        &working_dir,
+                                                        &store,
                                                         &pane_sessions,
                                                         &pane_metas,
                                                         &pane_pauses,
@@ -15943,6 +16921,7 @@ async fn run_server_connection(
                                                     // (the server already updated its own cache, but
                                                     // this keeps the two sources of truth in sync).
                                                     let panes = build_pane_list(
+                                                        &store.owner,
                                                         &pane_metas,
                                                         &input_channels,
                                                         session_id,
@@ -15989,7 +16968,7 @@ async fn run_server_connection(
                                                 };
                                                 if updated {
                                                     save_pane_configs(
-                                                        &working_dir,
+                                                        &store,
                                                         &pane_sessions,
                                                         &pane_metas,
                                                         &pane_pauses,
@@ -16089,7 +17068,7 @@ async fn run_server_connection(
                                                 };
                                                 if updated {
                                                     save_pane_configs(
-                                                        &working_dir,
+                                                        &store,
                                                         &pane_sessions,
                                                         &pane_metas,
                                                         &pane_pauses,
@@ -16125,7 +17104,7 @@ async fn run_server_connection(
                                                 };
                                                 if updated {
                                                     save_pane_configs(
-                                                        &working_dir,
+                                                        &store,
                                                         &pane_sessions,
                                                         &pane_metas,
                                                         &pane_pauses,
@@ -16137,6 +17116,7 @@ async fn run_server_connection(
                                                     let pane_list_msg = CliToServer::PaneList {
                                                         session_id,
                                                         panes: build_pane_list(
+                                                            &store.owner,
                                                             &pane_metas,
                                                             &input_channels,
                                                             session_id,
@@ -16216,10 +17196,8 @@ async fn run_server_connection(
                                                 auto_approve_todos,
                                                 auto_merge_prs,
                                             } => {
-                                                let project_dir = std::path::Path::new(&working_dir).to_path_buf();
                                                 match update_project_operations(
-                                                    &project_dir,
-                                                    session_id,
+                                                    &store,
                                                     auto_approve_todos,
                                                     auto_merge_prs,
                                                 ) {

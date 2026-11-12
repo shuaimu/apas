@@ -346,10 +346,26 @@ async fn run_connection(
     // If we have a project in the working directory, send SessionStart
     // so the server associates this CLI with the project's session,
     // then start a session handler per pane ready to receive input.
-    if let Ok(project) = crate::project::get_or_create_project(working_dir) {
+    // A `.apas` that does not parse is left alone rather than regenerated.
+    let project = crate::project_instances::open_project_metadata(working_dir);
+    if let Err(error) = &project {
+        tracing::warn!(%error, "not attaching to a project session");
+    }
+    if let Ok(project) = project {
         let hostname = hostname::get().ok().and_then(|v| v.into_string().ok());
         let git_remote = crate::worktree::normalized_git_remote(working_dir);
         let git_remote_url = crate::worktree::raw_git_remote(working_dir);
+        // This mode does not advertise project instances, so like any CLI
+        // without them it reports its whole roster untagged.
+        let panes = project
+            .panes
+            .iter()
+            .cloned()
+            .map(|mut pane| {
+                crate::project_instances::PaneOwner::Sole.tag(&mut pane);
+                pane
+            })
+            .collect();
         let session_start = CliToServer::SessionStart {
             session_id: project.id,
             project_id: Some(project.id),
@@ -359,7 +375,7 @@ async fn run_connection(
             git_remote,
             git_remote_url,
             pane_type: None,
-            panes: Some(project.panes.clone()),
+            panes: Some(panes),
         };
         let msg_text = serde_json::to_string(&session_start)?;
         ws_sender.send(Message::Text(msg_text.into())).await?;

@@ -5,7 +5,6 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
-use uuid::Uuid;
 
 mod attach;
 mod auth;
@@ -25,6 +24,8 @@ mod pane_identity;
 mod pane_status;
 mod plan_review;
 mod project;
+mod project_instances;
+mod project_join;
 mod provider_local;
 mod summary_runner;
 mod supervisor;
@@ -131,9 +132,24 @@ enum Commands {
     Update,
     /// Register a directory (default: the current one) as a project on this
     /// machine so it appears in the web UI. Does not start it.
+    ///
+    /// A checkout of a repository one of your projects already uses can join
+    /// that project instead, as another machine of it: registration asks
+    /// before joining, and lists the projects when several match. Only a
+    /// folder whose project has no tabs and has never been started can join.
     Register {
         /// Project directory (default: current directory)
         path: Option<PathBuf>,
+        /// Join this existing project, by id, without asking
+        #[arg(long, value_name = "ID", conflicts_with = "new")]
+        project: Option<uuid::Uuid>,
+        /// Register the folder as a separate project; skip matching it against
+        /// your existing projects
+        #[arg(long)]
+        new: bool,
+        /// Join the one matching project without asking
+        #[arg(long, short = 'y')]
+        yes: bool,
     },
     /// Login to the APAS server
     Login,
@@ -319,17 +335,53 @@ async fn main() -> Result<()> {
 
                 return Ok(());
             }
-            Commands::Register { path } => {
+            Commands::Register {
+                path,
+                project,
+                new,
+                yes,
+            } => {
                 let config = config::Config::load().unwrap_or_default();
-                if cli.token.is_none() && config.remote.token.is_none() {
+                let Some(token) = cli.token.clone().or_else(|| config.remote.token.clone()) else {
                     eprintln!("\x1b[33m🔐 Not logged in.\x1b[0m");
                     eprintln!("   Run '\x1b[1mapas login\x1b[0m' to authenticate.");
                     return Ok(());
-                }
+                };
+                let server = cli
+                    .server
+                    .clone()
+                    .or_else(|| config.remote.server.clone())
+                    .unwrap_or_else(|| DEFAULT_SERVER.to_string());
                 let dir = path
                     .or_else(|| cli.working_dir.clone().map(PathBuf::from))
                     .map_or_else(std::env::current_dir, Ok)?;
-                match register_directory(&dir, &std::env::current_dir()?) {
+                let cwd = std::env::current_dir()?;
+                let options = project_join::JoinOptions { project, new, yes };
+                // Only someone at a terminal can answer the join question.
+                let interactive = std::io::IsTerminal::is_terminal(&std::io::stdin());
+                // The lookup is async; the rest blocks on files, `git` and
+                // the terminal. So all of it runs off the runtime, and waits
+                // there for the lookup.
+                let runtime = tokio::runtime::Handle::current();
+                let folder = dir.clone();
+                let outcome = tokio::task::spawn_blocking(move || {
+                    let mut lookup = |query: &project_join::LookupQuery| {
+                        let client = project_join::http_client()?;
+                        runtime.block_on(project_join::lookup_by_remote(
+                            &client, &server, &token, query,
+                        ))
+                    };
+                    register_folder(
+                        &folder,
+                        &cwd,
+                        &options,
+                        interactive,
+                        &mut lookup,
+                        &mut project_join::confirm_on_terminal,
+                    )
+                })
+                .await?;
+                match outcome {
                     Ok(message) => eprintln!("{message}"),
                     Err(err) => {
                         eprintln!("\x1b[31mCould not register {}: {err:#}\x1b[0m", dir.display());
@@ -428,20 +480,9 @@ async fn main() -> Result<()> {
                     }
                 };
 
-                // Derive per host rather than mint-and-persist. The old code
-                // generated a random UUID and saved it to config.toml -- which
-                // lives on the shared NFS home, so whichever host ran first
-                // donated its identity to every other host in the cluster, and
-                // the server's machine map (keyed by this id) collapsed them
-                // into one flickering entry. A derived id needs no storage,
-                // survives reboots, and is necessarily distinct per host.
-                // An explicitly configured value still wins, for overrides.
-                let machine_id = config
-                    .daemon
-                    .machine_id
-                    .as_ref()
-                    .and_then(|raw| Uuid::parse_str(raw).ok())
-                    .unwrap_or_else(daemon_registry::derive_machine_id);
+                // Derived per host unless explicitly configured; see
+                // `resolved_machine_id` for why it is never minted and saved.
+                let machine_id = config.daemon.resolved_machine_id();
 
                 let project_roots = if !roots.is_empty() {
                     tracing::warn!(
@@ -523,10 +564,14 @@ async fn main() -> Result<()> {
         };
 
         tracing::info!("Starting in headless mode (streaming to {})", server);
+        // The machine the daemon on this host would report, so a standalone
+        // run owns and reports its panes as that machine. It used to report
+        // none at all.
+        let machine_id = config.daemon.resolved_machine_id();
         // Replacing the process is this caller's decision, not the project's.
         // The project used to `exec` from inside itself, which reads the same
         // only while a process hosts exactly one project.
-        match mode::dual_pane::run_headless(&server, &token, &working_dir).await? {
+        match mode::dual_pane::run_headless(&server, &token, &working_dir, machine_id).await? {
             mode::dual_pane::ProjectOutcome::RebootRequested => {
                 update::restart_cli();
                 std::process::exit(1);
@@ -666,7 +711,9 @@ fn maybe_auto_start_daemon(server_override: Option<String>) -> Result<()> {
 /// Returns what to tell the user, which is mostly where to go next: projects
 /// are started from the web now, not by being run in.
 fn register_and_defer(working_dir: &std::path::Path) -> Result<String> {
-    let metadata = project::get_or_create_project(working_dir)?;
+    // Creates a missing `.apas`, but never regenerates one that does not
+    // parse: on a shared home that would erase every machine's panes.
+    let metadata = project_instances::open_project_metadata(working_dir)?;
     let name = metadata
         .name
         .clone()
@@ -705,6 +752,73 @@ fn register_directory(dir: &Path, cwd: &Path) -> Result<String> {
         path = registered.path,
         id = registered.project_id,
     ))
+}
+
+/// `apas register [path]` with joining: register the folder, or give it the
+/// identity of one of the user's projects that uses the same repository, so
+/// it becomes another machine of that project instead of a new project.
+///
+/// `lookup` asks the server which projects use the folder's remote, and
+/// `confirm` asks the person at the terminal; see `project_join::decide` for
+/// when each is asked. `--new` asks neither and registers exactly as
+/// [`register_directory`] does.
+fn register_folder(
+    dir: &Path,
+    cwd: &Path,
+    options: &project_join::JoinOptions,
+    interactive: bool,
+    lookup: &mut dyn FnMut(&project_join::LookupQuery) -> Result<shared::ProjectsByRemoteResponse>,
+    confirm: &mut dyn FnMut(&str) -> bool,
+) -> Result<String> {
+    let absolute = if dir.is_absolute() {
+        dir.to_path_buf()
+    } else {
+        cwd.join(dir)
+    };
+    if options.new {
+        return register_directory(&absolute, cwd);
+    }
+    let folder = project::inspect_folder(&absolute)?;
+    let remote = worktree::normalized_git_remote(&folder.dir);
+    match project_join::decide(
+        &folder,
+        remote.as_deref(),
+        options,
+        interactive,
+        lookup,
+        confirm,
+    )? {
+        project_join::Decision::AsIs { notes } => {
+            let registered = register_directory(&folder.dir, cwd)?;
+            let mut message: String = notes
+                .iter()
+                .map(|note| format!("\x1b[33m! {note}\x1b[0m\n"))
+                .collect();
+            message.push_str(&registered);
+            Ok(message)
+        }
+        project_join::Decision::Join { project } => {
+            let joined = project::join_project(&folder, project.project_id, project.name.clone())?;
+            let folder_name = folder
+                .dir
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or(&joined.path);
+            let project_name = project
+                .name
+                .as_deref()
+                .filter(|name| !name.trim().is_empty())
+                .map_or_else(|| format!("project {}", joined.project_id), String::from);
+            Ok(format!(
+                "\x1b[36m✓ {folder_name} joined {project_name} on this machine.\x1b[0m\n   \
+                 Folder:  {path}\n   \
+                 Project: {id}\n   \
+                 Start it here, or add a tab on this machine, from {WEB_UI_URL}",
+                path = joined.path,
+                id = joined.project_id,
+            ))
+        }
+    }
 }
 
 enum AttachOutcome {
@@ -1347,21 +1461,93 @@ mod tests {
     }
 
     #[test]
+    fn a_launch_never_regenerates_metadata_it_cannot_parse() {
+        // Regenerating would start an empty project under a new identity, and
+        // on a shared home erase the panes every other machine saved there.
+        crate::project::test_support::with_isolated_config(|| {
+            let dir = tempfile::tempdir().expect("temp dir");
+            let metadata = dir.path().join(".apas");
+            let corrupt = b"{\"id\": \"not finished".to_vec();
+            fs::write(&metadata, &corrupt).expect("write");
+
+            assert!(super::register_and_defer(dir.path()).is_err());
+
+            assert_eq!(fs::read(&metadata).expect("read"), corrupt);
+            assert!(crate::project::list_registered_projects()
+                .expect("registry")
+                .is_empty());
+        });
+    }
+
+    #[test]
     fn register_subcommand_takes_an_optional_folder() {
         use clap::Parser;
         let bare = super::Cli::try_parse_from(["apas", "register"]).expect("parse bare");
         assert!(matches!(
             bare.command,
-            Some(super::Commands::Register { path: None })
+            Some(super::Commands::Register {
+                path: None,
+                project: None,
+                new: false,
+                yes: false,
+            })
         ));
         let with_path =
             super::Cli::try_parse_from(["apas", "register", "work"]).expect("parse path");
         match with_path.command {
-            Some(super::Commands::Register { path: Some(path) }) => {
+            Some(super::Commands::Register {
+                path: Some(path), ..
+            }) => {
                 assert_eq!(path, std::path::PathBuf::from("work"))
             }
             _ => panic!("expected register with a path"),
         }
+    }
+
+    #[test]
+    fn register_takes_the_join_choices() {
+        use clap::Parser;
+        let id = uuid::Uuid::new_v4();
+        let parsed = super::Cli::try_parse_from([
+            "apas",
+            "register",
+            "work",
+            "--project",
+            &id.to_string(),
+            "--yes",
+        ])
+        .expect("parse");
+        match parsed.command {
+            Some(super::Commands::Register {
+                path: Some(_),
+                project: Some(project),
+                new: false,
+                yes: true,
+            }) => assert_eq!(project, id),
+            _ => panic!("expected register with --project and --yes"),
+        }
+        assert!(matches!(
+            super::Cli::try_parse_from(["apas", "register", "--new", "-y"])
+                .expect("parse")
+                .command,
+            Some(super::Commands::Register {
+                new: true,
+                yes: true,
+                ..
+            })
+        ));
+        // Joining one project and keeping the folder separate contradict.
+        assert!(super::Cli::try_parse_from([
+            "apas",
+            "register",
+            "--new",
+            "--project",
+            &id.to_string(),
+        ])
+        .is_err());
+        assert!(
+            super::Cli::try_parse_from(["apas", "register", "--project", "not-a-uuid"]).is_err()
+        );
     }
 
     #[test]
@@ -1419,6 +1605,515 @@ mod tests {
             let missing = dir.path().join("missing");
             assert!(super::register_directory(&missing, dir.path()).is_err());
             assert!(!missing.exists());
+        });
+    }
+
+    // --- `apas register` joining an existing project by git remote --------
+
+    use crate::project_join::{JoinOptions, LookupQuery};
+    use shared::{ProjectRemoteInstance, ProjectRemoteMatch, ProjectsByRemoteResponse};
+    use std::path::Path;
+    use uuid::Uuid;
+
+    /// What `normalized_git_remote` makes of the checkouts below.
+    const REMOTE: &str = "github.com/owner/repo";
+
+    /// A git checkout at `dir` whose `origin` is the repository [`REMOTE`]
+    /// names, made without the user's git configuration.
+    fn checkout(dir: &Path) {
+        fs::create_dir_all(dir).expect("checkout dir");
+        for args in [
+            &["init", "-q"][..],
+            &["remote", "add", "origin", "git@github.com:Owner/Repo.git"][..],
+        ] {
+            let status = std::process::Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(args)
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .expect("run git");
+            assert!(status.success(), "git {args:?}");
+        }
+    }
+
+    /// One of the user's projects as the server lists it, checked out on
+    /// zoo-005.
+    fn remote_match(project_id: Uuid, name: &str, has_session: bool) -> ProjectRemoteMatch {
+        ProjectRemoteMatch {
+            project_id,
+            name: Some(name.to_string()),
+            has_session,
+            instances: vec![ProjectRemoteInstance {
+                machine_id: Some(Uuid::new_v4()),
+                hostname: "zoo-005".to_string(),
+                path: format!("/home/u/{name}"),
+                running: true,
+            }],
+        }
+    }
+
+    fn by_remote(
+        projects: Vec<ProjectRemoteMatch>,
+        local: Option<ProjectRemoteMatch>,
+    ) -> Option<ProjectsByRemoteResponse> {
+        Some(ProjectsByRemoteResponse {
+            git_remote: REMOTE.to_string(),
+            projects,
+            local,
+        })
+    }
+
+    /// What one `apas register` run asked the server and the terminal.
+    struct Asked {
+        lookups: Vec<LookupQuery>,
+        prompts: Vec<String>,
+    }
+
+    /// Run `apas register` in `dir`. The server answers `answer`, or is
+    /// unreachable for `None`; the person at the terminal, when there is one,
+    /// answers `confirm`.
+    fn register(
+        dir: &Path,
+        options: JoinOptions,
+        interactive: bool,
+        answer: Option<ProjectsByRemoteResponse>,
+        confirm: bool,
+    ) -> (anyhow::Result<String>, Asked) {
+        let mut lookups = Vec::new();
+        let mut prompts = Vec::new();
+        let result = super::register_folder(
+            dir,
+            Path::new("/"),
+            &options,
+            interactive,
+            &mut |query: &LookupQuery| {
+                lookups.push(query.clone());
+                answer
+                    .clone()
+                    .ok_or_else(|| anyhow::anyhow!("connection refused"))
+            },
+            &mut |prompt: &str| {
+                prompts.push(prompt.to_string());
+                confirm
+            },
+        );
+        (result, Asked { lookups, prompts })
+    }
+
+    /// What a plain `apas register` leaves in a folder: a pristine identity.
+    fn pristine_identity(dir: &Path) -> Uuid {
+        super::register_directory(dir, dir).expect("register");
+        crate::project::read_project_id(dir).expect("identity")
+    }
+
+    fn registry() -> Vec<(String, String)> {
+        crate::project::list_registered_projects()
+            .expect("registry")
+            .into_iter()
+            .map(|entry| (entry.project_id, entry.path))
+            .collect()
+    }
+
+    fn canonical(dir: &Path) -> String {
+        fs::canonicalize(dir)
+            .expect("canonical")
+            .to_str()
+            .expect("utf-8")
+            .to_string()
+    }
+
+    fn join(project: Uuid) -> JoinOptions {
+        JoinOptions {
+            project: Some(project),
+            ..JoinOptions::default()
+        }
+    }
+
+    #[test]
+    fn register_offers_the_one_project_of_the_same_repository_and_joins_it() {
+        crate::project::test_support::with_isolated_config(|| {
+            let home = tempfile::tempdir().expect("temp dir");
+            let dir = home.path().join("chiral-laptop");
+            checkout(&dir);
+            let own = pristine_identity(&dir);
+            let zoo = Uuid::new_v4();
+
+            // The server lists the folder's own identity too, since its remote
+            // matches; it is never offered.
+            let (result, asked) = register(
+                &dir,
+                JoinOptions::default(),
+                true,
+                by_remote(
+                    vec![
+                        remote_match(own, "chiral-laptop", false),
+                        remote_match(zoo, "chiral-network", true),
+                    ],
+                    Some(remote_match(own, "chiral-laptop", false)),
+                ),
+                true,
+            );
+            let message = result.expect("joined");
+
+            assert_eq!(
+                asked.lookups,
+                vec![LookupQuery {
+                    git_remote: REMOTE.to_string(),
+                    project_id: Some(own),
+                }]
+            );
+            assert_eq!(
+                asked.prompts,
+                vec![format!(
+                    "Join chiral-network ({zoo}, on zoo-005:/home/u/chiral-network)? [Y/n]"
+                )]
+            );
+            assert!(message.contains("joined chiral-network"), "{message}");
+            let metadata = crate::project_instances::read_project_metadata(&dir).expect("read");
+            assert_eq!(metadata.id, zoo);
+            assert!(metadata.panes.is_empty());
+            assert_eq!(metadata.name.as_deref(), Some("chiral-network"));
+            assert_eq!(registry(), vec![(zoo.to_string(), canonical(&dir))]);
+        });
+    }
+
+    #[test]
+    fn declining_the_join_keeps_the_folders_own_identity() {
+        crate::project::test_support::with_isolated_config(|| {
+            let home = tempfile::tempdir().expect("temp dir");
+            let dir = home.path().join("repo");
+            checkout(&dir);
+            let own = pristine_identity(&dir);
+
+            let (result, asked) = register(
+                &dir,
+                JoinOptions::default(),
+                true,
+                by_remote(vec![remote_match(Uuid::new_v4(), "repo", true)], None),
+                false,
+            );
+            let message = result.expect("registered");
+            assert_eq!(asked.prompts.len(), 1);
+            assert!(message.contains(&own.to_string()), "{message}");
+            assert_eq!(crate::project::read_project_id(&dir), Some(own));
+            assert_eq!(registry(), vec![(own.to_string(), canonical(&dir))]);
+        });
+    }
+
+    #[test]
+    fn a_folder_no_project_matches_is_registered_as_it_is() {
+        crate::project::test_support::with_isolated_config(|| {
+            let home = tempfile::tempdir().expect("temp dir");
+            let dir = home.path().join("repo");
+            checkout(&dir);
+
+            let (result, asked) = register(
+                &dir,
+                JoinOptions::default(),
+                true,
+                by_remote(Vec::new(), None),
+                true,
+            );
+            result.expect("registered");
+            // A folder with no identity yet has none to ask about.
+            assert_eq!(
+                asked.lookups,
+                vec![LookupQuery {
+                    git_remote: REMOTE.to_string(),
+                    project_id: None,
+                }]
+            );
+            assert!(asked.prompts.is_empty());
+            let id = crate::project::read_project_id(&dir).expect("a new identity");
+            assert_eq!(registry(), vec![(id.to_string(), canonical(&dir))]);
+        });
+    }
+
+    #[test]
+    fn several_matching_projects_need_an_explicit_choice() {
+        crate::project::test_support::with_isolated_config(|| {
+            let home = tempfile::tempdir().expect("temp dir");
+            let dir = home.path().join("repo");
+            checkout(&dir);
+            let (first, second) = (Uuid::new_v4(), Uuid::new_v4());
+            let answer = by_remote(
+                vec![
+                    remote_match(first, "repo", true),
+                    remote_match(second, "repo-2", false),
+                ],
+                None,
+            );
+
+            for options in [
+                JoinOptions::default(),
+                JoinOptions {
+                    yes: true,
+                    ..JoinOptions::default()
+                },
+            ] {
+                let (result, asked) = register(&dir, options, true, answer.clone(), true);
+                let error = format!("{:#}", result.expect_err("a choice is needed"));
+                assert!(error.contains(&first.to_string()), "{error}");
+                assert!(error.contains(&second.to_string()), "{error}");
+                assert!(error.contains("--project"), "{error}");
+                assert!(asked.prompts.is_empty());
+                assert!(!dir.join(".apas").exists(), "nothing registered meanwhile");
+                assert!(registry().is_empty());
+            }
+
+            let (result, asked) = register(&dir, join(second), false, answer, false);
+            result.expect("joined");
+            assert!(asked.prompts.is_empty(), "--project does not ask");
+            assert_eq!(crate::project::read_project_id(&dir), Some(second));
+            assert_eq!(registry(), vec![(second.to_string(), canonical(&dir))]);
+        });
+    }
+
+    #[test]
+    fn a_folder_whose_project_has_tabs_keeps_its_identity() {
+        crate::project::test_support::with_isolated_config(|| {
+            let home = tempfile::tempdir().expect("temp dir");
+            let zoo = Uuid::new_v4();
+            let own = Uuid::new_v4();
+            // Tabs in `panes`, and a file from before `panes` whose legacy
+            // sessions are history all the same.
+            let with_tabs = serde_json::json!({
+                "id": own, "name": "repo", "created_at": "2026-01-01T00:00:00Z",
+                "panes": [{
+                    "pane_id": 3, "provider": "codex", "mode": "interactive",
+                    "kind": "terminal", "session_id": Uuid::new_v4(),
+                }],
+            });
+            let legacy = serde_json::json!({
+                "id": own, "name": "repo", "created_at": "2026-01-01T00:00:00Z",
+                "deadloop_claude_session_id": Uuid::new_v4(),
+            });
+            for metadata in [with_tabs, legacy] {
+                let dir = home.path().join(format!("repo-{}", Uuid::new_v4()));
+                checkout(&dir);
+                let bytes = serde_json::to_vec_pretty(&metadata).expect("json");
+                fs::write(dir.join(".apas"), &bytes).expect("write");
+                let answer = by_remote(vec![remote_match(zoo, "repo", true)], None);
+
+                let (result, asked) = register(&dir, join(zoo), true, answer.clone(), true);
+                let error = format!("{:#}", result.expect_err("refused"));
+                assert!(error.contains("tab"), "{error}");
+                assert_eq!(fs::read(dir.join(".apas")).expect("read"), bytes);
+
+                let (result, asked_again) =
+                    register(&dir, JoinOptions::default(), true, answer, true);
+                let message = result.expect("registered");
+                assert!(message.contains(&own.to_string()), "{message}");
+                assert!(
+                    asked.lookups.is_empty() && asked_again.lookups.is_empty(),
+                    "tabs settle it without asking the server"
+                );
+                assert!(asked_again.prompts.is_empty());
+                assert_eq!(fs::read(dir.join(".apas")).expect("read"), bytes);
+                assert_eq!(registry(), vec![(own.to_string(), canonical(&dir))]);
+                // One folder per project in the registry: clear it for the next.
+                crate::project::unregister_project(&dir, own).expect("unregister");
+            }
+        });
+    }
+
+    #[test]
+    fn a_folder_whose_project_has_history_on_the_server_keeps_its_identity() {
+        crate::project::test_support::with_isolated_config(|| {
+            let home = tempfile::tempdir().expect("temp dir");
+            let dir = home.path().join("repo");
+            checkout(&dir);
+            let own = pristine_identity(&dir);
+            let zoo = Uuid::new_v4();
+
+            // No tabs left, but a session. Listed among the matches, or only
+            // as `local` because the remote its sessions recorded differs.
+            for answer in [
+                by_remote(
+                    vec![
+                        remote_match(own, "repo", true),
+                        remote_match(zoo, "repo", true),
+                    ],
+                    Some(remote_match(own, "repo", true)),
+                ),
+                by_remote(
+                    vec![remote_match(zoo, "repo", true)],
+                    Some(ProjectRemoteMatch {
+                        project_id: own,
+                        name: Some("repo".to_string()),
+                        has_session: true,
+                        instances: Vec::new(),
+                    }),
+                ),
+            ] {
+                let (result, asked) =
+                    register(&dir, JoinOptions::default(), true, answer.clone(), true);
+                let message = result.expect("registered");
+                assert!(asked.prompts.is_empty(), "no join is offered");
+                assert!(message.contains("has history"), "{message}");
+
+                let (result, _) = register(&dir, join(zoo), true, answer, true);
+                let error = format!("{:#}", result.expect_err("refused"));
+                assert!(error.contains("history"), "{error}");
+
+                assert_eq!(crate::project::read_project_id(&dir), Some(own));
+                assert_eq!(registry(), vec![(own.to_string(), canonical(&dir))]);
+            }
+        });
+    }
+
+    #[test]
+    fn a_run_nobody_can_answer_joins_only_when_told_to() {
+        crate::project::test_support::with_isolated_config(|| {
+            let home = tempfile::tempdir().expect("temp dir");
+            let dir = home.path().join("repo");
+            checkout(&dir);
+            let own = pristine_identity(&dir);
+            let zoo = Uuid::new_v4();
+            let answer = by_remote(vec![remote_match(zoo, "repo", true)], None);
+
+            let (result, asked) =
+                register(&dir, JoinOptions::default(), false, answer.clone(), true);
+            let message = result.expect("registered");
+            assert!(asked.prompts.is_empty(), "nobody to ask");
+            assert!(message.contains("--yes"), "{message}");
+            assert!(message.contains(&zoo.to_string()), "{message}");
+            assert_eq!(crate::project::read_project_id(&dir), Some(own));
+
+            let yes = JoinOptions {
+                yes: true,
+                ..JoinOptions::default()
+            };
+            let (result, asked) = register(&dir, yes, false, answer, false);
+            result.expect("joined");
+            assert!(asked.prompts.is_empty());
+            assert_eq!(crate::project::read_project_id(&dir), Some(zoo));
+            assert_eq!(registry(), vec![(zoo.to_string(), canonical(&dir))]);
+        });
+    }
+
+    /// A registry holds one folder per project. On a home shared between
+    /// machines the project's own checkout is already in reach.
+    #[test]
+    fn a_project_already_registered_at_another_folder_is_not_joined() {
+        crate::project::test_support::with_isolated_config(|| {
+            let home = tempfile::tempdir().expect("temp dir");
+            let zoo_dir = home.path().join("repo");
+            checkout(&zoo_dir);
+            let zoo = pristine_identity(&zoo_dir);
+            let dir = home.path().join("repo-again");
+            checkout(&dir);
+            let own = pristine_identity(&dir);
+            let before = registry();
+            let answer = by_remote(vec![remote_match(zoo, "repo", true)], None);
+
+            let (result, asked) =
+                register(&dir, JoinOptions::default(), true, answer.clone(), true);
+            let message = result.expect("registered");
+            assert!(
+                asked.prompts.is_empty(),
+                "a join that cannot happen is not offered"
+            );
+            assert!(message.contains(&canonical(&zoo_dir)), "{message}");
+
+            let (result, _) = register(&dir, join(zoo), true, answer, true);
+            let error = format!("{:#}", result.expect_err("refused"));
+            assert!(error.contains(&canonical(&zoo_dir)), "{error}");
+
+            assert_eq!(crate::project::read_project_id(&dir), Some(own));
+            assert_eq!(crate::project::read_project_id(&zoo_dir), Some(zoo));
+            assert_eq!(registry(), before);
+        });
+    }
+
+    #[test]
+    fn an_unreachable_server_never_leads_to_a_join() {
+        crate::project::test_support::with_isolated_config(|| {
+            let home = tempfile::tempdir().expect("temp dir");
+            let dir = home.path().join("repo");
+            checkout(&dir);
+            let zoo = Uuid::new_v4();
+
+            // An explicit join that cannot be checked changes nothing.
+            let (result, asked) = register(&dir, join(zoo), true, None, true);
+            let error = format!("{:#}", result.expect_err("refused"));
+            assert!(error.contains("connection refused"), "{error}");
+            assert_eq!(asked.lookups.len(), 1);
+            assert!(!dir.join(".apas").exists());
+            assert!(registry().is_empty());
+
+            // Otherwise the folder is registered as it is, with a warning.
+            let (result, asked) = register(&dir, JoinOptions::default(), true, None, true);
+            let message = result.expect("registered");
+            assert!(message.contains("Could not look up"), "{message}");
+            assert!(asked.prompts.is_empty());
+            let id = crate::project::read_project_id(&dir).expect("identity");
+            assert_ne!(id, zoo);
+            assert_eq!(registry(), vec![(id.to_string(), canonical(&dir))]);
+        });
+    }
+
+    #[test]
+    fn new_and_a_folder_without_a_remote_never_ask_the_server() {
+        crate::project::test_support::with_isolated_config(|| {
+            let home = tempfile::tempdir().expect("temp dir");
+            let zoo = Uuid::new_v4();
+            let answer = by_remote(vec![remote_match(zoo, "repo", true)], None);
+
+            let dir = home.path().join("repo");
+            checkout(&dir);
+            let new = JoinOptions {
+                new: true,
+                ..JoinOptions::default()
+            };
+            let (result, asked) = register(&dir, new, true, answer.clone(), true);
+            result.expect("registered");
+            assert!(asked.lookups.is_empty() && asked.prompts.is_empty());
+            assert_ne!(crate::project::read_project_id(&dir), Some(zoo));
+
+            let plain = home.path().join("notes");
+            fs::create_dir_all(&plain).expect("plain folder");
+            let (result, asked) = register(&plain, join(zoo), true, answer.clone(), true);
+            let error = format!("{:#}", result.expect_err("refused"));
+            assert!(error.contains("origin"), "{error}");
+            assert!(!plain.join(".apas").exists());
+            let (result, asked_again) =
+                register(&plain, JoinOptions::default(), true, answer, true);
+            result.expect("registered");
+            assert!(asked.lookups.is_empty() && asked_again.lookups.is_empty());
+            assert_ne!(crate::project::read_project_id(&plain), Some(zoo));
+        });
+    }
+
+    #[test]
+    fn project_must_name_one_of_the_matching_projects() {
+        crate::project::test_support::with_isolated_config(|| {
+            let home = tempfile::tempdir().expect("temp dir");
+            let dir = home.path().join("repo");
+            checkout(&dir);
+            let own = pristine_identity(&dir);
+            let (zoo, stranger) = (Uuid::new_v4(), Uuid::new_v4());
+            let answer = by_remote(vec![remote_match(zoo, "repo", true)], None);
+
+            let (result, _) = register(&dir, join(stranger), true, answer.clone(), true);
+            let error = format!("{:#}", result.expect_err("refused"));
+            assert!(error.contains("not one of your projects"), "{error}");
+            assert!(
+                error.contains(&zoo.to_string()),
+                "the matches are listed: {error}"
+            );
+            assert_eq!(crate::project::read_project_id(&dir), Some(own));
+
+            // Its own project is no join at all.
+            let (result, asked) = register(&dir, join(own), true, answer, true);
+            result.expect("registered");
+            assert!(asked.lookups.is_empty());
+            assert_eq!(crate::project::read_project_id(&dir), Some(own));
+            assert_eq!(registry(), vec![(own.to_string(), canonical(&dir))]);
         });
     }
 

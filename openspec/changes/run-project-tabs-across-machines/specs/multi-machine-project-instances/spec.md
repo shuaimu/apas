@@ -22,15 +22,30 @@ A project SHALL be able to run one instance on each of several machines at the s
 
 ### Requirement: Every pane belongs to exactly one machine
 
-Each pane SHALL record the machine that runs it. The server SHALL set that record from the authenticated instance that reports the pane, not from the pane data the instance supplies. A pane's history, terminal and controls SHALL stay with its machine for the pane's lifetime. No instance SHALL restore or adopt a pane recorded for another machine, even while that machine is stopped. A tab whose machine is not running SHALL be shown as stopped on that machine and SHALL NOT be closable until that machine runs the project. The owner SHALL be able to forget all tabs of a stopped machine after confirmation. Starting a stopped project SHALL start an instance on every online machine that owns tabs.
+Each pane reported by an instance with multi-instance support SHALL record the machine that runs it. The server SHALL set that record from the authenticated instance that reports the pane, not from the pane data the instance supplies, and SHALL record no machine for panes reported by an instance without that support. A pane with no recorded machine SHALL belong to no machine until an instance with multi-instance support reports it, which then adopts it. The server SHALL attribute such a pane to the host it last recorded the pane under, for display and routing only, and SHALL NOT refuse or drop a pane on account of that host when an instance with support reports it. A control or close for such a pane SHALL go to the attached instance on its attributed host, else to the sole attached instance when that instance lacks support, else to the primary instance when the pane has no attributed host, and SHALL otherwise be refused as stopped on the attributed host. A pane's history, terminal and controls SHALL stay with its machine for the pane's lifetime. No instance SHALL restore or adopt a pane recorded for another machine, even while that machine is stopped. A tab whose machine is not running SHALL be shown as stopped on that machine and SHALL NOT be closable until that machine runs the project. The owner SHALL be able to forget all tabs of a stopped machine after confirmation, and SHALL be told that they come back if that machine runs the project again. Starting a stopped project from the project view SHALL start an instance on every online machine with multi-instance support that owns tabs, or on the project view's resolved machine when no machine qualifies.
 
 #### Scenario: Pane ownership is assigned by the server
 - **WHEN** an instance on zoo-006 reports a pane whose data names zoo-005
 - **THEN** the server records the pane as zoo-006's
 
 #### Scenario: Legacy untagged panes
-- **WHEN** a persisted roster contains panes with no machine recorded
-- **THEN** they belong to the primary instance
+- **WHEN** a persisted roster from before multi-machine instances holds panes with no machine recorded, and the session was last recorded on zoo-005
+- **THEN** those tabs are shown under zoo-005 and their controls reach zoo-005's instance whenever it is attached
+- **AND** the first instance with multi-instance support that reports them records them as its own
+
+#### Scenario: A joined checkout starting first keeps a stopped host's tabs
+- **WHEN** a project's untagged tabs were last recorded on zoo-005, zoo-005 is stopped, and a laptop checkout joined to the project starts first and reports no tabs
+- **THEN** zoo-005's tabs stay in the project, shown as stopped on zoo-005
+- **AND** a control or close for one of them is refused with "zoo-005 is not running this project. Start it on zoo-005 first."
+
+#### Scenario: Tabs reported by an older CLI stay adoptable
+- **WHEN** a CLI without multi-instance support reports its tabs
+- **THEN** the server records their host but no machine
+- **AND** an instance with support on a shared home that later reports those tabs records them as its own
+
+#### Scenario: Untagged tab with no known host
+- **WHEN** a tab has no recorded machine and no attributed host
+- **THEN** its controls go to the primary instance
 
 #### Scenario: Tabs stay on their machine
 - **WHEN** a project's tabs belong to zoo-005, zoo-005 is stopped, and the project starts on zoo-006 in the same directory
@@ -38,20 +53,34 @@ Each pane SHALL record the machine that runs it. The server SHALL set that recor
 - **AND** zoo-005's tabs remain listed as stopped on zoo-005 until zoo-005 runs the project again
 
 #### Scenario: Close a tab whose machine is not running
-- **WHEN** a user closes a tab whose machine has no running instance
-- **THEN** the request is refused with an instruction to start the project on that machine
+- **WHEN** a user closes a tab owned by zoo-006 while zoo-006 has no running instance
+- **THEN** the request is refused with "zoo-006 is not running this project. Start it on zoo-006 first."
 
 #### Scenario: Forget a machine that will not return
 - **WHEN** the owner confirms forgetting a stopped machine's tabs
-- **THEN** those tabs leave the project roster, and running instances sharing the same project metadata remove them from it
+- **THEN** those tabs, including untagged tabs attributed to that machine's host, leave the project roster
+- **AND** running instances sharing the same project metadata remove the entries recorded for that machine
+- **AND** the confirmation says the tabs come back if that machine runs the project again
+
+#### Scenario: Forget a machine that is running
+- **WHEN** the owner asks to forget the tabs of a machine with a running instance of the project
+- **THEN** the request is refused and the tabs stay
 
 #### Scenario: Start a project whose tabs span machines
-- **WHEN** a stopped project has tabs owned by zoo-005 and zoo-006 and the user starts the project
-- **THEN** an instance starts on each of those machines that is online
+- **WHEN** a stopped project has tabs owned by zoo-005 and zoo-006 and the user starts the project from the project view
+- **THEN** an instance starts on each of those machines that is online and has multi-instance support
+
+#### Scenario: Start one machine from the Machines page
+- **WHEN** a user starts the project on zoo-006 from the Machines page while zoo-005 also owns tabs
+- **THEN** only zoo-006 starts an instance
+
+#### Scenario: Close the project from the project view
+- **WHEN** a project runs on zoo-005 and zoo-006 and the user closes it from the project view
+- **THEN** both instances stop
 
 ### Requirement: Instance rosters merge without erasing each other
 
-An instance's roster report SHALL replace only the panes that instance owns. An empty report SHALL mean that instance has no panes and SHALL leave other machines' panes in place; an absent report SHALL change nothing. The server SHALL keep one project-wide tab order and persist each pane's machine with the roster so stopped instances' tabs survive server restarts.
+An instance's roster report SHALL replace only the panes recorded for that instance's machine, and SHALL adopt the reported panes that have no recorded machine. A reported pane recorded for another machine SHALL be dropped and logged. Panes with no recorded machine that the instance did not report SHALL be left in place. An empty report SHALL mean that instance has no panes and SHALL leave every other pane in place; an absent report SHALL change nothing. A report from an instance without multi-instance support, which is only ever the sole instance, SHALL replace the whole roster as it does today. The server SHALL keep one project-wide tab order and persist each pane's machine and host with the roster so stopped instances' tabs survive server restarts.
 
 #### Scenario: One machine closes its last tab
 - **WHEN** zoo-006's instance reports an empty roster while zoo-005 has two tabs
@@ -61,9 +90,13 @@ An instance's roster report SHALL replace only the panes that instance owns. An 
 - **WHEN** the server restarts while a stopped zoo-006 instance has saved tabs
 - **THEN** those tabs are listed with zoo-006 as their host
 
+#### Scenario: An instance reports another machine's pane
+- **WHEN** zoo-006's instance reports a pane that the roster records for zoo-005
+- **THEN** the pane stays zoo-005's and the server logs the conflict
+
 ### Requirement: Controls reach the instance that owns the pane
 
-The server SHALL deliver every pane-scoped control, including terminal input and resize, question and plan answers, pause, resume, reboot, close, rename, model and effort changes, diff and pull-request requests, to the instance that owns the pane. It SHALL send project-wide updates to every attached instance. It SHALL evaluate provider capability and runtime access against the owning machine. It SHALL accept pane-scoped output, state and status only from the instance that owns that pane.
+The server SHALL deliver every pane-scoped control, including terminal input and resize, question and plan answers, pause, resume, reboot, close, rename, model and effort changes, diff and pull-request requests, and work-summary generation, to the instance that owns the pane and to no other. It SHALL deliver an answer that names no pane to the owner of the pane whose decision is pending, and input that names no pane and answers no decision to the owner of the legacy pane it means, else the primary instance. It SHALL deliver a reboot or lifecycle request to the instance on the machine the request names, else the primary instance. It SHALL send project-wide updates to every attached instance. It SHALL evaluate provider capability and runtime access against the owning machine. It SHALL accept pane-scoped output, state and status only from the instance that owns that pane. When a project membership is revoked, the server SHALL reject every attached instance that the revocation applies to, not only the primary.
 
 #### Scenario: Type into a tab on another machine
 - **WHEN** a user types into a tab owned by zoo-006 while zoo-005 is the primary
@@ -77,13 +110,26 @@ The server SHALL deliver every pane-scoped control, including terminal input and
 - **WHEN** the owner changes project flags
 - **THEN** every attached instance receives the change
 
+#### Scenario: Answer a question on another machine
+- **WHEN** a tab owned by zoo-006 is waiting on a question and the user answers it while zoo-005 is the primary
+- **THEN** the answer reaches zoo-006's instance only
+
+#### Scenario: Reboot one machine's instance
+- **WHEN** a user reboots the project's instance on zoo-006
+- **THEN** the request reaches zoo-006's instance and zoo-005's instance keeps running
+
 ### Requirement: An instance leaving affects only its own tabs
 
-When an instance disconnects or stops, only its tabs SHALL become disconnected or stopped and only their statuses SHALL clear. The session SHALL become inactive only when no instance remains. If the primary leaves, the next earliest instance SHALL become primary. An instance ending its session SHALL end the session only if it is the last instance.
+When an instance disconnects or stops, only its tabs SHALL become disconnected or stopped and only their statuses SHALL clear. The session SHALL become inactive only when no instance remains. If the primary leaves, the next earliest instance SHALL become primary. An instance ending its session SHALL end the session only if it is the last instance. Each instance's lifecycle inventory SHALL be kept and reported per machine, so one instance's report or departure does not replace another's.
 
 #### Scenario: Secondary machine goes offline
 - **WHEN** zoo-006 loses its connection while zoo-005 stays connected
 - **THEN** zoo-006's tabs show disconnected, zoo-005's tabs remain live, and the project stays active
+
+#### Scenario: Lifecycle per machine
+- **WHEN** zoo-005 and zoo-006 both report lifecycle inventories and a viewer opens the project
+- **THEN** the viewer receives one inventory for each machine
+- **AND** a reboot confirmation for zoo-006 counts only zoo-006's tabs
 
 #### Scenario: Last instance leaves
 - **WHEN** the only remaining instance disconnects
@@ -91,7 +137,7 @@ When an instance disconnects or stops, only its tabs SHALL become disconnected o
 
 ### Requirement: Instances sharing a directory never overwrite each other's tabs
 
-When several instances use one project directory, every write of project metadata SHALL hold an exclusive lock, re-read the file, and change only what the writer owns: its own panes, or the single project-level field being changed. Project-level fields SHALL never be rewritten from an instance's stale in-memory copy. An instance SHALL restore only its own panes. Untagged panes SHALL be adopted by an instance only when no other machine holds a live instance of the project. A periodic or background read SHALL never delete or regenerate project metadata.
+When several instances use one project directory, every write of project metadata SHALL hold an exclusive lock, re-read the file, and change only what the writer owns: its own panes, or the single project-level field being changed. Project-level fields SHALL never be rewritten from an instance's stale in-memory copy. An instance SHALL restore only its own panes. Untagged panes SHALL be adopted by an instance only when no other machine holds a live instance of the project. Forgetting a machine's tabs SHALL remove from the metadata only the entries recorded for that machine. A periodic or background read SHALL never delete or regenerate project metadata.
 
 #### Scenario: Concurrent saves on a shared home
 - **WHEN** zoo-005 adds a tab and zoo-006 renames one of its own tabs at the same time
@@ -107,7 +153,7 @@ When several instances use one project directory, every write of project metadat
 
 ### Requirement: Claims are per machine, released on stop, and exclude older daemons
 
-A capable daemon SHALL claim a project per machine and SHALL release that claim when the instance stops for any reason. While any capable instance runs a project, a daemon without multi-instance support SHALL be unable to start it. A stopped project SHALL be startable on another machine without waiting for the first machine's daemon to exit.
+A capable daemon SHALL claim a project per machine and SHALL release that claim when the instance stops for any reason. While any capable instance runs a project, a daemon without multi-instance support SHALL be unable to start it. A stopped project SHALL be startable on another machine without waiting for the first machine's daemon to exit. A daemon that refuses to start a project because of a claim SHALL report the reason as the project's last error rather than skip it silently.
 
 #### Scenario: Stop on one machine, start on another
 - **WHEN** a project is stopped on zoo-005 and then started on zoo-006
@@ -117,9 +163,13 @@ A capable daemon SHALL claim a project per machine and SHALL release that claim 
 - **WHEN** a capable instance runs a project and an older daemon is asked to start it
 - **THEN** the older daemon does not start it
 
+#### Scenario: A claim refusal is visible
+- **WHEN** a capable daemon is asked to start a project whose claim another host holds exclusively
+- **THEN** it does not start the project and reports the reason as the project's last error
+
 ### Requirement: Mixed fleets keep single-machine behaviour
 
-A CLI or daemon that does not advertise multi-instance support SHALL behave as today when no other machine runs the project. Its session start SHALL be rejected with an update instruction when another machine's instance is attached. Machine choice for new tabs SHALL be offered only for machines whose daemon advertises support, and the server SHALL refuse a request naming any other machine with a correlated reason. A host configured with an explicit shared machine id SHALL not advertise support.
+A CLI or daemon that does not advertise multi-instance support SHALL behave as today when no other machine runs the project. Its session start SHALL be rejected with an update instruction when another machine's instance is attached. Machine choice for new tabs SHALL be offered only for machines whose daemon is connected and advertises support, and the server SHALL refuse a request naming any other machine with a correlated reason. Machine entries SHALL distinguish a connected daemon that lacks support, which needs a reboot to update, from an offline one. A host configured with an explicit shared machine id SHALL not advertise support. A web or native client SHALL receive the frame listing a session's instances only if it advertised support, and a tab-launch result only for a request it sent with a correlation id. Starting and stopping a project on every machine SHALL be requested explicitly, so the Machines page's per-machine controls and older clients act on one machine.
 
 #### Scenario: Older CLI meets a running instance
 - **WHEN** an older CLI starts a session for a project already running on another machine
@@ -129,9 +179,18 @@ A CLI or daemon that does not advertise multi-instance support SHALL behave as t
 - **WHEN** a user requests a new tab on a machine whose daemon lacks support
 - **THEN** the tab is not created and the user is told to reboot that machine to update
 
+#### Scenario: Connected older daemon in the machine choice
+- **WHEN** zoo-006's daemon is connected but lacks support and the user opens the new-tab machine choice
+- **THEN** zoo-006 is shown disabled with "Reboot zoo-006 to update", not as offline
+
+#### Scenario: Older native build stays connected
+- **WHEN** a native build that does not advertise support views a project running on two machines
+- **THEN** it receives no instance-list frame and stays connected
+- **AND** the session list and pane records it already parses carry each instance's and tab's host
+
 ### Requirement: Users choose a machine when creating a tab
 
-When a user can launch on more than one eligible machine, the new-tab flow SHALL let them choose. The choices are the project's running instances, machines where the project is registered, and owned online machines without it. Disabled choices SHALL state why. The default SHALL be the selected tab's machine. Choosing a registered machine that is not running the project SHALL start the instance there and then create the tab. Each request SHALL receive a correlated result of routed, starting, or failed. Pane ids SHALL be unique across machines, including concurrent requests. Lost confirmations SHALL be reported as unconfirmed rather than replayed.
+When a user can launch on more than one eligible machine, the new-tab flow SHALL let them choose. The choices are the project's running instances, machines where the project is registered, and owned online machines without it. Disabled choices SHALL state why. The default SHALL be the selected tab's machine. Choosing a registered machine that is not running the project SHALL start the instance there and then create the tab. A request naming a machine SHALL never create the tab on another machine. Each request SHALL receive a correlated result of routed, starting, or failed, sent only to the connection that made the request; routed SHALL mean delivered to the instance, and starting SHALL always be followed by routed or failed. The start of a stopped instance SHALL be correlated with the daemon's reported outcome, so a refused or failed start fails the request with its reason. Pane ids SHALL be unique across machines, including concurrent requests. Lost confirmations SHALL be reported as unconfirmed rather than replayed.
 
 #### Scenario: New tab on a running instance
 - **WHEN** a user picks zoo-006, where the project is running
@@ -145,21 +204,54 @@ When a user can launch on more than one eligible machine, the new-tab flow SHALL
 - **WHEN** the instance on the chosen machine fails to start within the time limit
 - **THEN** the result is failed with the reason and no tab is created
 
+#### Scenario: Start refused by the daemon
+- **WHEN** the chosen machine's daemon refuses to start the project, for example because its policy is suspended
+- **THEN** the result is failed with the daemon's reason and no tab is created
+
+#### Scenario: Concurrent requests
+- **WHEN** two users add tabs to the project at the same moment on different machines
+- **THEN** the two tabs receive different pane ids
+
+#### Scenario: Confirmation lost while starting
+- **WHEN** the server restarts, or the requesting connection drops, while a launch is starting
+- **THEN** the client shows the launch as unconfirmed and does not resend it
+
 #### Scenario: Single eligible machine
 - **WHEN** only one machine is eligible
 - **THEN** the new-tab flow is unchanged
 
+### Requirement: Native task launches target the chosen machine
+
+A native task launch SHALL keep its existing meaning until an instance with multi-instance support runs the project: start the project on the chosen machine when nothing runs it, otherwise add the task to the running session. Once such an instance runs the project, the launch SHALL run the task on the chosen machine, starting a registered, stopped instance there first when that machine's daemon has support, and SHALL fail with the reason rather than run the task on another machine.
+
+#### Scenario: Before any capable instance runs the project
+- **WHEN** only an instance without multi-instance support runs the project, on zoo-005, and a user launches a native task choosing zoo-006
+- **THEN** the task is added to the running session, as it is today
+
+#### Scenario: Launch on a stopped capable machine
+- **WHEN** a capable instance runs the project on zoo-005 and a user launches a native task choosing zoo-006, where the project is registered, stopped, and the daemon has support
+- **THEN** zoo-006 starts its instance and the task runs there
+
+#### Scenario: Chosen machine cannot run an instance
+- **WHEN** a capable instance runs the project on zoo-005 and a user launches a native task choosing a machine whose daemon lacks support
+- **THEN** the launch fails with the reason and no task starts on any other machine
+
 ### Requirement: Tabs and project lists show where work runs
 
-Once a project's tabs span more than one machine, the tab bar SHALL show each tab's host and whether its machine's instance is connected. The project list SHALL keep one entry per project, show the primary host with the number of additional running instances, and include every machine's panes in its pane status. Mobile web and native SHALL show each tab's host.
+Once a project's tabs span more than one machine, the tab bar SHALL show each tab's host and whether its machine's instance is connected. A tab with no recorded machine SHALL be shown under its attributed host, and without a host when it has none. The project list SHALL keep one entry per project, show the primary host with the number of additional running instances, and include every machine's panes in its pane status. Mobile web and native SHALL show each tab's host. The server SHALL tell each viewer, per instance, whether that viewer may use the instance's runtime, and clients SHALL disable the tabs and machine choice of an instance the viewer may not use and say why.
 
 #### Scenario: Two machines
 - **WHEN** a project has tabs on zoo-005 and zoo-006
 - **THEN** each tab shows its host and the sidebar row shows "zoo-005 +1"
 
+#### Scenario: Instance the viewer cannot use
+- **WHEN** a viewer has project access but no runtime access to zoo-006, which runs one of the project's instances
+- **THEN** zoo-006's tabs and its machine choice are disabled for that viewer with the reason
+- **AND** zoo-005's tabs stay usable
+
 ### Requirement: A checkout can join an existing project by git remote
 
-`apas register` SHALL compare the checkout's canonical git remote with projects the user owns or hosts. When exactly one matches and the checkout has no project history, it SHALL offer to join that project. When several match, it SHALL list them and require an explicit choice. Joining SHALL give the checkout the existing project's identity with no panes, replacing only a pristine local identity. An explicit project option SHALL join directly, and a separate-project option SHALL skip matching. Non-interactive runs SHALL require explicit confirmation. Joining SHALL be refused when the local registry already lists that project at a different folder.
+`apas register` SHALL compare the checkout's canonical git remote with projects the user owns or hosts, including registered projects that have never started. When exactly one matches and the checkout has no project history, it SHALL offer to join that project. When several match, it SHALL list them and require an explicit choice. The checkout's own current identity SHALL never be offered as a match. Joining SHALL give the checkout the existing project's identity with no panes, replacing only a pristine local identity: one with no panes for which the server holds no session, whatever remote that project recorded. An explicit project option SHALL join directly, and a separate-project option SHALL skip matching. Non-interactive runs SHALL require explicit confirmation. Joining SHALL be refused when the local registry already lists that project at a different folder.
 
 #### Scenario: Laptop joins the zoo project
 - **WHEN** the owner runs `apas register` in a never-started laptop checkout whose remote matches one existing project
@@ -169,14 +261,30 @@ Once a project's tabs span more than one machine, the tab bar SHALL show each ta
 - **WHEN** the checkout's existing project already has panes or a session
 - **THEN** it is registered under its existing identity without a join prompt
 
+#### Scenario: History without a recorded remote is not re-identified
+- **WHEN** the checkout's project has a server session whose recorded remote is missing or different, and the checkout has no panes
+- **THEN** it is registered under its existing identity without a join prompt
+
+#### Scenario: Own identity is not offered
+- **WHEN** the checkout's own current identity is among the projects carrying its remote
+- **THEN** that identity is not offered as a project to join
+
 #### Scenario: Ambiguous match
 - **WHEN** several existing projects share the remote
 - **THEN** the command lists them and requires `--project`
 
 ### Requirement: An owned machine without the project can clone and join
 
-For an online machine the requester owns that does not have the project, the new-tab flow SHALL offer to clone the repository there as an instance of the same project. The clone SHALL receive the existing project identity and no panes. It SHALL NOT create a new branch or start automatically. The instance SHALL then start and the requested tab be created through the same correlated launch flow. A failure before registration SHALL remove the partial clone. Shared-cluster provisioning SHALL be unchanged.
+For an online machine the requester owns that does not have the project and whose daemon advertises multi-instance support, the new-tab flow SHALL offer to clone the repository there as an instance of the same project. Only a requester who hosts the project and owns the machine SHALL be able to request it. The clone SHALL receive the existing project identity and no panes. It SHALL NOT create a new branch or start automatically. The clone SHALL be acknowledged only after the machine's inventory lists the new checkout. The client SHALL then request the tab on that machine as an ordinary correlated launch, which starts the instance and creates the tab. If the clone's acknowledgement is lost, the client SHALL report the launch as unconfirmed and SHALL NOT resend the clone. A failure before registration SHALL remove the partial clone. Shared-cluster provisioning SHALL be unchanged.
 
 #### Scenario: Clone onto the laptop
 - **WHEN** the owner picks their laptop, which lacks the project, and confirms cloning
 - **THEN** the laptop clones the repository, registers it under the existing project id, starts the instance, and creates the tab there
+
+#### Scenario: Clone acknowledgement lost
+- **WHEN** the connection drops after a clone-to-join request was sent and before its acknowledgement arrived
+- **THEN** the client shows the launch as unconfirmed and does not send the clone again
+
+#### Scenario: Machine without support
+- **WHEN** the owner's laptop is online but its daemon lacks multi-instance support
+- **THEN** cloning there to join the project is not offered

@@ -17,7 +17,6 @@ use tokio_tungstenite::{connect_async, tungstenite::Message};
 use uuid::Uuid;
 
 use crate::config::Config;
-use crate::project;
 
 const INITIAL_RECONNECT_DELAY: Duration = Duration::from_secs(1);
 const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(60);
@@ -41,8 +40,10 @@ pub async fn run(server_url: &str, token: &str, working_dir: &Path) -> Result<()
     let config = Config::load().unwrap_or_default();
     let claude_path = config.local.claude_path.clone();
 
-    // Get or create project metadata - use project ID as session ID
-    let project_meta = project::get_or_create_project(working_dir)?;
+    // Get or create project metadata - use project ID as session ID. A file
+    // that does not parse is an error rather than regenerated, which would
+    // erase every machine's panes on a shared home.
+    let project_meta = crate::project_instances::open_project_metadata(working_dir)?;
     let session_id = project_meta.id;
     let project_name = project_meta.name.clone();
     let prompt = project_meta
