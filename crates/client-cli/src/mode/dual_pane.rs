@@ -2714,7 +2714,9 @@ fn route_web_input_to_pane(
 /// that only the removed foreground path used.
 ///
 /// `machine_id` is this host's, resolved as the daemon resolves its own, so a
-/// standalone run owns and reports its panes as the machine it is.
+/// standalone run owns and reports its panes as the machine it is. Whether it
+/// runs as an instance is `config.toml`'s to say alone: it has no daemon
+/// connection to learn whether the server runs instances.
 pub async fn run_headless(
     server_url: &str,
     token: &str,
@@ -2727,6 +2729,7 @@ pub async fn run_headless(
         working_dir,
         Arc::new(AtomicBool::new(false)),
         machine_id,
+        true,
     )
     .await
 }
@@ -2738,14 +2741,20 @@ pub async fn run_headless(
 /// instead would strand roughly thirty threads and every pane child, which is
 /// why cancellation is a flag the project observes rather than a cancelled
 /// future.
+///
+/// `instances` false runs it as the project's only runtime even where
+/// `config.toml` would allow an instance: the daemon starting it found that
+/// its server keeps one CLI per session
+/// ([`crate::project_instances::InstanceIdentity::with_instances`]).
 pub async fn run_project(
     server_url: &str,
     token: &str,
     working_dir: &Path,
     shutdown: Arc<AtomicBool>,
     machine_id: Uuid,
+    instances: bool,
 ) -> Result<ProjectOutcome> {
-    run_inner(server_url, token, working_dir, shutdown, machine_id).await
+    run_inner(server_url, token, working_dir, shutdown, machine_id, instances).await
 }
 
 async fn run_inner(
@@ -2754,12 +2763,15 @@ async fn run_inner(
     working_dir: &Path,
     shutdown: Arc<AtomicBool>,
     machine_id: Uuid,
+    instances: bool,
 ) -> Result<ProjectOutcome> {
     let config = crate::config::Config::load().unwrap_or_default();
     // Which machine this run is and whether it may run beside other machines'
     // instances of the project, which decides the panes it owns in `.apas`.
-    // Taken from the same setting the daemon decided its claim mode from.
-    let instance = crate::project_instances::InstanceIdentity::new(machine_id, &config.daemon);
+    // Taken from the same setting the daemon decided its claim mode from, and
+    // from what the daemon starting it allows.
+    let instance = crate::project_instances::InstanceIdentity::new(machine_id, &config.daemon)
+        .with_instances(instances);
     // Resolve binary paths to absolute paths at startup (while PATH is correct).
     // Systemd-run environments may have a minimal PATH that misses nvm/cargo bins.
     let claude_path = resolve_binary_path(&config.local.claude_path);
@@ -11000,6 +11012,59 @@ mod tests {
             let restored: Vec<u32> = start.tabs.iter().map(|(pane_id, ..)| *pane_id).collect();
             assert_eq!(restored, vec![3, 4]);
             assert_eq!(start.terminal_panes, HashSet::from([3, 4]));
+        });
+    }
+
+    /// A daemon whose server keeps one CLI per session starts a project as its
+    /// only runtime even where `config.toml` allows instances, as a CLI from
+    /// before instances runs it. On a shared home that is the host migration
+    /// it always was: zoo-006 restores the tabs zoo-005 ran, reports itself
+    /// without advertising instances, and saves every tab untagged for the
+    /// next capable instance to adopt. Started as an instance it would restore
+    /// only its own, and such a server would replace the project's roster
+    /// with that, so zoo-005's tabs would vanish from it.
+    #[test]
+    fn a_runtime_its_daemon_starts_alone_runs_every_pane_as_before_instances() {
+        crate::project::test_support::with_isolated_config(|| {
+            use shared::PaneKind::Terminal;
+            let (zoo5, zoo6) = (Uuid::new_v4(), Uuid::new_v4());
+            let dir = tempfile::tempdir().unwrap();
+            let metadata = write_project(
+                dir.path(),
+                vec![
+                    recorded_pane(3, Terminal, Some((zoo5, "zoo-005"))),
+                    recorded_pane(4, Terminal, None),
+                    recorded_pane(5, Terminal, Some((zoo6, "zoo-006"))),
+                ],
+            );
+            let daemon = crate::config::DaemonConfig::default();
+            let instances = shared::PROJECT_INSTANCES_CAPABILITY.to_string();
+            let instance = super::InstanceIdentity::new(zoo6, &daemon).with_instances(true);
+            assert!(super::cli_capabilities(&instance, false, false).contains(&instances));
+
+            let alone = super::InstanceIdentity::new(zoo6, &daemon).with_instances(false);
+            assert_eq!(alone.owner(), PaneOwner::Sole);
+            assert!(!super::cli_capabilities(&alone, false, false).contains(&instances));
+            match super::session_start_message(metadata.id, &alone, "/work", None, None, Vec::new())
+            {
+                CliToServer::SessionStart { machine_id, .. } => {
+                    assert_eq!(machine_id, Some(zoo6), "still reported as the machine it is")
+                }
+                other => panic!("expected a session start, got {other:?}"),
+            }
+
+            let start = super::open_runtime(dir.path(), &alone.owner()).unwrap();
+            let restored: Vec<u32> = start.tabs.iter().map(|(pane_id, ..)| *pane_id).collect();
+            assert_eq!(restored, vec![3, 4, 5]);
+            assert_eq!(start.terminal_panes, HashSet::from([3, 4, 5]));
+
+            let store = super::ProjectStore::new(dir.path(), alone.owner(), start.metadata.clone());
+            store.save_panes(&start.metadata.panes).unwrap();
+            let saved = on_disk(dir.path()).panes;
+            assert_eq!(ids_of(&saved), vec![3, 4, 5]);
+            assert!(saved
+                .iter()
+                .all(|pane| pane.machine_id.is_none() && pane.hostname.is_none()));
         });
     }
 

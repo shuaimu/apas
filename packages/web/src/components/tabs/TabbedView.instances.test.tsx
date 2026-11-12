@@ -446,3 +446,27 @@ describe("rebooting one machine's instance", () => {
     expectValid(request);
   });
 });
+
+describe("another machine starting or stopping the project", () => {
+  it("leaves the selected tab where it is", async () => {
+    // The remembered tab is keyed by the session's CLI connection. Every
+    // attached instance reports the session, listed in no fixed order, so
+    // following the first one listed would re-key it and jump to tab 10.
+    seed(11, [instance(ZOO5, "zoo-005", true), instance(ZOO6, "zoo-006")]);
+    act(() => useStore.setState((state) => ({
+      sessions: state.sessions.map((session) => ({ ...session, cliClientId: CLI })),
+      cliClients: [{ id: CLI, status: "online", activeSession: SID }],
+    })));
+    render(<TabbedView />);
+    await screen.findByTestId("terminal-pane-11");
+
+    const client = (id: string) => ({ id, name: id, status: "online", last_seen: null, active_session: SID });
+    deliver({ type: "cli_clients", clients: [client("cli-zoo-006"), client(CLI)] });
+    deliver({ type: "cli_clients", clients: [client(CLI)] });
+
+    expect(useStore.getState().cliClientId).toBe(CLI);
+    // Tab 10 was never selected, so its pane was never mounted.
+    expect(screen.queryByTestId("terminal-pane-10")).toBeNull();
+    expect(screen.getByTestId("terminal-pane-11")).toBeTruthy();
+  });
+});

@@ -73,4 +73,19 @@ describe("UserMessage", () => {
 
     expect(screen.getByText(monthDayTime(timestamp))).toBeTruthy();
   });
+
+  it("says why a refused send was not delivered, keeping its text", () => {
+    const reason = "zoo-005 is not running this project. Start it on zoo-005 first.";
+    const { container } = render(
+      <UserMessage message={userMessage({ content: "Run the suite.", deliveryError: reason })} />,
+    );
+
+    expect(container.querySelector("p")?.textContent).toBe("Run the suite.");
+    expect(screen.getByRole("status").textContent).toBe(`Not delivered: ${reason}`);
+  });
+
+  it("shows no delivery status on an ordinary send", () => {
+    render(<UserMessage message={userMessage({ content: "Run the suite." })} />);
+    expect(screen.queryByRole("status")).toBeNull();
+  });
 });

@@ -17,6 +17,7 @@ import {
   type SessionInstance,
 } from "./projectInstances";
 import { ompQuestionKey } from "./ompQuestions";
+import { refusedDeliveries, unconfirmedDeliveries } from "./terminalDelivery";
 
 /**
  * One project, several machines. These drive the real socket handler with the
@@ -161,11 +162,12 @@ describe("negotiating instances", () => {
     expectValidFrame(authenticate);
   });
 
-  it("leaves a refused input's acknowledgement to the error it accompanies", async () => {
+  it("changes nothing for a refused input's acknowledgement it is not tracking", async () => {
     // A negotiated viewer gets a mutation_ack for typed input the server
-    // refused, beside the Error toast the web already shows. Its request id is
-    // the input's client_msg_id, so it must not settle anything else, even an
-    // OMP answer that happens to share the id.
+    // refused, beside the Error toast the web already shows. It settles only
+    // a send this page is tracking under that id (see "refused input"), and
+    // its request id is the input's client_msg_id, so it must not settle
+    // anything else, even an OMP answer that happens to share the id.
     const refusal = fixture("server-mutation-ack-input.json");
     const omp = {
       sessionId: refusal.session_id as string,
@@ -569,7 +571,44 @@ describe("clone and add", () => {
     deliver(next, { type: "project_instance_created", machine_id: LAPTOP, request_id: result.requestId, project_id: PROJECT });
     expect(sentFrames(next, "add_pane")).toHaveLength(0);
     expect(sentFrames(next, "create_project_instance")).toHaveLength(0);
-    expect(launch(result.requestId)).toMatchObject({ status: "unconfirmed", error: expect.stringMatching(/finished, but no tab was added/) });
+    expect(launch(result.requestId)).toMatchObject({
+      status: "unconfirmed",
+      error: "The clone onto laptop finished. If its tab does not appear in the tab bar, add one there from the new-tab menu.",
+    });
+  });
+
+  it("never tells a duplicated browser tab that the clone its original carries on added no tab", async () => {
+    // The browser copies a tab's session storage into a duplicate, launches
+    // included, while the original goes on to add the tab. The clone's
+    // acknowledgement reaches both pages.
+    const ws = await openSocket();
+    negotiate();
+    const clone = useStore.getState().cloneAndAddPane(target, tab);
+
+    vi.resetModules();
+    const duplicate = (await import("./store")).useStore;
+    expect(duplicate.getState().addPaneRequests[clone.requestId!]).toMatchObject({
+      status: "unconfirmed",
+      cloneRequestId: clone.requestId,
+    });
+    duplicate.setState({ showToast: vi.fn(), listMachines: vi.fn(), negotiatedCapabilities: new Set([PROJECT_INSTANCES_CAPABILITY]) });
+    duplicate.getState().connect();
+    await new Promise((done) => setTimeout(done, 10));
+    const copy = duplicate.getState().ws as unknown as MockWs;
+
+    const ack = { type: "project_instance_created", machine_id: LAPTOP, request_id: clone.requestId, project_id: PROJECT };
+    deliver(ws, ack);
+    deliver(copy, ack);
+
+    // The original adds the tab, once.
+    expect(sentFrames(ws, "add_pane")).toEqual([expect.objectContaining({ session_id: SID, machine_id: LAPTOP })]);
+    // The duplicate adds nothing, and does not claim that nothing was added.
+    expect(sentFrames(copy, "add_pane")).toHaveLength(0);
+    const row = duplicate.getState().addPaneRequests[clone.requestId!];
+    expect(row).toMatchObject({ status: "unconfirmed" });
+    expect(row.error).not.toMatch(/no tab was added/);
+    expect(row.error).toMatch(/If its tab does not appear in the tab bar, add one there/);
+    duplicate.getState().disconnect();
   });
 
   it("refuses machines where a clone could not join", async () => {
@@ -634,7 +673,7 @@ describe("clone and add", () => {
     deliver(next, { type: "project_instance_created", machine_id: LAPTOP, request_id: clone.requestId, project_id: PROJECT });
     expect(reloaded.getState().addPaneRequests[clone.requestId!]).toMatchObject({
       status: "unconfirmed",
-      error: expect.stringMatching(/finished, but no tab was added/),
+      error: expect.stringMatching(/The clone onto laptop finished\. If its tab does not appear in the tab bar, add one there/),
     });
     expect(sentFrames(next, "add_pane")).toHaveLength(0);
     expect(sentFrames(next, "create_project_instance")).toHaveLength(0);
@@ -748,5 +787,185 @@ describe("lifecycle per instance", () => {
     expect(useStore.getState().rebootCli(ZOO5)).not.toBeNull();
     expect(useStore.getState().rebootCli(ZOO6)).toBeNull();
     expect(showToast).toHaveBeenCalledWith(expect.stringContaining("outside cluster policy"), "error");
+  });
+});
+
+describe("the session's CLI identity", () => {
+  // Every attached instance reports the project's session as its own, and
+  // the server lists them in no fixed order. The view's layout is keyed by
+  // the one this picks, so it must not follow whichever is listed first.
+  const PRIMARY_CLI = "cli-zoo-005";
+  const SECONDARY_CLI = "cli-zoo-006";
+
+  function cli(id: string, activeSession: string | null = SID) {
+    return { id, name: id, status: "online", version: "26.11.0", last_seen: null, active_session: activeSession };
+  }
+
+  function polledSession(cliClientId: string | null) {
+    return { id: SID, project_id: PROJECT, cli_client_id: cliClientId, status: "active", is_active: true };
+  }
+
+  beforeEach(() => {
+    useStore.setState({ cliClientId: PRIMARY_CLI, cliClients: [], sessions: [project({ cliClientId: PRIMARY_CLI })] });
+  });
+
+  it("stays on the primary's connection while another machine's instance attaches and leaves", async () => {
+    const ws = await openSocket();
+    negotiate();
+    deliver(ws, { type: "cli_clients", clients: [cli(SECONDARY_CLI), cli(PRIMARY_CLI)] });
+    expect(useStore.getState().cliClientId).toBe(PRIMARY_CLI);
+    deliver(ws, { type: "sessions", sessions: [polledSession(PRIMARY_CLI)] });
+    expect(useStore.getState().cliClientId).toBe(PRIMARY_CLI);
+    deliver(ws, { type: "cli_clients", clients: [cli(PRIMARY_CLI)] });
+    expect(useStore.getState().cliClientId).toBe(PRIMARY_CLI);
+  });
+
+  it("keeps the connection in use while the session row names none that is live", async () => {
+    useStore.setState({ sessions: [project()] });
+    const ws = await openSocket();
+    negotiate();
+    deliver(ws, { type: "cli_clients", clients: [cli(SECONDARY_CLI), cli(PRIMARY_CLI)] });
+    expect(useStore.getState().cliClientId).toBe(PRIMARY_CLI);
+  });
+
+  it("moves to the new primary only once the old one's connection is gone", async () => {
+    const ws = await openSocket();
+    negotiate();
+    deliver(ws, { type: "cli_clients", clients: [cli(SECONDARY_CLI), cli(PRIMARY_CLI)] });
+    // zoo-005 stops: zoo-006 is the only connection left, before the polled
+    // row has caught up with the handover.
+    deliver(ws, { type: "cli_clients", clients: [cli(SECONDARY_CLI)] });
+    expect(useStore.getState().cliClientId).toBe(SECONDARY_CLI);
+    deliver(ws, { type: "sessions", sessions: [polledSession(SECONDARY_CLI)] });
+    // zoo-005 comes back as a secondary on a new connection.
+    deliver(ws, { type: "cli_clients", clients: [cli("cli-zoo-005-again"), cli(SECONDARY_CLI)] });
+    expect(useStore.getState().cliClientId).toBe(SECONDARY_CLI);
+    // Nothing live: the poll falls back to the row, as it always did.
+    deliver(ws, { type: "cli_clients", clients: [] });
+    deliver(ws, { type: "sessions", sessions: [polledSession(SECONDARY_CLI)] });
+    expect(useStore.getState().cliClientId).toBe(SECONDARY_CLI);
+  });
+
+  it("picks the primary's connection when attaching to a project", () => {
+    useStore.setState({
+      cliClientId: "cli-of-another-project",
+      cliClients: [
+        { id: SECONDARY_CLI, status: "online", activeSession: SID },
+        { id: PRIMARY_CLI, status: "online", activeSession: SID },
+      ],
+    });
+    useStore.getState().commitSessionAttachment(SID, true);
+    expect(useStore.getState().cliClientId).toBe(PRIMARY_CLI);
+  });
+
+  it("takes the one live connection an older server lists, as before", async () => {
+    useStore.setState({ cliClientId: null, sessions: [project({ cliClientId: "cli-stale" })] });
+    const ws = await openSocket();
+    deliver(ws, { type: "cli_clients", clients: [cli("cli-other", "30000000-0000-4000-8000-0000000000aa"), cli("cli-current")] });
+    expect(useStore.getState().cliClientId).toBe("cli-current");
+  });
+});
+
+describe("refused input", () => {
+  // A negotiated viewer's typed input that the server refuses comes back as
+  // a mutation_ack carrying the input's client_msg_id, after the Error that
+  // already raised the notice. The send is settled: never sent again under
+  // that id, its reason shown where it is shown, its text kept.
+  const PANE = 4;
+  const REFUSAL = "zoo-005 is not running this project. Start it on zoo-005 first.";
+
+  function refusalFor(clientMsgId: unknown): Record<string, unknown> {
+    const ack = fixture("server-mutation-ack-input.json");
+    expect(ack).toMatchObject({ mutation: "input", accepted: false, error: REFUSAL });
+    return { ...ack, request_id: clientMsgId, session_id: SID, pane_id: PANE };
+  }
+
+  function bubble(clientMsgId: unknown) {
+    return useStore.getState().paneMessages[String(PANE)]
+      ?.find((message) => message.id === `optimistic-${clientMsgId}` || message.id === clientMsgId);
+  }
+
+  beforeEach(() => {
+    localStorage.removeItem("apas_pending_sends");
+    localStorage.removeItem("apas_terminal_deliveries");
+    useStore.setState({
+      isDualPane: true,
+      paneMessages: {},
+      pendingSends: [],
+      pendingTerminalDeliveries: [],
+      pendingSessionAttachment: null,
+    });
+  });
+
+  it("is neither retransmitted nor replayed, and its bubble keeps the text with the reason", async () => {
+    const ws = await openSocket();
+    negotiate();
+    vi.useFakeTimers();
+    expect(useStore.getState().sendMessageToPane("Run the suite.", PANE)).toEqual({ success: true });
+    const [input] = sentFrames(ws, "input");
+    deliver(ws, refusalFor(input.client_msg_id));
+
+    expect(useStore.getState().pendingSends).toEqual([]);
+    expect(localStorage.getItem("apas_pending_sends")).toBeNull();
+    expect(bubble(input.client_msg_id)).toMatchObject({ content: "Run the suite.", deliveryError: REFUSAL });
+    // The Error frame is the notice; the acknowledgement adds none.
+    expect(showToast).not.toHaveBeenCalled();
+
+    // No retransmission when the 3 s retry comes due...
+    vi.advanceTimersByTime(20_000);
+    // ...and no replay once the session is attached again.
+    useStore.setState({ pendingSessionAttachment: { sessionId: SID, forceReload: false, requestedFromSessionId: SID } });
+    deliver(ws, { type: "session_attached", session_id: SID, has_active_cli: true });
+    expect(sentFrames(ws, "input")).toEqual([input]);
+
+    // A second acknowledgement for the settled id changes nothing.
+    const settled = useStore.getState();
+    deliver(ws, refusalFor(input.client_msg_id));
+    expect(useStore.getState().paneMessages).toBe(settled.paneMessages);
+    expect(useStore.getState().pendingSends).toBe(settled.pendingSends);
+  });
+
+  it("stands corrected by an echo of an attempt that was delivered after all", async () => {
+    const ws = await openSocket();
+    negotiate();
+    useStore.getState().sendMessageToPane("Run the suite.", PANE);
+    const [input] = sentFrames(ws, "input");
+    deliver(ws, refusalFor(input.client_msg_id));
+    deliver(ws, { type: "user_input", session_id: SID, pane_id: PANE, text: "Run the suite.", client_msg_id: input.client_msg_id });
+    const delivered = useStore.getState().paneMessages[String(PANE)];
+    expect(delivered).toHaveLength(1);
+    expect(delivered[0]).toMatchObject({ id: input.client_msg_id, content: "Run the suite." });
+    expect(delivered[0].deliveryError).toBeUndefined();
+  });
+
+  it("settles a terminal delivery with the server's reason instead of leaving it unconfirmed", async () => {
+    const ws = await openSocket();
+    negotiate();
+    expect(useStore.getState().sendTerminalConversationMessage(PANE, "Run the suite.")).toEqual({ success: true });
+    const [input] = sentFrames(ws, "terminal_conversation_input");
+    deliver(ws, refusalFor(input.client_msg_id));
+
+    const [delivery] = useStore.getState().pendingTerminalDeliveries;
+    expect(delivery).toMatchObject({ id: input.client_msg_id, text: "Run the suite.", error: REFUSAL });
+    // Stored for a reload, reason included.
+    expect(JSON.parse(localStorage.getItem("apas_terminal_deliveries") ?? "[]")).toEqual([delivery]);
+    expect(unconfirmedDeliveries([delivery], delivery.sentAt + 60_000)).toEqual([]);
+    expect(refusedDeliveries([delivery])).toEqual([delivery]);
+    expect(bubble(input.client_msg_id)).toMatchObject({ deliveryError: REFUSAL });
+    expect(showToast).not.toHaveBeenCalled();
+
+    // Recorded after all: the transcript's acknowledgement still clears it.
+    deliver(ws, { type: "terminal_conversation_recorded", session_id: SID, pane_id: PANE, client_msg_id: input.client_msg_id });
+    expect(useStore.getState().pendingTerminalDeliveries).toEqual([]);
+  });
+
+  it("leaves another session's send alone", async () => {
+    const ws = await openSocket();
+    negotiate();
+    useStore.getState().sendMessageToPane("Run the suite.", PANE);
+    const [input] = sentFrames(ws, "input");
+    deliver(ws, { ...refusalFor(input.client_msg_id), session_id: "20000000-0000-4000-8000-0000000000ff" });
+    expect(useStore.getState().pendingSends).toHaveLength(1);
+    expect(bubble(input.client_msg_id)?.deliveryError).toBeUndefined();
   });
 });

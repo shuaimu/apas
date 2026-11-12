@@ -348,7 +348,7 @@ describe("choosing a machine for a new mobile agent", () => {
     expect(sent("create_project_instance")).toEqual([]);
 
     const confirmSheet = screen.getByRole("dialog", { name: "Clone this project onto laptop?" });
-    expect(confirmSheet.textContent).toContain("~/apas_projects/project");
+    expect(confirmSheet.textContent).toContain("~/apas_projects/project (auto-suffixed, as project-2 and so on, if that folder exists)");
     fireEvent.click(within(confirmSheet).getByRole("button", { name: "Clone and start" }));
     const [clone] = sent("create_project_instance");
     expect(clone).toMatchObject({ machine_id: LAPTOP, join_project_id: SID, instance_name: "project" });

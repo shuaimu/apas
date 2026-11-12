@@ -9,6 +9,7 @@ import { ReviewCard } from "@/../app/(code)/session/[sessionId]/review";
 import { DecisionActions } from "@/components/DecisionActions";
 import { EventCard } from "@/components/EventCard";
 import { OfflineBanner } from "@/components/ui";
+import { MutationRefusedError } from "@/connection/supervisor";
 import { useMobileStore } from "@/state/store";
 
 let mockParams: Record<string, string | undefined> = {};
@@ -135,7 +136,9 @@ describe("mobile code screens", () => {
     mockReadSelectedConversationPane.mockReset().mockReturnValue(new Promise(() => undefined));
     mockSaveSelectedConversationPane.mockReset().mockResolvedValue(undefined);
     mockReadPaneWorkSummarySnapshot.mockReset().mockResolvedValue(null);
-    mockRandomUUID.mockClear();
+    // Reset, not clear: a test that fails before using the ids it queued
+    // must not hand them to the next one.
+    mockRandomUUID.mockReset().mockImplementation(() => "04cbf715-81d0-42ca-86c5-87913e77c2c9");
     mockReadCachedSnapshot.mockReset();
     useMobileStore.setState({
       hydrated: true,
@@ -801,7 +804,10 @@ describe("mobile code screens", () => {
     const refusal = "zoo-005 is not running this project. Start it on zoo-005 first.";
     mockParams = { sessionId: session.id };
     mockReadCachedSnapshot.mockReturnValue(new Promise(() => undefined));
-    mockSendAcknowledged.mockRejectedValueOnce(new Error(refusal));
+    mockSendAcknowledged.mockRejectedValueOnce(new MutationRefusedError(refusal));
+    mockRandomUUID
+      .mockReturnValueOnce("8f2b7d64-1c1e-4f7a-9e55-2a6c3b0d9e01")
+      .mockReturnValueOnce("8f2b7d64-1c1e-4f7a-9e55-2a6c3b0d9e02");
     useMobileStore.setState({
       sessions: [session],
       features: { terminal: true, coding_mutations: true },
@@ -824,9 +830,42 @@ describe("mobile code screens", () => {
       pane_id: 5,
       client_msg_id: expect.any(String),
     }), expect.any(String));
-    // The draft stays, and sending it again (once the machine runs) carries
-    // the same id: a refused input was never recorded, so it is not a duplicate.
-    expect(view.getByText("Retry message safely")).toBeTruthy();
+    // The draft stays, but the refused id is spent: the server records only
+    // input it delivers, so the same id sent again once the machine runs
+    // would be delivered as new input. Sending again is a new message.
+    expect(view.getByText("Send message")).toBeTruthy();
+    expect(view.queryByText("Retry message safely")).toBeNull();
+    mockSendAcknowledged.mockResolvedValueOnce({ type: "user_input" });
+    fireEvent.press(view.getByText("Send message"));
+    await waitFor(() => expect(mockSendAcknowledged).toHaveBeenCalledTimes(2));
+    const [first, second] = mockSendAcknowledged.mock.calls.map(([message]) => (message as { client_msg_id: string }).client_msg_id);
+    expect(first).toBe("8f2b7d64-1c1e-4f7a-9e55-2a6c3b0d9e01");
+    expect(second).toBe("8f2b7d64-1c1e-4f7a-9e55-2a6c3b0d9e02");
+  });
+
+  it("retries an unacknowledged message under the same id", async () => {
+    // Nothing answered, so the first send may have landed: the retry must be
+    // recognisable as the same message.
+    mockParams = { sessionId: session.id };
+    mockReadCachedSnapshot.mockReturnValue(new Promise(() => undefined));
+    mockSendAcknowledged.mockRejectedValueOnce(new Error("The server did not acknowledge the action; retry with the same action identifier"));
+    mockRandomUUID.mockReturnValueOnce("8f2b7d64-1c1e-4f7a-9e55-2a6c3b0d9e03");
+    useMobileStore.setState({
+      sessions: [session],
+      features: { terminal: true, coding_mutations: true },
+      panesBySession: { [session.id]: [{ ...terminalPane, pane_id: 5, label: "Legacy 5" }] },
+    });
+    const view = render(<SessionActivityScreen />);
+
+    await waitFor(() => expect(view.getByText("✓ Legacy 5")).toBeTruthy());
+    fireEvent.changeText(view.getByPlaceholderText("Message this terminal conversation"), "Run the suite.");
+    fireEvent.press(view.getByText("Send message"));
+    await waitFor(() => expect(view.getByText("Retry message safely")).toBeTruthy());
+    mockSendAcknowledged.mockResolvedValueOnce({ type: "user_input" });
+    fireEvent.press(view.getByText("Retry message safely"));
+    await waitFor(() => expect(mockSendAcknowledged).toHaveBeenCalledTimes(2));
+    const ids = mockSendAcknowledged.mock.calls.map(([message]) => (message as { client_msg_id: string }).client_msg_id);
+    expect(ids).toEqual(["8f2b7d64-1c1e-4f7a-9e55-2a6c3b0d9e03", "8f2b7d64-1c1e-4f7a-9e55-2a6c3b0d9e03"]);
   });
 
   it("calls no machine stopped when the server did not negotiate instances", async () => {

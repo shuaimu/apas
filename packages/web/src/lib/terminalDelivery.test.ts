@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it } from "vitest";
 import {
-  DELIVERY_GRACE_MS, loadTerminalDeliveries, saveTerminalDeliveries,
+  DELIVERY_GRACE_MS, loadTerminalDeliveries, refusedDeliveries, saveTerminalDeliveries,
   unconfirmedDeliveries, type PendingDelivery,
 } from "./terminalDelivery";
 
@@ -22,10 +22,18 @@ describe("terminal delivery recovery", () => {
     expect(loadTerminalDeliveries()).toEqual([]);
   });
 
+  it("reports a refused send with its reason at once, never as unconfirmed", () => {
+    const refused = { ...pending, id: "send-2", error: "zoo-005 is not running this project. Start it on zoo-005 first." };
+    expect(unconfirmedDeliveries([pending, refused], pending.sentAt + DELIVERY_GRACE_MS)).toEqual([pending]);
+    expect(refusedDeliveries([pending, refused])).toEqual([refused]);
+    saveTerminalDeliveries([refused]);
+    expect(loadTerminalDeliveries()).toEqual([refused]);
+  });
+
   it("ignores malformed browser storage", () => {
     localStorage.setItem("apas_terminal_deliveries", "{");
     expect(loadTerminalDeliveries()).toEqual([]);
-    localStorage.setItem("apas_terminal_deliveries", JSON.stringify([{}, pending, null]));
+    localStorage.setItem("apas_terminal_deliveries", JSON.stringify([{}, pending, null, { ...pending, id: "send-3", error: 42 }]));
     expect(loadTerminalDeliveries()).toEqual([pending]);
   });
 });

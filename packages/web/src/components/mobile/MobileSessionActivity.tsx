@@ -31,6 +31,7 @@ import {
   type MachineProjectTarget,
 } from "@/lib/machineProjectTarget";
 import {
+  refusedDeliveries,
   unconfirmedDeliveries,
 } from "@/lib/terminalDelivery";
 import { instancesNegotiated, selectSessionInstances } from "@/lib/projectInstances";
@@ -201,7 +202,9 @@ function eventTone(message: Message, answeredQuestions: Map<string, Record<strin
     return "border-red-400 dark:border-red-800";
   }
   if (message.role === "user") {
-    return "border-[#c8c1ff] dark:border-[#665cc7]";
+    return message.deliveryError
+      ? "border-red-400 dark:border-red-800"
+      : "border-[#c8c1ff] dark:border-[#665cc7]";
   }
   return "border-[#dedee7] dark:border-[#383842]";
 }
@@ -296,6 +299,15 @@ function MobileEventCard({
           {expandable && (expanded ? <ChevronUp className="mt-0.5 h-4 w-4 shrink-0 text-[#686873]" /> : <ChevronDown className="mt-0.5 h-4 w-4 shrink-0 text-[#686873]" />)}
         </div>
       </button>
+
+      {message.role === "user" && message.deliveryError && (
+        // The server refused this send: say so on the send itself, which
+        // keeps its text to recover.
+        <p role="status" className="mt-2 flex items-start gap-1.5 text-sm text-red-700 dark:text-red-300">
+          <AlertTriangle aria-hidden="true" className="mt-0.5 h-4 w-4 shrink-0" />
+          <span className="min-w-0 break-words">Not delivered: {message.deliveryError}</span>
+        </p>
+      )}
 
       {expanded && message.role !== "user" && output?.type !== "approval_request" && !(output?.type === "tool_use" && output.tool === "AskUserQuestion") && (
         <pre className="mt-3 box-border w-full min-w-0 max-w-full overflow-auto whitespace-pre-wrap break-words rounded-xl bg-[#efeff5] p-3 text-sm font-normal leading-6 text-[#45454f] dark:bg-[#111115] dark:text-[#c7c7d1]">{detail}</pre>
@@ -492,16 +504,19 @@ export function MobileSessionActivity({ connected, onBack, onReconnect }: Mobile
     () => pendingDeliveries.filter((entry) => entry.sessionId === sessionId && entry.paneId === selectedPaneId),
     [pendingDeliveries, sessionId, selectedPaneId],
   );
+  // A refused send's outcome is known; only the others wait on the transcript.
+  const awaitingTranscript = pendingDeliveries.some((entry) => !entry.error);
   // Nothing else re-renders when the grace period simply elapses.
   useEffect(() => {
-    if (pendingDeliveries.length === 0) return;
+    if (!awaitingTranscript) return;
     const timer = window.setInterval(() => setDeliveryNow(Date.now()), 1_000);
     return () => window.clearInterval(timer);
-  }, [pendingDeliveries.length]);
+  }, [awaitingTranscript]);
   const unconfirmed = useMemo(
     () => unconfirmedDeliveries(selectedDeliveries, deliveryNow),
     [selectedDeliveries, deliveryNow],
   );
+  const refused = useMemo(() => refusedDeliveries(selectedDeliveries), [selectedDeliveries]);
 
   const firstVisibleActivityKey = visibleActivity[0]?.key;
   const lastVisibleActivityKey = visibleActivity.at(-1)?.key;
@@ -989,7 +1004,22 @@ export function MobileSessionActivity({ connected, onBack, onReconnect }: Mobile
       </div>
 
       <div className="shrink-0 border-t border-[#dedee7] bg-[#f7f7fa] p-3 pb-[max(0.75rem,env(safe-area-inset-bottom))] dark:border-[#383842] dark:bg-[#111115]">
-        {selectedDeliveries.length > 0 && unconfirmed.length === 0 && (
+        {refused.map((entry) => (
+          // The server refused it, so it is neither unconfirmed nor waiting:
+          // show why, and keep its text to restore. It is never resent.
+          <div key={entry.id} role="status" aria-live="polite" className="mb-1.5 flex items-start gap-2 rounded-xl border border-red-300 bg-red-50 px-3 py-2 text-xs text-red-800 dark:border-red-900 dark:bg-red-950/40 dark:text-red-200">
+            <AlertTriangle aria-hidden="true" className="mt-0.5 h-4 w-4 shrink-0" />
+            <span className="min-w-0 flex-1">
+              Your message was not delivered: {entry.error}
+              {!followUp && <button type="button" onClick={() => {
+                setFollowUp(entry.text);
+                dismissTerminalDelivery(entry.id);
+              }} className="ml-2 underline font-bold">Restore draft</button>}
+              <button type="button" onClick={() => dismissTerminalDelivery(entry.id)} className="ml-2 underline font-bold">Dismiss</button>
+            </span>
+          </div>
+        ))}
+        {selectedDeliveries.length > refused.length && unconfirmed.length === 0 && (
           <p role="status" className="mb-1.5 text-xs text-[#686873] dark:text-[#aaaab6]">Sent to terminal. Waiting for the agent to record it.</p>
         )}
         {unconfirmed.length > 0 && (

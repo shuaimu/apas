@@ -474,9 +474,33 @@ impl SessionManager {
     /// The server finished `cli_id`'s `SessionStart` as `machine_id`'s
     /// instance of `session_id`, policy included: the panes waiting for it
     /// can go to it now.
+    ///
+    /// Only while `cli_id` is still that machine's attached instance. Its
+    /// handler can finish after the same machine's reconnect has replaced
+    /// it, and recording it then would overwrite the replacement's start:
+    /// every later pane for that machine would wait for a start that never
+    /// comes, and fail after the time limit, until the machine reconnected.
+    /// Released before the replacement's own start, waiting panes could also
+    /// reach it before it holds the project's policy. The replacement
+    /// records its own start when its handler finishes.
     pub fn instance_started(&self, session_id: Uuid, machine_id: Uuid, cli_id: Uuid) {
         let key = (session_id, machine_id);
         let mut starts = self.instance_starts.lock().expect("instance starts poisoned");
+        // The starts, then the sessions: the order `wait_for_instance_start`
+        // takes them in.
+        let attached = self
+            .instance_on_machine(&session_id, &machine_id)
+            .map(|instance| instance.cli_id);
+        if attached != Some(cli_id) {
+            tracing::info!(
+                %session_id,
+                %machine_id,
+                %cli_id,
+                ?attached,
+                "ignoring the finished start of an instance no longer attached"
+            );
+            return;
+        }
         starts.started.insert(key, cli_id);
         let released = starts.finish(key, InstanceStartOutcome::Started);
         if released > 0 {
@@ -998,6 +1022,61 @@ mod tests {
         manager.detach_cli_instance(&session_id, &replacement).unwrap();
         assert!(matches!(
             manager.wait_for_instance_start(session_id, machine_id, None),
+            InstanceStartWait::Ready
+        ));
+    }
+
+    /// A connection whose `SessionStart` finishes after the same machine's
+    /// reconnect replaced it records nothing. Recorded, it would overwrite
+    /// the replacement's start, and every later pane for that machine would
+    /// wait for a start that never comes. Finished before the replacement's,
+    /// it would release waiting panes to an instance that does not hold the
+    /// project's policy yet.
+    #[tokio::test]
+    async fn a_replaced_connection_finishing_its_start_late_changes_nothing() {
+        let manager = SessionManager::new();
+        let session_id = Uuid::new_v4();
+        let machine_id = Uuid::new_v4();
+        let project = session_id.to_string();
+
+        // The replacement finishes first; the replaced one's late finish is
+        // ignored, and panes go straight to the replacement.
+        let (replaced, _rx1) = capable_instance(&manager, session_id, machine_id);
+        let (replacement, _rx2) = capable_instance(&manager, session_id, machine_id);
+        manager.instance_started(session_id, machine_id, replacement);
+        manager.instance_started(session_id, machine_id, replaced);
+        assert!(matches!(
+            manager.wait_for_instance_start(session_id, machine_id, Some(&project)),
+            InstanceStartWait::Ready
+        ));
+
+        // The replaced one finishes first: a pane waiting for the machine
+        // keeps waiting until the replacement has started.
+        let other_session = Uuid::new_v4();
+        let (replaced, _rx3) = capable_instance(&manager, other_session, machine_id);
+        let (replacement, _rx4) = capable_instance(&manager, other_session, machine_id);
+        let InstanceStartWait::Waiting {
+            waiter,
+            start: None,
+            mut outcome,
+        } = manager.wait_for_instance_start(other_session, machine_id, None)
+        else {
+            panic!("the attached instance has not finished its start")
+        };
+        manager.instance_started(other_session, machine_id, replaced);
+        assert!(
+            outcome.try_recv().is_err(),
+            "not released to an instance that has not started"
+        );
+        manager.instance_started(other_session, machine_id, replacement);
+        assert_eq!(
+            manager
+                .await_instance_start(waiter, outcome, Duration::from_secs(1))
+                .await,
+            Some(InstanceStartOutcome::Started)
+        );
+        assert!(matches!(
+            manager.wait_for_instance_start(other_session, machine_id, None),
             InstanceStartWait::Ready
         ));
     }

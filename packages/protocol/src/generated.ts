@@ -992,11 +992,27 @@ export type WebToServer =
   | {
       /**
        * Stop the project as a whole, as the project view's Close means:
-       * every machine with an instance of it attached, each authorized as a
-       * single-machine request would be. False, and absent from every older
-       * client, stops only `machine_id`, as a per-machine Stop on the
-       * Machines page does. An older server ignores the flag and stops only
-       * `machine_id`.
+       * every machine running it, each authorized as a single-machine
+       * request would be. That is `machine_id` (the view's resolved
+       * machine, which a Close always stops, running or not), every
+       * machine with an instance of it attached, and every machine whose
+       * connected daemon reports running it while its instance is not
+       * attached: one still starting, or reconnecting after its own
+       * connection dropped or the server restarted. Its machine entry
+       * shows the project running, which is what a client offers Close on,
+       * so stopping only the attached instances would leave that machine's
+       * agents running, and the project would come back when its instance
+       * reattached. A reporting daemon counts only when it belongs to an
+       * account one of the project's sessions runs under, so another
+       * account's checkout carrying the same project id is never stopped or
+       * named; a project with no session yet therefore stops only
+       * `machine_id`. A daemon's report lags a real stop by up to one
+       * heartbeat, so a machine that has just stopped may be sent a
+       * redundant Stop, which is harmless.
+       *
+       * False, and absent from every older client, stops only
+       * `machine_id`, as a per-machine Stop on the Machines page does. An
+       * older server ignores the flag and stops only `machine_id`.
        */
       all_instances?: boolean;
       machine_id: string;

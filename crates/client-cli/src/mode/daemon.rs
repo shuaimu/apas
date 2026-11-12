@@ -1,4 +1,4 @@
-use crate::daemon_registry::{ClaimMode, ClaimOutcome, InstanceClaimGuard};
+use crate::daemon_registry::{ClaimMode, ClaimOutcome, ClaimRefusal, InstanceClaimGuard};
 use anyhow::{Context, Result};
 use futures::{future::BoxFuture, SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
@@ -258,6 +258,20 @@ struct ResumeProject {
     project_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     path: Option<PathBuf>,
+    /// The server this daemon was connected to when it replaced itself keeps
+    /// one CLI per session ([`StartScope::Alone`]), so the replacement starts
+    /// the project again as its only runtime where no other host runs it
+    /// ([`StartScope::again`]). The replacement cannot ask a server first:
+    /// it resumes before it connects, and resuming as an instance would drop
+    /// the panes tagged for other machines from that server's roster. Absent
+    /// from manifests written before this, which resume as configured, as
+    /// they always did.
+    #[serde(default, skip_serializing_if = "is_false")]
+    single_machine_server: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 #[derive(Debug, Deserialize)]
@@ -335,6 +349,7 @@ fn take_resume_manifest_at(path: &std::path::Path) -> Vec<ResumeProject> {
             ResumeManifestEntry::LegacyProjectId(project_id) => ResumeProject {
                 project_id,
                 path: None,
+                single_machine_server: false,
             },
         })
         .collect()
@@ -417,6 +432,12 @@ struct RunningProject {
     /// reporting: the server rejected its session, or the runtime failed.
     /// Filled by the task as it ends; see [`RunningProject::ended_because`].
     ended_because: Arc<Mutex<Option<String>>>,
+    /// The shape this start claimed the project in, which the heartbeat keeps
+    /// it in: [`ClaimMode::Instances`] for an instance, and
+    /// [`ClaimMode::Exclusive`] for the project's only runtime, started by a
+    /// daemon that runs projects alone or alone because the server keeps one
+    /// CLI per session ([`StartScope::Alone`]).
+    claims: ClaimMode,
 }
 
 impl RunningProject {
@@ -438,15 +459,56 @@ impl RunningProject {
     }
 }
 
-/// Whether a start may run beside other machines' instances of its project.
+/// Whether a start may run beside other machines' instances of its project,
+/// which also decides how its runtime owns the project's panes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StartScope {
-    /// As this daemon's [`ClaimMode`] allows.
+    /// As this daemon's [`ClaimMode`] allows: a capable daemon starts an
+    /// instance, which runs only its own machine's panes.
     AsConfigured,
     /// Only where no other host runs the project, whatever the claim mode
     /// allows: the server this daemon is connected to keeps one CLI per
-    /// session ([`DaemonState::requested_start_scope`]).
+    /// session ([`DaemonState::requested_start_scope`]). And then as daemons
+    /// did before instances: as the project's only runtime, which restores
+    /// every pane in `.apas`, other machines' included, saves them untagged
+    /// and does not advertise `project_instances_v1`, and with claims of the
+    /// shape such daemons write
+    /// ([`crate::daemon_registry::claim_project_alone`]).
+    ///
+    /// An instance would report only its own machine's panes, and a server
+    /// that keeps one CLI per session replaces the whole roster with what its
+    /// CLI reports: every tab another machine's instance had tagged would
+    /// vanish from it, with no stopped badge, and a tab added meanwhile could
+    /// take one of their ids.
     Alone,
+    /// What was running here, started again after the daemon replaced
+    /// itself, or after a replacement failed, while the server keeps one CLI
+    /// per session: as [`StartScope::Alone`] where no other host runs the
+    /// project, and otherwise as configured, as it ran before. Never refused
+    /// for what the server runs, which never stops an instance already
+    /// running ([`StartScope::again`]).
+    AloneWherePossible,
+}
+
+impl StartScope {
+    /// How a project that was running here starts again after the daemon
+    /// replaced itself, or after a replacement failed, given whether the
+    /// server the daemon was connected to keeps one CLI per session.
+    ///
+    /// A resume runs before the new process has heard from any server, so the
+    /// process it replaced writes that answer into the resume manifest
+    /// ([`ResumeProject::single_machine_server`]); a restart after a failed
+    /// replacement still has its connection's. A server that runs instances
+    /// gets an instance back either way: the "Reboot to update" its refusals
+    /// ask for is what turns a project's only runtime, started while the
+    /// server kept one CLI per session, into an instance.
+    fn again(single_machine_server: bool) -> Self {
+        if single_machine_server {
+            Self::AloneWherePossible
+        } else {
+            Self::AsConfigured
+        }
+    }
 }
 
 /// The newest start of each project on this host, by project id; see
@@ -529,6 +591,11 @@ struct ProjectLaunch {
     project_path: PathBuf,
     shutdown: Arc<AtomicBool>,
     machine_id: Uuid,
+    /// Whether the runtime may run as an instance, as its claims do
+    /// ([`RunningProject::claims`]). False runs it as the project's only
+    /// runtime whatever `config.toml` allows, as a CLI from before instances
+    /// runs ([`StartScope::Alone`]).
+    instances: bool,
 }
 
 fn project_runtime_launcher() -> ProjectLauncher {
@@ -540,6 +607,7 @@ fn project_runtime_launcher() -> ProjectLauncher {
                 &launch.project_path,
                 launch.shutdown,
                 launch.machine_id,
+                launch.instances,
             )
             .await
         })
@@ -891,18 +959,29 @@ impl DaemonState {
     }
 
     /// Record both identity and path so a replacement does not need the
-    /// shared registry in order to find what this exact process was running.
+    /// shared registry in order to find what this exact process was running,
+    /// and whether this daemon's server keeps one CLI per session, which the
+    /// replacement cannot ask before it resumes them.
     fn running_projects_for_resume(&self) -> Vec<ResumeProject> {
         self.running
             .iter()
             .filter(|(_, running)| !running.handle.is_finished())
             .filter_map(|(project_id, _)| {
-                self.projects.get(project_id).map(|project| ResumeProject {
-                    project_id: project_id.clone(),
-                    path: Some(project.path.clone()),
-                })
+                self.projects
+                    .get(project_id)
+                    .map(|project| self.resume_entry(project_id, project))
             })
             .collect()
+    }
+
+    fn resume_entry(&self, project_id: &str, project: &ProjectEntry) -> ResumeProject {
+        ResumeProject {
+            project_id: project_id.to_string(),
+            path: Some(project.path.clone()),
+            // Every replacement is asked for over a connection that has
+            // registered, so this is that server's answer.
+            single_machine_server: self.requested_start_scope() == StartScope::Alone,
+        }
     }
 
     /// The resume list for a restart that one project asked for, which must
@@ -917,10 +996,7 @@ impl DaemonState {
         let mut resume = self.running_projects_for_resume();
         if !resume.iter().any(|entry| entry.project_id == project_id) {
             if let Some(project) = self.projects.get(project_id) {
-                resume.push(ResumeProject {
-                    project_id: project_id.to_string(),
-                    path: Some(project.path.clone()),
-                });
+                resume.push(self.resume_entry(project_id, project));
             }
         }
         resume
@@ -993,23 +1069,33 @@ impl DaemonState {
     /// logged rather than seized. That combination means two runtimes are
     /// live where only one may be, which is the thing claims exist to prevent
     /// — stealing the claim would hide it, and the operator needs to see it.
+    ///
+    /// Each project's claims keep the shape its start took
+    /// ([`RunningProject::claims`]): refreshed in the daemon's own shape, a
+    /// project's only runtime, started while the server kept one CLI per
+    /// session, would mark the guard again and let a capable daemon on another
+    /// host start an instance beside it.
     fn reconcile_running_claims(&self) {
-        let running: Vec<(String, String)> = self
-            .running
-            .iter()
-            .filter(|(_, project)| !project.handle.is_finished())
-            .filter_map(|(project_id, _)| {
-                self.projects
-                    .get(project_id)
-                    .map(|project| (project_id.clone(), project.path.display().to_string()))
-            })
-            .collect();
-        crate::daemon_registry::refresh_own_claims(
-            &self.registry_dir,
-            self.machine_info.machine_id,
-            self.claim_mode,
-            &running,
-        );
+        for claims in [ClaimMode::Instances, ClaimMode::Exclusive] {
+            let running: Vec<(String, String)> = self
+                .running
+                .iter()
+                .filter(|(_, project)| {
+                    !project.handle.is_finished() && project.claims == claims
+                })
+                .filter_map(|(project_id, _)| {
+                    self.projects
+                        .get(project_id)
+                        .map(|project| (project_id.clone(), project.path.display().to_string()))
+                })
+                .collect();
+            crate::daemon_registry::refresh_own_claims(
+                &self.registry_dir,
+                self.machine_info.machine_id,
+                claims,
+                &running,
+            );
+        }
     }
 
     /// The heartbeat's part in the shared registry: refresh this host's
@@ -1065,9 +1151,11 @@ impl DaemonState {
     /// session: a second machine's `SessionStart` replaces the first machine's
     /// instance there, and that instance's tabs can no longer be controlled.
     /// So until a registration says otherwise, a start asked for over this
-    /// connection runs only where no other host runs the project
+    /// connection runs only where no other host runs the project, and then as
+    /// the project's only runtime, as daemons ran projects before instances
     /// ([`DaemonState::requested_start_scope`]). Nothing already running here
-    /// is stopped because of it, and the claims of what runs keep their shape.
+    /// is stopped or changed because of it: each project keeps running as it
+    /// started, and its claims keep their shape.
     fn note_registration(&mut self, negotiated_capabilities: &[String]) {
         self.server_runs_instances = negotiated_capabilities
             .iter()
@@ -1075,15 +1163,17 @@ impl DaemonState {
         if self.claim_mode == ClaimMode::Instances && !self.server_runs_instances {
             tracing::info!(
                 "the server does not run project instances, so this host starts a project only \
-                 where no other machine runs it until the server does; projects running here \
-                 keep running"
+                 where no other machine runs it, as its only runtime, until the server does; \
+                 projects running here keep running"
             );
         }
     }
 
     /// How a start that the current server connection asks for may run:
-    /// beside other machines' instances only when this daemon can run them
-    /// and the server echoed that it runs them too.
+    /// beside other machines' instances, as an instance, only when this
+    /// daemon can run them and the server echoed that it runs them too.
+    /// Otherwise a capable daemon starts it alone, as the project's only
+    /// runtime ([`StartScope::Alone`]).
     fn requested_start_scope(&self) -> StartScope {
         if self.claim_mode == ClaimMode::Instances && !self.server_runs_instances {
             StartScope::Alone
@@ -1158,9 +1248,10 @@ impl DaemonState {
     /// is left for a project this daemon does not know.
     ///
     /// `scope` says whether the project may run beside other machines'
-    /// instances. It decides only whether to refuse: a project already running
-    /// here is never refused, and the claims written are the claim mode's
-    /// either way.
+    /// instances, and so whether its runtime starts as an instance or as the
+    /// project's only runtime, with claims of the matching shape
+    /// ([`DaemonState::claim_for_start`]). A project already running here is
+    /// never refused, and keeps running as it started.
     fn start_project(
         &mut self,
         project_id: &str,
@@ -1228,17 +1319,8 @@ impl DaemonState {
         let mut starts = claim_starts
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let claim_with = match scope {
-            StartScope::AsConfigured => crate::daemon_registry::claim_project,
-            StartScope::Alone => crate::daemon_registry::claim_project_alone,
-        };
-        match claim_with(
-            &self.registry_dir,
-            project_id,
-            &project_path.display().to_string(),
-            machine_id,
-            self.claim_mode,
-        ) {
+        let (claimed, claims) = self.claim_for_start(project_id, &project_path, scope);
+        match claimed {
             Ok(ClaimOutcome::HeldBy(refusal)) => {
                 drop(starts);
                 return Ok(StartOutcome::Refused(
@@ -1258,7 +1340,10 @@ impl DaemonState {
             *newest
         };
         drop(starts);
-        if self.claim_mode == ClaimMode::Instances {
+        // The runtime owns the project's panes as its claims say: an instance
+        // only its own machine's, the project's only runtime every one.
+        let instances = claims == ClaimMode::Instances;
+        if instances {
             // Running beside other machines is the point of instances, but it
             // is also what an operator chasing a duplicate needs to see.
             let others = crate::daemon_registry::live_instance_machines(
@@ -1278,6 +1363,15 @@ impl DaemonState {
                     "starting another instance of a project that other machines run"
                 );
             }
+        } else if self.claim_mode == ClaimMode::Instances {
+            // Why a host that runs instances is suddenly running tabs that
+            // other machines ran, and reporting them as its own.
+            tracing::info!(
+                project_id,
+                "starting this project as its only runtime, because the server keeps one CLI per \
+                 session: it runs every pane in .apas, other machines' included, and saves them \
+                 untagged, as before instances"
+            );
         }
         // Released when the task ends, however it ends, except when it asks
         // for the daemon to be replaced or the project was started here again
@@ -1307,6 +1401,7 @@ impl DaemonState {
             project_path,
             shutdown: project_shutdown.clone(),
             machine_id,
+            instances,
         });
         let id_for_task = project_id.to_string();
         let restart_tx = restart_tx.clone();
@@ -1365,10 +1460,63 @@ impl DaemonState {
                 shutdown: project_shutdown,
                 handle,
                 ended_because,
+                claims,
             },
         );
         tracing::info!(project_id, "started project in this instance");
         Ok(StartOutcome::Started)
+    }
+
+    /// Claim `project_id` for a start in `scope`. Returns the outcome and the
+    /// shape the claims take, which is also how the runtime owns the
+    /// project's panes ([`RunningProject::claims`]): this daemon's
+    /// [`ClaimMode`] as configured, and [`ClaimMode::Exclusive`] for a start
+    /// that runs alone because the server keeps one CLI per session.
+    fn claim_for_start(
+        &self,
+        project_id: &str,
+        project_path: &Path,
+        scope: StartScope,
+    ) -> (Result<ClaimOutcome>, ClaimMode) {
+        let project_path = project_path.display().to_string();
+        let machine_id = self.machine_info.machine_id;
+        let as_configured = || {
+            crate::daemon_registry::claim_project(
+                &self.registry_dir,
+                project_id,
+                &project_path,
+                machine_id,
+                self.claim_mode,
+            )
+        };
+        let alone = || {
+            crate::daemon_registry::claim_project_alone(
+                &self.registry_dir,
+                project_id,
+                &project_path,
+                machine_id,
+                self.claim_mode,
+            )
+        };
+        match scope {
+            StartScope::AsConfigured => (as_configured(), self.claim_mode),
+            StartScope::Alone => (alone(), ClaimMode::Exclusive),
+            StartScope::AloneWherePossible => match alone() {
+                Ok(ClaimOutcome::HeldBy(ClaimRefusal::SingleMachineServer(holder))) => {
+                    // Then it ran here as an instance beside that host's,
+                    // started while the server ran instances. Run alone, it
+                    // would run that host's panes as well.
+                    tracing::info!(
+                        project_id,
+                        other_host = %holder.hostname,
+                        "another host runs this project, so it starts here again as an instance, \
+                         as it ran before"
+                    );
+                    (as_configured(), self.claim_mode)
+                }
+                claimed => (claimed, ClaimMode::Exclusive),
+            },
+        }
     }
 
     /// Record why a project was not started, as its `last_error`, and return
@@ -1392,7 +1540,8 @@ impl DaemonState {
     /// waits for the instance's `SessionStart`.
     ///
     /// The start runs beside other machines' instances only when the server
-    /// said it runs them too ([`DaemonState::requested_start_scope`]).
+    /// said it runs them too, and otherwise as the project's only runtime
+    /// ([`DaemonState::requested_start_scope`]).
     fn handle_start_request(
         &mut self,
         project_id: String,
@@ -2141,8 +2290,11 @@ pub async fn run(
     // straight on. The claims survived the `exec` too, and each start below
     // takes its project's back under this same pid.
     //
-    // As configured, before any server has answered: these were running, and
-    // what a server says it can do never stops an instance already running.
+    // Before any server has answered: these were running, and what a server
+    // says it can do never stops an instance already running. Each runs as
+    // the server the replaced daemon was connected to allowed, which it wrote
+    // down: alone where that server kept one CLI per session and no other
+    // host runs the project, and otherwise as configured.
     for project in take_resume_manifest() {
         let project_id = project.project_id.clone();
         if let Err(err) = state.restore_project_from_resume(&project) {
@@ -2154,7 +2306,7 @@ pub async fn run(
             server_url,
             token,
             &restart_tx,
-            StartScope::AsConfigured,
+            StartScope::again(project.single_machine_server),
         ) {
             Ok(StartOutcome::Started | StartOutcome::AlreadyRunning) => {
                 tracing::info!(project_id, "resumed project after replacement");
@@ -2360,17 +2512,13 @@ async fn run_connection(
                 // that cannot `exec`. Restarting the one project still clears
                 // whatever made the user ask, so it beats doing nothing. Its
                 // task kept the claims for the replacement, so this start
-                // finds them still its own. As configured, whatever the
-                // server runs: the project was running here a moment ago, and
-                // that never stops an instance already running.
+                // finds them still its own. Never refused for what the server
+                // runs: the project was running here a moment ago, and that
+                // never stops an instance already running. It starts as the
+                // resume would have ([`StartScope::again`]).
                 state.stop_running_project(&project_id).await;
-                match state.start_project(
-                    &project_id,
-                    server_url,
-                    token,
-                    restart_tx,
-                    StartScope::AsConfigured,
-                ) {
+                let scope = StartScope::again(state.requested_start_scope() == StartScope::Alone);
+                match state.start_project(&project_id, server_url, token, restart_tx, scope) {
                     Ok(StartOutcome::Started | StartOutcome::AlreadyRunning) => {
                         tracing::info!(project_id, "restarted project");
                     }
@@ -2960,6 +3108,7 @@ mod local_registration_tests {
                         shutdown: shutdown.clone(),
                         handle,
                         ended_because: Default::default(),
+                        claims: ClaimMode::Instances,
                     },
                 );
                 state
@@ -3042,6 +3191,7 @@ mod requested_restart_tests {
                 shutdown: Arc::new(AtomicBool::new(false)),
                 handle,
                 ended_because: Default::default(),
+                claims: ClaimMode::Instances,
             },
         );
     }
@@ -3158,10 +3308,12 @@ mod resume_tests {
             ResumeProject {
                 project_id: "alpha".to_string(),
                 path: Some(PathBuf::from("/projects/alpha")),
+                single_machine_server: false,
             },
             ResumeProject {
                 project_id: "beta".to_string(),
                 path: Some(PathBuf::from("/projects/beta")),
+                single_machine_server: false,
             },
         ];
         write_resume_manifest_at(&path, &projects);
@@ -3186,6 +3338,7 @@ mod resume_tests {
             &[ResumeProject {
                 project_id: "alpha".to_string(),
                 path: Some(PathBuf::from("/projects/alpha")),
+                single_machine_server: false,
             }],
         );
         write_resume_manifest_at(&path, &[]);
@@ -3203,6 +3356,64 @@ mod resume_tests {
             vec![ResumeProject {
                 project_id: "alpha".to_string(),
                 path: None,
+                single_machine_server: false,
+            }]
+        );
+    }
+
+    /// Whether the replaced daemon's server kept one CLI per session survives
+    /// the replacement, which resumes before it can ask a server. A manifest
+    /// written before the flag existed resumes as configured, as it always
+    /// did, and a daemon from before the flag still reads one that carries
+    /// it, so rolling back does not cost the projects their resume.
+    #[test]
+    fn whether_the_server_kept_one_cli_per_session_survives_the_replacement() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("resume.json");
+        let projects = vec![
+            ResumeProject {
+                project_id: "alpha".to_string(),
+                path: Some(PathBuf::from("/projects/alpha")),
+                single_machine_server: true,
+            },
+            ResumeProject {
+                project_id: "beta".to_string(),
+                path: Some(PathBuf::from("/projects/beta")),
+                single_machine_server: false,
+            },
+        ];
+        write_resume_manifest_at(&path, &projects);
+
+        /// A resume entry as a daemon from before the flag declares it.
+        #[derive(serde::Deserialize)]
+        struct Earlier {
+            project_id: String,
+            #[serde(default)]
+            path: Option<PathBuf>,
+        }
+        let earlier: Vec<Earlier> =
+            serde_json::from_slice(&std::fs::read(&path).expect("read manifest"))
+                .expect("an earlier daemon reads it");
+        assert_eq!(
+            earlier
+                .iter()
+                .map(|project| (project.project_id.as_str(), project.path.clone()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("alpha", Some(PathBuf::from("/projects/alpha"))),
+                ("beta", Some(PathBuf::from("/projects/beta")))
+            ]
+        );
+        assert_eq!(take_resume_manifest_at(&path), projects);
+
+        std::fs::write(&path, br#"[{"project_id":"alpha","path":"/projects/alpha"}]"#)
+            .expect("write an earlier manifest");
+        assert_eq!(
+            take_resume_manifest_at(&path),
+            vec![ResumeProject {
+                project_id: "alpha".to_string(),
+                path: Some(PathBuf::from("/projects/alpha")),
+                single_machine_server: false,
             }]
         );
     }
@@ -3268,6 +3479,20 @@ mod instance_tests {
         })
     }
 
+    /// Each launch's project path, and whether it was let run as an instance.
+    type Launches = Arc<Mutex<Vec<(PathBuf, bool)>>>;
+
+    /// `inner`, recording into `launches` how each launch was asked to run.
+    fn recording(inner: ProjectLauncher, launches: Launches) -> ProjectLauncher {
+        Arc::new(move |launch: ProjectLaunch| {
+            launches
+                .lock()
+                .unwrap()
+                .push((launch.project_path.clone(), launch.instances));
+            inner(launch)
+        })
+    }
+
     fn now_secs() -> u64 {
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -3283,6 +3508,7 @@ mod instance_tests {
         // This test's config directory, which holds the claims, and the
         // thread's redirect to it, for as long as the harness lives.
         config: ConfigDirGuard,
+        launches: Launches,
     }
 
     fn harness(mode: ClaimMode, ending: Ending) -> Harness {
@@ -3307,7 +3533,8 @@ mod instance_tests {
         // Registered with a server that runs instances, unless a test says
         // otherwise.
         state.note_registration(&[shared::PROJECT_INSTANCES_CAPABILITY.to_string()]);
-        state.launcher = launcher(ending);
+        let launches = Launches::default();
+        state.launcher = recording(launcher(ending), launches.clone());
         let (restart_tx, restart_rx) = tokio::sync::mpsc::unbounded_channel();
         Harness {
             state,
@@ -3315,12 +3542,26 @@ mod instance_tests {
             restart_rx,
             projects: tempfile::tempdir().unwrap(),
             config,
+            launches,
         }
     }
 
     impl Harness {
         fn machine(&self) -> Uuid {
             self.state.machine_info.machine_id
+        }
+
+        /// Whether the newest launch of `project_id` was let run as an
+        /// instance, or `None` if it was never launched.
+        fn launched_as_instance(&self, project_id: &str) -> Option<bool> {
+            let path = self.projects.path().join(project_id);
+            self.launches
+                .lock()
+                .unwrap()
+                .iter()
+                .rev()
+                .find(|(launched, _)| *launched == path)
+                .map(|(_, instances)| *instances)
         }
 
         fn add_project(&mut self, project_id: &str) -> PathBuf {
@@ -3786,20 +4027,28 @@ mod instance_tests {
             serde_json::json!("peer.invalid")
         );
 
-        // Where no other host runs it, it starts, with a capable daemon's
-        // claims: what runs is the same runtime.
+        // Where no other host runs it, it starts as daemons ran it before
+        // instances: as the project's only runtime, which runs every pane, and
+        // claimed as those daemons claim, with the guard alone and unmarked,
+        // which keeps a capable daemon on another host out of it. Started as
+        // an instance it would report only this machine's panes, and this
+        // server would replace the project's roster with them. (Before this,
+        // the start was an instance with an instance's claims.)
         let replies = h.request_start("proj-alone", policy(), Some(Uuid::new_v4()));
         let (_, _, success, error) = outcome_of(&replies).unwrap();
         assert!(success, "{error:?}");
-        assert!(h.instance_path("proj-alone", h.machine()).exists());
+        assert_eq!(h.launched_as_instance("proj-alone"), Some(false));
+        assert!(!h.instance_path("proj-alone", h.machine()).exists());
+        let guard = h.read(&h.guard_path("proj-alone"));
         assert_eq!(
-            h.read(&h.guard_path("proj-alone"))["instances"],
-            serde_json::json!(true)
+            guard["hostname"],
+            serde_json::json!(crate::daemon_registry::hostname())
         );
+        assert!(guard.get("instances").is_none(), "{guard}");
 
         // Another host starting it meanwhile does not turn a further start of
-        // what runs here into a refusal, and the heartbeat keeps its claims
-        // as they are.
+        // what runs here into a refusal or a second launch, and the heartbeat
+        // keeps its claims in their shape.
         let other = Uuid::new_v4();
         write_foreign_claim(
             &h.instance_path("proj-alone", other),
@@ -3815,21 +4064,26 @@ mod instance_tests {
         assert!(entry.is_running);
         assert_eq!(entry.last_error, None);
         h.state.reconcile_running_claims();
-        assert!(h.instance_path("proj-alone", h.machine()).exists());
-        assert_eq!(
-            h.read(&h.guard_path("proj-alone"))["instances"],
-            serde_json::json!(true)
-        );
+        assert!(!h.instance_path("proj-alone", h.machine()).exists());
+        assert!(h
+            .read(&h.guard_path("proj-alone"))
+            .get("instances")
+            .is_none());
 
-        // What was running before the server answered, resumed after the
-        // daemon replaced itself or restarted after a failed replacement,
-        // starts as configured.
+        // What was running here when the daemon replaced itself, or when a
+        // replacement failed, is never refused for what the server runs.
+        // Another host runs this one, so it ran here as an instance beside
+        // that host and starts as one again: run alone, it would run that
+        // host's panes as well.
         assert_eq!(
-            h.start_as("proj-resumed", StartScope::AsConfigured),
+            h.start_as("proj-resumed", StartScope::again(true)),
             StartOutcome::Started
         );
+        assert_eq!(h.launched_as_instance("proj-resumed"), Some(true));
+        assert!(h.instance_path("proj-resumed", h.machine()).exists());
 
-        // Registered again with a server that runs instances: it joins.
+        // Registered again with a server that runs instances: it joins, as an
+        // instance.
         h.state
             .note_registration(&[shared::PROJECT_INSTANCES_CAPABILITY.to_string()]);
         let replies = h.request_start("proj-shared", policy(), Some(Uuid::new_v4()));
@@ -3839,6 +4093,28 @@ mod instance_tests {
         assert!(entry.is_running);
         assert_eq!(entry.last_error, None);
         assert!(h.instance_path("proj-shared", h.machine()).exists());
+        assert_eq!(h.launched_as_instance("proj-shared"), Some(true));
+
+        // What already runs here keeps running as it started, its claims in
+        // their shape.
+        let replies = h.request_start("proj-alone", policy(), Some(Uuid::new_v4()));
+        assert!(outcome_of(&replies).unwrap().2);
+        h.state.reconcile_running_claims();
+        assert!(!h.instance_path("proj-alone", h.machine()).exists());
+        assert!(h
+            .read(&h.guard_path("proj-alone"))
+            .get("instances")
+            .is_none());
+        assert_eq!(
+            h.launches
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(path, _)| path.ends_with("proj-alone"))
+                .count(),
+            1,
+            "launched once"
+        );
 
         // A daemon that runs projects alone anyway keeps its own reason.
         let mut h = harness(ClaimMode::Exclusive, Ending::WhenStopped);
@@ -3857,6 +4133,110 @@ mod instance_tests {
         assert!(error
             .unwrap()
             .contains("config.toml sets daemon.machine_id"));
+    }
+
+    /// A project the daemon starts again after replacing itself, or after a
+    /// replacement failed, runs as the server the daemon was connected to
+    /// allowed: alone where that server kept one CLI per session and no other
+    /// host runs the project, so the server's roster keeps every tab, and as
+    /// an instance where the server runs instances, which is what the
+    /// "Reboot to update" a server asks for has to bring back. The heartbeat
+    /// keeps each start's claims in its own shape, side by side, and a stop
+    /// releases either.
+    #[tokio::test]
+    async fn a_project_started_again_runs_as_its_server_allowed() {
+        let mut h = harness(ClaimMode::Instances, Ending::WhenStopped);
+        for project_id in ["proj-alone", "proj-instance"] {
+            h.add_project(project_id);
+        }
+
+        assert_eq!(
+            h.start_as("proj-alone", StartScope::again(true)),
+            StartOutcome::Started
+        );
+        assert_eq!(h.launched_as_instance("proj-alone"), Some(false));
+        assert!(!h.instance_path("proj-alone", h.machine()).exists());
+        assert!(h
+            .read(&h.guard_path("proj-alone"))
+            .get("instances")
+            .is_none());
+
+        assert_eq!(
+            h.start_as("proj-instance", StartScope::again(false)),
+            StartOutcome::Started
+        );
+        assert_eq!(h.launched_as_instance("proj-instance"), Some(true));
+        assert!(h.instance_path("proj-instance", h.machine()).exists());
+        assert_eq!(
+            h.read(&h.guard_path("proj-instance"))["instances"],
+            serde_json::json!(true)
+        );
+
+        let me = crate::daemon_registry::hostname();
+        let old = now_secs() - 60;
+        for project_id in ["proj-alone", "proj-instance"] {
+            write_foreign_claim(&h.guard_path(project_id), &me, h.machine(), old, true);
+        }
+        h.state.reconcile_running_claims();
+        let alone = h.read(&h.guard_path("proj-alone"));
+        assert!(alone["heartbeat"].as_u64().unwrap() >= old + 60);
+        assert!(alone.get("instances").is_none(), "{alone}");
+        assert!(!h.instance_path("proj-alone", h.machine()).exists());
+        let instance = h.read(&h.guard_path("proj-instance"));
+        assert!(instance["heartbeat"].as_u64().unwrap() >= old + 60);
+        assert_eq!(instance["instances"], serde_json::json!(true));
+        assert!(h.instance_path("proj-instance", h.machine()).exists());
+
+        for project_id in ["proj-alone", "proj-instance"] {
+            h.state.stop_project(project_id).await.unwrap();
+            assert!(!h.guard_path(project_id).exists(), "{project_id}");
+            assert!(
+                !h.instance_path(project_id, h.machine()).exists(),
+                "{project_id}"
+            );
+        }
+    }
+
+    /// The replacement resumes before it has heard from any server, so the
+    /// daemon it replaces writes down whether its server keeps one CLI per
+    /// session, for every project it resumes, the one that asked for the
+    /// restart included. A daemon that runs projects alone anyway has nothing
+    /// to write.
+    #[tokio::test]
+    async fn a_replacement_is_told_whether_its_server_kept_one_cli_per_session() {
+        let single_machine_server = |state: &DaemonState| -> Vec<bool> {
+            state
+                .resume_projects_after_requested_restart("proj")
+                .iter()
+                .map(|project| project.single_machine_server)
+                .collect()
+        };
+        let mut h = harness(ClaimMode::Instances, Ending::WhenStopped);
+        h.add_project("proj");
+        assert_eq!(h.start("proj"), StartOutcome::Started);
+        assert_eq!(single_machine_server(&h.state), vec![false]);
+        h.state.note_registration(&[]);
+        assert_eq!(single_machine_server(&h.state), vec![true]);
+        assert_eq!(
+            h.state
+                .running_projects_for_resume()
+                .iter()
+                .map(|project| project.single_machine_server)
+                .collect::<Vec<_>>(),
+            vec![true]
+        );
+        h.state.stop_project("proj").await.unwrap();
+        assert_eq!(
+            single_machine_server(&h.state),
+            vec![true],
+            "the project that asked is listed although its task ended"
+        );
+
+        let mut h = harness(ClaimMode::Exclusive, Ending::WhenStopped);
+        h.add_project("proj");
+        assert_eq!(h.start("proj"), StartOutcome::Started);
+        h.state.note_registration(&[]);
+        assert_eq!(single_machine_server(&h.state), vec![false]);
     }
 
     /// `ProjectRuntimeStarted` answers every correlated request exactly once,

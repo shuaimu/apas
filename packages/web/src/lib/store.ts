@@ -28,6 +28,7 @@ import {
 } from "./paneStatus";
 import {
   LEGACY_MACHINE_KEY,
+  liveSessionCliClientId,
   PROJECT_INSTANCES_CAPABILITY,
   parseSessionInstances,
   primaryInstance,
@@ -58,6 +59,10 @@ export interface Message {
   outputType?: OutputType;
   sessionId?: string;
   paneId?: number;
+  /** On this page's own unconfirmed send: the server refused it, and why
+   *  (`mutation_ack` for `input`). The text stays here to recover. Cleared
+   *  if an echo later shows it was delivered after all. */
+  deliveryError?: string;
 }
 
 export interface CliClient {
@@ -1446,7 +1451,11 @@ function failAddPaneRequest(set: StoreSet, get: () => AppState, requestId: strin
 }
 
 /** Where this browser tab keeps its launches across a reload. Per tab, like
- *  the connection that is the only one ever told a launch's outcome. */
+ *  the connection that is the only one ever told a launch's outcome, with one
+ *  exception: a browser copies a tab's session storage into a duplicate of
+ *  it, so a duplicate starts with launches that the page it copied may still
+ *  be carrying out. Nothing restored may therefore claim what that page did
+ *  or did not do (`applyCloneAndAddCreated`). */
 const ADD_PANE_REQUESTS_KEY = "apas_add_pane_requests";
 const ADD_PANE_REQUEST_STATUSES = new Set<AddPaneRequestStatus>([
   "cloning", "pending", "starting", "routed", "failed", "unconfirmed",
@@ -1489,10 +1498,14 @@ function storedAddPaneRequest(value: unknown): AddPaneRequest | null {
  * only to the connection the reload ended, so one still in flight can no
  * longer be confirmed: it comes back unconfirmed, as after a dropped
  * connection, and is never resent. A clone's acknowledgement goes to every
- * connection of its owner, so a late one still turns the warning into "the
- * clone finished; add a tab there" (`applyCloneAndAddCreated`). A routed
+ * connection of its owner, so a late one still says the clone finished and
+ * where to add a tab if none appeared (`applyCloneAndAddCreated`). A routed
  * launch was delivered: its tab appears, or its instance reports its own
  * refusal. Failed and unconfirmed ones stay until dismissed.
+ *
+ * A duplicated browser tab restores the same list, while the page it was
+ * copied from may still be carrying those launches out. It reports them the
+ * same way, and never resends them either.
  */
 export function restoreAddPaneRequests(stored: unknown): Record<string, AddPaneRequest> {
   if (!Array.isArray(stored)) return {};
@@ -1738,11 +1751,15 @@ function applyCloneAndAddCreated(data: Record<string, unknown>, set: StoreSet, g
   const projectId = typeof data.project_id === "string" ? data.project_id : undefined;
   const pending = pendingCloneAdds.get(request.requestId);
   if (request.status !== "cloning" || !pending) {
-    // The launch was already reported unconfirmed; it never continues. A late
-    // success still tells the user where the checkout ended up.
+    // The launch was already reported unconfirmed; it never continues here. A
+    // late success still tells the user where the checkout ended up. It must
+    // not say that no tab was added: this page may be a duplicate of the
+    // browser tab that sent the clone, which receives the same
+    // acknowledgement and goes on to add the tab. Its tab then appears here
+    // too, and the advice holds either way.
     if (request.status === "unconfirmed" && !error && projectId) {
       patchAddPaneRequest(set, request.requestId, {
-        error: `The clone onto ${host} finished, but no tab was added. Add one there from the new-tab menu.`,
+        error: `The clone onto ${host} finished. If its tab does not appear in the tab bar, add one there from the new-tab menu.`,
       });
       get().listMachines();
     }
@@ -2245,15 +2262,16 @@ export const useStore = create<AppState>((set, get) => ({
 
     const { cliClients, sessions } = state;
 
-    let newCliClientId: string | null = null;
-    const activeClient = cliClients.find(c => c.activeSession === sessionId);
     const sessionInfo = sessions.find(s => s.id === sessionId);
-    // Prefer live active-session mapping over persisted session metadata.
-    if (activeClient) {
-      newCliClientId = activeClient.id;
-    } else if (sessionInfo?.cliClientId) {
-      newCliClientId = sessionInfo.cliClientId;
-    }
+    // Prefer live active-session mapping over persisted session metadata,
+    // and among several live instances the primary's (see
+    // liveSessionCliClientId).
+    const newCliClientId = liveSessionCliClientId(
+      cliClients,
+      sessionId,
+      sessionInfo?.cliClientId,
+      state.cliClientId,
+    ) ?? sessionInfo?.cliClientId ?? null;
 
     if (newCliClientId) {
       localStorage.setItem("apas_cli_client_id", newCliClientId);
@@ -4479,6 +4497,82 @@ function savePendingSends(items: PendingSend[]) {
   }
 }
 
+/** Show a refusal on this page's own bubble for the send, keeping its text.
+ *  The bubble keeps its `optimistic-` id, so an echo of an attempt that was
+ *  delivered after all still claims it (and clears the refusal). */
+function withRefusedSendBubble(
+  state: AppState,
+  sendId: string,
+  paneId: number | null | undefined,
+  error: string,
+): Partial<AppState> {
+  const bubbleId = `optimistic-${sendId}`;
+  const keys = paneId == null
+    ? Object.keys(state.paneMessages)
+    : [paneKey(paneId), ...Object.keys(state.paneMessages)];
+  for (const key of keys) {
+    const bucket = state.paneMessages[key];
+    const index = bucket ? bucket.findIndex((message) => message.id === bubbleId) : -1;
+    if (!bucket || index < 0) continue;
+    const updated = [...bucket];
+    updated[index] = { ...updated[index], deliveryError: error };
+    const paneMessages = { ...state.paneMessages, [key]: updated };
+    return {
+      paneMessages,
+      // Legacy compat, as addMessageToPane keeps them.
+      deadloopMessages: paneMessages[paneKey(PANE_ID_DEADLOOP)] || [],
+      interactiveMessages: paneMessages[paneKey(PANE_ID_INTERACTIVE)] || [],
+    };
+  }
+  return {};
+}
+
+/**
+ * Settle typed input the server refused: a `mutation_ack` for `input`, whose
+ * `request_id` is the send's `client_msg_id`. Its outcome is known, whichever
+ * attempt (first send, retransmission or replay) the server answered:
+ * - it leaves the pending queue, in memory and in storage, so it is neither
+ *   retransmitted nor replayed after a reconnect: the server records only
+ *   the ids of input it delivers, so once the tab's machine runs the project
+ *   a resend would be delivered as new input, long after the user saw it
+ *   refused;
+ * - a terminal delivery stops waiting for the transcript and shows the
+ *   server's reason, keeping its text to restore;
+ * - this page's bubble for it shows the reason, keeping its text.
+ * The `error` frame carrying the same reason has already raised the notice,
+ * so nothing more is announced. An id this page is not tracking (settled
+ * already, or never sent here) changes nothing.
+ */
+function settleRefusedInput(data: Record<string, unknown>, set: StoreSet, get: () => AppState) {
+  const sendId = data.request_id;
+  const sessionId = data.session_id;
+  if (data.accepted !== false || typeof sendId !== "string" || !sendId || typeof sessionId !== "string") return;
+  const { pendingSends, pendingTerminalDeliveries } = get();
+  const send = pendingSends.find((entry) => entry.id === sendId && entry.sessionId === sessionId);
+  const delivery = pendingTerminalDeliveries.find((entry) =>
+    entry.id === sendId && entry.sessionId === sessionId && !entry.error);
+  if (!send && !delivery) return;
+  const error = typeof data.error === "string" && data.error.trim()
+    ? data.error
+    : "The server refused this message.";
+  const paneId = typeof data.pane_id === "number" ? data.pane_id : send?.paneId ?? delivery?.paneId;
+  set((state) => {
+    const next: Partial<AppState> = state.sessionId === sessionId
+      ? withRefusedSendBubble(state, sendId, paneId, error)
+      : {};
+    if (send) {
+      next.pendingSends = state.pendingSends.filter((entry) => entry.id !== sendId);
+      savePendingSends(next.pendingSends);
+    }
+    if (delivery) {
+      next.pendingTerminalDeliveries = state.pendingTerminalDeliveries.map((entry) =>
+        entry.id === sendId && entry.sessionId === sessionId ? { ...entry, error } : entry);
+      saveTerminalDeliveries(next.pendingTerminalDeliveries);
+    }
+    return next;
+  });
+}
+
 /// Retransmit any unacked pending sends for the current session. Called
 /// after authenticate (and reconnect) so the server gets a second
 /// chance at sends that landed in the void during a silently-stale WS.
@@ -4775,6 +4869,10 @@ export function handleServerMessage(
 ) {
   switch (data.type) {
     case "mutation_ack": {
+      if (data.mutation === "input") {
+        settleRefusedInput(data, set, get);
+        break;
+      }
       if (data.mutation !== "question" || typeof data.request_id !== "string") break;
       set((state) => {
         const entry = [...state.ompQuestions].find(([, question]) =>
@@ -5008,9 +5106,6 @@ export function handleServerMessage(
       }));
 
       const { sessionId } = get();
-      const activeClientForSession = sessionId
-        ? parsedClients.find((c) => c.activeSession === sessionId)
-        : undefined;
       const hasActiveClientInOurList = sessionId
         ? parsedClients.some(c => c.activeSession === sessionId)
         : false;
@@ -5021,10 +5116,21 @@ export function handleServerMessage(
           ...(hasActiveClientInOurList ? { isAttached: true } : {}),
         };
 
-        if (activeClientForSession && state.cliClientId !== activeClientForSession.id) {
-          next.cliClientId = activeClientForSession.id;
+        // Every instance of a project on several machines reports its
+        // session; another machine attaching or leaving must not re-key this
+        // view's layout to whichever of them is listed first.
+        const activeClientIdForSession = sessionId
+          ? liveSessionCliClientId(
+              parsedClients,
+              sessionId,
+              state.sessions.find((session) => session.id === sessionId)?.cliClientId,
+              state.cliClientId,
+            )
+          : undefined;
+        if (activeClientIdForSession && state.cliClientId !== activeClientIdForSession) {
+          next.cliClientId = activeClientIdForSession;
           if (typeof window !== "undefined") {
-            localStorage.setItem("apas_cli_client_id", activeClientForSession.id);
+            localStorage.setItem("apas_cli_client_id", activeClientIdForSession);
           }
         }
 
@@ -5868,7 +5974,6 @@ export function handleServerMessage(
         }
         const next: Partial<AppState> = { sessions: parsedSessions, workingPanesBySession };
         if (state.sessionId) {
-          const activeClient = state.cliClients.find((c) => c.activeSession === state.sessionId);
           const currentSession = parsedSessions.find((s) => s.id === state.sessionId);
           if (currentSession?.panes) {
             const paneStatuses = { ...state.paneStatuses };
@@ -5892,7 +5997,12 @@ export function handleServerMessage(
             // This prevents stale "attached" UI state after a CLI crashes.
             next.isAttached = Boolean(currentSession.isActive);
           }
-          const preferredCliClientId = activeClient?.id ?? currentSession?.cliClientId ?? null;
+          const preferredCliClientId = liveSessionCliClientId(
+            state.cliClients,
+            state.sessionId,
+            currentSession?.cliClientId,
+            state.cliClientId,
+          ) ?? currentSession?.cliClientId ?? null;
 
           if (preferredCliClientId && state.cliClientId !== preferredCliClientId) {
             next.cliClientId = preferredCliClientId;
@@ -6444,6 +6554,9 @@ export function handleServerMessage(
                 updated[idx] = {
                   ...orig,
                   id: orig.id.replace(/^optimistic-/, ""),
+                  // An attempt sent before a refusal arrived can still be
+                  // delivered once the machine runs again: the echo stands.
+                  deliveryError: undefined,
                 };
               }
               const nextPending = state.pendingSends.filter(

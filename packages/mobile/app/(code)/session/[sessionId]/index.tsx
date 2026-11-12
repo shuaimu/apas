@@ -10,6 +10,7 @@ import { PaneWorkSummarySheet } from "@/components/PaneWorkSummarySheet";
 import { sessionActivityStatus } from "@/components/SessionCard";
 import { EmptyState, ErrorNotice, FormField, OfflineBanner, PrimaryButton, Screen, SecondaryButton, StatusBadge } from "@/components/ui";
 import { connectionSupervisor } from "@/connection/runtime";
+import { MutationRefusedError } from "@/connection/supervisor";
 import { useTheme } from "@/design/tokens";
 import { readCachedSnapshot, readConversationPosition, readSelectedConversationPane, saveConversationPosition, saveSelectedConversationPane, type ConversationPosition } from "@/storage/cache";
 import { paneStatusIsPendingAnswer } from "@/state/paneStatus";
@@ -233,6 +234,15 @@ export default function SessionActivityScreen() {
     });
   };
 
+  // The draft stays either way. An unacknowledged send keeps its id, so a
+  // retry is recognised as the same message if the first one landed. A
+  // refused send's id is spent: the server records only input it delivers,
+  // so the same id sent again once the tab's machine runs would be delivered
+  // as new input. Sending the text again is a new message under a new id.
+  const settleUnsentFollowUp = (error: unknown) => {
+    if (error instanceof MutationRefusedError) setFollowUpRequestId(null);
+  };
+
   const steer = async () => {
     if (!mutationsAllowed() || !followUp.trim() || activePaneId === null || selectedUnavailable) return;
     const supervisor = connectionSupervisor();
@@ -259,6 +269,7 @@ export default function SessionActivityScreen() {
         setFollowUp("");
         setFollowUpRequestId(null);
       } catch (error) {
+        settleUnsentFollowUp(error);
         setActionError(error instanceof Error ? error.message : "The terminal conversation message was not acknowledged.");
       }
       return;
@@ -277,6 +288,7 @@ export default function SessionActivityScreen() {
       setFollowUp("");
       setFollowUpRequestId(null);
     } catch (error) {
+      settleUnsentFollowUp(error);
       setActionError(error instanceof Error ? error.message : "The instruction was not acknowledged. Retry safely.");
     }
   };

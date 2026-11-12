@@ -400,13 +400,17 @@ export function confirmationText(copy: ConfirmationCopy): string {
   return [copy.title, ...copy.body].join("\n\n");
 }
 
-/** What the clone-here confirmation says. */
+/** What the clone-here confirmation says. The folder is only the one asked
+ *  for: the daemon never reuses an existing folder, so when another checkout
+ *  (often a separate project of the same repository) already has that name it
+ *  clones into a suffixed one instead. The acknowledgement does not carry the
+ *  path; the Machines page lists where the checkout went. */
 export function cloneHereCopy(hostname: string, gitRemote: string): ConfirmationCopy {
   const name = cloneInstanceName(gitRemote);
   return {
     title: `Clone this project onto ${hostname}?`,
     body: [
-      `${hostname} clones ${gitRemote} into ~/apas_projects/${name} as another checkout of this project, with no new branch. The project then starts there and the new tab opens on ${hostname}.`,
+      `${hostname} clones ${gitRemote} into ~/apas_projects/${name} (auto-suffixed, as ${name}-2 and so on, if that folder exists) as another checkout of this project, with no new branch. The project then starts there and the new tab opens on ${hostname}.`,
       "Cloning a large repository can take a few minutes.",
     ],
   };

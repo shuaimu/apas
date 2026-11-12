@@ -693,18 +693,85 @@ async fn project_start_machines(state: &AppState, project_id: &str) -> Vec<Uuid>
     machines
 }
 
-/// The machines a project-wide Close stops: `machine_id`, which a Close
-/// always stopped, and every machine with an instance of the project
-/// attached.
-fn project_stop_machines(state: &AppState, project_id: &str, machine_id: Uuid) -> Vec<Uuid> {
-    let mut machines = vec![machine_id];
-    for session_id in state.sessions.project_session_ids(project_id) {
-        for instance in state.sessions.session_attachments(&session_id) {
+/// Why a project-wide Close stops a machine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StopRelation {
+    /// The machine the request names, which a Close always stopped.
+    Named,
+    /// An instance of the project is attached there.
+    Attached,
+    /// Its connected daemon reports running the project, but no instance
+    /// of it is attached: one still starting, or reconnecting after its
+    /// connection dropped or the server restarted.
+    Reporting,
+}
+
+/// The machines a project-wide Close stops, each with why: every machine
+/// running the project, as `StopMachineProjectCli.all_instances` says. That
+/// is `machine_id`, every machine with an instance of the project attached,
+/// and every machine whose connected daemon reports running it while its
+/// instance is not attached. A client offers Close on that report, so leaving
+/// such a machine out would keep its agents running, and the project would
+/// come back when its instance reattached.
+///
+/// A reporting daemon counts only when it belongs to an account the
+/// project's sessions run under, the one account every instance of a session
+/// runs under. Another account's checkout can carry the same project id, and
+/// its daemon reports running it until that instance's `SessionStart` is
+/// refused; it is not part of this project.
+async fn project_stop_machines(
+    state: &AppState,
+    project_id: &str,
+    machine_id: Uuid,
+) -> Vec<(Uuid, StopRelation)> {
+    // The machine named keeps its place first; it is the project's own too
+    // when it is also found attached or reporting.
+    fn relate(machines: &mut Vec<(Uuid, StopRelation)>, machine: Uuid, relation: StopRelation) {
+        match machines.iter_mut().find(|(listed, _)| *listed == machine) {
+            Some((_, listed)) if *listed == StopRelation::Named => *listed = relation,
+            Some(_) => {}
+            None => machines.push((machine, relation)),
+        }
+    }
+    let mut machines = vec![(machine_id, StopRelation::Named)];
+    let session_ids = state.sessions.project_session_ids(project_id);
+    for session_id in &session_ids {
+        for instance in state.sessions.session_attachments(session_id) {
             if let Some(attached) = instance.machine_id {
-                if !machines.contains(&attached) {
-                    machines.push(attached);
-                }
+                relate(&mut machines, attached, StopRelation::Attached);
             }
+        }
+    }
+    let reporting: Vec<Uuid> = state
+        .sessions
+        .machines_running_project(project_id)
+        .into_iter()
+        .filter(|machine| {
+            !machines
+                .iter()
+                .any(|(listed, relation)| listed == machine && *relation == StopRelation::Attached)
+        })
+        .collect();
+    if reporting.is_empty() {
+        return machines;
+    }
+    let mut accounts = HashSet::new();
+    for session_id in &session_ids {
+        match state.db.get_session(&session_id.to_string()).await {
+            Ok(Some(row)) => accounts.extend(Uuid::parse_str(&row.user_id).ok()),
+            Ok(None) => {}
+            Err(error) => {
+                tracing::warn!(%session_id, %error, "session lookup failed for a project Close")
+            }
+        }
+    }
+    for machine in reporting {
+        if state
+            .sessions
+            .daemon_owner(&machine)
+            .is_some_and(|owner| accounts.contains(&owner))
+        {
+            relate(&mut machines, machine, StopRelation::Reporting);
         }
     }
     machines
@@ -727,14 +794,22 @@ async fn may_act_on_every_instance(state: &AppState, user_id: &Uuid, project_id:
 }
 
 /// A refusal for one machine of a request that may cover several, naming
-/// that machine's host when it does.
-fn machine_refusal(state: &AppState, machine_id: Uuid, several: bool, reason: &str) -> String {
+/// that machine's host when it does. `nameable` false gives the machine's id
+/// instead, as for a machine the server does not know; see
+/// [`may_name_machine`].
+fn machine_refusal(
+    state: &AppState,
+    machine_id: Uuid,
+    several: bool,
+    nameable: bool,
+    reason: &str,
+) -> String {
     if !several {
         return reason.to_string();
     }
-    let host = state
-        .sessions
-        .machine_hostname(&machine_id)
+    let host = nameable
+        .then(|| state.sessions.machine_hostname(&machine_id))
+        .flatten()
         .unwrap_or_else(|| machine_id.to_string());
     format!("{host}: {reason}")
 }
@@ -764,12 +839,63 @@ async fn start_policy(
     }
 }
 
+/// Why the project must not start on `machine_id`, or `None`: an instance
+/// whose CLI cannot share the project runs it on another machine. Such a CLI
+/// is only ever the session's sole instance, so an instance started here
+/// would be refused when it attached, after its daemon had already started
+/// the project and restored its saved tabs, and a Start is not correlated,
+/// so its requester would hear nothing. It is refused before any daemon
+/// frame instead, with the reason that `SessionStart` would be refused with.
+///
+/// That instance's own machine is not refused: a Start there goes ahead as
+/// it always did, and its daemon answers that the project already runs. It
+/// is recognized by the instance's machine when it reported one, else by its
+/// host; one with no host could be anywhere, so every machine is refused.
+///
+/// A native task launch needs no such check: while such a CLI runs the
+/// project, the task goes to its running session and no machine is started
+/// (`mobile::launch_task`).
+fn beside_older_instance_refusal(
+    state: &AppState,
+    project_id: &str,
+    machine_id: &Uuid,
+) -> Option<String> {
+    let target_host = state
+        .sessions
+        .machine_hostname(machine_id)
+        .map(|host| normalize_machine_hostname(&host))
+        .filter(|host| !host.is_empty());
+    state
+        .sessions
+        .project_session_ids(project_id)
+        .iter()
+        .flat_map(|session_id| state.sessions.session_attachments(session_id))
+        .filter(|instance| !instance.capable)
+        .find(|older| {
+            let same_machine = match older.machine_id {
+                Some(older_machine) => older_machine == *machine_id,
+                None => {
+                    let older_host = older
+                        .hostname
+                        .as_deref()
+                        .map(normalize_machine_hostname)
+                        .filter(|host| !host.is_empty());
+                    older_host.is_some() && older_host == target_host
+                }
+            };
+            !same_machine
+        })
+        .map(|older| crate::session::instances::beside_older_cli_refusal(&older))
+}
+
 /// `StartMachineProjectCli`. A per-machine Start on the Machines page, and
 /// every older client, starts only `machine_id`. The project view's Start
 /// (`all_instances`) starts each machine [`project_start_machines`] names,
 /// and `machine_id` only when none qualifies. Each machine is authorized as
 /// a per-machine Start would be, and when several were chosen a refusal names
-/// the host it concerns.
+/// the host it concerns. A machine that cannot run the project beside an
+/// older CLI running it elsewhere is refused before any daemon frame; see
+/// [`beside_older_instance_refusal`].
 async fn start_machine_project(
     state: &AppState,
     connection_id: &Uuid,
@@ -799,6 +925,8 @@ async fn start_machine_project(
         vec![machine_id]
     };
 
+    // A refusal names a host only when several machines were chosen, and
+    // those all list the project and own its tabs.
     let mut authorized = Vec::new();
     for target in targets {
         if has_machine_project_runtime_access(state, user_id, &target, project_id).await {
@@ -807,7 +935,7 @@ async fn start_machine_project(
             send_policy_error(
                 state,
                 connection_id,
-                machine_refusal(state, target, several, "Machine not found"),
+                machine_refusal(state, target, several, true, "Machine not found"),
             )
             .await;
         }
@@ -826,18 +954,24 @@ async fn start_machine_project(
     }
     let mut compatible = Vec::new();
     for target in authorized {
-        if state
+        let refusal = if !state
             .sessions
             .daemon_supports_capability(&target, shared::PROJECT_POLICY_CAPABILITY)
         {
-            compatible.push(target);
+            Some(incompatible.to_string())
         } else {
-            send_policy_error(
-                state,
-                connection_id,
-                machine_refusal(state, target, several, incompatible),
-            )
-            .await;
+            beside_older_instance_refusal(state, project_id, &target)
+        };
+        match refusal {
+            None => compatible.push(target),
+            Some(refusal) => {
+                send_policy_error(
+                    state,
+                    connection_id,
+                    machine_refusal(state, target, several, true, &refusal),
+                )
+                .await
+            }
         }
     }
     if compatible.is_empty() {
@@ -867,7 +1001,7 @@ async fn start_machine_project(
             send_policy_error(
                 state,
                 connection_id,
-                machine_refusal(state, target, several, "Daemon is offline"),
+                machine_refusal(state, target, several, true, "Daemon is offline"),
             )
             .await;
         }
@@ -876,8 +1010,14 @@ async fn start_machine_project(
 
 /// `StopMachineProjectCli`. A per-machine Stop, and every older client,
 /// stops only `machine_id`; the project view's Close (`all_instances`) stops
-/// every machine [`project_stop_machines`] names. Each machine is authorized
-/// as a per-machine Stop would be.
+/// every machine running the project, as [`project_stop_machines`] finds
+/// them: the machine named, every attached instance's, and every machine
+/// whose connected daemon reports running it while its instance is not
+/// attached. Each machine is authorized as a per-machine Stop would be.
+///
+/// When several machines are stopped a refusal names the host it concerns,
+/// except the machine the request named when [`may_name_machine`] does not
+/// allow it: that one is refused by its id, as an unknown machine is.
 async fn stop_machine_project(
     state: &AppState,
     connection_id: &Uuid,
@@ -892,17 +1032,22 @@ async fn stop_machine_project(
         return;
     }
     let targets = if all_instances {
-        project_stop_machines(state, project_id, machine_id)
+        project_stop_machines(state, project_id, machine_id).await
     } else {
-        vec![machine_id]
+        vec![(machine_id, StopRelation::Named)]
     };
     let several = targets.len() > 1;
-    for target in targets {
+    let session_ids = state.sessions.project_session_ids(project_id);
+    for (target, relation) in targets {
         if !has_machine_project_runtime_access(state, user_id, &target, project_id).await {
+            // Attached and reporting machines are the project's own; only
+            // the machine the request named can be any machine at all.
+            let nameable = relation != StopRelation::Named
+                || (several && may_name_machine(state, &session_ids, user_id, &target).await);
             send_policy_error(
                 state,
                 connection_id,
-                machine_refusal(state, target, several, "Machine not found"),
+                machine_refusal(state, target, several, nameable, "Machine not found"),
             )
             .await;
             continue;
@@ -918,10 +1063,11 @@ async fn stop_machine_project(
             )
             .await
         {
+            // Runtime access there means the requester can see the machine.
             send_policy_error(
                 state,
                 connection_id,
-                machine_refusal(state, target, several, "Daemon is offline"),
+                machine_refusal(state, target, several, true, "Daemon is offline"),
             )
             .await;
         }
@@ -2209,6 +2355,52 @@ struct NewPaneRequest {
     spec: NewPaneSpec,
 }
 
+/// Whether `user_id` can see `machine_id` among their machines: they own it,
+/// or their cluster membership covers it. Only such a machine is ever named
+/// to them for itself; see [`may_name_machine`].
+async fn machine_visible_to(state: &AppState, user_id: &Uuid, machine_id: &Uuid) -> bool {
+    match state.sessions.daemon_owner(machine_id) {
+        Some(owner) if owner == *user_id => true,
+        Some(owner) => state
+            .db
+            .cluster_member_can_use_machine(
+                &owner.to_string(),
+                &user_id.to_string(),
+                &machine_id.to_string(),
+            )
+            .await
+            .unwrap_or(false),
+        None => false,
+    }
+}
+
+/// Whether a refusal may name `machine_id`'s host to `user_id`: the machine
+/// runs an instance of one of `session_ids`, a tab of one is tagged for it,
+/// or `user_id` can see it among their machines. Any other machine id a
+/// request names is answered as one the server does not know. Machine ids
+/// derive from `user@host`, so naming the host of whatever id was asked for
+/// would confirm to anyone that another account has a daemon on a guessed
+/// host.
+async fn may_name_machine(
+    state: &AppState,
+    session_ids: &[Uuid],
+    user_id: &Uuid,
+    machine_id: &Uuid,
+) -> bool {
+    let related = session_ids.iter().any(|session_id| {
+        state
+            .sessions
+            .instance_on_machine(session_id, machine_id)
+            .is_some()
+            || state
+                .sessions
+                .get_session_panes(session_id)
+                .iter()
+                .any(|pane| pane.machine_id == Some(*machine_id))
+    });
+    related || machine_visible_to(state, user_id, machine_id).await
+}
+
 /// A machine's host name for messages, or "That machine".
 fn machine_label(state: &AppState, machine_id: Uuid) -> String {
     state
@@ -2632,23 +2824,10 @@ async fn start_target(
         }
     };
     let project_id = row.project_id.clone().unwrap_or_else(|| row.id.clone());
-    let owner = state.sessions.daemon_owner(&machine_id);
-    let visible = match owner {
-        Some(owner) if owner == request.user_id => true,
-        Some(owner) => state
-            .db
-            .cluster_member_can_use_machine(
-                &owner.to_string(),
-                &request.user_id.to_string(),
-                &machine_id.to_string(),
-            )
-            .await
-            .unwrap_or(false),
-        None => false,
-    };
-    if !visible {
+    if !machine_visible_to(state, &request.user_id, &machine_id).await {
         return Err("That machine is not available to you".to_string());
     }
+    let owner = state.sessions.daemon_owner(&machine_id);
     let host = machine_label(state, machine_id);
     // Every instance runs under the account the session belongs to, and
     // another account's instance is refused when it starts.
@@ -3738,8 +3917,16 @@ async fn with_viewer_runtime_access(
 /// second would replace it, and a reboot confirmation would then count
 /// another machine's tabs. Older native builds would also drop their socket
 /// on the instance-set frame, which is why it is gated at all.
+///
+/// The viewer already receives every change broadcast, so each frame here
+/// reads its state only as it is queued, with nothing awaited in between
+/// (`send_to_web_with`). Read earlier, a set or inventory that changed
+/// meanwhile would be broadcast first and this older copy would arrive after
+/// it, as the viewer's last word: a running machine's tabs shown stopped
+/// until the next change. The instance set is queued without `runtime_access`
+/// for that reason, as broadcasts are; this connection's outbound task fills
+/// it in for the viewer (`with_viewer_runtime_access`).
 async fn replay_instances_after_attach(state: &AppState, connection_id: &Uuid, session_id: Uuid) {
-    let mut inventories = state.sessions.attached_lifecycle_inventories(&session_id);
     if !state
         .sessions
         .web_supports_capability(connection_id, shared::PROJECT_INSTANCES_CAPABILITY)
@@ -3748,38 +3935,58 @@ async fn replay_instances_after_attach(state: &AppState, connection_id: &Uuid, s
         // relay gives such a viewer: the first instance to report is not
         // always the primary after a restart. With nothing attached, the one
         // last reported, as before.
-        inventories = state
-            .sessions
-            .primary_lifecycle_inventory(&session_id)
-            .into_iter()
-            .collect();
-    } else {
-        let instances = match state.sessions.get_web_user(connection_id) {
-            Some(user_id) => viewer_session_instances(state, &session_id, &user_id).await,
-            None => state.sessions.session_instances(&session_id),
-        };
-        state
-            .sessions
-            .send_to_web(
-                connection_id,
-                ServerToWeb::SessionInstances {
-                    session_id,
-                    instances,
-                },
-            )
-            .await;
+        if let Some((machine_id, inventory)) =
+            state.sessions.primary_lifecycle_inventory(&session_id)
+        {
+            state
+                .sessions
+                .send_to_web(
+                    connection_id,
+                    ServerToWeb::CliLifecycleInventory {
+                        session_id,
+                        inventory,
+                        machine_id,
+                    },
+                )
+                .await;
+        }
+        return;
     }
-    for (machine_id, inventory) in inventories {
+    state
+        .sessions
+        .send_to_web_with(connection_id, || {
+            Some(ServerToWeb::SessionInstances {
+                session_id,
+                instances: state.sessions.session_instances(&session_id),
+            })
+        })
+        .await;
+    let machines: Vec<Option<Uuid>> = state
+        .sessions
+        .attached_lifecycle_inventories(&session_id)
+        .into_iter()
+        .map(|(machine_id, _)| machine_id)
+        .collect();
+    for machine_id in machines {
+        // That machine's inventory as it stands now: a newer one relayed
+        // since the list was read would otherwise be overtaken by this copy.
+        // Nothing for one whose instance has detached meanwhile.
         state
             .sessions
-            .send_to_web(
-                connection_id,
-                ServerToWeb::CliLifecycleInventory {
-                    session_id,
-                    inventory,
-                    machine_id,
-                },
-            )
+            .send_to_web_with(connection_id, || {
+                state
+                    .sessions
+                    .attached_lifecycle_inventories(&session_id)
+                    .into_iter()
+                    .find(|(machine, _)| *machine == machine_id)
+                    .map(
+                        |(machine_id, inventory)| ServerToWeb::CliLifecycleInventory {
+                            session_id,
+                            inventory,
+                            machine_id,
+                        },
+                    )
+            })
             .await;
     }
 }
@@ -4064,19 +4271,44 @@ fn lifecycle_cli_message(
 /// The instance a reboot or lifecycle request is for: the one on `machine_id`,
 /// else the primary. `Err` carries the refusal for a named machine that runs
 /// no instance; the request must not land on another machine instead.
-fn lifecycle_target(
+///
+/// The refusal names the machine's host only when [`may_name_machine`]
+/// allows it, by the host its tab carries when it has one. Any other machine
+/// is refused as one the server does not know: the request only proves
+/// access to the session, not to the machine it names.
+async fn lifecycle_target(
     state: &AppState,
+    connection_id: &Uuid,
     session_id: &Uuid,
     machine_id: Option<Uuid>,
 ) -> Result<Option<InstanceAttachment>, String> {
-    match machine_id {
-        Some(machine_id) => state
-            .sessions
-            .instance_on_machine(session_id, &machine_id)
-            .map(Some)
-            .ok_or_else(|| not_running_message(state, Some(machine_id), None)),
-        None => Ok(state.sessions.primary_instance(session_id)),
+    let Some(machine_id) = machine_id else {
+        return Ok(state.sessions.primary_instance(session_id));
+    };
+    if let Some(instance) = state.sessions.instance_on_machine(session_id, &machine_id) {
+        return Ok(Some(instance));
     }
+    let nameable = match state.sessions.get_web_user(connection_id) {
+        Some(user_id) => may_name_machine(state, &[*session_id], &user_id, &machine_id).await,
+        None => false,
+    };
+    // The host a tab of that machine carries survives a restart, which
+    // forgets machines until their daemons connect again.
+    let tab_host = nameable
+        .then(|| {
+            state
+                .sessions
+                .get_session_panes(session_id)
+                .into_iter()
+                .find(|pane| pane.machine_id == Some(machine_id))
+                .and_then(|pane| pane.hostname)
+        })
+        .flatten();
+    Err(not_running_message(
+        state,
+        nameable.then_some(machine_id),
+        tab_host,
+    ))
 }
 
 /// The first pane of `instance` whose retired backend cannot run at all, and
@@ -4102,7 +4334,7 @@ async fn handle_reboot_cli(
     session_id: Uuid,
     machine_id: Option<Uuid>,
 ) {
-    let target = match lifecycle_target(state, &session_id, machine_id) {
+    let target = match lifecycle_target(state, connection_id, &session_id, machine_id).await {
         Ok(target) => target,
         Err(refusal) => {
             send_policy_error(state, connection_id, refusal).await;
@@ -4181,7 +4413,7 @@ async fn handle_cli_lifecycle_request(
         inventory,
         machine_id,
     };
-    let target = match lifecycle_target(state, &session_id, machine_id) {
+    let target = match lifecycle_target(state, connection_id, &session_id, machine_id).await {
         Ok(target) => target,
         Err(refusal) => {
             state
@@ -8844,6 +9076,19 @@ mod project_instance_tests {
         }
     }
 
+    impl Endpoint<ServerToWeb> {
+        /// What the viewer is sent: every queued frame as the connection's
+        /// outbound task delivers it, with each instance set's
+        /// `runtime_access` filled in for this viewer.
+        async fn delivered(&mut self, state: &AppState) -> Vec<ServerToWeb> {
+            let mut delivered = Vec::new();
+            for message in self.drain() {
+                delivered.push(with_viewer_runtime_access(state, &self.id, message).await);
+            }
+            delivered
+        }
+    }
+
     struct Project {
         state: AppState,
         /// The project's owner.
@@ -9664,7 +9909,10 @@ mod project_instance_tests {
             _ => None,
         };
         let expected = vec![(Some(p.m5), Some(true)), (Some(p.m6), Some(false))];
-        assert_eq!(web.drain().iter().find_map(access), Some(expected.clone()));
+        assert_eq!(
+            web.delivered(&p.state).await.iter().find_map(access),
+            Some(expected.clone())
+        );
         let broadcast = ServerToWeb::SessionInstances {
             session_id: p.session,
             instances: p.state.sessions.session_instances(&p.session),
@@ -10472,6 +10720,411 @@ mod project_instance_tests {
         assert!(d5.drain().is_empty() && d6.drain().is_empty());
     }
 
+    /// The project as `host`'s daemon lists it, running or not.
+    fn listed(p: &Project, host: &str, running: bool) -> shared::MachineProjectInfo {
+        shared::MachineProjectInfo {
+            project_id: p.project_id(),
+            name: None,
+            path: format!("/work/{host}"),
+            preferred_machine_id: None,
+            is_running: running,
+            pid: None,
+            memory_kb: None,
+            last_error: None,
+            git_remote: None,
+        }
+    }
+
+    /// A connected daemon of `owner`, an account other than the project's
+    /// host, on `machine_id`, listing `projects`.
+    fn foreign_daemon(
+        p: &Project,
+        owner: Uuid,
+        machine_id: Uuid,
+        host: &str,
+        projects: Vec<shared::MachineProjectInfo>,
+    ) -> Endpoint<ServerToDaemon> {
+        let (tx, rx) = mpsc::channel(16);
+        p.state.sessions.register_daemon(
+            machine_id,
+            owner,
+            tx,
+            shared::MachineInfo {
+                machine_id,
+                hostname: host.to_string(),
+                os: "linux".to_string(),
+                arch: "x86_64".to_string(),
+                daemon_version: None,
+                deepseek_backend: None,
+                last_seen: None,
+            },
+            projects,
+        );
+        p.state.sessions.set_daemon_capabilities(
+            machine_id,
+            CAPABLE_DAEMON
+                .iter()
+                .map(|capability| capability.to_string())
+                .collect(),
+        );
+        Endpoint { id: machine_id, rx }
+    }
+
+    /// The project view's Close also stops a machine whose connected daemon
+    /// reports running the project while its instance is not attached, one
+    /// starting or reconnecting: its machine entry shows the project running,
+    /// and stopping only the attached instances would leave its agents
+    /// running, to come back when it reattached. A daemon that lists the
+    /// project without running it, a disconnected one, and another account's
+    /// that runs a checkout carrying the same id are left alone. A
+    /// per-machine Stop still stops its machine alone.
+    #[tokio::test]
+    async fn a_project_wide_close_stops_a_machine_whose_instance_is_not_attached() {
+        let p = project().await;
+        let m7 = Uuid::new_v4();
+        let m8 = Uuid::new_v4();
+        let foreign = Uuid::new_v4();
+        let stranger = Uuid::new_v4();
+        p.state.db.create_user(&user(stranger)).await.unwrap();
+        let mut d5 = p.daemon(p.m5, HOST_A, CAPABLE_DAEMON);
+        let mut d6 = p.daemon(p.m6, HOST_B, CAPABLE_DAEMON);
+        let mut d7 = p.daemon(m7, HOST_C, CAPABLE_DAEMON);
+        let mut d8 = p.daemon(m8, "zoo-008", CAPABLE_DAEMON);
+        let mut df = foreign_daemon(
+            &p,
+            stranger,
+            foreign,
+            "zoo-009",
+            vec![listed(&p, "zoo-009", true)],
+        );
+        p.state
+            .sessions
+            .update_daemon_projects(&p.m6, vec![listed(&p, HOST_B, true)]);
+        // zoo-008 ran it, and its daemon is gone.
+        p.state
+            .sessions
+            .update_daemon_projects(&m8, vec![listed(&p, "zoo-008", true)]);
+        p.state.sessions.unregister_daemon(&m8);
+        let mut web = p.viewer(p.owner, &[]);
+        let viewer = web.id;
+        let project_id = p.project_id();
+        let close = |machine_id: Uuid, all_instances: bool| {
+            stop_machine_project(
+                &p.state,
+                &viewer,
+                &p.owner,
+                machine_id,
+                &project_id,
+                all_instances,
+            )
+        };
+
+        // Nothing attached: the named machine and the one reporting it.
+        close(p.m5, true).await;
+        assert!(stopped(&mut d5) && stopped(&mut d6));
+        assert!(!stopped(&mut d7), "listed, not running");
+        assert!(d8.drain().is_empty(), "disconnected");
+        assert!(df.drain().is_empty(), "another account's checkout");
+
+        // The primary attached, zoo-006 reconnecting.
+        let _a = p.instance(p.m5, HOST_A);
+        close(p.m5, true).await;
+        assert!(stopped(&mut d5) && stopped(&mut d6));
+        assert!(!stopped(&mut d7) && d8.drain().is_empty() && df.drain().is_empty());
+
+        // A per-machine Stop stops that machine alone.
+        close(p.m5, false).await;
+        assert!(stopped(&mut d5));
+        assert!(!stopped(&mut d6) && !stopped(&mut d7));
+        assert!(
+            errors(&web.drain()).is_empty(),
+            "no refusal for any machine left alone"
+        );
+    }
+
+    /// A project-wide Close never names the host of the machine it was sent
+    /// with unless the requester knows of that machine. Another account's
+    /// machine is refused by its id, exactly as an id no daemon ever used.
+    #[tokio::test]
+    async fn a_project_wide_close_does_not_name_a_machine_it_was_sent_with_for_a_stranger() {
+        let p = project().await;
+        let stranger = Uuid::new_v4();
+        p.state.db.create_user(&user(stranger)).await.unwrap();
+        let mut d5 = p.daemon(p.m5, HOST_A, CAPABLE_DAEMON);
+        let mut d6 = p.daemon(p.m6, HOST_B, CAPABLE_DAEMON);
+        let _a = p.instance(p.m5, HOST_A);
+        let _b = p.instance(p.m6, HOST_B);
+        let foreign = Uuid::new_v4();
+        let mut df = foreign_daemon(&p, stranger, foreign, HOST_C, Vec::new());
+        let unknown = Uuid::new_v4();
+        let mut web = p.viewer(p.owner, &[]);
+
+        for machine in [foreign, unknown] {
+            stop_machine_project(&p.state, &web.id, &p.owner, machine, &p.project_id(), true).await;
+            assert_eq!(
+                errors(&web.drain()),
+                vec![format!("{machine}: Machine not found")]
+            );
+            assert!(stopped(&mut d5) && stopped(&mut d6));
+        }
+        p.state.sessions.unregister_daemon(&foreign);
+        stop_machine_project(&p.state, &web.id, &p.owner, foreign, &p.project_id(), true).await;
+        assert_eq!(
+            errors(&web.drain()),
+            vec![format!("{foreign}: Machine not found")]
+        );
+        assert!(df.drain().is_empty());
+    }
+
+    /// The text a reboot request naming `machine` is refused with.
+    async fn reboot_refusal(p: &Project, web: &mut Endpoint<ServerToWeb>, machine: Uuid) -> String {
+        handle_reboot_cli(&p.state, &web.id, p.session, Some(machine)).await;
+        let refused = errors(&web.drain());
+        assert_eq!(refused.len(), 1, "{refused:?}");
+        refused[0].clone()
+    }
+
+    /// The text a lifecycle request naming `machine` fails with.
+    async fn lifecycle_refusal(
+        p: &Project,
+        web: &mut Endpoint<ServerToWeb>,
+        machine: Uuid,
+    ) -> String {
+        let request = Uuid::new_v4();
+        handle_cli_lifecycle_request(
+            &p.state,
+            &web.id,
+            p.session,
+            p.owner,
+            request,
+            shared::CliLifecycleOperation::RebootCli,
+            Some(machine),
+        )
+        .await;
+        web.drain()
+            .into_iter()
+            .find_map(|message| match message {
+                ServerToWeb::CliLifecycleStatus {
+                    request_id,
+                    phase: shared::CliLifecyclePhase::Failed,
+                    message: Some(text),
+                    ..
+                } if request_id == request => Some(text),
+                _ => None,
+            })
+            .expect("the request failed")
+    }
+
+    /// A reboot or lifecycle request naming a machine that runs no instance
+    /// of the session names that machine's host only when the requester
+    /// knows of it: one of their own machines, or one a tab is tagged for.
+    /// Another account's machine is refused exactly as an id no daemon ever
+    /// used, before and after its daemon disconnects: machine ids derive from
+    /// `user@host`, and naming its host would confirm a guessed one.
+    #[tokio::test]
+    async fn a_lifecycle_refusal_names_only_a_machine_the_requester_knows() {
+        let p = project().await;
+        let mut a = p.instance(p.m5, HOST_A);
+        let _d6 = p.daemon(p.m6, HOST_B, CAPABLE_DAEMON);
+        let stranger = Uuid::new_v4();
+        p.state.db.create_user(&user(stranger)).await.unwrap();
+        let foreign = Uuid::new_v4();
+        let _df = foreign_daemon(&p, stranger, foreign, HOST_C, Vec::new());
+        let tagged = Uuid::new_v4();
+        let _dt = foreign_daemon(&p, stranger, tagged, "zoo-008", Vec::new());
+        p.roster(vec![
+            pane(3, Some(p.m5), Some(HOST_A)),
+            pane(4, Some(tagged), Some("zoo-008")),
+        ]);
+        let unknown = Uuid::new_v4();
+        let mut web = p.viewer(p.owner, &[PROJECT_INSTANCES_CAPABILITY]);
+        let anonymous = "This tab's machine is not running this project.".to_string();
+
+        assert_eq!(reboot_refusal(&p, &mut web, unknown).await, anonymous);
+        assert_eq!(lifecycle_refusal(&p, &mut web, unknown).await, anonymous);
+        assert_eq!(reboot_refusal(&p, &mut web, foreign).await, anonymous);
+        assert_eq!(lifecycle_refusal(&p, &mut web, foreign).await, anonymous);
+        p.state.sessions.unregister_daemon(&foreign);
+        assert_eq!(reboot_refusal(&p, &mut web, foreign).await, anonymous);
+        assert_eq!(lifecycle_refusal(&p, &mut web, foreign).await, anonymous);
+
+        // The requester's own machine, and a machine a tab is tagged for.
+        assert_eq!(
+            reboot_refusal(&p, &mut web, p.m6).await,
+            not_running(HOST_B)
+        );
+        assert_eq!(
+            lifecycle_refusal(&p, &mut web, p.m6).await,
+            not_running(HOST_B)
+        );
+        assert_eq!(
+            reboot_refusal(&p, &mut web, tagged).await,
+            not_running("zoo-008")
+        );
+        assert_eq!(
+            lifecycle_refusal(&p, &mut web, tagged).await,
+            not_running("zoo-008")
+        );
+        assert!(a.drain().is_empty(), "nothing reached the running instance");
+    }
+
+    /// A CLI without instance support is the only instance it knows of, so
+    /// a Start on any other machine would only bring up an instance the
+    /// server refuses when it attaches, after starting that machine's saved
+    /// tabs. Such a Start is refused before any daemon frame, with the reason
+    /// that refusal would give, per machine and project-wide alike. A Start
+    /// of the older CLI's own machine goes ahead as it always did.
+    #[tokio::test]
+    async fn a_start_beside_an_older_cli_is_refused_before_any_daemon_frame() {
+        let p = project().await;
+        let m7 = Uuid::new_v4();
+        let older_daemon = &[shared::PROJECT_POLICY_CAPABILITY];
+        let mut d5 = p.daemon(p.m5, HOST_A, older_daemon);
+        let mut d6 = p.daemon(p.m6, HOST_B, CAPABLE_DAEMON);
+        let mut d7 = p.daemon(m7, HOST_C, CAPABLE_DAEMON);
+        // An older CLI runs the project on zoo-005 and reported no machine.
+        let older = p.cli(&[shared::PROJECT_POLICY_CAPABILITY]);
+        assert!(matches!(
+            p.state.sessions.attach_cli_instance(
+                p.session,
+                older.id,
+                None,
+                Some(format!("/work/{HOST_A}")),
+                Some(HOST_A.to_string()),
+            ),
+            AttachOutcome::Attached { .. }
+        ));
+        p.roster(vec![
+            pane(3, Some(p.m6), Some(HOST_B)),
+            pane(4, Some(m7), Some(HOST_C)),
+        ]);
+        let mut web = p.viewer(p.owner, &[shared::PROJECT_POLICY_CAPABILITY]);
+        let refusal = format!(
+            "This project is running on {HOST_A} with an APAS CLI that cannot share it with other machines; stop it there, or reboot {HOST_A} from the Machines page to update it, then start it here"
+        );
+        let viewer = web.id;
+        let project_id = p.project_id();
+        let start = |machine_id: Uuid, all_instances: bool| {
+            start_machine_project(
+                &p.state,
+                &viewer,
+                &p.owner,
+                machine_id,
+                &project_id,
+                all_instances,
+            )
+        };
+
+        start(p.m6, false).await;
+        assert_eq!(errors(&web.drain()), vec![refusal.clone()]);
+        assert!(d6.drain().is_empty());
+
+        start(p.m5, false).await;
+        assert!(started(&mut d5), "its own machine starts as before");
+        assert!(errors(&web.drain()).is_empty());
+
+        // Project-wide: each machine that owns tabs is refused by name.
+        start(p.m5, true).await;
+        assert_eq!(
+            errors(&web.drain()),
+            vec![
+                format!("{}: {refusal}", if p.m6 < m7 { HOST_B } else { HOST_C }),
+                format!("{}: {refusal}", if p.m6 < m7 { HOST_C } else { HOST_B }),
+            ]
+        );
+        assert!(d5.drain().is_empty() && d6.drain().is_empty() && d7.drain().is_empty());
+
+        // One that reported its machine is recognized by it.
+        p.state
+            .sessions
+            .detach_cli_instance(&p.session, &older.id)
+            .unwrap();
+        let older = p.instance_with(p.m5, HOST_A, &[shared::PROJECT_POLICY_CAPABILITY]);
+        start(p.m5, false).await;
+        assert!(started(&mut d5));
+        start(m7, false).await;
+        assert_eq!(errors(&web.drain()), vec![refusal.clone()]);
+        assert!(d7.drain().is_empty());
+
+        // One with no host could be anywhere, so every machine is refused.
+        p.state
+            .sessions
+            .detach_cli_instance(&p.session, &older.id)
+            .unwrap();
+        let hostless = p.cli(&[shared::PROJECT_POLICY_CAPABILITY]);
+        assert!(matches!(
+            p.state
+                .sessions
+                .attach_cli_instance(p.session, hostless.id, None, None, None),
+            AttachOutcome::Attached { .. }
+        ));
+        start(p.m5, false).await;
+        assert_eq!(
+            errors(&web.drain()),
+            vec![refusal.replace(HOST_A, "another machine")]
+        );
+        assert!(d5.drain().is_empty());
+    }
+
+    /// The refusals clients show word for word for a tab they cannot use,
+    /// pinned to what the server sends. The not-running refusal of an input
+    /// is the golden fixture `server-mutation-ack-input.json`, which the web
+    /// and native tests compare their copy with; the host-less not-running
+    /// refusal and the no-access refusal are the copy in
+    /// `packages/web/src/lib/tabHosts.ts` and
+    /// `packages/mobile/src/state/projectInstances.ts`. Rewording one here
+    /// means rewording those too.
+    #[tokio::test]
+    async fn the_refusals_clients_mirror_are_what_the_server_sends() {
+        let p = project().await;
+        let _b = p.instance(p.m6, HOST_B);
+        let unnamed = Uuid::new_v4();
+        p.roster(vec![
+            pane(4, Some(p.m5), Some(HOST_A)),
+            pane(5, Some(unnamed), None),
+        ]);
+        let mut web = p.viewer(p.owner, &[PROJECT_INSTANCES_CAPABILITY]);
+        web.drain();
+
+        typed(&p, &web.id, Some(4), Some("msg-1")).await;
+        let ack = web
+            .drain()
+            .into_iter()
+            .find(|message| matches!(message, ServerToWeb::MutationAck { .. }))
+            .expect("the input was refused under its id");
+        let mut sent = serde_json::to_value(&ack).unwrap();
+        sent["session_id"] = serde_json::json!("20000000-0000-4000-8000-000000000001");
+        let fixture: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("../../packages/protocol/fixtures/server-mutation-ack-input.json"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(sent, fixture);
+
+        typed(&p, &web.id, Some(5), None).await;
+        assert_eq!(
+            errors(&web.drain()),
+            vec!["This tab's machine is not running this project.".to_string()]
+        );
+
+        let (hosted, member) = hosted_project().await;
+        let _a = hosted.instance(hosted.m5, HOST_A);
+        let _b = hosted.instance(hosted.m6, HOST_B);
+        hosted.roster(vec![pane(4, Some(hosted.m6), Some(HOST_B))]);
+        let mut member_web = hosted.viewer(member, &[PROJECT_INSTANCES_CAPABILITY]);
+        member_web.drain();
+        typed(&hosted, &member_web.id, Some(4), None).await;
+        assert_eq!(
+            errors(&member_web.drain()),
+            vec![format!(
+                "Access denied: you cannot use {HOST_B}, which runs this project instance"
+            )]
+        );
+    }
+
     /// A project only registered on its owner's machine, by `apas register`
     /// or a bare `apas`, has no record or placement on the server until it
     /// first starts. A Start from the Machines page places it as that start's
@@ -10740,7 +11393,7 @@ mod project_instance_tests {
         replay_instances_after_attach(&p.state, &capable.id, p.session).await;
         replay_instances_after_attach(&p.state, &older.id, p.session).await;
 
-        let capable = capable.drain();
+        let capable = capable.delivered(&p.state).await;
         assert!(matches!(
             capable.first(),
             Some(ServerToWeb::SessionInstances { instances, .. })
@@ -10805,6 +11458,128 @@ mod project_instance_tests {
         );
         replay_instances_after_attach(&p.state, &older.id, p.session).await;
         assert_eq!(inventories(&older.drain()), vec![Some(p.m5)]);
+    }
+
+    /// Start the attach replay for `viewer` and let it run up to its first
+    /// wait, as a viewer attaching while an instance changes would.
+    async fn replay_in_flight(p: &Project, viewer: Uuid) -> tokio::task::JoinHandle<()> {
+        let state = p.state.clone();
+        let session = p.session;
+        let replay = tokio::spawn(async move {
+            replay_instances_after_attach(&state, &viewer, session).await;
+        });
+        tokio::task::yield_now().await;
+        replay
+    }
+
+    /// The machines of each instance set a viewer was sent, in order.
+    fn instance_sets(messages: &[ServerToWeb]) -> Vec<Vec<Option<Uuid>>> {
+        messages
+            .iter()
+            .filter_map(|message| match message {
+                ServerToWeb::SessionInstances { instances, .. } => Some(
+                    instances
+                        .iter()
+                        .map(|instance| instance.machine_id)
+                        .collect::<Vec<_>>(),
+                ),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// An instance that detaches or attaches while a viewer's attach replay
+    /// is under way is broadcast to that viewer at once. The replay must not
+    /// arrive after that broadcast with the set as it was before: the viewer
+    /// keeps the last set it is sent, and would show a running machine's tabs
+    /// stopped, or a stopped machine's usable, until the next change.
+    #[tokio::test]
+    async fn an_instance_changing_during_the_attach_replay_is_not_overtaken() {
+        // zoo-006 detaches meanwhile.
+        let p = project().await;
+        let _a = p.instance(p.m5, HOST_A);
+        let b = p.instance(p.m6, HOST_B);
+        let mut web = p.viewer(p.owner, &[PROJECT_INSTANCES_CAPABILITY]);
+        web.drain();
+        let replay = replay_in_flight(&p, web.id).await;
+        p.state
+            .sessions
+            .detach_cli_instance(&p.session, &b.id)
+            .unwrap();
+        replay.await.unwrap();
+        let sets = instance_sets(&web.delivered(&p.state).await);
+        assert_eq!(sets.last(), Some(&vec![Some(p.m5)]), "{sets:?}");
+
+        // zoo-006 attaches meanwhile.
+        let p = project().await;
+        let _a = p.instance(p.m5, HOST_A);
+        let mut web = p.viewer(p.owner, &[PROJECT_INSTANCES_CAPABILITY]);
+        web.drain();
+        let replay = replay_in_flight(&p, web.id).await;
+        let _b = p.instance(p.m6, HOST_B);
+        replay.await.unwrap();
+        let delivered = web.delivered(&p.state).await;
+        let sets = instance_sets(&delivered);
+        assert_eq!(sets.last(), Some(&vec![Some(p.m5), Some(p.m6)]), "{sets:?}");
+        // Still filled in for the viewer on its way out, as broadcasts are.
+        assert!(delivered.iter().all(|message| match message {
+            ServerToWeb::SessionInstances { instances, .. } => instances
+                .iter()
+                .all(|instance| instance.runtime_access == Some(true)),
+            _ => true,
+        }));
+    }
+
+    /// A newer inventory an instance reports while a viewer's attach replay
+    /// is under way reaches that viewer first; the replay must not follow it
+    /// with the older one, which a reboot confirmation would then count.
+    #[tokio::test]
+    async fn an_inventory_reported_during_the_attach_replay_is_not_overtaken() {
+        let p = project().await;
+        let _a = p.instance(p.m5, HOST_A);
+        let _b = p.instance(p.m6, HOST_B);
+        let reported = |persistent_terminal_hosting: bool| shared::CliLifecycleInventory {
+            persistent_terminal_hosting,
+            ..Default::default()
+        };
+        p.state
+            .sessions
+            .set_lifecycle_inventory(p.session, Some(p.m5), reported(false));
+        let mut web = p.viewer(p.owner, &[PROJECT_INSTANCES_CAPABILITY]);
+        web.drain();
+
+        let replay = replay_in_flight(&p, web.id).await;
+        // zoo-005 reports again, and the relay delivers it to the viewer.
+        p.state
+            .sessions
+            .set_lifecycle_inventory(p.session, Some(p.m5), reported(true));
+        p.state
+            .sessions
+            .send_to_web(
+                &web.id,
+                ServerToWeb::CliLifecycleInventory {
+                    session_id: p.session,
+                    inventory: reported(true),
+                    machine_id: Some(p.m5),
+                },
+            )
+            .await;
+        replay.await.unwrap();
+
+        let last = web
+            .delivered(&p.state)
+            .await
+            .into_iter()
+            .filter_map(|message| match message {
+                ServerToWeb::CliLifecycleInventory {
+                    machine_id: Some(machine),
+                    inventory,
+                    ..
+                } if machine == p.m5 => Some(inventory.persistent_terminal_hosting),
+                _ => None,
+            })
+            .last();
+        assert_eq!(last, Some(true), "the newer inventory is the last word");
     }
 
     /// Pane summaries name each tab's machine, show an untagged tab under

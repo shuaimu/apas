@@ -1445,6 +1445,31 @@ impl SessionManager {
             .collect()
     }
 
+    /// Machines whose connected daemon itself reports running `project_id`,
+    /// sorted: the daemon's own inventory, not the machine lists' projection,
+    /// which marks a project running from its attached instances. So this
+    /// includes a machine whose instance is not attached: one still
+    /// starting, or reconnecting. A disconnected daemon's report is not
+    /// trusted; its running flags are cleared when it leaves.
+    pub fn machines_running_project(&self, project_id: &str) -> Vec<Uuid> {
+        let reporting: Vec<Uuid> = self
+            .machine_projects
+            .iter()
+            .filter(|entry| {
+                entry
+                    .iter()
+                    .any(|project| project.project_id == project_id && project.is_running)
+            })
+            .map(|entry| *entry.key())
+            .collect();
+        let mut machines: Vec<Uuid> = reporting
+            .into_iter()
+            .filter(|machine_id| self.is_daemon_connected(machine_id))
+            .collect();
+        machines.sort();
+        machines
+    }
+
     /// Best-effort immediate revocation after account suspension. Persistent
     /// route guards remain authoritative if a socket races this fan-out.
     pub async fn disconnect_user(&self, user_id: &str) {
@@ -2910,6 +2935,36 @@ impl SessionManager {
             )
         } else {
             false
+        }
+    }
+
+    /// [`Self::send_to_web`] for a frame that reports state a broadcast also
+    /// sends, such as a replay after attach. The frame is built only once the
+    /// connection has room for it, and queued with nothing awaited between
+    /// reading that state and queuing it. A change broadcast meanwhile, with
+    /// `try_send`, is then either already in what `build` reads or queued
+    /// after it, and never overtaken by an older copy. Nothing is queued when
+    /// `build` returns `None`. False when the connection is gone, or stalled
+    /// for as long as `send_to_web` waits.
+    pub async fn send_to_web_with(
+        &self,
+        connection_id: &Uuid,
+        build: impl FnOnce() -> Option<ServerToWeb>,
+    ) -> bool {
+        let sender = self.web_senders.get(connection_id).map(|s| s.clone());
+        let Some(sender) = sender else {
+            return false;
+        };
+        let Ok(Ok(permit)) = tokio::time::timeout(Duration::from_secs(5), sender.reserve()).await
+        else {
+            return false;
+        };
+        match build() {
+            Some(msg) => {
+                permit.send(msg);
+                true
+            }
+            None => false,
         }
     }
 

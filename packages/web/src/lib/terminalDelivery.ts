@@ -8,16 +8,28 @@ export interface PendingDelivery {
   paneId: number;
   text: string;
   sentAt: number;
+  /** Why the server refused this send (`mutation_ack` for `input`). Its
+   *  outcome is known: it is not unconfirmed, and its id is never sent again.
+   *  The entry stays, with its text, until the user restores or dismisses it,
+   *  or a transcript acknowledgement shows it was delivered after all. */
+  error?: string;
 }
 
 export const DELIVERY_GRACE_MS = 10_000;
 const STORAGE_KEY = "apas_terminal_deliveries";
 
+/** Sends still waiting for the transcript past the grace period. A refused
+ *  send is not among them: the server already said what happened to it. */
 export function unconfirmedDeliveries(
   pending: PendingDelivery[],
   now: number,
 ): PendingDelivery[] {
-  return pending.filter((entry) => now - entry.sentAt >= DELIVERY_GRACE_MS);
+  return pending.filter((entry) => !entry.error && now - entry.sentAt >= DELIVERY_GRACE_MS);
+}
+
+/** Sends the server refused, shown at once with its reason. */
+export function refusedDeliveries(pending: PendingDelivery[]): PendingDelivery[] {
+  return pending.filter((entry) => Boolean(entry.error));
 }
 
 export function loadTerminalDeliveries(): PendingDelivery[] {
@@ -28,7 +40,8 @@ export function loadTerminalDeliveries(): PendingDelivery[] {
     return entries.filter((entry): entry is PendingDelivery =>
       entry && typeof entry.id === "string" && typeof entry.sessionId === "string"
       && Number.isInteger(entry.paneId) && typeof entry.text === "string"
-      && Number.isFinite(entry.sentAt),
+      && Number.isFinite(entry.sentAt)
+      && (entry.error === undefined || typeof entry.error === "string"),
     );
   } catch {
     return [];

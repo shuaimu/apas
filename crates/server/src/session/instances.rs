@@ -154,6 +154,17 @@ fn host_label(instance: &InstanceAttachment) -> String {
         .to_string()
 }
 
+/// Why a project cannot start on another machine while `older`, an instance
+/// whose CLI cannot share the project, runs it: what such a start's
+/// `SessionStart` is refused with, and what a Start is refused with before
+/// it reaches a daemon.
+pub(crate) fn beside_older_cli_refusal(older: &InstanceAttachment) -> String {
+    let host = host_label(older);
+    format!(
+        "This project is running on {host} with an APAS CLI that cannot share it with other machines; stop it there, or reboot {host} from the Machines page to update it, then start it here"
+    )
+}
+
 fn admission(existing: &InstanceAttachment, incoming: &InstanceAttachment) -> Admission {
     if existing.cli_id == incoming.cli_id {
         return Admission::Replace;
@@ -177,10 +188,7 @@ fn admission(existing: &InstanceAttachment, incoming: &InstanceAttachment) -> Ad
             if existing.machine_id.is_some() && existing.machine_id == incoming.machine_id {
                 Admission::Replace
             } else {
-                let host = host_label(existing);
-                Admission::Reject(format!(
-                    "This project is running on {host} with an APAS CLI that cannot share it with other machines; stop it there, or reboot {host} from the Machines page to update it, then start it here"
-                ))
+                Admission::Reject(beside_older_cli_refusal(existing))
             }
         }
         (true, false) => {

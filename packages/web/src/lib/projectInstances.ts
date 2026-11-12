@@ -103,6 +103,35 @@ export function primaryInstance(instances: SessionInstance[]): SessionInstance |
 }
 
 /**
+ * The live CLI connection a session's view state is keyed by (`cliClientId`:
+ * the remembered tab and sidebar layout, the usage limits shown), or
+ * `undefined` when no listed client reports the session, in which case each
+ * caller keeps its own fallback.
+ *
+ * Every attached instance reports the project's one session as its active
+ * session, and `cli_clients` lists them in no fixed order. Taking the first
+ * would follow whichever instance happened to be listed first, so another
+ * machine starting or stopping the project would re-key that state and send
+ * the view back to its first tab. So: the session row's client while it is
+ * live, which is the primary's (only the primary writes the row); else the
+ * one already in use while its connection is still attached; only then the
+ * first listed. A server without instances lists at most one client per
+ * session, so there this picks what the first match always did.
+ */
+export function liveSessionCliClientId(
+  clients: readonly { id: string; activeSession?: string }[],
+  sessionId: string,
+  sessionRowClientId: string | null | undefined,
+  currentClientId: string | null | undefined,
+): string | undefined {
+  const live = clients.filter((client) => client.activeSession === sessionId);
+  for (const preferred of [sessionRowClientId, currentClientId]) {
+    if (preferred && live.some((client) => client.id === preferred)) return preferred;
+  }
+  return live[0]?.id;
+}
+
+/**
  * What a project row shows for its hosts: the primary host plus how many more
  * instances are attached ("zoo-005 +1"). `fallbackHostname` is the session's
  * recorded host, which is all an older server reports.

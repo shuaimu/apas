@@ -185,7 +185,9 @@ pub enum ClaimMode {
     /// The project-wide guard alone, unmarked, refusing while any other host
     /// runs the project: how every daemon behaved before instances. For a host
     /// whose `daemon.machine_id` is set, which shares its machine id with every
-    /// other host on the same home and so cannot claim per machine.
+    /// other host on the same home and so cannot claim per machine. A capable
+    /// daemon also claims in this shape what it starts as a project's only
+    /// runtime ([`claim_project_alone`]).
     Exclusive,
 }
 
@@ -682,11 +684,17 @@ fn claim_project_at(
 ///
 /// In [`ClaimMode::Instances`] it refuses, as every daemon did before
 /// instances, while any other host has a live claim on the project: an
-/// instance claim, or the guard, marked or not. Otherwise it claims exactly as
-/// [`claim_project`] does. The claims keep `mode`'s shape, marker included:
-/// what starts is the same capable runtime, the heartbeat refreshes them in
-/// that shape, and only the server stands in the way of a further instance.
-/// [`ClaimMode::Exclusive`] refuses any other live host already.
+/// instance claim, or the guard, marked or not. Otherwise it claims the way a
+/// daemon from before instances does, in [`ClaimMode::Exclusive`]'s shape:
+/// the guard alone, unmarked, with this host's instance claim removed. What
+/// starts is not an instance but the project's only runtime, which runs every
+/// pane, other machines' included, as a CLI from before instances does. A
+/// capable daemon on another host must stay out of it even once the server
+/// runs instances: an instance started there would restore that machine's
+/// panes, which this runtime is already running, before the server refused
+/// its session. The daemon refreshes the claims in that shape for as long as
+/// the runtime runs. [`ClaimMode::Exclusive`] refuses any other live host
+/// already.
 pub fn claim_project_alone(
     config_dir: &Path,
     project_id: &str,
@@ -725,15 +733,40 @@ fn claim_project_alone_at(
             )));
         }
     }
-    claim_project_at(
+    match claim_project_at(
         config_dir,
         project_id,
         project_path,
         machine_id,
-        mode,
+        ClaimMode::Exclusive,
         actor,
         now,
-    )
+    )? {
+        // Another host the check above could not tell apart from this
+        // machine, one sharing its machine id say. The server is still why a
+        // capable daemon refuses.
+        ClaimOutcome::HeldBy(ClaimRefusal::RunningElsewhere(holder))
+            if mode == ClaimMode::Instances =>
+        {
+            Ok(ClaimOutcome::HeldBy(ClaimRefusal::SingleMachineServer(
+                holder,
+            )))
+        }
+        ClaimOutcome::HeldBy(refusal) => Ok(ClaimOutcome::HeldBy(refusal)),
+        claimed => {
+            if mode == ClaimMode::Instances {
+                // Left by this project's last run here as an instance, it
+                // would say that it still runs as one until it lapsed.
+                let own = instance_claim_path(config_dir, project_id, machine_id);
+                if read_json::<ProjectClaim>(&own)
+                    .is_some_and(|claim| claim.hostname == actor.host)
+                {
+                    let _ = std::fs::remove_file(own);
+                }
+            }
+            Ok(claimed)
+        }
+    }
 }
 
 fn write_instance_claim(
@@ -1396,8 +1429,9 @@ mod tests {
 
     /// Facing a server that keeps one CLI per session, a capable daemon starts
     /// a project only where no other host runs it, as daemons did before
-    /// instances, whatever the other host's claim says. Alone, it claims in
-    /// its own shape, marker included.
+    /// instances, whatever the other host's claim says. Alone, it claims as
+    /// those daemons did too: the guard alone, unmarked, for what starts is
+    /// the project's only runtime and runs every pane.
     #[test]
     fn a_start_that_must_run_alone_refuses_beside_any_other_live_host() {
         let now = now_secs();
@@ -1467,22 +1501,33 @@ mod tests {
         capable_instance(lapsed.path(), now - STALE_AFTER_SECS - 10);
         assert_eq!(alone(lapsed.path(), now), ClaimOutcome::Acquired);
 
-        // Alone, the claims are a capable daemon's: its instance claim and the
-        // guard marked, so the start is no different once the server runs
-        // instances again.
+        // Alone, the claims are a daemon's from before instances: the guard
+        // alone, unmarked. What starts runs every pane, other machines'
+        // included, so a capable daemon on another host stays out of it, even
+        // once its own server runs instances. Its instance would restore that
+        // machine's panes, already running here, before the server refused it.
         let unclaimed = TempDir::new().unwrap();
         assert_eq!(alone(unclaimed.path(), now), ClaimOutcome::Acquired);
         for dir in [&lapsed, &unclaimed] {
-            let own = read_claim(&instance_claim_path(dir.path(), "p1", m6)).unwrap();
-            assert_eq!(own.hostname, "zoo-006");
+            assert!(!instance_claim_path(dir.path(), "p1", m6).exists());
             let guard = read_claim(&claim_path(dir.path(), "p1")).unwrap();
             assert_eq!(
                 (guard.hostname.as_str(), guard.instances),
-                ("zoo-006", true)
+                ("zoo-006", false)
             );
+            match claim_project_at(dir.path(), "p1", "/proj", m5, ClaimMode::Instances, &zoo5, now)
+                .unwrap()
+            {
+                ClaimOutcome::HeldBy(ClaimRefusal::ExclusiveHolder(holder)) => {
+                    assert_eq!(holder.hostname, "zoo-006")
+                }
+                other => panic!("expected a refusal beside a runtime run alone, got {other:?}"),
+            }
         }
 
-        // This host's own claims, a previous daemon's say, are no other host.
+        // This host's own claims, a previous daemon's say, are no other host,
+        // and give way to this start's shape: the instance claim that run
+        // left goes, rather than saying it still runs as an instance.
         let earlier = TempDir::new().unwrap();
         claim_project_at(
             earlier.path(),
@@ -1495,6 +1540,35 @@ mod tests {
         )
         .unwrap();
         assert_eq!(alone(earlier.path(), now), ClaimOutcome::AlreadyOurs);
+        assert!(!instance_claim_path(earlier.path(), "p1", m6).exists());
+        let guard = read_claim(&claim_path(earlier.path(), "p1")).unwrap();
+        assert_eq!((guard.pid, guard.instances), (12, false));
+
+        // A host the check cannot tell apart from this machine, one sharing
+        // its machine id, refuses with the server's reason all the same, and
+        // its claims are left alone.
+        let shared_id = TempDir::new().unwrap();
+        claim_project_at(
+            shared_id.path(),
+            "p1",
+            "/proj",
+            m6,
+            ClaimMode::Instances,
+            &host("zoo-clone", 7),
+            now,
+        )
+        .unwrap();
+        match alone(shared_id.path(), now) {
+            ClaimOutcome::HeldBy(ClaimRefusal::SingleMachineServer(holder)) => {
+                assert_eq!(holder.hostname, "zoo-clone")
+            }
+            other => panic!("expected the single-machine server's refusal, got {other:?}"),
+        }
+        assert_eq!(
+            read_claim(&instance_claim_path(shared_id.path(), "p1", m6))
+                .map(|claim| claim.hostname),
+            Some("zoo-clone".to_string())
+        );
 
         // A daemon that runs projects alone anyway refuses as it always did.
         match claim_project_alone_at(

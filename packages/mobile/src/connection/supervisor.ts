@@ -39,6 +39,22 @@ const MAX_RETRY_MS = 30_000;
 const MUTATION_ACK_TIMEOUT_MS = 3_000;
 const MUTATION_ATTEMPTS = 3;
 
+/**
+ * The server answered an acknowledged action with a refusal (`mutation_ack`
+ * with `accepted: false`). Unlike an interruption or a missing
+ * acknowledgement, its outcome is known: the request id is spent, so a later
+ * attempt must use a new one. For typed input this matters most: the server
+ * records only the ids of input it delivers, so resending a refused
+ * `client_msg_id` once the tab's machine runs the project again would deliver
+ * it as new input, long after the user saw it refused.
+ */
+export class MutationRefusedError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "MutationRefusedError";
+  }
+}
+
 interface PendingAcknowledgement {
   message: WebToServer;
   attempts: number;
@@ -243,7 +259,7 @@ export class ConnectionSupervisor {
         this.clearTimer(pending.timer);
         this.pendingAcknowledgements.delete(acknowledgementId);
         if (message.type === "mutation_ack" && !message.accepted) {
-          pending.reject(new Error(message.error ?? "The server rejected this action"));
+          pending.reject(new MutationRefusedError(message.error ?? "The server rejected this action"));
         } else {
           pending.resolve(message);
         }

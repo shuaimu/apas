@@ -2,7 +2,7 @@ import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import type { MobileBootstrapResponse, ServerToWeb } from "@apas/protocol";
 
-import { ConnectionSupervisor, type SocketLike } from "./supervisor";
+import { ConnectionSupervisor, MutationRefusedError, type SocketLike } from "./supervisor";
 
 // The server frames added for multi-machine project instances, as the shared
 // crate's golden fixtures spell them.
@@ -266,10 +266,41 @@ describe("ConnectionSupervisor", () => {
     const sends = socket.sent.length;
     socket.receive(refusal);
     await expect(acknowledged).rejects.toThrow(refusal.error!);
+    // A refusal, not a lost acknowledgement: its id is spent.
+    await expect(acknowledged).rejects.toBeInstanceOf(MutationRefusedError);
     // Settled: the timer that would resend it is gone with it.
     jest.advanceTimersByTime(10_000);
     expect(socket.sent).toHaveLength(sends);
     expect(socket.closed).toBe(false);
+  });
+
+  it("tells a missing acknowledgement apart from a refusal", async () => {
+    const socket = new FakeSocket();
+    const supervisor = new ConnectionSupervisor({
+      createSocket: () => socket,
+      accessToken: async () => "access",
+      bootstrap: async () => emptyBootstrap,
+      persistBootstrap: async () => undefined,
+      setPhase: jest.fn(),
+      setMutationsAllowed: jest.fn(),
+      applyBootstrap: jest.fn(),
+    });
+    supervisor.start();
+    socket.open();
+    await Promise.resolve();
+    const acknowledged = supervisor.sendAcknowledged({
+      type: "input",
+      session_id: emptyBootstrap.user_id,
+      pane_id: 3,
+      text: "Run the suite.",
+      client_msg_id: "msg-unanswered",
+    }, "msg-unanswered");
+    const rejected = acknowledged.catch((error: unknown) => error);
+    jest.advanceTimersByTime(9_000);
+    const error = await rejected;
+    // Its outcome is unknown, so a retry keeps the same id.
+    expect(error).toBeInstanceOf(Error);
+    expect(error).not.toBeInstanceOf(MutationRefusedError);
   });
 
   it("drops a silent socket after the heartbeat response deadline", async () => {

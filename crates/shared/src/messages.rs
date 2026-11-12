@@ -1341,8 +1341,10 @@ pub enum WebToServer {
         // inputs it hasn't seen acked (3s retry + reconnect replay); the
         // server uses this id to drop retransmits of an input it already
         // stored instead of double-storing them. A refusal can also be
-        // answered with a `MutationKind::Input` acknowledgement carrying it;
-        // see there.
+        // answered with a `MutationKind::Input` acknowledgement carrying it,
+        // which ends that retry and replay for good: the server never records
+        // a refused id, so a later resend would be delivered as new input.
+        // See there.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         client_msg_id: Option<String>,
     },
@@ -1357,7 +1359,8 @@ pub enum WebToServer {
         pane_id: u32,
         text: String,
         // As on `Input`: echoed by `UserInput`, and carried by a
-        // `MutationKind::Input` acknowledgement of a refusal.
+        // `MutationKind::Input` acknowledgement of a refusal, which settles
+        // the send.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         client_msg_id: Option<String>,
     },
@@ -1703,11 +1706,27 @@ pub enum WebToServer {
         machine_id: Uuid,
         project_id: String,
         /// Stop the project as a whole, as the project view's Close means:
-        /// every machine with an instance of it attached, each authorized as a
-        /// single-machine request would be. False, and absent from every older
-        /// client, stops only `machine_id`, as a per-machine Stop on the
-        /// Machines page does. An older server ignores the flag and stops only
-        /// `machine_id`.
+        /// every machine running it, each authorized as a single-machine
+        /// request would be. That is `machine_id` (the view's resolved
+        /// machine, which a Close always stops, running or not), every
+        /// machine with an instance of it attached, and every machine whose
+        /// connected daemon reports running it while its instance is not
+        /// attached: one still starting, or reconnecting after its own
+        /// connection dropped or the server restarted. Its machine entry
+        /// shows the project running, which is what a client offers Close on,
+        /// so stopping only the attached instances would leave that machine's
+        /// agents running, and the project would come back when its instance
+        /// reattached. A reporting daemon counts only when it belongs to an
+        /// account one of the project's sessions runs under, so another
+        /// account's checkout carrying the same project id is never stopped or
+        /// named; a project with no session yet therefore stops only
+        /// `machine_id`. A daemon's report lags a real stop by up to one
+        /// heartbeat, so a machine that has just stopped may be sent a
+        /// redundant Stop, which is harmless.
+        ///
+        /// False, and absent from every older client, stops only
+        /// `machine_id`, as a per-machine Stop on the Machines page does. An
+        /// older server ignores the flag and stops only `machine_id`.
         #[serde(default)]
         all_instances: bool,
     },
@@ -2030,20 +2049,42 @@ pub enum MutationKind {
     /// The server sends it when it refuses the input because of the tab's
     /// machine: that machine is not running the project ("<host> is not
     /// running this project. Start it on <host> first."), or the sender may
-    /// not use it. Resending changes neither answer, and a client that settles
-    /// sends by id would otherwise resend until it gave up with no reason to
-    /// show. The server may send one for any other refusal of such an input
-    /// too, so a client settles the send with `error` whatever the reason. A
-    /// refusal reported only as an `Error`, and every refusal from an older
-    /// server, leaves the send unanswered, as before.
+    /// not use it. It may send one for any other refusal of such an input
+    /// too. A refusal reported only as an `Error`, and every refusal from an
+    /// older server, leaves the send unanswered, as before.
+    ///
+    /// Every client that tracks the send settles it on this acknowledgement,
+    /// whatever the reason and whichever attempt it answers (the first send,
+    /// a retransmission or a replay):
+    /// - It never sends that `client_msg_id` again: no retransmission, and no
+    ///   replay after a reconnect, including from stored sends its other
+    ///   connections share. The server records the id only of input it
+    ///   delivers, so it judges every resend afresh: once the tab's machine
+    ///   runs the project again, a resend would be delivered as new input,
+    ///   possibly minutes after the user saw it refused. Sending the text
+    ///   again is the user's choice, and a new send under a new id.
+    /// - It shows `error` where it shows the send, instead of showing the
+    ///   send as unconfirmed or still under way: its outcome is known. The
+    ///   [`ServerToWeb::Error`] carrying the same text already told the user,
+    ///   so a client that shows that error need not show the reason again as
+    ///   a notice of its own.
+    /// - It keeps the typed text recoverable, as for any send that did not
+    ///   reach the agent.
+    ///
+    /// An acknowledgement for an id the client is not tracking, because it
+    /// already settled that send or never sent it, changes nothing. A
+    /// [`ServerToWeb::UserInput`] echo of a settled id can still arrive, from
+    /// an attempt sent before the acknowledgement arrived and judged after the
+    /// tab's machine ran the project again: the input was delivered after
+    /// all, and the echo stands.
     ///
     /// It goes only to the connection that sent the input, and only when that
     /// connection negotiated [`PROJECT_INSTANCES_CAPABILITY`]. It comes in
     /// addition to the [`ServerToWeb::Error`] carrying the same text, never
-    /// instead of it, so a client that shows that error, as the web does,
-    /// ignores this. The gate is what keeps older native builds connected:
-    /// their bundled schema lists only the four kinds above, and they drop
-    /// the socket on a frame it rejects.
+    /// instead of it, so a client that does not track sends by id still
+    /// shows the refusal. The gate is what keeps older native builds
+    /// connected: their bundled schema lists only the four kinds above, and
+    /// they drop the socket on a frame it rejects.
     Input,
 }
 
@@ -2134,7 +2175,8 @@ pub enum ServerToWeb {
     /// Correlated acceptance or rejection for a time-sensitive coding
     /// mutation. `accepted` means the current authorized CLI accepted the
     /// operation for processing; clients never infer success from send().
-    /// A [`MutationKind::Input`] acknowledgement is only ever a rejection.
+    /// A [`MutationKind::Input`] acknowledgement is only ever a rejection,
+    /// and settles the send it names; see there.
     MutationAck {
         request_id: String,
         session_id: Uuid,
@@ -6470,8 +6512,8 @@ mod project_instances_tests {
     }
 
     /// A refused input comes back as a rejection carrying the input's
-    /// `client_msg_id`, so a client that settles sends by id can show the
-    /// reason instead of resending. A client built before the kind existed
+    /// `client_msg_id`, so the client that sent it settles that send and shows
+    /// the reason instead of resending. A client built before the kind existed
     /// cannot read the frame at all, which is why only a connection that
     /// negotiated instances receives it.
     #[test]

@@ -453,12 +453,16 @@ describe("confirmation copy", () => {
     expect(text).not.toMatch(/delete|permanent/i);
   });
 
-  it("names the machine, the repository and the folder a clone creates", () => {
+  it("names the machine, the repository and the folder a clone asks for", () => {
     expect(cloneInstanceName("github.com/example/chiral-network")).toBe("chiral-network");
     expect(cloneInstanceName("gitlab.example.com/group/repo.git")).toBe("repo");
     const copy = cloneHereCopy("laptop", "github.com/example/chiral-network");
     expect(copy.title).toBe("Clone this project onto laptop?");
-    expect(copy.body[0]).toContain("~/apas_projects/chiral-network");
+    // Only asked for: a separate project of the same repository often holds
+    // that folder already, and the daemon then clones beside it.
+    expect(copy.body[0]).toContain(
+      "~/apas_projects/chiral-network (auto-suffixed, as chiral-network-2 and so on, if that folder exists)",
+    );
     expect(copy.body[0]).toContain("no new branch");
   });
 });

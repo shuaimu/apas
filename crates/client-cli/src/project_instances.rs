@@ -90,6 +90,19 @@ impl InstanceIdentity {
         }
     }
 
+    /// This identity for a run its daemon allows to be an instance, or not:
+    /// `instances` false makes it the project's only runtime whatever
+    /// `config.toml` allows ([`PaneOwner::Sole`]), which restores and saves
+    /// every pane untagged and does not advertise the capability, as a CLI
+    /// from before instances. A capable daemon starts a project so while its
+    /// server keeps one CLI per session: an instance would report only its own
+    /// machine's panes, and such a server replaces the whole roster with what
+    /// its CLI reports. The machine id and hostname are still reported.
+    pub fn with_instances(mut self, instances: bool) -> Self {
+        self.capable &= instances;
+        self
+    }
+
     /// The panes of `.apas` this run owns.
     pub fn owner(&self) -> PaneOwner {
         if self.capable {
@@ -2342,5 +2355,36 @@ mod tests {
         assert!(owner.owns(&reported));
         assert_eq!(reported.hostname.as_deref(), Some("zoo-005"));
         assert!(PaneOwner::Sole.owns(&reported));
+    }
+
+    /// A daemon can run a project as its only runtime where `config.toml`
+    /// allows instances, but can never make an instance of a run the setting
+    /// rules out.
+    #[test]
+    fn a_daemon_can_take_instances_away_but_never_grant_them() {
+        let machine = Uuid::new_v4();
+        let alone = InstanceIdentity::new(machine, &DaemonConfig::default()).with_instances(false);
+        assert!(!alone.capable);
+        assert_eq!(alone.owner(), PaneOwner::Sole);
+        assert_eq!(
+            (alone.machine_id, alone.hostname.clone()),
+            (machine, current_hostname()),
+            "still the machine it is"
+        );
+        assert!(
+            InstanceIdentity::new(machine, &DaemonConfig::default())
+                .with_instances(true)
+                .capable
+        );
+
+        let configured = DaemonConfig {
+            machine_id: Some(Uuid::new_v4().to_string()),
+            ..DaemonConfig::default()
+        };
+        assert!(
+            !InstanceIdentity::new(machine, &configured)
+                .with_instances(true)
+                .capable
+        );
     }
 }

@@ -1,5 +1,5 @@
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi, type Mock } from "vitest";
 import { handleServerMessage, paneWorkSummaryKey, useStore, type Message, type PaneConfig, type PaneWorkSummary } from "@/lib/store";
 import { MobileSessionActivity, type MobileSessionActivityProps } from "./MobileSessionActivity";
 
@@ -821,6 +821,45 @@ describe("MobileSessionActivity", () => {
     fireEvent.click(screen.getByRole("button", { name: "Restore draft" }));
     expect((screen.getByRole("textbox") as HTMLTextAreaElement).value).toBe("recover this");
     expect(actions.sendTerminalConversationMessage).not.toHaveBeenCalled();
+    expect(useStore.getState().pendingTerminalDeliveries).toEqual([]);
+  });
+
+  it("shows the server's reason for a refused message at once, and restores its draft", () => {
+    const reason = "zoo-005 is not running this project. Start it on zoo-005 first.";
+    const actions = seedStore({
+      paneConfigs: [pane({ pane_id: 3, kind: "terminal" })],
+      paneMessages: { "3": [] },
+    });
+    renderActivity();
+    fireEvent.change(screen.getByRole("textbox"), { target: { value: "Run the suite." } });
+    fireEvent.click(screen.getByRole("button", { name: "Send conversation message" }));
+    const ws = useStore.getState().ws as unknown as { send: Mock };
+    const input = ws.send.mock.calls
+      .map(([raw]) => JSON.parse(String(raw)) as Record<string, unknown>)
+      .find((frame) => frame.type === "terminal_conversation_input");
+    expect(input?.client_msg_id).toBeTruthy();
+
+    // The server refuses it for the tab's machine; the Error frame toasts.
+    act(() => handleServerMessage({
+      type: "mutation_ack",
+      request_id: input!.client_msg_id,
+      session_id: "session-a",
+      pane_id: 3,
+      mutation: "input",
+      accepted: false,
+      error: reason,
+    }, useStore.setState, useStore.getState));
+
+    // Its outcome is known: neither waiting nor unconfirmed.
+    expect(screen.getByText(`Your message was not delivered: ${reason}`)).toBeTruthy();
+    expect(screen.queryByText(/Waiting for the agent to record it/)).toBeNull();
+    expect(screen.queryByText(/No confirmation/)).toBeNull();
+    // The conversation says so on the send itself.
+    expect(screen.getByText(`Not delivered: ${reason}`)).toBeTruthy();
+
+    fireEvent.click(screen.getByRole("button", { name: "Restore draft" }));
+    expect((screen.getByRole("textbox") as HTMLTextAreaElement).value).toBe("Run the suite.");
+    expect(actions.sendTerminalConversationMessage).toHaveBeenCalledTimes(1);
     expect(useStore.getState().pendingTerminalDeliveries).toEqual([]);
   });
 
