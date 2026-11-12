@@ -205,9 +205,13 @@ export function TerminalPane({
   const termRef = useRef<Terminal | null>(null);
   const fitRef = useRef<FitAddon | null>(null);
   const renderStateRef = useRef(createTerminalRenderState());
+  // Whether the emulator holds output since it was last reset: a tab that
+  // cannot be used says it shows retained output only when it does.
+  const shownRef = useRef(false);
   const [lifecycleView, setLifecycleView] = useState<{
     lifecycle?: TerminalLifecycle;
     status?: string;
+    shown?: boolean;
   }>({ lifecycle: undefined });
 
   // Snapshot/live reconciliation state lives in a ref so reconnects do not
@@ -331,8 +335,14 @@ export function TerminalPane({
 
     const unsubscribe = subscribeTerminal(paneId, (event: TerminalEvent) => {
       const accepted = applyTerminalEvent(renderStateRef.current, event, {
-        write: (bytes) => term.write(bytes),
-        reset: () => term.reset(),
+        write: (bytes) => {
+          if (bytes.length > 0) shownRef.current = true;
+          term.write(bytes);
+        },
+        reset: () => {
+          shownRef.current = false;
+          term.reset();
+        },
       });
       // Output remains entirely outside React. Only low-frequency lifecycle
       // changes update component state to render or clear the status banner.
@@ -340,6 +350,7 @@ export function TerminalPane({
         setLifecycleView({
           lifecycle: renderStateRef.current.lifecycle,
           status: renderStateRef.current.status,
+          shown: shownRef.current,
         });
       }
     });
@@ -405,6 +416,7 @@ export function TerminalPane({
     lifecycleView.lifecycle,
     lifecycleView.status,
     Boolean(inputDisabledReason),
+    lifecycleView.shown,
   );
 
   return (

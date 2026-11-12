@@ -826,19 +826,36 @@ export function MobileSessionActivity({ connected, onBack, onReconnect }: Mobile
               // The pane's machine, once the project spans machines or the
               // pane cannot be used there.
               const host = tabHosts.tabs.get(pane.pane_id);
+              const hostname = host?.badge ? host.hostname : undefined;
+              const hostState = host && host.state !== "running" ? tabHostStateLabel(host.state) : undefined;
+              // A chip naming a machine puts it on a second line, and is never
+              // wider than the row: on one line a phone's row (about 200px)
+              // could not hold even "Claude 2 · zoo-006 (stopped)", and a long
+              // name pushed the machine's state out of view. Each line gives
+              // way on its own; the state and the pane's status stay whole.
+              // Flex items drop edge spaces, hence whitespace-pre; the name
+              // read out is the whole text, which a truncated chip no longer
+              // shows.
+              const chipName = hostname
+                ? `${paneLabel(pane)} · ${hostname}${hostState ? ` (${hostState})` : ""}${statusSuffix}`
+                : undefined;
               return (
-                <button key={pane.pane_id} type="button" aria-pressed={selected} title={host?.refusal} onClick={() => { workspace.selectInteractive(); selectPane(pane.pane_id); }} className={`min-h-11 shrink-0 rounded-full border px-3 py-1.5 text-xs font-bold ${selected ? "border-[#6d5efc] text-[#6d5efc]" : "border-[#dedee7] text-[#686873] dark:border-[#383842] dark:text-[#aaaab6]"} ${host?.refusal && !selected ? "opacity-60" : ""}`}>
-                  {paneLabel(pane)}
-                  {host?.badge && host.hostname && (
+                <button key={pane.pane_id} type="button" aria-pressed={selected} aria-label={chipName} title={host?.refusal} onClick={() => { workspace.selectInteractive(); selectPane(pane.pane_id); }} className={`min-h-11 shrink-0 rounded-full border px-3 py-1.5 text-xs font-bold ${hostname ? "flex max-w-full flex-col items-center justify-center leading-tight" : ""} ${selected ? "border-[#6d5efc] text-[#6d5efc]" : "border-[#dedee7] text-[#686873] dark:border-[#383842] dark:text-[#aaaab6]"} ${host?.refusal && !selected ? "opacity-60" : ""}`}>
+                  {hostname ? (
                     <>
-                      {" · "}
-                      <span className="font-normal">
-                        {host.hostname}
-                        {host.state !== "running" && ` (${tabHostStateLabel(host.state)})`}
+                      <span className="max-w-full truncate">{paneLabel(pane)}</span>
+                      <span className="flex max-w-full text-[11px] font-normal">
+                        <span className="min-w-0 truncate">{hostname}</span>
+                        {hostState && <span className="shrink-0 whitespace-pre">{` · ${hostState}`}</span>}
+                        {statusSuffix && <span className="shrink-0 whitespace-pre">{statusSuffix}</span>}
                       </span>
                     </>
+                  ) : (
+                    <>
+                      {paneLabel(pane)}
+                      {statusSuffix}
+                    </>
                   )}
-                  {statusSuffix}
                 </button>
               );
             }) : (

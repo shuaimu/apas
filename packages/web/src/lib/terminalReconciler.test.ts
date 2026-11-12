@@ -202,12 +202,17 @@ describe("terminal lifecycle banners", () => {
   // A stopped machine's tab: its terminal is disconnected, and the banner
   // above it already says the machine is not running the project.
   it("promises no reconnect or reboot for a tab that cannot be used", () => {
-    expect(terminalLifecycleBanner("disconnected", undefined, true)).toBe(
+    expect(terminalLifecycleBanner("disconnected", undefined, true, true)).toBe(
       "Showing retained terminal output.",
     );
-    // After a server restart nothing is retained for it: no claim at all.
+    // A terminal that stayed open across a server restart keeps its screen.
+    expect(terminalLifecycleBanner("unknown", undefined, true, true)).toBe(
+      "Showing retained terminal output.",
+    );
+    // One showing nothing (opened after the restart) gets no claim at all.
+    expect(terminalLifecycleBanner("disconnected", undefined, true)).toBeNull();
     expect(terminalLifecycleBanner("unknown", undefined, true)).toBeNull();
     expect(terminalLifecycleBanner("exited", "status 2", true)).toBe("Process ended (status 2).");
-    expect(terminalLifecycleBanner("running", undefined, true)).toBeNull();
+    expect(terminalLifecycleBanner("running", undefined, true, true)).toBeNull();
   });
 });

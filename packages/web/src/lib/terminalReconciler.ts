@@ -143,14 +143,17 @@ export function applyTerminalEvent(
  * this viewer may not use that machine. The banner above the terminal says
  * why and what to do, so this line only says what is shown: "while it
  * reconnects" or "reboot the pane" would contradict that banner, and a
- * stopped machine's terminals are disconnected. An `unknown` terminal of such
- * a tab gets no line at all: after a server restart nothing is retained for
- * it, so claiming retained output would describe a blank screen.
+ * stopped machine's terminals are disconnected. `shown`: the terminal holds
+ * output. Such a tab's disconnected or unknown terminal says it shows retained
+ * output only when it does, and otherwise gets no line: after a server restart
+ * the server retains nothing, so a terminal opened then is blank, while one
+ * that stayed open keeps what it showed.
  */
 export function terminalLifecycleBanner(
   lifecycle: TerminalLifecycle | undefined,
   status?: string,
   refused = false,
+  shown = false,
 ): string | null {
   switch (lifecycle) {
     case "exited": {
@@ -158,10 +161,10 @@ export function terminalLifecycleBanner(
       return refused ? ended : `${ended} Reboot the pane to start a new one.`;
     }
     case "disconnected":
-      if (refused) return "Showing retained terminal output.";
+      if (refused) return shown ? "Showing retained terminal output." : null;
       return "CLI connection interrupted. Showing retained terminal output while it reconnects.";
     case "unknown":
-      if (refused) return null;
+      if (refused) return shown ? "Showing retained terminal output." : null;
       return "Terminal process state is unavailable. Reconnect or reboot the pane if it remains unresponsive.";
     case "running":
     case undefined:

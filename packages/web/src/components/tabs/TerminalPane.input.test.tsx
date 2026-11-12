@@ -156,6 +156,7 @@ describe("TerminalPane input for a tab that cannot take it", () => {
     const { container, rerender } = render(
       <TerminalPane paneId={11} inputDisabledReason={STOPPED} />,
     );
+    act(() => emitTerminal(11, snapshot("running", "retained screen")));
     act(() => emitTerminal(11, { kind: "state", lifecycle: "disconnected" }));
     expect(container.textContent).toContain("Showing retained terminal output.");
     expect(container.textContent).not.toContain("reconnects");
@@ -164,4 +165,35 @@ describe("TerminalPane input for a tab that cannot take it", () => {
     rerender(<TerminalPane paneId={11} />);
     expect(container.textContent).toContain("while it reconnects");
   });
+
+  // After a server restart the server retains nothing for such a tab: a
+  // terminal opened then is blank, while one that stayed open keeps its screen.
+  it("says it shows retained output only while it shows some", () => {
+    const open = render(<TerminalPane paneId={12} inputDisabledReason={STOPPED} />);
+    act(() => emitTerminal(12, snapshot("running", "screen before the restart", 4)));
+    act(() => emitTerminal(12, snapshot("unknown", "", 0)));
+    expect(open.container.textContent).toContain("Showing retained terminal output.");
+    open.unmount();
+
+    const fresh = render(<TerminalPane paneId={13} inputDisabledReason={STOPPED} />);
+    act(() => emitTerminal(13, snapshot("unknown", "", 0)));
+    expect(fresh.container.textContent).not.toContain("retained");
+    act(() => emitTerminal(13, { kind: "state", lifecycle: "disconnected" }));
+    expect(fresh.container.textContent).not.toContain("retained");
+  });
 });
+
+function snapshot(
+  lifecycle: "running" | "unknown",
+  text: string,
+  seq = 1,
+): Parameters<typeof emitTerminal>[1] {
+  return {
+    kind: "snapshot",
+    bytes: new TextEncoder().encode(text),
+    seq,
+    truncated: false,
+    instanceId: lifecycle === "running" ? "pty-1" : undefined,
+    lifecycle,
+  };
+}

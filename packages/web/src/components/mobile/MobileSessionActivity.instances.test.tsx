@@ -153,6 +153,26 @@ describe("where mobile panes run", () => {
     expect(screen.getByText("zoo-005 +1")).toBeTruthy();
   });
 
+  // A phone's chip row is about 200px wide, too narrow for a pane's name,
+  // machine and state on one line: a chip naming a machine puts it on a
+  // second line and is never wider than the row, or a long name pushes the
+  // machine's state out of view.
+  it("keeps a chip naming a machine within the row, its machine's state whole", () => {
+    seed(11);
+    renderScreen();
+    const chip = screen.getByRole("button", { name: "Claude 2 · zoo-006 (stopped)" });
+    expect(chip.className.split(" ")).toEqual(expect.arrayContaining(["flex-col", "max-w-full"]));
+    const [label, machine] = Array.from(chip.children) as HTMLElement[];
+    expect(label.textContent).toBe("Claude 2");
+    expect(label.className.split(" ")).toEqual(expect.arrayContaining(["max-w-full", "truncate"]));
+    expect(machine.textContent).toBe("zoo-006 · stopped");
+    expect(machine.className.split(" ")).toContain("max-w-full");
+    const [hostname, state] = Array.from(machine.children) as HTMLElement[];
+    expect(hostname.className.split(" ")).toEqual(expect.arrayContaining(["min-w-0", "truncate"]));
+    expect(state.textContent).toBe(" · stopped");
+    expect(state.className.split(" ")).toEqual(expect.arrayContaining(["shrink-0", "whitespace-pre"]));
+  });
+
   it("explains a stopped machine's pane and offers to start or forget that machine", () => {
     seed(11);
     renderScreen();
