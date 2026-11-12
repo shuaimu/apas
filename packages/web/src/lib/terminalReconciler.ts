@@ -137,16 +137,31 @@ export function applyTerminalEvent(
   return true;
 }
 
+/**
+ * The line above a terminal saying what its process is doing. `refused`: the
+ * tab cannot be used now, because its machine is not running the project or
+ * this viewer may not use that machine. The banner above the terminal says
+ * why and what to do, so this line only says what is shown: "while it
+ * reconnects" or "reboot the pane" would contradict that banner, and a
+ * stopped machine's terminals are disconnected. An `unknown` terminal of such
+ * a tab gets no line at all: after a server restart nothing is retained for
+ * it, so claiming retained output would describe a blank screen.
+ */
 export function terminalLifecycleBanner(
   lifecycle: TerminalLifecycle | undefined,
   status?: string,
+  refused = false,
 ): string | null {
   switch (lifecycle) {
-    case "exited":
-      return `Process ended (${status ?? "status unavailable"}). Reboot the pane to start a new one.`;
+    case "exited": {
+      const ended = `Process ended (${status ?? "status unavailable"}).`;
+      return refused ? ended : `${ended} Reboot the pane to start a new one.`;
+    }
     case "disconnected":
+      if (refused) return "Showing retained terminal output.";
       return "CLI connection interrupted. Showing retained terminal output while it reconnects.";
     case "unknown":
+      if (refused) return null;
       return "Terminal process state is unavailable. Reconnect or reboot the pane if it remains unresponsive.";
     case "running":
     case undefined:

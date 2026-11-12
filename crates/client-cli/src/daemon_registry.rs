@@ -426,9 +426,56 @@ fn write_atomic<T: Serialize>(path: &Path, value: &T, actor: &Actor) -> Result<(
     Ok(())
 }
 
+/// Read a record, believing its absence only once this host's NFS client has
+/// looked again.
+///
+/// A host that removes a file, or finds one absent, caches that absence for
+/// as long as it trusts its cached attributes of the directory: 30 s on the
+/// shared home. A file another host creates there meanwhile stays invisible
+/// to it. Since claims are released on stop, that is the normal case: a host
+/// that has just released a project's guard reads a peer's re-created guard
+/// as absent, and before this check it took the guard over a live holder
+/// (smoke run of 2026-11-12, a guard rewritten 1 s after its holder wrote
+/// it). Opening the directory makes the client revalidate it, close-to-open,
+/// which drops absences the directory's change has made stale; measured on
+/// the shared home, a re-created claim was then visible at once rather than
+/// after 30 s. A listing needs nothing extra: `read_dir` opens the directory.
 fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Option<T> {
-    let body = std::fs::read_to_string(path).ok()?;
+    let body = match std::fs::read_to_string(path) {
+        Ok(body) => body,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            revalidate_ancestors(path);
+            std::fs::read_to_string(path).ok()?
+        }
+        Err(_) => return None,
+    };
     serde_json::from_str(&body).ok()
+}
+
+/// Revalidate the nearest directory above `path` that this host can open.
+/// That directory may itself be cached as absent, as a project's instance
+/// claim directory is on a host that looked before another host created it;
+/// revalidating its parent is what makes it visible.
+fn revalidate_ancestors(path: &Path) {
+    for dir in path.ancestors().skip(1) {
+        match std::fs::File::open(dir) {
+            Ok(_) => return,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => return,
+        }
+    }
+}
+
+/// `read_dir`, with an absent directory checked again as [`read_json`]
+/// checks an absent file.
+fn read_dir_revalidated(dir: &Path) -> std::io::Result<std::fs::ReadDir> {
+    match std::fs::read_dir(dir) {
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            revalidate_ancestors(dir);
+            std::fs::read_dir(dir)
+        }
+        listing => listing,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -838,7 +885,7 @@ fn hold_guard(
 
 /// Live instance claims for a project, any host's.
 fn live_instance_claims(config_dir: &Path, project_id: &str, now: u64) -> Vec<ProjectClaim> {
-    let Ok(entries) = std::fs::read_dir(instance_claims_dir(config_dir, project_id)) else {
+    let Ok(entries) = read_dir_revalidated(&instance_claims_dir(config_dir, project_id)) else {
         return Vec::new();
     };
     entries
@@ -2345,5 +2392,27 @@ mod tests {
             claims_dir(dir.path())
         );
         assert!(!instance.to_string_lossy().contains(".."));
+    }
+
+    /// The staleness this second look exists for is an NFS client's and
+    /// cannot happen on a local filesystem; what can be pinned is that the
+    /// second look reads a record that is there, leaves an absent one absent,
+    /// and creates nothing.
+    #[test]
+    fn an_absent_record_is_looked_for_again_without_creating_anything() {
+        let dir = TempDir::new().unwrap();
+        let id = Uuid::new_v4();
+        let nested = instance_claim_path(dir.path(), "p1", id);
+        assert!(read_claim(&nested).is_none());
+        assert!(read_dir_revalidated(&instance_claims_dir(dir.path(), "p1")).is_err());
+        assert_eq!(
+            std::fs::read_dir(dir.path()).unwrap().count(),
+            0,
+            "looking again creates no directory"
+        );
+
+        write_instance_claim(&nested, None, "p1", "/proj", id, &host("a", 1), now_secs()).unwrap();
+        assert_eq!(read_claim(&nested).map(|claim| claim.machine_id), Some(id));
+        assert_eq!(live_instance_claims(dir.path(), "p1", now_secs()).len(), 1);
     }
 }

@@ -431,6 +431,7 @@ export function TabBar({
           // the project, or this viewer may not use that machine.
           const refusal = host?.refusal;
           const hostTone = host ? HOST_BADGE_TONES[host.state] : undefined;
+          const showsHostBadge = Boolean(host?.badge && host.hostname && hostTone);
 
           return (
             <button
@@ -449,7 +450,13 @@ export function TabBar({
               aria-label={host?.badge && host.hostname
                 ? `${label}${isBot ? " (Bot)" : ""} — ${tabHostDescription(host)}`
                 : undefined}
-              className={`group relative flex items-center gap-1.5 px-3 py-2 text-sm font-medium transition-colors flex-shrink-0 border-r border-gray-200 dark:border-gray-700 max-w-[200px] ${
+              className={`group relative flex items-center gap-1.5 px-3 py-2 text-sm font-medium transition-colors flex-shrink-0 border-r border-gray-200 dark:border-gray-700 ${
+                // Room for the host badge beside the name: within the plain
+                // cap a stopped machine's badge left the name one letter.
+                // A name at its 7rem cap still leaves the badge room for a
+                // short host and its longest state word ("disconnected").
+                showsHostBadge ? "max-w-[320px]" : "max-w-[200px]"
+              } ${
                 isActive
                   ? "bg-white dark:bg-gray-900 text-gray-900 dark:text-gray-100 border-b-2 border-b-blue-500 -mb-px"
                   : "text-gray-500 dark:text-gray-400 hover:bg-gray-200 dark:hover:bg-gray-700/50 hover:text-gray-700 dark:hover:text-gray-300"
@@ -521,7 +528,9 @@ export function TabBar({
                 // inactive tabs collapse to icon + activity dot so a
                 // dozen panes still fit in one row. Desktop (sm:) keeps
                 // the label visible on all tabs.
-                <span className={`truncate ${isActive ? "inline" : "hidden sm:inline"}`}>
+                // Beside a host badge the name keeps its width, up to a
+                // cap, and the badge gives way instead.
+                <span className={`truncate ${showsHostBadge ? "shrink-0 max-w-[7rem]" : ""} ${isActive ? "inline" : "hidden sm:inline"}`}>
                   {label}
                   {isBot && " (Bot)"}
                 </span>
@@ -530,11 +539,11 @@ export function TabBar({
               {/* Which machine runs the tab, once that is worth saying: the
                   roster spans machines, or this tab cannot be used. Like the
                   label, phones show it on the active tab only. */}
-              {host?.badge && host.hostname && hostTone && (
+              {showsHostBadge && host?.hostname && hostTone && (
                 <span
                   data-testid="tab-host-badge"
                   title={tabHostDescription(host)}
-                  className={`${isActive ? "inline-flex" : "hidden sm:inline-flex"} ${host.state === "running" ? "max-w-[96px]" : "max-w-[136px]"} min-w-0 flex-shrink-0 items-center gap-1 rounded px-1 py-px text-[10px] font-normal leading-tight ${hostTone.badge}`}
+                  className={`${isActive ? "inline-flex" : "hidden sm:inline-flex"} ${host.state === "running" ? "max-w-[96px]" : "max-w-[136px]"} min-w-0 shrink items-center gap-1 rounded px-1 py-px text-[10px] font-normal leading-tight ${hostTone.badge}`}
                 >
                   <span aria-hidden="true" className={`h-1.5 w-1.5 flex-shrink-0 rounded-full ${hostTone.dot}`} />
                   <span className="truncate">{host.hostname}</span>

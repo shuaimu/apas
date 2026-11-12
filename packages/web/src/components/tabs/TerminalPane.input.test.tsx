@@ -1,5 +1,6 @@
-import { render } from "@testing-library/react";
+import { act, render } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { emitTerminal } from "@/lib/terminalBus";
 
 /**
  * A terminal tab whose machine is not running the project, or that this
@@ -146,5 +147,21 @@ describe("TerminalPane input for a tab that cannot take it", () => {
     expect(storeState.sendTerminalResize).not.toHaveBeenCalled();
     expect(storeState.sendTerminalInput).not.toHaveBeenCalled();
     expect(term.dispose).not.toHaveBeenCalled();
+  });
+
+  // A stopped machine's terminals are disconnected, under a banner saying the
+  // machine is not running the project: the line above the terminal must not
+  // promise a reconnect.
+  it("does not promise a reconnect while its machine is not running the project", () => {
+    const { container, rerender } = render(
+      <TerminalPane paneId={11} inputDisabledReason={STOPPED} />,
+    );
+    act(() => emitTerminal(11, { kind: "state", lifecycle: "disconnected" }));
+    expect(container.textContent).toContain("Showing retained terminal output.");
+    expect(container.textContent).not.toContain("reconnects");
+
+    // A tab that can be used keeps the reconnect wording.
+    rerender(<TerminalPane paneId={11} />);
+    expect(container.textContent).toContain("while it reconnects");
   });
 });

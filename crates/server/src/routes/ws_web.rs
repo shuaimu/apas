@@ -888,14 +888,50 @@ fn beside_older_instance_refusal(
         .map(|older| crate::session::instances::beside_older_cli_refusal(&older))
 }
 
+/// Why the project must not start on `machine_id`, or `None`: that machine's
+/// connected daemon cannot run instances, and an instance runs the project on
+/// another machine. Such a daemon only runs a project as its only runtime. On
+/// a shared home it finds the running instance's claim and skips the start
+/// without a word; with its own checkout it starts the project, and its CLI
+/// is refused when it attaches. A Start is not correlated, so its requester
+/// would hear nothing either way. It is refused before any daemon frame
+/// instead, with the reason a new tab targeted at that machine gets.
+fn older_daemon_beside_instance_refusal(
+    state: &AppState,
+    project_id: &str,
+    machine_id: &Uuid,
+) -> Option<String> {
+    if !state.sessions.is_daemon_connected(machine_id)
+        || state
+            .sessions
+            .daemon_supports_capability(machine_id, shared::PROJECT_INSTANCES_CAPABILITY)
+    {
+        return None;
+    }
+    let runs_elsewhere = state
+        .sessions
+        .project_session_ids(project_id)
+        .iter()
+        .flat_map(|session_id| state.sessions.session_attachments(session_id))
+        .any(|instance| instance.capable && instance.machine_id != Some(*machine_id));
+    runs_elsewhere.then(|| {
+        let host = machine_label(state, *machine_id);
+        format!(
+            "{host} runs an older APAS that cannot run this project beside other machines. Reboot {host} to update it."
+        )
+    })
+}
+
 /// `StartMachineProjectCli`. A per-machine Start on the Machines page, and
 /// every older client, starts only `machine_id`. The project view's Start
 /// (`all_instances`) starts each machine [`project_start_machines`] names,
 /// and `machine_id` only when none qualifies. Each machine is authorized as
 /// a per-machine Start would be, and when several were chosen a refusal names
 /// the host it concerns. A machine that cannot run the project beside an
-/// older CLI running it elsewhere is refused before any daemon frame; see
-/// [`beside_older_instance_refusal`].
+/// older CLI running it elsewhere, and a machine whose daemon cannot run
+/// instances while an instance runs the project elsewhere, are refused
+/// before any daemon frame; see [`beside_older_instance_refusal`] and
+/// [`older_daemon_beside_instance_refusal`].
 async fn start_machine_project(
     state: &AppState,
     connection_id: &Uuid,
@@ -961,6 +997,7 @@ async fn start_machine_project(
             Some(incompatible.to_string())
         } else {
             beside_older_instance_refusal(state, project_id, &target)
+                .or_else(|| older_daemon_beside_instance_refusal(state, project_id, &target))
         };
         match refusal {
             None => compatible.push(target),
@@ -11064,6 +11101,49 @@ mod project_instance_tests {
             vec![refusal.replace(HOST_A, "another machine")]
         );
         assert!(d5.drain().is_empty());
+    }
+
+    /// The other way round: an instance runs the project, and the Start
+    /// names a machine whose daemon cannot run instances. That daemon would
+    /// skip it without a word on a shared home, or start a CLI the server
+    /// refuses when it attaches. It is refused before any daemon frame with
+    /// the reason a targeted new tab gets, and goes ahead as before once no
+    /// instance runs the project.
+    #[tokio::test]
+    async fn a_start_on_an_older_daemon_beside_an_instance_is_refused_before_any_daemon_frame() {
+        let p = project().await;
+        let mut d5 = p.daemon(p.m5, HOST_A, CAPABLE_DAEMON);
+        let mut d6 = p.daemon(p.m6, HOST_B, &[shared::PROJECT_POLICY_CAPABILITY]);
+        let running = p.instance(p.m5, HOST_A);
+        let mut web = p.viewer(p.owner, &[shared::PROJECT_POLICY_CAPABILITY]);
+        let viewer = web.id;
+        let project_id = p.project_id();
+        let start = |machine_id: Uuid| {
+            start_machine_project(&p.state, &viewer, &p.owner, machine_id, &project_id, false)
+        };
+
+        start(p.m6).await;
+        assert_eq!(
+            errors(&web.drain()),
+            vec![format!(
+                "{HOST_B} runs an older APAS that cannot run this project beside other machines. Reboot {HOST_B} to update it."
+            )]
+        );
+        assert!(d6.drain().is_empty(), "nothing reached the older daemon");
+
+        // The running instance's own machine is not affected.
+        start(p.m5).await;
+        assert!(started(&mut d5));
+        assert!(errors(&web.drain()).is_empty());
+
+        // With no instance running, the older daemon runs the project alone.
+        p.state
+            .sessions
+            .detach_cli_instance(&p.session, &running.id)
+            .unwrap();
+        start(p.m6).await;
+        assert!(started(&mut d6));
+        assert!(errors(&web.drain()).is_empty());
     }
 
     /// The refusals clients show word for word for a tab they cannot use,

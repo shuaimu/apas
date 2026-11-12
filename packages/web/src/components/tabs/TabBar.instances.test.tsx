@@ -141,6 +141,12 @@ describe("host badges", () => {
     const badge = within(stopped).getByTestId("tab-host-badge");
     expect(badge.textContent).toBe("zoo-006· stopped");
     expect(badge.getAttribute("title")).toBe("zoo-006 is not running this project");
+    // The badge gives way before the name (jsdom has no layout, so the
+    // classes stand in): a stopped badge used to leave the name "C…".
+    expect(stopped.className).toContain("max-w-[320px]");
+    expect(badge.className.split(" ")).toContain("shrink");
+    expect(badge.className).not.toContain("flex-shrink-0");
+    expect(within(stopped).getByText("Claude 2").className.split(" ")).toContain("shrink-0");
     expect(screen.getByRole("button", { name: "Claude 1 — Runs on zoo-005" })).toBe(tabElement(container, 1));
 
     const close = stopped.querySelector(`[title="${reason}"][aria-disabled="true"]`);

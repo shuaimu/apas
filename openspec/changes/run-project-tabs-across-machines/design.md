@@ -395,6 +395,23 @@ could be on any machine, so every Start is refused. A native task launch needs
 no such check: while such a CLI runs the project, the task goes to its running
 session and no machine is started.
 
+The other way round, while an instance runs the project, a Start naming a
+machine whose connected daemon lacks the capability is refused before any
+daemon frame too, with the reason a new tab targeted at that machine gets:
+"<host> runs an older APAS that cannot run this project beside other machines.
+Reboot <host> to update it." Sent on, that daemon would skip the start without
+a word on a shared home, where it finds the instance's claim, and with its own
+checkout would start a CLI the server refuses when it attaches. The smoke run
+found the silent skip. A project-wide Start's fan-out never includes such a
+machine; when nothing qualifies and the Start falls back to the machine it
+names, that machine is refused as a per-machine Start is. The check reads
+attached instances only. So in the seconds before a running instance has
+reattached, after a server restart or while its connection is re-established,
+such a Start still reaches that daemon, which skips it as before. Counting
+machines whose daemons report running the project would close that window but
+would refuse legitimate Starts for up to a heartbeat after a real stop, since a
+report lags the stop.
+
 The server routes an `AddPane` naming a non-primary machine only when that
 machine's daemon advertises the capability. Otherwise it returns a correlated
 failure saying to reboot the machine to update it, rather than landing the tab
@@ -559,6 +576,19 @@ refreshes each running project's claims in the shape its start took.
 
 Claim records are written temp-and-rename with host- and pid-qualified temp
 names; the current `.tmp.<pid>` name can collide across hosts.
+
+Releasing on stop makes one host's removal of a claim the usual state just
+before another host writes it again, and an NFS client caches an absence for
+as long as it trusts its cached attributes of the directory, 30 s on the shared
+home. A claim is therefore believed absent only after the reader has looked
+again having opened the nearest existing directory above it, which makes the
+client revalidate that directory (close-to-open consistency); a re-created
+claim is then visible at once. Listings need nothing extra, since opening the
+directory is how they start. Without the second look, the 2026-11-12 smoke run
+saw a host that had just released a project's guard read a peer's guard,
+written a second earlier, as absent and write its own over it. That was benign
+there, both being capable and the guard marked, but the same read could miss
+an unmarked guard and start an instance beside a project's only runtime.
 
 `start_project` no longer skips a claimed project silently. A refusal is
 reported as the project's `last_error`, and a start that carried a
@@ -737,7 +767,9 @@ request itself names, which can be any machine at all: it names that machine's
 host only when the requester knows the machine (Decision 4), and otherwise
 reads "<id>: Machine not found", as for an unknown machine. A Start is also
 refused, before any daemon frame, for every machine that cannot run the
-project beside a CLI without the capability that runs it (Decision 5). A Start
+project beside a CLI without the capability that runs it, and for a machine
+whose connected daemon lacks the capability while an instance runs the project
+(Decision 5). A Start
 first places a project that only its owner's machine has registered
 (Decision 10). `false`, which every older client sends, keeps today's
 single-machine meaning for the Machines page's per-machine Start and Stop,
@@ -883,16 +915,23 @@ bare `apas` in a new directory, register a project on the machine without
 telling the server. Until something starts it there is no project record and
 no cluster placement, so the runtime-access check refused every web Start of
 it as "Machine not found", and a project registered that way could never be
-started from the web. `StartMachineProjectCli`, for the machine it names, and
-a native task launch therefore first place such a project when the requester
-owns that machine, the machine lists the project, and the project has no
-placement in the requester's cluster. Under the project-operation guard they
-call `authorize_project_registration`, exactly as the instance's
-`SessionStart` would a moment later. It creates a missing project record
-owned by the requester, with the direct placement, and refuses a suspended or
-deleting project or one the requester has no access to; a refusal leaves
-everything as it was, and the Start is refused as before. A cluster member
-still needs a project role first.
+started from the web. `StartMachineProjectCli`, for the machine it names,
+therefore first places such a project when the requester owns that machine,
+the machine lists the project, and the project has no placement in the
+requester's cluster. Under the project-operation guard it calls
+`authorize_project_registration`, exactly as the instance's `SessionStart`
+would a moment later. It creates a missing project record owned by the
+requester, with the direct placement, and refuses a suspended or deleting
+project or one the requester has no access to; a refusal leaves everything as
+it was, and the Start is refused as before. A cluster member still needs a
+project role first.
+
+A native task launch places a project the same way, but cannot yet offer one
+that has never run: its launch targets come from project policy, which needs
+the project record, so the placement in its launch path helps only a project
+that already has a record but no placement in the requester's cluster.
+Starting the project once from the web or the Machines page creates the
+record. This predates instances and is left for a later change.
 
 ### 11. Clone to join
 

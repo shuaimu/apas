@@ -404,6 +404,7 @@ export function TerminalPane({
   const lifecycleBanner = terminalLifecycleBanner(
     lifecycleView.lifecycle,
     lifecycleView.status,
+    Boolean(inputDisabledReason),
   );
 
   return (

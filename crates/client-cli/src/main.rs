@@ -384,8 +384,10 @@ async fn main() -> Result<()> {
                 match outcome {
                     Ok(message) => eprintln!("{message}"),
                     Err(err) => {
+                        // Said once, here: returning the error as well had
+                        // `main` print the same reason a second time.
                         eprintln!("\x1b[31mCould not register {}: {err:#}\x1b[0m", dir.display());
-                        return Err(err);
+                        std::process::exit(1);
                     }
                 }
                 // The resident instance is what reports registered projects to
