@@ -14,26 +14,28 @@ running by itself, and stopping it from a phone means opening the raw terminal
 and pressing its Esc key.
 
 This change adds a light, in-tab tier beside the worker. A person leaves an
-OMP tab repeating an instruction within finite limits, and sees, pauses and
-stops that from the desktop web and the mobile browser. It is for work its
-owner would already trust to a tab. It is not contained, verified or budgeted
-the way a worker is, it has no backlog or checklist, it opens no draft pull
-request, and it says so. It is not folded into the worker product, because
-worker readiness must fail closed, and one name for two trust models is how a
-person ends up believing a tab was sandboxed.
+OMP tab repeating an instruction, until a limit they set or until someone
+stops it, and sees, pauses and stops that from the desktop web and the mobile
+browser. It is for work its owner would already trust to a tab. It is not
+contained, verified or budgeted the way a worker is, it has no backlog or
+checklist, it opens no draft pull request, and it says so. It is not folded
+into the worker product, because worker readiness must fail closed, and one
+name for two trust models is how a person ends up believing a tab was
+sandboxed.
 
 ## What Changes
 
 - A person can put an OMP terminal tab on **autopilot**: a prompt that is
   submitted again each time the tab settles, either at once or on a set
-  interval of one minute to 24 hours. A start must carry an iteration limit
-  (at most 1,000) and a time limit (at most seven days), and may carry a token
-  limit. The start dialog proposes 20 iterations and 8 hours. There is no
+  interval of one minute to 24 hours. An iteration limit and a time limit
+  can each be set, and neither is required. The start dialog proposes no
+  limit, and an autopilot without one runs until someone stops it or one of
+  the rules below pauses or ends it. There is no token limit. There is no
   default prompt; the dialog offers what was last used in that tab, so an
   ended autopilot can be started again in one step.
-- Autopilot ends by itself at any limit, or, optionally, after an iteration
-  that makes no tool call. The limits are checked between turns, so a turn in
-  progress is never cut off and can outlast them. The time limit always ends
+- Autopilot ends by itself at a limit it was given, or, optionally, after an
+  iteration that makes no tool call. Limits are checked between turns, so a
+  turn in progress is never cut off and can outlast them. A time limit ends
   autopilot at its deadline, whatever the tab is doing then.
 - The loop runs inside the tab's OMP process, in the extension APAS already
   loads there to report activity. OMP's own `/goal` and `/loop` are **not**
@@ -58,26 +60,26 @@ person ends up believing a tab was sandboxed.
 - Autopilot state is its own attribute of a tab, beside Working, Pending answer
   and Idle. A tab waiting for its next iteration is not listed as an idle tab,
   and a paused or ended autopilot says why.
-- Only the account that hosts a tab can start or resume its autopilot through
-  APAS. On a shared machine that is the machine's owner, also for a project a
-  cluster member created there, and the owner can do it only for a project
-  that has been shared with them. Anyone who may type into the tab can pause
-  or stop it.
+- Anyone who may type into a tab can start, pause, resume and stop its
+  autopilot, on their own machine or on one shared with them. No further
+  permission is needed. An autopilot spends the OMP login of the machine it
+  runs on, whoever started it.
 - Autopilot starts no new iteration without its controller. It holds once the
   tab's APAS process has been absent for a minute or its machine has been off
   the server for ten minutes, whether or not an iteration is due then. It
-  continues when that hold ends within an hour and pauses once the hold has
-  lasted an hour. It comes back paused after the agent process restarts, and
-  it ends when the tab is switched to another conversation.
+  continues when that hold ends within four hours and pauses once the hold
+  has lasted four hours. It comes back paused after the agent process
+  restarts, and it ends when the tab is switched to another conversation.
 - Iterations are recorded as autopilot's, not as the person's messages.
 - Three consecutive failed iterations pause autopilot instead of retrying
   without end. Reaching the login's usage limit therefore pauses a
-  back-to-back autopilot within a few minutes, until its owner resumes it.
+  back-to-back autopilot within a few minutes, until someone resumes it.
 - The start dialog states what this mode is: the tab keeps running on its host
   as the account APAS runs under, with the tab's own permissions, and APAS
-  adds no sandbox, independent review or spending limit. The limits are kept
-  by code inside the agent's own process. They bound the loop and are not a
-  security boundary.
+  adds no sandbox, independent review or spending limit. With no limit set,
+  it says that autopilot runs until someone stops it. Limits that are set are
+  kept by code inside the agent's own process. They bound the loop and are
+  not a security boundary.
 - This reverses, for interactive OMP tabs only, the worker cutover's position
   that unattended work belongs to workers alone. Autopilot is never counted,
   listed or offered as a worker, and legacy bot history stays read-only. A
@@ -95,8 +97,9 @@ person ends up believing a tab was sandboxed.
 - First version: OMP terminal tabs, desktop web and mobile browser. Left out:
   the native app; push notifications, which reach only native-app
   installations (an end or a pause is shown in the tab and in the lists);
-  stopping OMP's own modes remotely; other providers; starting autopilot when
-  a tab is created; and a project or cluster permission.
+  stopping OMP's own modes remotely; a token or spending limit; other
+  providers; starting autopilot when a tab is created; and a project or
+  cluster permission.
 
 ## Capabilities
 
@@ -117,7 +120,8 @@ person ends up believing a tab was sandboxed.
 
 ## Impact
 
-- **Shared protocol:** a start request with its limits, pause/resume/stop
+- **Shared protocol:** a start request with its optional limits,
+  pause/resume/stop
   requests, a correlated receipt with three outcomes, and a per-tab autopilot
   state frame, all gated by a new instance capability and a new viewer
   capability; an optional autopilot summary on the per-pane session summary;
@@ -150,12 +154,12 @@ person ends up believing a tab was sandboxed.
   server and web since 2026-11-13, and their CLI is published; a machine
   takes it at its next daemon reboot. Nothing here deploys, enables a policy
   or restarts a running agent.
-- **Should land first, as its own change:** a repair of the OMP question
-  bridge. Since OMP 18.18.3 the `ask` tool sends one HTML form, which APAS's
-  question bridge does not recognise, so question cards and remote answers for
-  OMP tabs are likely not working on current OMP. This comes from reading the
-  code, not from a run; the first task group checks it and reports the result.
-  A tab that asks a question waits until someone answers, by default without a
-  time limit. The Pending answer status should still work, so such a tab
-  shows red, but the question may have to be answered in the terminal. The
-  start dialog says so.
+- **Known and left alone:** the OMP question bridge. Since OMP 18.18.3 the
+  `ask` tool sends one HTML form, which APAS's question bridge does not
+  recognise, so question cards and remote answers for OMP tabs are likely not
+  working on current OMP. This comes from reading the code, not from a run.
+  The owner decided to leave it out: this change does not repair it, check it
+  or wait for a repair. A tab that asks a question waits until someone
+  answers, by default without a time limit. The Pending answer status should
+  still work, so such a tab shows red, but the question may have to be
+  answered in the terminal. The start dialog says so.

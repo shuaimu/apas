@@ -2,7 +2,7 @@
 
 ### Requirement: Pane toolbar offers autopilot on OMP terminal tabs
 
-For an active OMP terminal tab on a server that supports autopilot, the web interface SHALL show an autopilot control in the pane toolbar, placed before the Terminal/Conversation switch, and SHALL place nothing between that switch and the provider usage status where one is shown. The control SHALL show the tab's reported autopilot condition. When the tab has no autopilot or an ended one, the control SHALL show the ended reason, if any, and SHALL open the start dialog; for a viewer who is not the tab's hosting account, starting SHALL be disabled with "Only the account that runs this tab's machine can start autopilot." When the tab is on autopilot or has a paused autopilot, the control SHALL offer the actions that apply to that condition and a way to read the prompt, timing, limits, progress and time limit end; for a viewer who is not the tab's hosting account, Resume SHALL be disabled with "Only the account that runs this tab's machine can resume autopilot." For an autopilot that is paused because the tab's agent process exited, the control SHALL offer no Resume, Stop or Stop now and SHALL say "This tab's agent is not running. Reboot it first; its autopilot comes back paused." When the tab's autopilot state is not reported while its machine is connected and supports autopilot, the control SHALL say that the state is not reported, SHALL offer Stop and Stop now, and SHALL NOT offer starting, Pause or Resume. When autopilot is unavailable for the tab, the control SHALL be shown disabled with the reason rather than hidden. The control SHALL NOT appear for a non-terminal pane or for a terminal tab of another provider. Using the control SHALL NOT recreate the tab's terminal instance or change which view is selected.
+For an active OMP terminal tab on a server that supports autopilot, the web interface SHALL show an autopilot control in the pane toolbar, placed before the Terminal/Conversation switch, and SHALL place nothing between that switch and the provider usage status where one is shown. The control SHALL show the tab's reported autopilot condition. When the tab has no autopilot or an ended one, the control SHALL show the ended reason, if any, and SHALL open the start dialog. When the tab is on autopilot or has a paused autopilot, the control SHALL offer the actions that apply to that condition and a way to read the prompt, the timing, the limits or that none is set, when it started, the progress and, when a time limit is set, its end. For a viewer who may not send input to the tab, the control SHALL show the state and SHALL disable every action with the reason. For an autopilot that is paused because the tab's agent process exited, the control SHALL offer no Resume, Stop or Stop now and SHALL say "This tab's agent is not running. Reboot it first; its autopilot comes back paused." When the tab's autopilot state is not reported while its machine is connected and supports autopilot, the control SHALL say that the state is not reported, SHALL offer Stop and Stop now, and SHALL NOT offer starting, Pause or Resume. When autopilot is unavailable for the tab, the control SHALL be shown disabled with the reason rather than hidden. The control SHALL NOT appear for a non-terminal pane or for a terminal tab of another provider. Using the control SHALL NOT recreate the tab's terminal instance or change which view is selected.
 
 #### Scenario: OMP terminal tab that is not on autopilot
 - **WHEN** an OMP terminal tab that supports autopilot is active and has no autopilot
@@ -17,13 +17,13 @@ For an active OMP terminal tab on a server that supports autopilot, the web inte
 - **WHEN** the active tab's last autopilot ended at its time limit
 - **THEN** the control shows "Ended: time limit reached" and opens the start dialog with that autopilot's prompt, timing and limits
 
-#### Scenario: A viewer who is not the hosting account
-- **WHEN** a project member who is not the tab's hosting account opens the control of a tab that has no autopilot
-- **THEN** starting is disabled with "Only the account that runs this tab's machine can start autopilot."
+#### Scenario: A collaborator who may use the tab
+- **WHEN** a project member who may type into a tab hosted by another account opens the control of that tab, which has no autopilot
+- **THEN** starting is offered as it is to the hosting account
 
-#### Scenario: A paused autopilot seen by a viewer who is not the hosting account
-- **WHEN** that member opens the control of a tab whose autopilot is paused
-- **THEN** Resume is disabled with "Only the account that runs this tab's machine can resume autopilot.", and Stop is still offered
+#### Scenario: A viewer who may not use the tab
+- **WHEN** a viewer without runtime access to the tab's machine opens the control of a tab whose autopilot is paused
+- **THEN** the control shows the condition and its details, and Resume and Stop are disabled with the reason
 
 #### Scenario: The tab's state is not reported
 - **WHEN** the active tab's autopilot state is not reported while its machine is connected and supports autopilot

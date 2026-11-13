@@ -78,9 +78,8 @@ What OMP 18.18.9 offers an extension:
   (branch, fork, or a promoted `/btw` answer) and
   `session_before_tree`/`session_tree` when the tab's conversation changes.
 - Managed timers (`ctx.setTimeout`, `ctx.setInterval`), `pi.appendEntry()` for
-  journal entries, `ctx.sessionManager.getBranch()` and
-  `getUsageStatistics()`, `ctx.ui.setStatus()`, `getEditorText()` and
-  `setEditorText()`, and the SDK's exported `VERSION`.
+  journal entries, `ctx.sessionManager.getBranch()`, `ctx.ui.setStatus()`,
+  `getEditorText()` and `setEditorText()`, and the SDK's exported `VERSION`.
 
 ## Goals / Non-Goals
 
@@ -92,8 +91,9 @@ What OMP 18.18.9 offers an extension:
   applies it or its agent is restarted, after which autopilot is paused
   anyway. One iteration already handed to OMP cannot be recalled; decision 3
   says what happens to it.
-- Limits that client code enforces between turns and that a person can read
-  back at any time, with a time limit that always ends autopilot.
+- Limits that a person may set, that client code enforces between turns and
+  that can be read back at any time. A time limit, when one is set, always
+  ends autopilot. No limit is the default.
 - A state the server and clients can show truthfully: what the tab reported,
   and when it has not reported.
 - No iteration without a controller, and no silent restart of unattended work.
@@ -116,7 +116,10 @@ What OMP 18.18.9 offers an extension:
   well. Until it exists, a timed check runs until a limit or a person stops
   it, and the start dialog says so.
 - A project or cluster permission (see decision 9).
-- Repairing the question bridge for OMP 18.18.3 and later (see Risks).
+- A token or spending limit. The draft offered an approximate token limit,
+  and the owner left it out.
+- Repairing the question bridge for OMP 18.18.3 and later. The owner left it
+  out, and nothing here checks it or waits for it (see Risks).
 - Converting or reviving legacy bots.
 
 ## Decisions
@@ -181,7 +184,7 @@ The design needs at least OMP 18.18.2: before it, `sendUserMessage` resolved
 when a prompt was dropped, so a dropped iteration would leave autopilot
 waiting for a turn that never comes. A check that each function exists cannot
 see that change, so the extension reads the SDK's `VERSION` as well as
-checking for every call it uses, `ctx.sessionModes` included. Task 1.7 finds
+checking for every call it uses, `ctx.sessionModes` included. Task 1.6 finds
 the real minimum, which may be higher: this tag's changelog does not say
 when `awaitingAsyncWork`, the job snapshot's delivery fields and aside
 delivery for `sendUserMessage` arrived.
@@ -191,7 +194,7 @@ extension only for timed repeats. It keeps the racy stop and the invisible
 states for half the feature and doubles what must be tested against every OMP
 update.
 
-### 2. One autopilot is a prompt, a timing and finite limits
+### 2. One autopilot is a prompt, a timing and optional limits
 
 A start carries:
 
@@ -199,9 +202,8 @@ A start carries:
 |---|---|---|
 | prompt | Submitted as typed text each iteration | 1 to 16,000 bytes (the size of a first instruction today); no control characters other than newline and tab |
 | repeat | When the next iteration is due | "as soon as each turn ends" (five seconds after the tab settles), or every 60 s to 24 h, measured from the previous iteration's submission |
-| iteration limit | Most iterations it may submit; the first counts | 1 to 1,000 |
-| time limit | Autopilot ends at start + this; paused, waiting and holding time counts | 60 s to 7 days, and not shorter than the repeat interval |
-| token limit | Optional; tokens the session records while autopilot is on, not while it is paused | positive |
+| iteration limit | Optional. Most iterations it may submit; the first counts | none, or 1 to 1,000,000 |
+| time limit | Optional. Autopilot ends at start + this; paused, waiting and holding time counts | none, or 60 s to 365 days and not shorter than the repeat interval |
 | end without tool call | End after an iteration whose turn calls no tool | proposed on for "as soon as each turn ends", off otherwise |
 
 A timed repeat is measured from submission to submission, as the retired
@@ -209,22 +211,50 @@ bot's interval was. A person's message then does not move the schedule, and
 "every 15 minutes" means what it says. When a turn outlasts the interval the
 next iteration follows five seconds after the tab settles.
 
-The dialog proposes 20 iterations and 8 hours, or the interval times the
-iteration limit when that is longer, capped at seven days. It proposes
-nothing for the prompt except that of the last autopilot the tab reports
-(decisions 5 and 6), so that an autopilot that ended overnight can be
-started again without retyping. These values are looser than the worker's
-default allowance of two hours and 24 runs a day. That is intended: the
-worker's allowance is policy for work nobody starts by hand, and these are
-editable proposals for the account that spends its own login.
+**No limit is the default.** The dialog proposes no iteration limit and no
+time limit, and a person sets either or both when they want one. This is the
+owner's decision; the draft required both, capped at 1,000 iterations and
+seven days. The upper bounds in the table are not policy: they refuse a
+mistyped number, and someone who wants more chooses no limit. There is no
+token limit. The draft offered an approximate one, and the owner left it out.
+
+The dialog proposes nothing for the prompt except that of the last autopilot
+the tab reports (decisions 5 and 6), with that autopilot's timing and limits,
+so that an autopilot that ended overnight can be started again without
+retyping.
+
+What pauses or ends an autopilot that has no limit:
+
+- a person pauses or stops it, or interrupts the tab in the terminal
+  (decision 4);
+- three iterations in a row fail, which is what a usage limit causes
+  (decision 4);
+- an iteration makes no tool call, when that option is on;
+- APAS could not control the tab for four hours (decision 7);
+- the tab's agent exits or restarts, which a project stop also causes, and
+  autopilot comes back paused (decisions 6 and 8);
+- the tab leaves its conversation (decision 6), or one of OMP's own modes is
+  switched on (decision 11);
+- the tab is closed.
+
+Nothing else does. The retired bot also ran without an end. What differs here
+is that an autopilot never starts again by itself after a restart, pauses on
+failures and interrupts, holds without its controller, and is shown and can
+be stopped on every surface.
+
+Each limit travels as an explicit value: a number, or "none". A start in
+which a limit is missing altogether is refused at each of the three checks
+below, so a field that one version drops can never turn a limited autopilot
+into an unlimited one.
 
 The bounds are checked three times. The server checks them so that a refusal
 carries a reason: on this wire a frame that fails to parse is dropped without
-an answer, so the viewer's request keeps the limits optional and the server
-validates them. The server forwards a strict form (limits required, unknown
-fields rejected, as `JobLimits` and `WorkerLimits` are), which the CLI
-re-checks. The extension checks them once more, because it enforces them and
-may be older than the CLI that feeds it.
+an answer, so the viewer's request declares the limits as optional fields and
+the server validates them. The server forwards a strict form (each limit
+required, as a number or "none", and unknown fields rejected, as `JobLimits`
+and `WorkerLimits` are), which the CLI re-checks. The extension checks them
+once more, because it enforces them and may be older than the CLI that feeds
+it.
 
 A second start is refused; changing an autopilot is stop and start. The
 extension creates an `autopilot_id` (UUID) when it accepts a start; no
@@ -235,13 +265,12 @@ to U+009F, so a carriage return is refused. Conditions: `starting`, `running`,
 work), `holding` (for the controller or for the server), `paused` and
 `ended`, the last two with a reason.
 
-Alternative rejected: allow "until I stop it". The retired bot did, and a
-standing responsibility with no end is what the worker tier is for. There is
-a second reason: every iteration is appended to one OMP conversation, and
-the CLI re-reads that file whenever it changes, so the caps also bound how
-far one conversation grows. A week is long enough to cover real use and short
-enough to force a look. This is the first of the choices listed for the owner
-below.
+Alternative rejected: require an end date, as the draft did, with at most
+1,000 iterations and seven days. It guarantees that every autopilot ends
+without anyone acting, and it forces a look at least once a week. The owner
+decided against it: a limit is the choice of whoever starts the autopilot.
+The cost is in Risks: an autopilot that nobody stops keeps spending its
+machine's login, and its one conversation keeps growing.
 
 ### 3. An iteration is submitted only from a settled tab, as an agent-attributed message
 
@@ -278,15 +307,15 @@ result can then still arrive later; when it starts a turn, autopilot treats
 that turn like any other. A job with a pending wake that never ends, such as
 a dev server the agent started in the background, makes every later
 `agent_end` the waiting kind, and autopilot then waits for it until a person
-stops it or the time limit ends it.
+stops it or a time limit, if one was set, ends it.
 
 A `/compact` typed during a turn aborts that turn after OMP has detached its
 event stream, so no end of that turn reaches the extension. OMP resumes the
 turn when the compaction commits or is a no-op and `compaction.autoContinue`
 is on. When it is cancelled or fails nothing follows, and autopilot stays
 "running an iteration" until a later run ends, a person pauses or stops it,
-or the time limit ends it. This is read from the source, and task 1.3
-observes it.
+or a time limit, if one was set, ends it. This is read from the source, and
+task 1.3 observes it.
 
 When the tab is settled and an iteration is due, the extension does the rest
 in one synchronous step from a managed timer. It reads its request files and
@@ -355,20 +384,22 @@ person's message and moves their counters, and assistant text is stored as the
 agent's own words. The marker is therefore carried as an assistant tool-use
 block with the reserved name `ApasAutopilotIteration` and the input
 `{ autopilot_id, iteration, limit }`, sent with
-`terminal_turn_complete: false`. The first marker of each autopilot, and the
-first after each resume, also carries the prompt, which the reader takes from
-the journal's start entry. The stored conversation then holds the
-instruction once, and not a copy per iteration. Everyone who can open the
-session can read the prompt already. The server already stores tool-use
-blocks and acts on one name only (`AskUserQuestion`), so status, pending
-decisions and notifications need no change. The web renders this name as the
-line "Autopilot · iteration 3 of 20", with the prompt behind the first one,
-and leaves the name out of `isToolLikeMessage`, as it does `AskUserQuestion`,
-so consecutive markers are not folded into a tool-call group. The pane work
-summary lists the block as a tool call named `ApasAutopilotIteration`; that
-is accepted. A client that does not know the name, an older web build or the
-native app, shows a generic tool entry. Nothing is published as `UserInput`,
-so the server's last-user-input time and prompt counts do not move.
+`terminal_turn_complete: false`; `limit` is left out when the autopilot has
+no iteration limit. The first marker of each autopilot, and the first after
+each resume, also carries the prompt, which the reader takes from the
+journal's start entry. The stored conversation then holds the instruction
+once, and not a copy per iteration. Everyone who can open the session can
+read the prompt already. The server already stores tool-use blocks and acts
+on one name only (`AskUserQuestion`), so status, pending decisions and
+notifications need no change. The web renders this name as the line
+"Autopilot · iteration 3 of 20", or "Autopilot · iteration 3" without an
+iteration limit, with the prompt behind the first one, and leaves the name
+out of `isToolLikeMessage`, as it does `AskUserQuestion`, so consecutive
+markers are not folded into a tool-call group. The pane work summary lists
+the block as a tool call named `ApasAutopilotIteration`; that is accepted. A
+client that does not know the name, an older web build or the native app,
+shows a generic tool entry. Nothing is published as `UserInput`, so the
+server's last-user-input time and prompt counts do not move.
 
 The CLI's transcript reader treats a user message as an iteration only when
 both of these hold: its attribution is `agent`, and it pairs with the nearest
@@ -386,30 +417,21 @@ prompt that appears nowhere.
 
 - **Iterations:** a counter incremented when an iteration is submitted. A
   submission that OMP rejects while it is still outstanding does not use one
-  up (decision 3). Autopilot ends when the turn of the last iteration ends.
-- **Time:** an absolute deadline fixed at start, with its own managed timer.
-  When it fires, autopilot ends at once, whatever it is doing. A turn in
-  progress is not interrupted and finishes as an ordinary turn of the tab.
-  Autopilot also ends at once when the next iteration would be due after the
-  deadline. The deadline is checked again on resume. A timer does not outlive
-  the process, so at `session_start` the extension checks the deadline of a
-  restored autopilot and arms the timer again. A turn or a tab that never
-  settles therefore cannot keep a tab "on autopilot" past its time limit.
-- **Tokens:** tokens are counted while autopilot is on, not while it is
-  paused. The extension reads `getUsageStatistics()` at start, at each resume
-  and after each turn, and adds the input, output and cache-write tokens
-  recorded since the last start or resume to what was counted before. The
-  journal records the tokens used so far at each submission, pause and end
-  (decision 6), so a pause and a resume lose nothing. An agent restart while
-  autopilot is on writes no pause entry: the restored autopilot continues
-  from its last entry and loses at most what was used after the last
-  submission, normally one turn's count. That is the bound. By reading, the
-  statistic is OMP's running total over the session file (assistant
-  messages, side requests and completed `task` results, on every branch);
-  task 1.5 confirms it. The check is between turns, so the limit can be
-  overshot by one turn. A provider that records no usage never reaches it,
-  and cache reads are not counted. The clients call it approximate for these
-  reasons.
+  up (decision 3). With an iteration limit, autopilot ends when the turn of
+  the last iteration ends. Without one, the counter only reports progress.
+- **Time:** with a time limit, an absolute deadline fixed at start, with its
+  own managed timer. When it fires, autopilot ends at once, whatever it is
+  doing. A turn in progress is not interrupted and finishes as an ordinary
+  turn of the tab. Autopilot also ends at once when the next iteration would
+  be due after the deadline. The deadline is checked again on resume. A timer
+  does not outlive the process, so at `session_start` the extension checks
+  the deadline of a restored autopilot and arms the timer again. A JavaScript
+  timer cannot be relied on further ahead than about 24 days, so the
+  extension arms this one for at most a day at a time and arms it again
+  until the deadline. A turn or a tab that never settles therefore cannot
+  keep a tab "on autopilot" past its time limit. Without a time limit there
+  is no deadline, and such an autopilot runs until one of the cases in
+  decision 2 pauses or ends it.
 - **No tool call:** the extension counts `tool_execution_start` events during
   the iteration's turn. The rule applies only to an iteration whose turn
   completed normally; the failure and interrupt rules take precedence.
@@ -465,10 +487,10 @@ prompt that appears nowhere.
 More than one of these rules can apply at the end of the same turn. A rule
 that ends autopilot then wins over one that pauses it, because a pause with
 nothing left to resume helps nobody. The order is: a stop that was requested;
-the time limit; the token limit; the iteration limit; then the pause for an
-interrupt; then the pause after three failures. The end for an iteration
-without a tool call applies only when no other rule does. So a last
-iteration that is interrupted or fails ends autopilot at its iteration limit.
+the time limit; the iteration limit; then the pause for an interrupt; then
+the pause after three failures. The end for an iteration without a tool call
+applies only when no other rule does. So a last iteration that is
+interrupted or fails ends autopilot at its iteration limit.
 
 All of these are soft in one sense: none stops a turn already running. Stop
 now does, with `ctx.abort()`. What that call does about background work
@@ -492,9 +514,9 @@ Alternative rejected: OMP's `--max-time` and `session.maxCost`. `--max-time`
 leaves an open tab that silently does no model work, and a cost cap's refusal
 emits no `agent_end`. Cost is also zero for subscription logins.
 
-Alternative rejected for now: interrupt the turn in progress when the time
-limit passes. It would make the time limit hard, at the price of cutting a
-turn off in the middle of an edit. It is listed for the owner below.
+Alternative rejected: interrupt the turn in progress when the time limit
+passes. It would make the time limit hard, at the price of cutting a turn
+off in the middle of an edit. The owner confirmed that the turn finishes.
 
 ### 5. Control and state use the pane's private runtime files
 
@@ -564,15 +586,16 @@ the extension took a request. The report carries a format version and a
 counter, and the extension rewrites it on every change and at least every 30
 seconds. The CLI treats a report it has not seen refreshed for 90 seconds as
 not reported. The report holds the current autopilot with its prompt,
-timing, limits, progress, condition and deadline, or the last ended one with
-its prompt, timing and limits, its reason and end time, and whether a turn
-has run since; and OMP's own modes (decision 11). It stays within 64 KiB:
-a prompt without control characters encodes to at most twice its 16,000
-bytes, and text that OMP supplies, such as a goal's objective, is cut to 500
-characters with a marker. The request files have the same cap.
-`omp-activity.json` keeps its six fields, so an older CLI still reads it. The
-types that read reports accept unknown fields, because a tab's extension can
-be newer than the CLI reading it.
+timing, limits, start time, progress, condition and, when it has a time
+limit, its deadline; or the last ended one with its prompt, timing and
+limits, its reason and end time, and whether a turn has run since; and OMP's
+own modes (decision 11). It stays within 64 KiB: a prompt without control
+characters encodes to at most twice its 16,000 bytes, and text that OMP
+supplies, such as a goal's objective, is cut to 500 characters with a
+marker. The request files have the same cap. `omp-activity.json` keeps its
+six fields, so an older CLI still reads it. The types that read reports
+accept unknown fields, because a tab's extension can be newer than the CLI
+reading it.
 
 These files are not an authority boundary. They are private to the OS account,
 and the checks show which launch a file belongs to, not who wrote it. Any
@@ -595,10 +618,9 @@ is right for an answer and would drop or refuse a stop.
 The extension appends a custom entry (`apas-autopilot`) to the tab's OMP
 session at start, at each submission, at each submission that was not
 accepted, and at every pause, resume and end. Only the start entry holds the
-prompt. Each submission, pause and end entry holds the tokens used so far
-(decision 4). Every entry names its autopilot and its session, and the
-extension reads the active branch (`getBranch()`), ignoring entries of
-another session.
+prompt. Every entry names its autopilot and its session, and the extension
+reads the active branch (`getBranch()`), ignoring entries of another
+session.
 
 The extension reads the latest entry of the current session back whenever
 the tab arrives in a conversation: at `session_start`, which fires once per
@@ -608,9 +630,9 @@ branch or in the session tree. The shipped extension already handles these
 four events with one handler. What follows depends on how the tab arrived:
 
 - At `session_start`, an autopilot that the entry shows as not ended is
-  reported as paused with the reason "the agent was restarted", the
-  iterations it had left, the tokens of its last entry and the same
-  deadline, or as ended when the deadline has passed. It never resumes by
+  reported as paused with the reason "the agent was restarted", its
+  iteration count and, where it has them, the same limits and deadline; or
+  as ended when it has a deadline that has passed. It never resumes by
   itself. When the agent process had exited by itself, this report replaces
   the pause the CLI showed meanwhile (decision 8).
 - After one of the other three events, a reload excepted (below), an
@@ -666,7 +688,7 @@ literal construction sites, and still carries the retired bot's fields.
 
 Alternative rejected: carry a paused autopilot into the new conversation.
 Resume would then run the prompt in a conversation it was not started in, and
-the token count and the journal would have to be rebuilt across files.
+the journal would have to be rebuilt across files.
 
 ### 7. A heartbeat keeps autopilot from running without its controller
 
@@ -708,15 +730,15 @@ unreachable for more than 600 seconds, counted from the last frame that
 arrived from it, or the server cannot control autopilot. A hold starts at
 the moment one of these three conditions is first true and lasts until none
 is, whether or not an iteration is due and whether or not a turn is in
-progress. The hour below is counted from that moment. While a hold lasts
-the extension submits nothing. While it lasts and
-no turn is in progress, the condition the extension reports is holding; a
-turn in progress is not stopped and keeps its condition. A hold is not a
-pause: iterations continue within the same limits when it ends within one
-hour. As soon as a hold has lasted one hour it becomes a pause ("Paused:
-APAS could not control this tab for more than an hour"), whatever its cause,
-so a machine that was cut off for a day does not start work again by itself
-when contact returns. The deadline keeps running throughout.
+progress. The four hours below are counted from that moment. While a hold
+lasts the extension submits nothing. While it lasts and no turn is in
+progress, the condition the extension reports is holding; a turn in progress
+is not stopped and keeps its condition. A hold is not a pause: iterations
+continue as before when it ends within four hours. As soon as a hold has
+lasted four hours it becomes a pause ("Paused: APAS could not control this
+tab for more than four hours"), whatever its cause, so a machine that was
+cut off for a day does not start work again by itself when contact returns.
+A deadline, where there is one, keeps running throughout.
 
 While a hold lasts because the controller or the server is gone, the path
 that would carry the condition to clients is gone too. Clients show the state
@@ -724,14 +746,15 @@ as not reported, and the terminal's own status line shows the hold.
 
 This is not the worker's lease. A turn in progress is not stopped, and the
 bound is the tab's own machine clock. It does mean an autopilot cannot keep
-starting work for a week while nothing can see or stop it. The pane host's
-existing adoption grace (600 s, or 900 s around a reboot) still ends the
-provider when the controller never returns. A tab on a direct PTY does not
-survive a CLI reboot at all; its agent is restarted and its autopilot comes
-back paused.
+starting work without end while nothing can see or stop it, which matters
+more now that an autopilot need not have a limit. The pane host's existing
+adoption grace (600 s, or 900 s around a reboot) still ends the provider
+when the controller never returns. A tab on a direct PTY does not survive a
+CLI reboot at all; its agent is restarted and its autopilot comes back
+paused.
 
 An older CLI writes no heartbeat, so an extension left running after a
-rollback holds and, after an hour, pauses.
+rollback holds and, after four hours, pauses.
 
 Alternative rejected: pause on every disconnect and require a person to
 resume. A server deploy or a daemon reboot would then end every overnight
@@ -739,6 +762,11 @@ autopilot.
 
 Alternative rejected: hold without a bound. It lets unattended work start
 again by itself days after anyone last saw it.
+
+Alternative rejected: one hour, the draft's bound. The owner chose four
+hours, so that an autopilot rides out a longer outage or a maintenance
+window. The cost is that work can start again by itself up to four hours
+after anyone could last see or stop it.
 
 ### 8. One control variant, a receipt and a state frame, routed to the tab's machine
 
@@ -770,10 +798,9 @@ structured command to an OMP tab:
   builds ignore.
 - The optional `negotiated_capabilities` on `ServerToCli::Registered`
   (decision 7).
-- An optional `viewer_hosts` beside `runtime_access` on each instance of
-  `SessionInstances`: whether the viewer is the account whose instance that
-  is. The server fills it where it fills `runtime_access`. A client disables
-  starting and Resume with their reasons when it is false (decision 12).
+- Nothing new on `SessionInstances`. A client already receives
+  `runtime_access` for each instance, and disables the autopilot actions
+  with the tab's existing reason when it is false (decisions 9 and 12).
 
 Capabilities: `omp_tab_autopilot_v1` for the project instance and
 `tab_autopilot_v1` for viewers. The server checks the owning instance's
@@ -823,18 +850,19 @@ is no agent to resume and nothing that could apply a stop. The control says
 paused.", and the CLI refuses a request for such a tab with the same text.
 When the agent is launched again the extension's own report replaces this
 state (decision 6): the autopilot is then paused because the agent was
-restarted, or ended if its deadline passed meanwhile. The CLI keeps this
-state in memory only, so after the CLI process is replaced the tab reads
-"not reported" until the agent is launched again.
+restarted, or ended if it had a deadline that passed meanwhile. The CLI
+keeps this state in memory only, so after the CLI process is replaced the
+tab reads "not reported" until the agent is launched again.
 
 The server handles a request in this order. It requires that the requester
 negotiated `tab_autopilot_v1`. It claims the request id. It resolves the
 session with `resolve_target_session`. It requires a terminal OMP tab that is
-not legacy bot history. It finds the owning instance and checks access to its
-machine. It checks the instance capability and refuses an older machine with
-the update text. It applies decision 9 to a start or resume. It validates a
-start's bounds. It forwards to the owner only, and answers the requester from
-a spawned task, so a slow tab cannot block that connection's other frames. If
+not legacy bot history. It finds the owning instance and checks the
+requester's runtime access to its machine, which is the whole of decision 9
+and the same for every action. It checks the instance capability and refuses
+an older machine with the update text. It validates a start's bounds. It
+forwards to the owning instance only, and answers the requester from a
+spawned task, so a slow tab cannot block that connection's other frames. If
 the CLI's receipt has not arrived after five seconds it answers "uncertain".
 Requests are tracked by request id, not one per tab.
 
@@ -857,39 +885,46 @@ Alternative rejected: derive "needs an agent reboot" from a missing state
 file. The file is also missing in the first seconds after every launch, so
 the control would ask for a reboot right after one.
 
-### 9. The hosting account starts; anyone who can type stops; no policy switch yet
+### 9. Anyone who can type into the tab can start and stop; no policy switch yet
 
-Start and resume are accepted only from the account whose instance runs the
-tab. Pause and stop need what typing into the tab needs: runtime access on
-that machine. Stopping must never need more authority than starting something
-does.
+Every autopilot action, start, pause, resume, stop and stop now, needs what
+typing into the tab needs: runtime access on the tab's machine
+(`check_session_runtime_access`). A start needs nothing more, and a stop
+nothing less.
 
-The reason is whose login and machine are spent. An autopilot runs for hours
-on the hosting account's OMP login, with that account's files. On a shared
-machine the hosting account is the machine's owner, also for a project a
-cluster member created there, so such a member cannot start autopilot on
-their own project. The machine's owner can start it only after the project
-has been shared with them: a viewer's session list holds the projects the
-viewer owns or is a member of, and a host that is neither gets the project
-only as a link to the Machines page, where the web offers no way to open its
-tabs. On a shared machine, autopilot on a member's project therefore needs
-the project's owner to add the machine's owner as a project user, or the
-policy alternative below. A collaborator with runtime access can already type
-`/loop` into the terminal, and nothing here prevents that; this rule decides
-only what APAS's own control, and a phone, will do on someone else's machine.
-It governs requests that arrive through APAS, and decision 5 says why it is
-not a boundary against the tab's own agent.
+This is the owner's decision. The draft let only the hosting account start
+and resume. What the rule does:
 
-Alternative rejected: runtime access for everything, as the retired bot had.
-It is consistent with typing, but it makes a shared tab a way to spend
-another account's quota unattended from a phone.
+- **It matches typing.** A collaborator with runtime access can already type
+  a prompt, or `/loop`, into the terminal. The same person can now leave the
+  tab on autopilot through APAS's own control, and from a phone.
+- **It closes the shared-machine gap.** Under the draft's rule a cluster
+  member could not start autopilot on their own project when it ran on a
+  shared machine, and the machine's owner could do it only after being added
+  to the project.
+- **It lets one account spend another's login.** An autopilot runs on the
+  hosting account's OMP login, with that account's files, whoever started
+  it, and by decision 2 it has no end unless a limit is set. The start
+  dialog names the machine and says that the OMP login configured there is
+  spent, to everyone alike.
+- **It stays visible and stoppable.** Everyone who can open the session sees
+  the state and the prompt, and anyone with runtime access can pause or stop
+  it. Taking a person's access away later does not stop an autopilot they
+  started; someone who still has access stops it.
+
+The rule governs requests that arrive through APAS, and decision 5 says why
+it is not a boundary against the tab's own agent.
+
+Alternative rejected: only the hosting account starts and resumes, as the
+draft had it. It keeps an account's quota from being spent unattended by
+someone else. The owner decided that whoever may use a tab may also leave it
+running.
 
 Alternative rejected for now: a permission on `EffectiveProjectPolicy`,
-narrowing over deployment, cluster and project, default denied. It is the
-right shape if collaborators should be allowed to start autopilot, and it can
-widen this rule later without changing anything else. It adds three editors
-and a second enforcement point for a first version whose only users are tab
-owners.
+narrowing over deployment, cluster and project. It is the right shape if
+starting autopilot should later be narrower than typing, and it can be added
+without changing anything else. It adds three editors and a second
+enforcement point.
 
 ### 10. Autopilot is a second attribute in status, lists and the conversation; no push notification yet
 
@@ -918,11 +953,12 @@ clear. No Idle frame then goes out between two immediate iterations.
 - **Conversation:** the marker line of decision 3, and a second status line
   with the condition.
 
-No push notification is added for autopilot in this version. The existing
-ones are unchanged: a tab's first completed turn and a published question
-still notify as they do today. Push reaches only native-app installations,
-the native app shows nothing about autopilot, and no native build is
-released, so the events would reach nobody who could act on them. A person learns that an autopilot ended or paused from the tab, the
+No push notification is added for autopilot in this version, which the owner
+confirmed. The existing ones are unchanged: a tab's first completed turn and
+a published question still notify as they do today. Push reaches only
+native-app installations, the native app shows nothing about autopilot, and
+no native build is released, so the events would reach nobody who could act
+on them. A person learns that an autopilot ended or paused from the tab, the
 project list and the idle lists. When notifications are added, with a native
 view, the review of this draft settled their shape: a question keyed in the
 question path's own format, from the opaque question id the CLI already
@@ -967,7 +1003,7 @@ Autopilot refuses to start or resume while goal, loop or plan mode is in any
 state other than off, and pauses if one is switched on, because OMP's loop
 suppresses its own goal continuation and two drivers on one tab cannot both
 be right. Plan mode is in the rule for another reason: by reading, a prompt
-submitted in plan mode may not start a turn, and task 1.6 confirms it. The
+submitted in plan mode may not start a turn, and task 1.5 confirms it. The
 same applies to autoresearch, a third self-continuing mode that
 `ctx.sessionModes` does not report. The extension detects it from its
 experiment tool `init_experiment` being among `pi.getActiveTools()` and
@@ -980,29 +1016,31 @@ Alternative rejected: show nothing for modes APAS did not start. Then the
 existing behaviour stays invisible: a tab in goal mode looks finished after
 every turn.
 
-Alternative rejected for now: a remote stop for these modes. It is listed for
-the owner below.
+Alternative rejected for now: a remote stop for these modes. The owner
+confirmed that they are shown and not stopped.
 
 ### 12. Where the controls live
 
 - **Desktop:** a control in the pane toolbar before the Terminal/Conversation
   switch (the pane-toolbar delta). It opens the start dialog or, when on, a
   small menu with Pause or Resume, Stop, Stop now and Details (prompt,
-  timing, limits, progress, time limit end). For an ended autopilot it shows
-  the reason and opens the start dialog with that autopilot's values. For a
-  viewer who is not the hosting account (`viewer_hosts` false, decision 8),
-  starting and Resume are disabled, each with its reason. The client applies
-  these reasons only while the tab's instance is attached; when it is not,
-  the reason for a machine that is not running the project comes first. While
-  the state is not reported and the machine is connected and supports
-  autopilot, the control says so and offers Stop and Stop now only. The start
-  dialog carries the statement the spec requires. The confirmations for
-  closing a tab, rebooting its agent and closing the project say when a tab
-  on autopilot is affected. The Reboot CLI confirmation and the Machines
-  page's controls are left as they are, because neither holds per-tab state;
-  what happens to an autopilot then is what decision 7 gives: a hosted tab
-  holds, and a direct-PTY tab comes back paused. The Overview's pane cards
-  show the condition beside the status.
+  timing, limits or "no limit", start time, progress, and the time limit end
+  when there is one). For an ended autopilot it shows the reason and opens
+  the start dialog with that autopilot's values. For a viewer without
+  runtime access on the tab's machine (`runtime_access` false on that
+  instance), every action is disabled with the reason the tab already gives
+  for why it cannot be used. That reason applies only while the tab's
+  instance is attached; when it is not, the reason for a machine that is not
+  running the project comes first. While the state is not reported and the
+  machine is connected and supports autopilot, the control says so and
+  offers Stop and Stop now only. The start dialog carries the statement the
+  spec requires. The confirmations for closing a tab, rebooting its agent
+  and closing the project say when a tab on autopilot is affected. The
+  Reboot CLI confirmation and the Machines page's controls are left as they
+  are, because neither holds per-tab state; what happens to an autopilot
+  then is what decision 7 gives: a hosted tab holds, and a direct-PTY tab
+  comes back paused. The Overview's pane cards show the condition beside the
+  status.
 - **Interrupt:** the toolbar's Interrupt button is shown today on every
   Working tab, and the CLI ignores it for a terminal tab. A tab on autopilot
   is Working most of the time, so the button a person reaches for first would
@@ -1011,8 +1049,8 @@ the owner below.
 - **Mobile browser:** "Start autopilot" in the tab's "Pane actions" sheet; a
   state notice with the condition, Pause or Resume, Stop (which asks whether
   to let the turn finish or interrupt it) and Details, shown while the tab is
-  on autopilot or paused; starting and Resume disabled for a viewer who is
-  not the hosting account, as on the desktop; Stop and Stop now among the
+  on autopilot or paused; every action disabled for a viewer without runtime
+  access on the tab's machine, as on the desktop; Stop and Stop now among the
   occasional actions, and no notice, while the state is not reported, which
   is the ordinary case in the first seconds after every launch; the ended
   reason with "Start again"; the indication of OMP's own modes; a glyph on
@@ -1067,10 +1105,17 @@ a tab was sandboxed.
   JavaScript tests join a real gate; one hermetic check against the installed
   OMP is part of verification and is repeated when OMP's minor version
   changes.
-- **Limits are soft, and kept in the agent's own process.** A single turn can
-  run for hours and spend past the token limit, and the agent could rewrite
-  its own limits. → Stated in the dialog; the time limit always ends
-  autopilot; Stop now interrupts.
+- **Limits are optional, soft, and kept in the agent's own process.** No
+  limit is the default, a single turn can run for hours past one that is
+  set, and the agent could rewrite its own limits. → Stated in the dialog; a
+  time limit, when set, always ends autopilot; Stop now interrupts.
+- **An autopilot nobody stops.** Without a limit it runs until one of the
+  cases in decision 2 pauses or ends it, and each of those needs a failure,
+  an interrupt, a lost controller or a person. A healthy autopilot that
+  keeps finding work spends its machine's login for as long as the provider
+  allows. → The owner's decision. The dialog says it; the state is on every
+  surface, with the iteration count and the start time; anyone who can use
+  the tab can stop it; and a usage limit pauses it through the failure rule.
 - **One iteration cannot be recalled.** A prompt OMP has accepted can start
   after Pause or Stop. → It counts as the turn in progress. After Stop now it
   is aborted if it starts a run; if OMP only records it, it stays in the
@@ -1080,20 +1125,22 @@ a tab was sandboxed.
   every list. But since OMP 18.18.3 `ask` sends an HTML form that the
   question bridge does not recognise, so the question's content and remote
   answering are probably unavailable on current OMP and the person must
-  answer in the terminal; the start dialog says that this can happen. That
-  repair is a separate change and should land first. If the hosting
-  account's OMP settings give `ask` a timeout, questions answer themselves
-  while nobody is there.
-- **The hosting account's quota.** An autopilot can exhaust the login its
-  owner's other tabs use, and a usage limit then pauses it within minutes. →
+  answer in the terminal; the start dialog says that this can happen. This
+  was read from the code and not run. The owner left the repair out: this
+  change does not check it or wait for it. If the hosting account's OMP
+  settings give `ask` a timeout, questions answer themselves while nobody is
+  there.
+- **The hosting account's quota, spent by anyone who can use the tab.** An
+  autopilot can exhaust the login the hosting account's other tabs use,
+  whoever started it, and a usage limit then pauses it within minutes. →
   Three failures pause it instead of hammering the provider; the dialog says
-  which machine's OMP login is spent, and the runbook points to OMP's own
-  setting for waiting out a reset.
+  which machine's OMP login is spent; the state shows on every surface; and
+  the runbook points to OMP's own setting for waiting out a reset.
 - **Unreviewed changes.** The tab can commit and push with the account's
   credentials, and PR hand-off is a non-draft `gh pr create`. → Same as any
   tab; the dialog says so and says whether the tab uses the shared checkout.
-- **The authority rule is not containment.** Anyone with terminal access can
-  type a loop, and any process of the account can write the request files. →
+- **Access is not containment.** Anyone who can type into the tab can start
+  autopilot, and any process of the account can write the request files. →
   Said in the spec, the dialog and the runbook.
 - **Background work after Stop now.** Jobs a turn launched keep running.
   After Stop now interrupts a running turn, OMP records their results without
@@ -1103,16 +1150,17 @@ a tab was sandboxed.
   aborted, or that a `/compact` cut a turn short. A killed job, or an abort
   from another part of OMP, can pause autopilot, and a turn hidden by a
   cancelled `/compact` leaves it "running an iteration". → Both fail towards
-  doing less: a pause states its reason, and the time limit still ends
-  autopilot.
+  doing less: a pause states its reason, and a stuck autopilot submits
+  nothing. A time limit, when set, still ends it; without one it stays shown
+  as running until a later run ends or a person stops it.
 - **"No tool call" is a heuristic.** It can end an autopilot early or never.
-  → It is optional, labelled as what it is, and the limits remain.
+  → It is optional, labelled as what it is, and limits can be set beside it.
 - **A bigger extension.** A fault in it would also take down activity
   reporting and the question bridge. → Autopilot code is isolated behind its
   own guard and uses only managed timers; a broken optional import cannot
   stop the extension loading.
-- **False holds.** A stalled heartbeat writer stops iterations, and after an
-  hour pauses them. The pane host and the CLI each work out the runtime
+- **False holds.** A stalled heartbeat writer stops iterations, and after
+  four hours pauses them. The pane host and the CLI each work out the runtime
   directory from their own environment; if they ever differed, the heartbeat
   would land where the extension does not look. → Both fail in the safe
   direction, and the terminal's status line shows the hold.
@@ -1126,9 +1174,10 @@ a tab was sandboxed.
   mentions and budget tokens. The prompt never appears in a list or a
   summary.
 - **One conversation grows.** Every iteration is appended to one OMP session,
-  and the CLI re-reads that file whenever it changes. → The caps bound it;
-  compacting or starting a fresh session between iterations is a later
-  option.
+  and the CLI re-reads that file whenever it changes. → Nothing bounds it
+  unless a limit is set. Compacting or starting a fresh session between
+  iterations is a later option, and it matters more now that no limit is the
+  default.
 - **Billing attribution.** OMP documents the attribution of a message as a
   billing field: on a GitHub Copilot login an agent-initiated request is
   counted differently from a typed one, and OMP's own loop submits as typed.
@@ -1185,50 +1234,51 @@ Two more unarchived changes are touched without a conflict.
 `mobile-session-chrome-and-project-management` keeps occasional pane actions
 away from the composer; the autopilot notice is a state notice, and starting
 autopilot is placed among the occasional actions. `share-cluster-with-users`
-lets members operate projects on shared machines; decision 9 keeps one
-operation, starting autopilot, with the machine's owner.
+lets members operate projects on shared machines; by decision 9 autopilot
+follows the rule for input there, so a member who may type into a tab on a
+shared machine may also start and stop its autopilot.
 
 No main spec defines the OMP terminal provider yet; `provider-support` lists
 five terminal profiles without it. That drift predates this change, which
 states its own preconditions and modifies nothing there.
 
-## Decisions for the owner
+## Decisions taken by the owner
 
-The draft takes a position on each of these. Each can be changed without
-reworking the rest.
+The draft took a position on nine questions and listed them here. The owner
+answered them on 2026-11-13. Five answers changed the draft.
 
-1. **An end date is required.** At most 1,000 iterations and seven days, with
-   "start again" prefilled. The alternative is no end date for the hosting
-   account, with finite values still proposed.
-2. **Only the hosting account starts.** On a shared machine a member's
-   project must first be shared with the machine's owner. The alternatives
-   are anyone who may type, as the bot allowed, or members where a policy
-   allows it.
-3. **The time limit lets a turn in progress finish.** The alternative is to
-   interrupt it after a grace period.
-4. **A hold longer than an hour becomes a pause.** The alternative is to hold
-   until contact returns.
-5. **No push notification in this version.** The alternative is to add the
-   events of decision 10 together with a read-only line in the native app.
-6. **OMP's own modes are shown, not stopped.** The alternative is a
-   best-effort remote stop, which would first need a check of how reliably an
-   extension wins the race to exit OMP's loop.
-7. **A token limit is offered.** It is approximate, and it is the easiest
-   part to leave out.
-8. **The question bridge repair should land first, as a separate change.**
-   Task 1.8's result decides whether this change waits for it. The dialog
-   sentence ships either way.
-9. **An ended autopilot's reason clears by itself.** It stays on the control
-   until another start, and in lists until a later turn has run. The
-   alternative is a Dismiss action.
+1. **Limits are optional, and no limit is the default.** The draft required
+   an end date, at most 1,000 iterations and seven days. Changed in
+   decisions 2 and 4.
+2. **Anyone who can type into the tab can start and stop.** The draft let
+   only the hosting account start and resume. Changed in decision 9, which
+   also drops the `viewer_hosts` field the draft added.
+3. **The time limit lets a turn in progress finish.** As drafted.
+4. **A hold longer than four hours becomes a pause.** The draft said one
+   hour. Changed in decision 7.
+5. **No push notification in this version.** As drafted.
+6. **OMP's own modes are shown, not stopped.** As drafted.
+7. **No token limit.** The draft offered an approximate one. Removed from
+   decisions 2, 4 and 6, together with the task that checked OMP's usage
+   statistics.
+8. **The question bridge is left alone for now.** The draft wanted its
+   repair to land first as a separate change, and had a task whose result
+   decided whether to wait. Nothing here checks it or waits for it. The risk
+   and the dialog's sentence about questions stay.
+9. **An ended autopilot's reason clears by itself.** As drafted: it stays on
+   the control until another start, and in lists until a later turn has run.
 
 ## Open Questions
 
 - Whether group 1 runs against a stub model or a short run on a real, cheap
   model. Task 1.1 asks before building either.
-
 - Whether to add an in-terminal `/autopilot` command for status, pause and
-  stop. It would never start or resume, which the server could not authorize.
+  stop. The draft kept start and resume out of it because the server could
+  not authorize them. Anyone who can type may now start, so that reason is
+  gone, and the command could start too if the start dialog's statement were
+  shown some other way.
+- Whether the state should say who started an autopilot, now that it need
+  not be the hosting account. Nothing records it today.
 - Whether the heartbeat's "connected" should mean that the tab's instance is
   attached to its session, not only that the CLI is registered. Today a CLI
   whose instance was replaced by another runtime is neither closed nor told.
