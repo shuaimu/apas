@@ -2,7 +2,7 @@
 
 import { useCallback, useId, useRef, useEffect, useState } from "react";
 import type { ReactNode } from "react";
-import { Bot, ChevronDown, LoaderCircle, RefreshCw } from "lucide-react";
+import { Bot, ChevronDown, LoaderCircle, RefreshCw, Repeat } from "lucide-react";
 import { paneKey } from "@/lib/store";
 import type { CliLifecycleInventory, CliLifecycleStatus, PaneConfig, PaneKind } from "@/lib/store";
 import { useIsLaunchProfileAllowed } from "@/lib/tabTypes";
@@ -22,6 +22,7 @@ import {
   isDeepseekModel,
   isRetiredProviderModel,
 } from "@/lib/providerOptions";
+import { autopilotMarkerLabel, type AutopilotListStatus } from "@/lib/autopilot";
 
 interface TabBarProps {
   tabs: PaneConfig[];
@@ -70,6 +71,12 @@ interface TabBarProps {
   /** The new-tab machine step. Shown only when `showChoice`; otherwise the
    *  menu is exactly what it was with one machine. */
   machineChoices?: MachineChoiceModel;
+  /** The tabs with an autopilot to show. One that is on, or paused, marks
+   *  its tab; a tab without an entry renders as it always has. */
+  autopilotTabs?: Map<number, AutopilotListStatus>;
+  /** Added to the Close confirmation: which tabs are on autopilot and what
+   *  becomes of their autopilot. */
+  closeProjectNote?: string;
   paneStatuses: Record<string, string | null>;
   pausedPanes: number[];
   /** Mobile-only controls merged into the tab-bar row so the top header can
@@ -264,6 +271,8 @@ export function TabBar({
   onStartMachine,
   onForgetMachine,
   machineChoices,
+  autopilotTabs,
+  closeProjectNote,
   paneStatuses,
   pausedPanes,
   leading,
@@ -432,6 +441,10 @@ export function TabBar({
           const refusal = host?.refusal;
           const hostTone = host ? HOST_BADGE_TONES[host.state] : undefined;
           const showsHostBadge = Boolean(host?.badge && host.hostname && hostTone);
+          // On autopilot, or paused: marked on the tab. An ended one is not.
+          const autopilot = autopilotTabs?.get(tab.pane_id);
+          const autopilotLabel = autopilot ? autopilotMarkerLabel(autopilot.kind) : null;
+          const spokenName = `${label}${isBot ? " (Bot)" : ""}${autopilotLabel ? `, ${autopilotLabel}` : ""}`;
 
           return (
             <button
@@ -446,10 +459,12 @@ export function TabBar({
               onContextMenu={(e) => handleContextMenu(e, tab.pane_id)}
               title={refusal}
               // Spelled out once a host badge shows: joined from the
-              // visible spans, the label and host would run together.
+              // visible spans, the label and host would run together. And
+              // for a tab on autopilot, whose marker is only a glyph. A tab
+              // with neither keeps the name its content gives it.
               aria-label={host?.badge && host.hostname
-                ? `${label}${isBot ? " (Bot)" : ""} — ${tabHostDescription(host)}`
-                : undefined}
+                ? `${spokenName} — ${tabHostDescription(host)}`
+                : autopilotLabel ? spokenName : undefined}
               className={`group relative flex items-center gap-1.5 px-3 py-2 text-sm font-medium transition-colors flex-shrink-0 border-r border-gray-200 dark:border-gray-700 ${
                 // Room for the host badge beside the name: within the plain
                 // cap a stopped machine's badge left the name one letter.
@@ -533,6 +548,20 @@ export function TabBar({
                 <span className={`truncate ${showsHostBadge ? "shrink-0 max-w-[7rem]" : ""} ${isActive ? "inline" : "hidden sm:inline"}`}>
                   {label}
                   {isBot && " (Bot)"}
+                </span>
+              )}
+
+              {/* The tab repeats a prompt on its own. Not the worker's icon:
+                  autopilot is not a worker. Dimmed while it is paused. */}
+              {autopilot && autopilotLabel && (
+                <span
+                  data-testid="tab-autopilot-marker"
+                  data-autopilot={autopilot.kind}
+                  aria-hidden="true"
+                  title={`Autopilot · ${autopilot.text}`}
+                  className={`flex-shrink-0 ${autopilot.kind === "on" ? "text-indigo-500" : "text-amber-500 opacity-60"}`}
+                >
+                  <Repeat className="h-3 w-3" />
                 </span>
               )}
 
@@ -682,12 +711,10 @@ export function TabBar({
         {showCloseProjectButton && onCloseProject && (
           <button
             onClick={() => {
-              if (
-                confirm(multiMachine
-                  ? "Close this project? Every agent in it is shut down on every machine running it, and it stops appearing in the idle list until you open it again."
-                  : "Close this project? Every agent in it is shut down, and it stops appearing in the idle list until you open it again.",
-                )
-              ) {
+              const question = multiMachine
+                ? "Close this project? Every agent in it is shut down on every machine running it, and it stops appearing in the idle list until you open it again."
+                : "Close this project? Every agent in it is shut down, and it stops appearing in the idle list until you open it again.";
+              if (confirm(closeProjectNote ? `${question}\n\n${closeProjectNote}` : question)) {
                 onCloseProject();
               }
             }}

@@ -3,6 +3,7 @@
 import { useMemo, useState } from "react";
 import { ChevronRight, ChevronDown, Wrench } from "lucide-react";
 import type { Message } from "@/lib/store";
+import { AUTOPILOT_ITERATION_TOOL_NAME } from "@/lib/autopilot";
 import { AssistantMessage } from "./AssistantMessage";
 
 interface ToolGroupCardProps {
@@ -30,10 +31,13 @@ export function isToolLikeMessage(m: Message): boolean {
     // AskUserQuestion cards need to stay inline — the user has to see
     // and click them; hiding one inside a collapsed group would strand
     // an unanswered question.
-    return ot.tool !== "AskUserQuestion";
+    // An autopilot iteration marker is not a tool call at all: it says
+    // where an iteration starts, and folding consecutive markers into a
+    // "2 tool calls" group would hide exactly that.
+    return ot.tool !== "AskUserQuestion" && ot.tool !== AUTOPILOT_ITERATION_TOOL_NAME;
   }
   if (ot.type === "tool_result") {
-    return ot.tool !== "AskUserQuestion";
+    return ot.tool !== "AskUserQuestion" && ot.tool !== AUTOPILOT_ITERATION_TOOL_NAME;
   }
   return false;
 }

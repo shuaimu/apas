@@ -24,6 +24,7 @@ import {
 import { useProjectOrder } from "@/lib/useProjectOrder";
 import { projectHostLabel } from "@/lib/tabHosts";
 import { paneNotRunning } from "@/lib/projectInstances";
+import { autopilotListStatus } from "@/lib/autopilot";
 
 // Truncate path in the middle to preserve the folder name at the end
 // e.g., "/home/shuai/workspace/long-project" -> "/home/.../long-project"
@@ -174,6 +175,7 @@ export function Sidebar({ onClose, onCollapse, width }: SidebarProps) {
             pane,
             awaitingAnswer: pane.awaiting_answer === true,
             usageLimit: paneUsageLimit(session, pane, usageLimits, availabilityNow),
+            autopilot: autopilotListStatus(pane.autopilot),
           })),
       ),
     [availabilityNow, machines, sessions, usageLimits],
@@ -182,15 +184,24 @@ export function Sidebar({ onClose, onCollapse, width }: SidebarProps) {
     () => waitingAgents.filter((agent) => agent.awaitingAnswer),
     [waitingAgents],
   );
+  // A tab on autopilot that waits for its next iteration, or holds, is not
+  // waiting for its user, so it is not an idle tab. A paused or ended
+  // autopilot does need someone: it stays among the idle tabs, with why.
+  const autopilotAgents = useMemo(
+    () => waitingAgents
+      .filter((agent) => !agent.awaitingAnswer && agent.autopilot?.kind === "on")
+      .sort(compareRecentlyIdle),
+    [waitingAgents],
+  );
   const idleAgents = useMemo(
     () => waitingAgents
-      .filter((agent) => !agent.awaitingAnswer && !agent.usageLimit)
+      .filter((agent) => !agent.awaitingAnswer && !agent.usageLimit && agent.autopilot?.kind !== "on")
       .sort(compareRecentlyIdle),
     [waitingAgents],
   );
   const limitedAgents = useMemo(
     () => waitingAgents
-      .filter((agent) => !agent.awaitingAnswer && agent.usageLimit)
+      .filter((agent) => !agent.awaitingAnswer && agent.usageLimit && agent.autopilot?.kind !== "on")
       .sort(compareRecentlyIdle),
     [waitingAgents],
   );
@@ -200,13 +211,18 @@ export function Sidebar({ onClose, onCollapse, width }: SidebarProps) {
     pane,
     awaitingAnswer,
     usageLimit,
+    autopilot,
   }: (typeof waitingAgents)[number]) => {
     const name = projectNameFor(session);
     // The agent's own machine: a project's panes can run on several.
     const paneHost = pane.hostname || session.hostname;
-    const resetLabel = !awaitingAnswer && usageLimit
+    const onAutopilot = !awaitingAnswer && autopilot?.kind === "on";
+    const resetLabel = !awaitingAnswer && !onAutopilot && usageLimit
       ? usageLimitResetLabel(usageLimit, availabilityNow)
       : null;
+    // What the autopilot is doing, or why it paused or ended. A question
+    // keeps precedence: the row then says only that an answer is pending.
+    const autopilotLabel = awaitingAnswer ? null : autopilot?.text ?? null;
     return (
       <button
         key={`${session.id}:${pane.pane_id}`}
@@ -232,17 +248,24 @@ export function Sidebar({ onClose, onCollapse, width }: SidebarProps) {
           <span className={`shrink-0 rounded-full px-2 py-0.5 text-right text-[0.65rem] font-semibold leading-tight ${
             awaitingAnswer
               ? "bg-amber-100 text-amber-800 dark:bg-amber-950/60 dark:text-amber-200"
+              : onAutopilot
+              ? "bg-indigo-100 text-indigo-700 dark:bg-indigo-950/60 dark:text-indigo-300"
               : usageLimit
               ? "bg-red-100 text-red-700 dark:bg-red-950/60 dark:text-red-300"
               : "bg-gray-100 text-gray-600 dark:bg-gray-700 dark:text-gray-300"
           }`}>
-            {awaitingAnswer ? "Pending answer" : usageLimit ? usageLimitedLabel(usageLimit) : "Idle"}
+            {awaitingAnswer ? "Pending answer" : onAutopilot ? "On autopilot" : usageLimit ? usageLimitedLabel(usageLimit) : "Idle"}
           </span>
         </div>
         {(paneHost || resetLabel) && (
           <div className="mt-1 truncate text-xs text-gray-500 dark:text-gray-400">
             {[paneHost, resetLabel].filter(Boolean).join(" · ")}
           </div>
+        )}
+        {/* On a line of its own that wraps: beside the host on one truncated
+            line, the sidebar would cut a pause or end reason short. */}
+        {autopilotLabel && (
+          <div className="mt-1 break-words text-xs text-gray-500 dark:text-gray-400">{autopilotLabel}</div>
         )}
       </button>
     );
@@ -734,7 +757,7 @@ export function Sidebar({ onClose, onCollapse, width }: SidebarProps) {
 
       {view === "idle" ? (
         <div className="flex-1 overflow-y-auto p-2">
-          {pendingAgents.length > 0 || idleAgents.length > 0 || limitedAgents.length > 0 ? (
+          {pendingAgents.length > 0 || idleAgents.length > 0 || limitedAgents.length > 0 || autopilotAgents.length > 0 ? (
             <>
               {pendingAgents.length > 0 && (
                 <section aria-labelledby="sidebar-pending-answer-heading">
@@ -751,10 +774,26 @@ export function Sidebar({ onClose, onCollapse, width }: SidebarProps) {
                   {idleAgents.map(renderWaitingAgent)}
                 </div>
               )}
+              {autopilotAgents.length > 0 && (
+                <section
+                  aria-labelledby="sidebar-on-autopilot-heading"
+                  className={pendingAgents.length > 0 || idleAgents.length > 0 ? "mt-4 border-t border-gray-200 pt-3 dark:border-gray-800" : ""}
+                >
+                  <h3
+                    id="sidebar-on-autopilot-heading"
+                    className="mb-2 px-1 text-xs font-semibold uppercase tracking-wide text-indigo-600 dark:text-indigo-300"
+                  >
+                    On autopilot
+                  </h3>
+                  <div className="space-y-1.5">
+                    {autopilotAgents.map(renderWaitingAgent)}
+                  </div>
+                </section>
+              )}
               {limitedAgents.length > 0 && (
                 <section
                   aria-labelledby="sidebar-usage-limited-heading"
-                  className={pendingAgents.length > 0 || idleAgents.length > 0 ? "mt-4 border-t border-gray-200 pt-3 dark:border-gray-800" : ""}
+                  className={pendingAgents.length > 0 || idleAgents.length > 0 || autopilotAgents.length > 0 ? "mt-4 border-t border-gray-200 pt-3 dark:border-gray-800" : ""}
                 >
                   <h3
                     id="sidebar-usage-limited-heading"

@@ -25,6 +25,8 @@ import {
 import { ActivitySparkline } from "./ActivitySparkline";
 import { paneIsAwaitingAnswerStatus } from "@/lib/paneStatus";
 import { useIsLaunchProfileAllowed } from "@/lib/tabTypes";
+import { useSessionAutopilotStatuses } from "@/lib/useAutopilot";
+import type { AutopilotListStatus } from "@/lib/autopilot";
 
 interface PaneGridProps {
   onOpenPane: (paneId: number) => void;
@@ -57,6 +59,8 @@ export function PaneGrid({
   const pausedPanes = useStore((s) => s.pausedPanes);
   const paneMessages = useStore((s) => s.paneMessages);
   const paneDiffs = useStore((s) => s.paneDiffs);
+  const sessionId = useStore((s) => s.sessionId);
+  const autopilotStatuses = useSessionAutopilotStatuses(sessionId, paneConfigs);
   // One grid: the managed/unmanaged split existed for team mode, and a pane
   // still marked managed is now just a pane.
   const sorted = useMemo(() => {
@@ -87,6 +91,7 @@ export function PaneGrid({
             pane={pane}
             status={status ?? null}
             isPaused={isPaused}
+            autopilot={autopilotStatuses.get(pane.pane_id)}
             messages={messages}
             lastActivity={lastMsg?.timestamp}
             diffStats={diff?.diff ? summarizeDiffStats(diff.diff) : undefined}
@@ -105,6 +110,9 @@ interface PaneCardProps {
   pane: PaneConfig;
   status: string | null;
   isPaused: boolean;
+  /** The tab's autopilot, when it has one to show: its condition, or why it
+   *  paused or ended. Shown beside the status, never in its place. */
+  autopilot?: AutopilotListStatus;
   messages: Message[];
   lastActivity?: Date;
   diffStats?: { added: number; removed: number };
@@ -118,6 +126,7 @@ function PaneCard({
   pane,
   status,
   isPaused,
+  autopilot,
   messages,
   lastActivity,
   diffStats,
@@ -255,6 +264,21 @@ function PaneCard({
       {status && (
         <div className="rounded bg-blue-50 dark:bg-blue-900/30 px-2 py-1 text-xs text-blue-700 dark:text-blue-300">
           {status}
+        </div>
+      )}
+
+      {autopilot && (
+        <div
+          data-testid="pane-card-autopilot"
+          className={`rounded px-2 py-1 text-xs ${
+            autopilot.kind === "on"
+              ? "bg-indigo-50 text-indigo-700 dark:bg-indigo-900/30 dark:text-indigo-300"
+              : autopilot.kind === "paused"
+                ? "bg-amber-50 text-amber-800 dark:bg-amber-900/30 dark:text-amber-200"
+                : "bg-gray-100 text-gray-600 dark:bg-gray-700/50 dark:text-gray-300"
+          }`}
+        >
+          Autopilot · {autopilot.text}
         </div>
       )}
 

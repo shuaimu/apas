@@ -21,7 +21,7 @@ import {
 } from "@/lib/providerOptions";
 import { resolveMachineProjectTarget } from "@/lib/machineProjectTarget";
 import { paneIsAwaitingAnswerStatus } from "@/lib/paneStatus";
-import { instancesNegotiated, selectSessionInstances } from "@/lib/projectInstances";
+import { instancesNegotiated, primaryInstance, selectSessionInstances } from "@/lib/projectInstances";
 import { buildMachineChoices, sessionCanCloneJoin, type MachineChoice } from "@/lib/machineChoice";
 import {
   cloneHereCopy,
@@ -33,6 +33,17 @@ import {
   sessionIsOwned,
 } from "@/lib/tabHosts";
 import { AddPaneLaunches } from "./AddPaneLaunches";
+import {
+  AUTOPILOT_PROJECT_NOT_RUNNING_TEXT,
+  autopilotRequestsOfSession,
+  closeProjectAutopilotNote,
+  closeTabAutopilotNote,
+  paneCanHaveAutopilot,
+  rebootAgentAutopilotNote,
+} from "@/lib/autopilot";
+import { useAutopilotNegotiated, useSessionAutopilotStatuses } from "@/lib/useAutopilot";
+import { AutopilotControl } from "./AutopilotControl";
+import { AutopilotRequestNotices, AutopilotStatusLine } from "./AutopilotStatus";
 
 // xterm.js touches `document` at import time, so it can't be part of the
 // server bundle. Loading it lazily also keeps the ~300 KB emulator out of
@@ -266,17 +277,21 @@ export function shouldShowPaneRebootButton(activeTabId: number | null): boolean 
 export function confirmedPaneRebootTarget(
   activeTabId: number | null,
   confirmFn: (message: string) => boolean,
+  /** What else the reboot does to this tab, such as pausing its autopilot. */
+  note?: string,
 ): number | null {
   if (!shouldShowPaneRebootButton(activeTabId)) return null;
-  return confirmFn(PANE_REBOOT_CONFIRM_MESSAGE) ? activeTabId : null;
+  const message = note ? `${PANE_REBOOT_CONFIRM_MESSAGE}\n\n${note}` : PANE_REBOOT_CONFIRM_MESSAGE;
+  return confirmFn(message) ? activeTabId : null;
 }
 
 export function requestConfirmedPaneReboot(
   activeTabId: number | null,
   confirmFn: (message: string) => boolean,
   rebootPane: (paneId: number) => void,
+  note?: string,
 ): void {
-  const target = confirmedPaneRebootTarget(activeTabId, confirmFn);
+  const target = confirmedPaneRebootTarget(activeTabId, confirmFn, note);
   if (target == null) return;
   rebootPane(target);
 }
@@ -423,6 +438,10 @@ export function TabbedView({
   const dismissAddPaneRequest = useStore((s) => s.dismissAddPaneRequest);
   const forgetMachinePanes = useStore((s) => s.forgetMachinePanes);
   const addPaneRequests = useStore((s) => s.addPaneRequests);
+  const autopilotRequests = useStore((s) => s.autopilotRequests);
+  const dismissAutopilotRequest = useStore((s) => s.dismissAutopilotRequest);
+  // No autopilot control is shown at all on a server without autopilot.
+  const autopilotNegotiated = useAutopilotNegotiated();
   // The project's attached instances, one per machine. Selector-safe: an
   // unchanged set keeps its identity.
   const instances = useStore((s) => selectSessionInstances(s, s.sessionId));
@@ -474,7 +493,7 @@ export function TabbedView({
   // 3-option cleanup dialog shown when closing a pane that owns a worktree.
   // null = closed. paneId/worktreePath populated when open.
   const [cleanupDialog, setCleanupDialog] = useState<
-    { paneId: number; worktreePath: string } | null
+    { paneId: number; worktreePath: string; note?: string } | null
   >(null);
   // Diff viewer modal (Phase 1.2a). When set, shows paneDiffs[paneId].
   const [diffModalPaneId, setDiffModalPaneId] = useState<number | null>(null);
@@ -592,6 +611,26 @@ export function TabbedView({
       .filter((request) => request.sessionId === sessionId)
       .sort((a, b) => a.startedAt - b.startedAt),
     [addPaneRequests, sessionId],
+  );
+
+  // The tabs with an autopilot to show: on, paused, or ended with a reason.
+  const autopilotStatuses = useSessionAutopilotStatuses(sessionId, effectiveTabs);
+  const autopilotRequestList = useMemo(
+    () => autopilotRequestsOfSession(autopilotRequests, sessionId),
+    [autopilotRequests, sessionId],
+  );
+  // A tab's name as the tab bar shows it.
+  const tabDisplayLabel = useCallback((paneId: number): string | undefined => {
+    const index = effectiveTabs.findIndex((tab) => tab.pane_id === paneId);
+    return index < 0 ? undefined : effectiveTabs[index].label || `Tab ${index + 1}`;
+  }, [effectiveTabs]);
+  // Closing the project stops every agent in it; the confirmation names the
+  // tabs that are on autopilot and says what becomes of it.
+  const closeProjectNote = useMemo(
+    () => closeProjectAutopilotNote(effectiveTabs
+      .filter((tab) => autopilotStatuses.get(tab.pane_id)?.kind === "on")
+      .map((tab) => tabDisplayLabel(tab.pane_id) ?? `Tab ${tab.pane_id}`)),
+    [autopilotStatuses, effectiveTabs, tabDisplayLabel],
   );
 
   const activeTabHost = activeTabId != null ? tabHosts.tabs.get(activeTabId) : undefined;
@@ -755,18 +794,20 @@ export function TabbedView({
       }
       const pane = effectiveTabs.find((t) => t.pane_id === paneId);
       const worktreePath = pane?.worktree_path;
+      // Closing a tab ends its agent, and its autopilot with it.
+      const note = closeTabAutopilotNote(autopilotStatuses.get(paneId) ?? null);
       if (worktreePath) {
         // Pane owns an isolated worktree — open the 3-option dialog.
-        setCleanupDialog({ paneId, worktreePath });
+        setCleanupDialog({ paneId, worktreePath, note });
         return;
       }
-      if (!confirm("Close this tab?")) return;
+      if (!confirm(note ? `Close this tab?\n\n${note}` : "Close this tab?")) return;
       removePane(paneId);
       selectAfterClosing(paneId);
     },
     // `effectiveTabs` is read above to find the pane's worktree; leaving it out
     // would let a stale closure miss one and skip the cleanup dialog.
-    [effectiveTabs, removePane, selectAfterClosing, showTabError, tabHosts],
+    [autopilotStatuses, effectiveTabs, removePane, selectAfterClosing, showTabError, tabHosts],
   );
 
   const handleConfirmCleanup = useCallback(
@@ -1098,6 +1139,20 @@ export function TabbedView({
   // The selected tab's machine is not running the project, or this viewer
   // may not use it: its controls stay visible, disabled, with the reason.
   const paneControlsDisabled = Boolean(activeRefusal);
+  // The selected tab, when autopilot applies to it: an interactive OMP
+  // terminal tab, on a server that has autopilot.
+  const activeAutopilotTab = autopilotNegotiated
+    && activeConfig
+    && activeTabId != null
+    && !activeIsUnsupported
+    && paneCanHaveAutopilot(activeConfig)
+    ? activeConfig
+    : undefined;
+  // Merging or discarding a tab's branch closes the tab too.
+  const withAutopilotNote = (question: string, paneId: number) => {
+    const note = closeTabAutopilotNote(autopilotStatuses.get(paneId) ?? null);
+    return note ? `${question}\n\n${note}` : question;
+  };
 
   return (
     <ProjectWorkersWorkspace
@@ -1146,6 +1201,8 @@ export function TabbedView({
         onStartMachine={handleStartMachine}
         onForgetMachine={handleForgetMachine}
         machineChoices={machineChoices}
+        autopilotTabs={autopilotStatuses}
+        closeProjectNote={closeProjectNote}
         paneStatuses={paneStatuses}
         pausedPanes={pausedPanes}
         leading={mobileLeading}
@@ -1153,6 +1210,11 @@ export function TabbedView({
       />
 
       <AddPaneLaunches launches={launches} onDismiss={dismissAddPaneRequest} />
+      <AutopilotRequestNotices
+        requests={autopilotRequestList}
+        tabLabel={tabDisplayLabel}
+        onDismiss={dismissAutopilotRequest}
+      />
 
       {/* Add tab error notification */}
       {addTabError && (
@@ -1229,7 +1291,10 @@ export function TabbedView({
                   ))}
                 </select>
               )}
-              {activeStatus && !activeIsAwaitingAnswer && activeTabId != null && (
+              {/* Not on a terminal tab: the CLI ignores it there, so the
+                  button a person reaches for first on a working tab would do
+                  nothing. A tab on autopilot has Stop now. */}
+              {!activeIsTerminal && activeStatus && !activeIsAwaitingAnswer && activeTabId != null && (
                 <button
                   onClick={() => {
                     if (activeTabId == null) return;
@@ -1274,6 +1339,28 @@ export function TabbedView({
             </>
         )}
 
+        {/* Before the view switch, so nothing stands between that switch and
+            the provider usage after it. Only for an OMP terminal tab, and
+            only on a server that has autopilot. */}
+        {activeAutopilotTab && (
+          <AutopilotControl
+            // One control per tab: an open menu, a half-typed start or a send
+            // error never carries over to the tab selected next.
+            key={`${sessionId}:${activeAutopilotTab.pane_id}`}
+            sessionId={sessionId}
+            paneId={activeAutopilotTab.pane_id}
+            tabLabel={tabDisplayLabel(activeAutopilotTab.pane_id) ?? `Tab ${activeAutopilotTab.pane_id}`}
+            hostname={activeTabHost?.hostname
+              ?? activeAutopilotTab.hostname
+              ?? primaryInstance(instances)?.hostname
+              ?? currentSession?.hostname}
+            // A tab's own reason comes first. With nothing known per tab, a
+            // project that is not running has no instance to ask either.
+            tabRefusal={activeRefusal ?? (isAttached ? undefined : AUTOPILOT_PROJECT_NOT_RUNNING_TEXT)}
+            sharedCheckout={!activeAutopilotTab.worktree_path}
+          />
+        )}
+
         {activeIsTerminal && !activeIsUnsupported && (
           <TerminalViewToggle
             mode={activeTerminalViewMode}
@@ -1316,6 +1403,9 @@ export function TabbedView({
                 activeTabId,
                 (message) => typeof window === "undefined" || window.confirm(message),
                 rebootPane,
+                rebootAgentAutopilotNote(
+                  (activeTabId != null ? autopilotStatuses.get(activeTabId) : undefined) ?? null,
+                ),
               );
             }}
             disabled={paneControlsDisabled}
@@ -1487,6 +1577,12 @@ export function TabbedView({
         </div>
       )}
 
+      {/* Autopilot is a second attribute: its line stands beside the status
+          above, never in its place. OMP's own modes are shown here too. */}
+      {activeAutopilotTab && (
+        <AutopilotStatusLine sessionId={sessionId} paneId={activeAutopilotTab.pane_id} />
+      )}
+
       {/* Input box — disabled for running deadloop panes and hidden on
           terminal panes (which take input in xterm). */}
       {!activeIsTerminal && !activeIsUnsupported && (
@@ -1522,6 +1618,7 @@ export function TabbedView({
       <WorktreeCleanupModal
         open={cleanupDialog !== null}
         worktreePath={cleanupDialog?.worktreePath || ""}
+        note={cleanupDialog?.note}
         onCancel={() => setCleanupDialog(null)}
         onConfirm={handleConfirmCleanup}
       />
@@ -1536,13 +1633,13 @@ export function TabbedView({
         }}
         onMerge={() => {
           if (diffModalPaneId === null) return;
-          if (!confirm("Merge this pane's branch into the project's HEAD, then close the pane? Aborts on conflict — resolve manually with git if it fails.")) return;
+          if (!confirm(withAutopilotNote("Merge this pane's branch into the project's HEAD, then close the pane? Aborts on conflict — resolve manually with git if it fails.", diffModalPaneId))) return;
           removePane(diffModalPaneId, "merge_and_remove");
           setDiffModalPaneId(null);
         }}
         onDiscard={() => {
           if (diffModalPaneId === null) return;
-          if (!confirm("Discard this branch AND its worktree, then close the pane? This is destructive — uncommitted changes are lost.")) return;
+          if (!confirm(withAutopilotNote("Discard this branch AND its worktree, then close the pane? This is destructive — uncommitted changes are lost.", diffModalPaneId))) return;
           removePane(diffModalPaneId, "discard");
           setDiffModalPaneId(null);
         }}
@@ -1940,11 +2037,13 @@ export function PaneDiffModal({
 interface WorktreeCleanupModalProps {
   open: boolean;
   worktreePath: string;
+  /** What else closing does to this tab, such as ending its autopilot. */
+  note?: string;
   onCancel: () => void;
   onConfirm: (action: PaneCleanupAction) => void;
 }
 
-function WorktreeCleanupModal({ open, worktreePath, onCancel, onConfirm }: WorktreeCleanupModalProps) {
+function WorktreeCleanupModal({ open, worktreePath, note, onCancel, onConfirm }: WorktreeCleanupModalProps) {
   if (!open) return null;
   return (
     <div
@@ -1959,6 +2058,11 @@ function WorktreeCleanupModal({ open, worktreePath, onCancel, onConfirm }: Workt
         <p className="mb-4 break-all text-sm text-zinc-400">
           Worktree: <span className="font-mono text-zinc-200">{worktreePath}</span>
         </p>
+        {note && (
+          <p role="note" className="mb-4 rounded border border-amber-700/70 bg-amber-950/30 px-3 py-2 text-sm text-amber-100">
+            {note}
+          </p>
+        )}
         <div className="flex flex-col gap-2">
           <button
             type="button"

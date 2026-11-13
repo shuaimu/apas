@@ -9,6 +9,8 @@ import { CodeBlock } from "@/components/code/CodeBlock";
 import { ToolCard } from "@/components/tools/ToolCard";
 import { ApprovalPrompt } from "@/components/tools/ApprovalPrompt";
 import { AskUserQuestionCard } from "@/components/tools/AskUserQuestionCard";
+import { AUTOPILOT_ITERATION_TOOL_NAME, parseAutopilotIterationMarker } from "@/lib/autopilot";
+import { AutopilotIterationMarker } from "./AutopilotIterationMarker";
 
 interface AssistantMessageProps {
   message: Message;
@@ -157,6 +159,15 @@ function truncateValue(value: string, max = 140): string {
 
 export const AssistantMessage = memo(function AssistantMessage({ message, disabledReason }: AssistantMessageProps) {
   const outputType = message.outputType;
+
+  // An autopilot iteration is stored as a tool-use block because nothing
+  // stores a neutral notice, but it is neither a tool call nor the agent
+  // speaking. A block this page cannot read falls through to the generic
+  // tool card, as it does on a client that does not know the name.
+  if (outputType?.type === "tool_use" && outputType.tool === AUTOPILOT_ITERATION_TOOL_NAME) {
+    const marker = parseAutopilotIterationMarker(outputType.input);
+    if (marker) return <AutopilotIterationMarker marker={marker} timestamp={message.timestamp} />;
+  }
 
   return (
     <div className="flex gap-2 sm:gap-3 min-w-0">

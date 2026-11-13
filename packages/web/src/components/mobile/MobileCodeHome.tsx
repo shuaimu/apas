@@ -22,6 +22,7 @@ import { compareRecentlyIdle } from "@/lib/idlePaneOrdering";
 import { buildProjectList } from "@/lib/projectList";
 import { paneNotRunning, parseSessionInstances, type SessionInstance } from "@/lib/projectInstances";
 import { projectHostLabel } from "@/lib/tabHosts";
+import { autopilotListStatus } from "@/lib/autopilot";
 import {
   paneUsageLimit,
   usageLimitedLabel,
@@ -469,6 +470,7 @@ export function MobileCodeHome({
               usageLimits,
               availabilityNow,
             ),
+            autopilot: autopilotListStatus(pane.autopilot),
           })),
       ),
     [availabilityNow, registeredInventory, sessions, usageLimits],
@@ -477,15 +479,24 @@ export function MobileCodeHome({
     () => waitingPanes.filter((entry) => entry.awaitingAnswer),
     [waitingPanes],
   );
+  // A tab on autopilot that waits for its next iteration, or holds, is not
+  // waiting for its user, so it is not an idle tab. A paused or ended
+  // autopilot does need someone: it stays among the idle tabs, with why.
+  const autopilotPanes = useMemo(
+    () => waitingPanes
+      .filter((entry) => !entry.awaitingAnswer && entry.autopilot?.kind === "on")
+      .sort(compareRecentlyIdle),
+    [waitingPanes],
+  );
   const idlePanes = useMemo(
     () => waitingPanes
-      .filter((entry) => !entry.awaitingAnswer && !entry.usageLimit)
+      .filter((entry) => !entry.awaitingAnswer && !entry.usageLimit && entry.autopilot?.kind !== "on")
       .sort(compareRecentlyIdle),
     [waitingPanes],
   );
   const limitedPanes = useMemo(
     () => waitingPanes
-      .filter((entry) => !entry.awaitingAnswer && entry.usageLimit)
+      .filter((entry) => !entry.awaitingAnswer && entry.usageLimit && entry.autopilot?.kind !== "on")
       .sort(compareRecentlyIdle),
     [waitingPanes],
   );
@@ -516,11 +527,16 @@ export function MobileCodeHome({
     pane,
     awaitingAnswer,
     usageLimit,
+    autopilot,
   }: (typeof waitingPanes)[number]) => {
     const name = session.project_name || "Coding session";
-    const resetLabel = !awaitingAnswer && usageLimit
+    const onAutopilot = !awaitingAnswer && autopilot?.kind === "on";
+    const resetLabel = !awaitingAnswer && !onAutopilot && usageLimit
       ? usageLimitResetLabel(usageLimit, availabilityNow)
       : null;
+    // What the autopilot is doing, or why it paused or ended. A question
+    // keeps precedence: the row then says only that an answer is pending.
+    const autopilotLabel = awaitingAnswer ? null : autopilot?.text ?? null;
     return (
       <button
         key={`${session.id}:${pane.pane_id}`}
@@ -546,16 +562,23 @@ export function MobileCodeHome({
           <span className={`max-w-[58%] shrink-0 rounded-full px-2.5 py-1 text-right text-[0.7rem] font-bold leading-tight ${
             awaitingAnswer
               ? "bg-amber-100 text-amber-800 dark:bg-amber-950/60 dark:text-amber-200"
+              : onAutopilot
+              ? "bg-[#eeecff] text-[#5b4de0] dark:bg-[#292452] dark:text-[#c8c1ff]"
               : usageLimit
               ? "bg-red-100 text-red-700 dark:bg-red-950/60 dark:text-red-300"
               : "bg-[#efeff5] text-[#686873] dark:bg-[#25252d] dark:text-[#aaaab6]"
           }`}>
-            {awaitingAnswer ? "Pending answer" : usageLimit ? usageLimitedLabel(usageLimit) : "Idle"}
+            {awaitingAnswer ? "Pending answer" : onAutopilot ? "On autopilot" : usageLimit ? usageLimitedLabel(usageLimit) : "Idle"}
           </span>
         </div>
         <p className="mt-2 truncate text-sm text-[#686873] dark:text-[#aaaab6]">
           {[pane.hostname || sessionTarget(session), resetLabel].filter(Boolean).join(" · ")}
         </p>
+        {/* On a line of its own that wraps: beside the host on one truncated
+            line, a phone would cut the reason short. */}
+        {autopilotLabel && (
+          <p className="mt-1 break-words text-sm text-[#686873] dark:text-[#aaaab6]">{autopilotLabel}</p>
+        )}
       </button>
     );
   };
@@ -751,7 +774,7 @@ export function MobileCodeHome({
             </div>
           )
         ) : filter === "idle" ? (
-          pendingPanes.length > 0 || idlePanes.length > 0 || limitedPanes.length > 0 ? (
+          pendingPanes.length > 0 || idlePanes.length > 0 || limitedPanes.length > 0 || autopilotPanes.length > 0 ? (
             <>
               {pendingPanes.length > 0 && (
                 <section aria-labelledby="mobile-pending-answer-heading">
@@ -768,10 +791,26 @@ export function MobileCodeHome({
                   {idlePanes.map(renderWaitingPane)}
                 </div>
               )}
+              {autopilotPanes.length > 0 && (
+                <section
+                  aria-labelledby="mobile-on-autopilot-heading"
+                  className={pendingPanes.length > 0 || idlePanes.length > 0 ? "mt-5 border-t border-[#dedee7] pt-4 dark:border-[#383842]" : ""}
+                >
+                  <h2
+                    id="mobile-on-autopilot-heading"
+                    className="mb-2.5 text-sm font-extrabold uppercase tracking-wide text-[#5b4de0] dark:text-[#c8c1ff]"
+                  >
+                    On autopilot
+                  </h2>
+                  <div className="space-y-2.5">
+                    {autopilotPanes.map(renderWaitingPane)}
+                  </div>
+                </section>
+              )}
               {limitedPanes.length > 0 && (
                 <section
                   aria-labelledby="mobile-usage-limited-heading"
-                  className={pendingPanes.length > 0 || idlePanes.length > 0 ? "mt-5 border-t border-[#dedee7] pt-4 dark:border-[#383842]" : ""}
+                  className={pendingPanes.length > 0 || idlePanes.length > 0 || autopilotPanes.length > 0 ? "mt-5 border-t border-[#dedee7] pt-4 dark:border-[#383842]" : ""}
                 >
                   <h2
                     id="mobile-usage-limited-heading"

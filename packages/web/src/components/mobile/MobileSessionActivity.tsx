@@ -13,6 +13,7 @@ import {
   MoreVertical,
   Pencil,
   Plus,
+  Repeat,
   RotateCcw,
   Settings2,
   Trash2,
@@ -22,6 +23,10 @@ import {
   WifiOff,
   X,
 } from "lucide-react";
+import type { AutopilotSpec } from "@apas/protocol";
+import { AutopilotIterationMarker } from "@/components/chat/AutopilotIterationMarker";
+import { AutopilotStartDialog } from "@/components/tabs/AutopilotStartDialog";
+import { AutopilotRequestNotices } from "@/components/tabs/AutopilotStatus";
 import { AskUserQuestionCard } from "@/components/tools/AskUserQuestionCard";
 import { ProjectWorkersWorkspace } from "@/components/workers/ProjectWorkersWorkspace";
 import { readSelectedPane, writeSelectedPane } from "@/lib/mobileSelectedPane";
@@ -34,7 +39,7 @@ import {
   refusedDeliveries,
   unconfirmedDeliveries,
 } from "@/lib/terminalDelivery";
-import { instancesNegotiated, selectSessionInstances } from "@/lib/projectInstances";
+import { instancesNegotiated, primaryInstance, selectSessionInstances } from "@/lib/projectInstances";
 import { buildMachineChoices, sessionCanCloneJoin, type MachineChoice } from "@/lib/machineChoice";
 import {
   cloneHereCopy,
@@ -51,6 +56,29 @@ import {
   type ConfirmationCopy,
 } from "@/lib/tabHosts";
 import { AddPaneLaunches } from "@/components/tabs/AddPaneLaunches";
+import {
+  autopilotActionRequest,
+  autopilotControlModel,
+  autopilotMarkerLabel,
+  autopilotRequestsOfSession,
+  autopilotStartInFlight,
+  AUTOPILOT_ITERATION_TOOL_NAME,
+  AUTOPILOT_PROJECT_NOT_RUNNING_TEXT,
+  closeTabAutopilotNote,
+  paneAutopilotKey,
+  paneCanHaveAutopilot,
+  parseAutopilotIterationMarker,
+  rebootAgentAutopilotNote,
+  type AutopilotRequestKind,
+} from "@/lib/autopilot";
+import { useAutopilotNegotiated, useSessionAutopilotStatuses } from "@/lib/useAutopilot";
+import {
+  MobileAutopilotActions,
+  MobileAutopilotDetailsSheet,
+  MobileAutopilotNotice,
+  MobileAutopilotStopSheet,
+  MobileAutopilotTerminalNotice,
+} from "./MobileAutopilot";
 import { MobileProjectManageSheet } from "./MobileProjectManageSheet";
 import { MobilePaneWorkSummarySheet } from "./MobilePaneWorkSummarySheet";
 import { MobileTerminalKeyBar } from "./MobileTerminalKeyBar";
@@ -270,6 +298,14 @@ function MobileEventCard({
   const nativeState = useStore((state) => message.sessionId && message.paneId !== undefined &&
     output?.type === "tool_use" && output.toolUseId && isOmpQuestionInput(output.input)
     ? state.ompQuestions.get(ompQuestionKey(message.sessionId, message.paneId, output.toolUseId)) : undefined);
+  // An autopilot iteration is stored as a tool-use block, but it is neither a
+  // tool call nor a message from the person: it is the line that says where
+  // an iteration starts. A block this page cannot read stays a tool card, as
+  // it is on a client that does not know the name.
+  const iteration = output?.type === "tool_use" && output.tool === AUTOPILOT_ITERATION_TOOL_NAME
+    ? parseAutopilotIterationMarker(output.input)
+    : null;
+  if (iteration) return <AutopilotIterationMarker marker={iteration} timestamp={message.timestamp} />;
   const detail = eventDetail(message);
   const label = eventLabel(message);
   const expandable = detail.length > 180 || detail.includes("\n") || output?.type === "tool_use";
@@ -365,6 +401,13 @@ export function MobileSessionActivity({ connected, onBack, onReconnect }: Mobile
   const showToast = useStore((state) => state.showToast);
   const startMachineProjectCli = useStore((state) => state.startMachineProjectCli);
   const summarySupported = useStore((state) => state.negotiatedCapabilities.has("pane_work_summary_v1"));
+  // Autopilot of the project's OMP terminal tabs. On a server without it,
+  // nothing about it is shown at all.
+  const autopilotNegotiated = useAutopilotNegotiated();
+  const paneAutopilot = useStore((state) => state.paneAutopilot);
+  const autopilotRequests = useStore((state) => state.autopilotRequests);
+  const controlPaneAutopilot = useStore((state) => state.controlPaneAutopilot);
+  const dismissAutopilotRequest = useStore((state) => state.dismissAutopilotRequest);
 
   const [selectedPaneId, setSelectedPaneId] = useState<number | null>(null);
   const [followUp, setFollowUp] = useState("");
@@ -387,6 +430,8 @@ export function MobileSessionActivity({ connected, onBack, onReconnect }: Mobile
   const [machineKey, setMachineKey] = useState<string | null>(null);
   const [cloneTarget, setCloneTarget] = useState<{ choice: MachineChoice; option: LaunchOption; copy: ConfirmationCopy } | null>(null);
   const [forgetTarget, setForgetTarget] = useState<{ machineId: string; hostname: string; copy: ConfirmationCopy } | null>(null);
+  // The autopilot sheet that is open, and the tab it was opened for.
+  const [autopilotSheet, setAutopilotSheet] = useState<{ kind: "start" | "stop" | "details"; paneId: number } | null>(null);
   // Messages written into the pty that the provider has not recorded back.
   const pendingDeliveries = useStore((state) => state.pendingTerminalDeliveries);
   const dismissTerminalDelivery = useStore((state) => state.dismissTerminalDelivery);
@@ -446,6 +491,54 @@ export function MobileSessionActivity({ connected, onBack, onReconnect }: Mobile
       .sort((a, b) => a.startedAt - b.startedAt),
     [addPaneRequests, sessionId],
   );
+
+  // The tabs with an autopilot to show: on, paused, or ended with a reason.
+  const autopilotStatuses = useSessionAutopilotStatuses(sessionId, paneConfigs);
+  const autopilotRequestList = useMemo(
+    () => autopilotRequestsOfSession(autopilotRequests, sessionId),
+    [autopilotRequests, sessionId],
+  );
+  // The selected tab, when autopilot applies to it: an interactive OMP
+  // terminal tab, on a server that has autopilot. One model for the notice,
+  // the tab's actions and the sheets, and the same one the desktop toolbar
+  // uses, so a phone disables the same actions for the same reasons.
+  const autopilotPane = autopilotNegotiated && sessionId && selectedPane && paneCanHaveAutopilot(selectedPane)
+    ? selectedPane
+    : undefined;
+  const autopilotEntry = autopilotPane && sessionId
+    ? paneAutopilot[paneAutopilotKey(sessionId, autopilotPane.pane_id)]
+    : undefined;
+  const autopilotHost = selectedHost?.hostname
+    ?? autopilotPane?.hostname
+    ?? primaryInstance(instances)?.hostname
+    ?? session?.hostname;
+  const autopilot = useMemo(() => autopilotPane
+    ? autopilotControlModel({
+        entry: autopilotEntry,
+        hostname: autopilotHost,
+        // Offline, or the tab's machine unreachable: every action is disabled
+        // with the reason, and nothing is queued for later.
+        connected,
+        // A tab's own reason comes first. With nothing known per tab, a
+        // project that is not running has no instance to ask either.
+        tabRefusal: selectedRefusal ?? (sessionIsRunning ? undefined : AUTOPILOT_PROJECT_NOT_RUNNING_TEXT),
+      })
+    : null, [autopilotEntry, autopilotHost, autopilotPane, connected, selectedRefusal, sessionIsRunning]);
+  const autopilotStartPending = Boolean(autopilotPane && sessionId
+    && autopilotStartInFlight(autopilotRequests, sessionId, autopilotPane.pane_id));
+  // A sheet goes with what it showed. Once the autopilot it was opened for is
+  // gone, or another tab is selected, it closes, and does not come back open
+  // by itself with the next autopilot.
+  const autopilotSheetKind = autopilot
+    && autopilotSheet
+    && autopilotSheet.paneId === autopilotPane?.pane_id
+    && (autopilotSheet.kind === "start"
+      || (autopilotSheet.kind === "stop" ? autopilot.actions.includes("stop") : Boolean(autopilot.autopilot)))
+    ? autopilotSheet.kind
+    : null;
+  useEffect(() => {
+    if (autopilotSheet && !autopilotSheetKind) setAutopilotSheet(null);
+  }, [autopilotSheet, autopilotSheetKind]);
 
   useEffect(() => {
     if (sessionId) loadSessionActivity(sessionId);
@@ -731,6 +824,25 @@ export function MobileSessionActivity({ connected, onBack, onReconnect }: Mobile
     setForgetTarget(null);
   };
 
+  // Sent once and never again by this screen: the request list shows what
+  // became of it. A pause or stop carries the autopilot's id only as a hint;
+  // while the tab's state is not reported there is none, and a stop needs
+  // none.
+  const sendAutopilot = (kind: Exclude<AutopilotRequestKind, "start">) => {
+    if (!sessionId || !autopilotPane) return;
+    const action = autopilotActionRequest(kind, autopilot?.autopilot?.autopilot_id);
+    if (!action) return;
+    const result = controlPaneAutopilot(sessionId, autopilotPane.pane_id, action);
+    setActionError(result.success ? null : result.error ?? "The request could not be sent.");
+  };
+
+  const startAutopilot = (spec: AutopilotSpec) => {
+    if (!sessionId || !autopilotPane) return { success: false };
+    const result = controlPaneAutopilot(sessionId, autopilotPane.pane_id, { kind: "start", spec: { ...spec } });
+    if (result.success) setAutopilotSheet(null);
+    return result;
+  };
+
   const dismissRename = () => {
     setRenameTarget(null);
     setRenameDraft("");
@@ -799,6 +911,14 @@ export function MobileSessionActivity({ connected, onBack, onReconnect }: Mobile
   const openProjectStartHosts = openProjectTarget && instancesSupported
     ? projectStartHosts({ panes: paneConfigs, machines, projectId: openProjectTarget.projectId })
     : [];
+  // Closing a tab ends its agent, and its autopilot with it; rebooting the
+  // agent brings the autopilot back paused. Each confirmation says so.
+  const closeAutopilotNote = closeTarget
+    ? closeTabAutopilotNote(autopilotStatuses.get(closeTarget.pane_id) ?? null)
+    : undefined;
+  const rebootAutopilotNote = rebootTarget
+    ? rebootAgentAutopilotNote(autopilotStatuses.get(rebootTarget.pane_id) ?? null)
+    : undefined;
 
   return (
     <ProjectWorkersWorkspace key={`${accountId}:${projectId ?? sessionId}`} project={projectContext} paneSelectionRequested={false}
@@ -837,6 +957,22 @@ export function MobileSessionActivity({ connected, onBack, onReconnect }: Mobile
               const host = tabHosts.tabs.get(pane.pane_id);
               const hostname = host?.badge ? host.hostname : undefined;
               const hostState = host && host.state !== "running" ? tabHostStateLabel(host.state) : undefined;
+              // On autopilot, or with a paused one: a glyph, because the chip
+              // has no room for another word, and the name read out says it.
+              // An ended autopilot is not marked. The glyph stands inside the
+              // chip, so the row is no wider, and a chip naming a machine
+              // still gives way within the row. A tab with no autopilot keeps
+              // exactly the chip and the name it had.
+              const autopilotStatus = autopilotStatuses.get(pane.pane_id);
+              const autopilotMark = autopilotStatus ? autopilotMarkerLabel(autopilotStatus.kind) : null;
+              const autopilotGlyph = (layout: string) => autopilotStatus && autopilotMark ? (
+                <Repeat
+                  aria-hidden="true"
+                  data-testid="chip-autopilot-glyph"
+                  data-autopilot={autopilotStatus.kind}
+                  className={`h-3 w-3 shrink-0 ${layout} ${autopilotStatus.kind === "on" ? "text-[#6d5efc]" : "text-amber-500 opacity-60"}`}
+                />
+              ) : null;
               // A chip naming a machine puts it on a second line, and is never
               // wider than the row: on one line a phone's row (about 200px)
               // could not hold even "Claude 2 · zoo-006 (stopped)", and a long
@@ -846,13 +982,22 @@ export function MobileSessionActivity({ connected, onBack, onReconnect }: Mobile
               // read out is the whole text, which a truncated chip no longer
               // shows.
               const chipName = hostname
-                ? `${paneLabel(pane)} · ${hostname}${hostState ? ` (${hostState})` : ""}${statusSuffix}`
-                : undefined;
+                ? `${paneLabel(pane)} · ${hostname}${hostState ? ` (${hostState})` : ""}${statusSuffix}${autopilotMark ? `, ${autopilotMark}` : ""}`
+                : autopilotMark
+                  ? `${paneLabel(pane)}${statusSuffix}, ${autopilotMark}`
+                  : undefined;
               return (
                 <button key={pane.pane_id} type="button" aria-pressed={selected} aria-label={chipName} title={host?.refusal} onClick={() => { workspace.selectInteractive(); selectPane(pane.pane_id); }} className={`min-h-11 shrink-0 rounded-full border px-3 py-1.5 text-xs font-bold ${hostname ? "flex max-w-full flex-col items-center justify-center leading-tight" : ""} ${selected ? "border-[#6d5efc] text-[#6d5efc]" : "border-[#dedee7] text-[#686873] dark:border-[#383842] dark:text-[#aaaab6]"} ${host?.refusal && !selected ? "opacity-60" : ""}`}>
                   {hostname ? (
                     <>
-                      <span className="max-w-full truncate">{paneLabel(pane)}</span>
+                      {autopilotMark ? (
+                        <span className="flex max-w-full items-center gap-1">
+                          {autopilotGlyph("")}
+                          <span className="min-w-0 truncate">{paneLabel(pane)}</span>
+                        </span>
+                      ) : (
+                        <span className="max-w-full truncate">{paneLabel(pane)}</span>
+                      )}
                       <span className="flex max-w-full text-[11px] font-normal">
                         <span className="min-w-0 truncate">{hostname}</span>
                         {hostState && <span className="shrink-0 whitespace-pre">{` · ${hostState}`}</span>}
@@ -861,6 +1006,7 @@ export function MobileSessionActivity({ connected, onBack, onReconnect }: Mobile
                     </>
                   ) : (
                     <>
+                      {autopilotGlyph("mr-1 inline-block align-[-0.125em]")}
                       {paneLabel(pane)}
                       {statusSuffix}
                     </>
@@ -939,6 +1085,17 @@ export function MobileSessionActivity({ connected, onBack, onReconnect }: Mobile
       )}
 
       <AddPaneLaunches launches={launches} onDismiss={dismissAddPaneRequest} variant="mobile" />
+      {/* What became of each autopilot request. One that was not confirmed
+          stays here until it is dismissed; nothing sends it again. */}
+      <AutopilotRequestNotices
+        requests={autopilotRequestList}
+        tabLabel={(paneId) => {
+          const pane = paneConfigs.find((candidate) => candidate.pane_id === paneId);
+          return pane ? paneLabel(pane) : undefined;
+        }}
+        onDismiss={dismissAutopilotRequest}
+        variant="mobile"
+      />
 
       {workspace.content}
       {retainedTerminal && (
@@ -953,6 +1110,18 @@ export function MobileSessionActivity({ connected, onBack, onReconnect }: Mobile
             <p role="status" className="flex shrink-0 items-start gap-2 border-b border-neutral-800 px-3 py-2 text-xs text-amber-300">
               <AlertTriangle aria-hidden="true" className="mt-px h-4 w-4 shrink-0" /> {retainedRefusal}
             </p>
+          )}
+          {/* The composer and its autopilot notice are hidden while the
+              terminal is open, so the terminal carries the notice: an open
+              terminal shows the selected tab. */}
+          {terminalIsOpen && !workspace.active && autopilot && autopilotPane && (
+            <MobileAutopilotTerminalNotice
+              model={autopilot}
+              shownReason={retainedRefusal}
+              onAction={sendAutopilot}
+              onStop={() => setAutopilotSheet({ kind: "stop", paneId: autopilotPane.pane_id })}
+              onDetails={() => setAutopilotSheet({ kind: "details", paneId: autopilotPane.pane_id })}
+            />
           )}
           <div className="flex min-h-0 flex-1 flex-col"><TerminalPane key={`${sessionId}:${retainedTerminal.paneId}`} paneId={retainedTerminal.paneId} visible={terminalIsOpen && !workspace.active} inputDisabledReason={retainedRefusal} /></div>
           <MobileTerminalKeyBar paneId={retainedTerminal.paneId} connected={connected} disabledReason={retainedRefusal} />
@@ -1069,6 +1238,22 @@ export function MobileSessionActivity({ connected, onBack, onReconnect }: Mobile
             </span>
           </div>
         )}
+        {/* Autopilot is a second attribute: its notice stands beside the
+            status below, never in its place, and leaves the composer usable.
+            A state notice, like the one for an unconfirmed send; starting is
+            among the tab's occasional actions. Nothing is shown while the
+            tab's state is not reported. */}
+        {autopilot && autopilotPane && (
+          <MobileAutopilotNotice
+            model={autopilot}
+            modes={autopilotEntry?.state?.omp_modes}
+            startInFlight={autopilotStartPending}
+            onAction={sendAutopilot}
+            onStop={() => setAutopilotSheet({ kind: "stop", paneId: autopilotPane.pane_id })}
+            onDetails={() => setAutopilotSheet({ kind: "details", paneId: autopilotPane.pane_id })}
+            onStartAgain={() => setAutopilotSheet({ kind: "start", paneId: autopilotPane.pane_id })}
+          />
+        )}
         {connected && selectedStatus && <div role="status" aria-live="polite" className={`mb-1.5 flex w-fit max-w-full items-center gap-1.5 rounded-full px-2.5 py-1 text-xs font-bold ${selectedIsAwaitingAnswer ? "bg-amber-100 text-amber-800 dark:bg-amber-950/60 dark:text-amber-200" : "bg-[#eeecff] text-[#5b4de0] dark:bg-[#292452] dark:text-[#c8c1ff]"}`}>{selectedIsAwaitingAnswer ? <AlertTriangle aria-hidden="true" className="h-3.5 w-3.5 shrink-0" /> : <LoaderCircle aria-hidden="true" className="h-3.5 w-3.5 shrink-0 animate-spin" />}<span className="truncate">{selectedStatus}</span></div>}
         {!connected && canCompose && <p className="mb-1.5 text-[11px] text-amber-700 dark:text-amber-300">You can keep drafting while offline. Reconnect to send.</p>}
         {connected && !sessionIsRunning && canCompose && <p className="mb-1.5 text-[11px] text-amber-700 dark:text-amber-300">You can draft a message, but this project must be running before it can be sent.</p>}
@@ -1135,7 +1320,7 @@ export function MobileSessionActivity({ connected, onBack, onReconnect }: Mobile
 
       {moreOpen && (
         <div className="fixed inset-0 z-[95] flex items-end bg-black/45" onClick={() => setMoreOpen(false)}>
-          <div role="dialog" aria-modal="true" aria-label="Pane actions" onClick={(event) => event.stopPropagation()} className="w-full rounded-t-[1.4rem] border-t border-[#dedee7] bg-[#f7f7fa] p-4 pb-[max(1rem,env(safe-area-inset-bottom))] shadow-2xl dark:border-[#383842] dark:bg-[#111115]">
+          <div role="dialog" aria-modal="true" aria-label="Pane actions" onClick={(event) => event.stopPropagation()} className="max-h-[82dvh] w-full overflow-y-auto rounded-t-[1.4rem] border-t border-[#dedee7] bg-[#f7f7fa] p-4 pb-[max(1rem,env(safe-area-inset-bottom))] shadow-2xl dark:border-[#383842] dark:bg-[#111115]">
             <div className="flex items-center justify-between">
               <h2 className="text-lg font-extrabold">{selectedPane ? paneLabel(selectedPane) : "No pane selected"}</h2>
               <button type="button" aria-label="Close actions" onClick={() => setMoreOpen(false)} className="rounded-lg p-2 hover:bg-[#efeff5] dark:hover:bg-[#25252d]"><X className="h-5 w-5" /></button>
@@ -1170,6 +1355,23 @@ export function MobileSessionActivity({ connected, onBack, onReconnect }: Mobile
               }} className="flex w-full items-center gap-3 rounded-2xl border border-[#dedee7] bg-white p-3.5 text-left font-bold disabled:opacity-40 dark:border-[#383842] dark:bg-[#1b1b21]"><SquareTerminal className="h-5 w-5 shrink-0 text-[#686873] dark:text-[#aaaab6]" /> Raw terminal</button>
               {summarySupported && (
                 <button type="button" aria-label="Open work summary" disabled={selectedPaneId === null} onClick={() => { setMoreOpen(false); setSummaryOpen(true); }} className="flex w-full items-center gap-3 rounded-2xl border border-[#dedee7] bg-white p-3.5 text-left font-bold disabled:opacity-40 dark:border-[#383842] dark:bg-[#1b1b21]"><History className="h-5 w-5 shrink-0 text-[#686873] dark:text-[#aaaab6]" /> Work summary</button>
+              )}
+              {/* Starting autopilot is an occasional action; so are Stop and
+                  Stop now while the tab's state is not reported. A tab with a
+                  current autopilot has its actions in the state notice. */}
+              {autopilot && autopilotPane && (
+                <MobileAutopilotActions
+                  model={autopilot}
+                  startInFlight={autopilotStartPending}
+                  onStart={() => {
+                    setMoreOpen(false);
+                    setAutopilotSheet({ kind: "start", paneId: autopilotPane.pane_id });
+                  }}
+                  onAction={(kind) => {
+                    setMoreOpen(false);
+                    sendAutopilot(kind);
+                  }}
+                />
               )}
               <button
                 type="button"
@@ -1305,6 +1507,39 @@ export function MobileSessionActivity({ connected, onBack, onReconnect }: Mobile
         </div>
       )}
 
+      {/* The same prompt, timing and limit choices and the same statement as
+          the desktop dialog. Nothing is sent until Start autopilot is
+          pressed, and only once. */}
+      {autopilot && autopilotPane && autopilotSheetKind === "start" && (
+        <AutopilotStartDialog
+          variant="sheet"
+          tabLabel={paneLabel(autopilotPane)}
+          hostname={autopilotHost}
+          sharedCheckout={!autopilotPane.worktree_path}
+          last={autopilot.lastEnded?.spec}
+          onCancel={() => setAutopilotSheet(null)}
+          onStart={startAutopilot}
+        />
+      )}
+      {autopilot && autopilotPane && autopilotSheetKind === "stop" && (
+        <MobileAutopilotStopSheet
+          tabLabel={paneLabel(autopilotPane)}
+          model={autopilot}
+          onChoose={(kind) => {
+            setAutopilotSheet(null);
+            sendAutopilot(kind);
+          }}
+          onClose={() => setAutopilotSheet(null)}
+        />
+      )}
+      {autopilot && autopilotPane && autopilotSheetKind === "details" && (
+        <MobileAutopilotDetailsSheet
+          tabLabel={paneLabel(autopilotPane)}
+          model={autopilot}
+          onClose={() => setAutopilotSheet(null)}
+        />
+      )}
+
       {rebootTarget && (
         <div className="fixed inset-0 z-[96] flex items-end bg-black/45" onClick={() => setRebootTarget(null)}>
           <div role="dialog" aria-modal="true" aria-label={`Reboot ${paneLabel(rebootTarget)}`} onClick={(event) => event.stopPropagation()} className="w-full rounded-t-[1.4rem] border-t border-[#dedee7] bg-[#f7f7fa] p-4 pb-[max(1rem,env(safe-area-inset-bottom))] shadow-2xl dark:border-[#383842] dark:bg-[#111115]">
@@ -1316,6 +1551,11 @@ export function MobileSessionActivity({ connected, onBack, onReconnect }: Mobile
               The running process is killed and respawned on the same session, so the agent resumes
               with its prior conversation.
             </p>
+            {rebootAutopilotNote && (
+              <p role="note" className="mt-2 rounded-xl border border-amber-300 bg-amber-50 px-3 py-2 text-sm leading-5 text-amber-900 dark:border-amber-900 dark:bg-amber-950/40 dark:text-amber-200">
+                {rebootAutopilotNote}
+              </p>
+            )}
             <div className="mt-4 flex gap-2.5">
               <button type="button" onClick={() => setRebootTarget(null)} className="flex-1 rounded-xl border border-[#dedee7] px-4 py-2.5 text-sm font-bold dark:border-[#383842]">Cancel</button>
               <button type="button" onClick={() => { rebootPane(rebootTarget.pane_id); setRebootTarget(null); }} className="flex-1 rounded-xl bg-[#6d5efc] px-4 py-2.5 text-sm font-bold text-white">Reboot pane</button>
@@ -1333,6 +1573,11 @@ export function MobileSessionActivity({ connected, onBack, onReconnect }: Mobile
                 ? "This pane has its own worktree. Choose what happens to that work."
                 : "The agent in this pane is stopped and the pane is removed."}
             </p>
+            {closeAutopilotNote && (
+              <p role="note" className="mt-2 rounded-xl border border-amber-300 bg-amber-50 px-3 py-2 text-sm leading-5 text-amber-900 dark:border-amber-900 dark:bg-amber-950/40 dark:text-amber-200">
+                {closeAutopilotNote}
+              </p>
+            )}
             {closeTarget.worktree_path ? (
               <div className="mt-4 space-y-2">
                 {([

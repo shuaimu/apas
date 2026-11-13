@@ -38,6 +38,17 @@ import {
 } from "./projectInstances";
 import { noRuntimeAccessReason } from "./tabHosts";
 import { receiveWorkerMessage } from "./workers";
+import type { AutopilotAction, PaneAutopilotSummary } from "@apas/protocol";
+import {
+  AUTOPILOT_OFFLINE_TEXT,
+  autopilotRequestKind,
+  autopilotSummaryFromState,
+  paneAutopilotKey,
+  parsePaneAutopilotFrame,
+  TAB_AUTOPILOT_CAPABILITY,
+  type AutopilotRequest,
+  type PaneAutopilotEntry,
+} from "./autopilot";
 
 // UUID generator with fallback for environments without crypto.randomUUID
 function generateId(): string {
@@ -162,6 +173,10 @@ export interface SessionPaneSummary {
   awaiting_answer?: boolean;
   idle_since?: string | null;
   usage_limited?: UsageLimitedStatus & { resets_at?: string };
+  /** Autopilot availability and condition of an OMP terminal tab, without
+   *  its prompt. Absent for other panes and from older servers. A pushed
+   *  `pane_autopilot_state` updates it in place between two list polls. */
+  autopilot?: PaneAutopilotSummary | null;
 }
 
 /** Request-keyed creation feedback. Local terminal results survive until dismissed. */
@@ -766,6 +781,15 @@ interface AppState {
    *  session. Never resent. Kept in this tab's session storage so a reload
    *  reports the ones it cut off as unconfirmed (`restoreAddPaneRequests`). */
   addPaneRequests: Record<string, AddPaneRequest>;
+  /** What each OMP terminal tab reports about autopilot, by
+   *  `paneAutopilotKey(sessionId, paneId)`, for every attached session.
+   *  Pruned with the roster and dropped with the socket. A tab with no entry
+   *  reads as not reported, never as off. */
+  paneAutopilot: Record<string, PaneAutopilotEntry>;
+  /** Autopilot requests by request id, for every session: waiting for their
+   *  receipt, accepted until the tab reports, or refused or unconfirmed until
+   *  dismissed. Never resent. */
+  autopilotRequests: Record<string, AutopilotRequest>;
 
   // Messages (single pane mode / fallback)
   messages: Message[];
@@ -1062,6 +1086,17 @@ interface AppState {
     provider?: string | null,
   ) => void;
   interruptPane: (paneId: number) => void;
+  /** Start, pause, resume or stop autopilot on one OMP terminal tab. Sent
+   *  once and tracked in `autopilotRequests` until its receipt; refused here,
+   *  with nothing queued, while the page is offline or the server has no
+   *  autopilot. */
+  controlPaneAutopilot: (
+    sessionId: string,
+    paneId: number,
+    action: AutopilotAction,
+  ) => { success: boolean; error?: string; requestId?: string };
+  /** Forget a request that is no longer in flight. */
+  dismissAutopilotRequest: (requestId: string) => void;
   reorderPanes: (paneIds: number[]) => void;
   /** Reboot the CLI of one of the project's instances; absent = the
    *  primary's. A daemon runs every project on its machine, so this restarts
@@ -1440,6 +1475,130 @@ function failAddPaneRequest(set: StoreSet, get: () => AppState, requestId: strin
   pendingCloneAdds.delete(requestId);
   patchAddPaneRequest(set, requestId, { status: "failed", error });
   get().showToast(error, "error");
+}
+
+// How long an autopilot request waits for its receipt before it is reported
+// as not confirmed. The server answers within five seconds, with "uncertain"
+// when the tab's machine has not answered it.
+const AUTOPILOT_RECEIPT_TIMEOUT_MS = 15_000;
+// A receipt is not the state: the tab applies an accepted request within a
+// second, and its machine relays the new state within a few more. The
+// accepted request is dropped when that state arrives, or after this long.
+const AUTOPILOT_ACCEPTED_SETTLE_MS = 6_000;
+const autopilotRequestTimers = new Map<string, ReturnType<typeof setTimeout>>();
+/** The socket generation each autopilot request was sent on (`wsGeneration`). */
+const autopilotRequestGenerations = new Map<string, number>();
+
+function clearAutopilotRequestTimer(requestId: string) {
+  const timer = autopilotRequestTimers.get(requestId);
+  if (timer) clearTimeout(timer);
+  autopilotRequestTimers.delete(requestId);
+}
+
+function scheduleAutopilotRequestTimer(requestId: string, delayMs: number, onExpire: () => void) {
+  clearAutopilotRequestTimer(requestId);
+  const timer = setTimeout(() => {
+    autopilotRequestTimers.delete(requestId);
+    onExpire();
+  }, delayMs);
+  // Node-based component tests should not stay alive solely for this UI timer.
+  (timer as unknown as { unref?: () => void }).unref?.();
+  autopilotRequestTimers.set(requestId, timer);
+}
+
+function withoutAutopilotRequests(
+  requests: Record<string, AutopilotRequest>,
+  drop: (request: AutopilotRequest) => boolean,
+): Record<string, AutopilotRequest> {
+  let changed = false;
+  const kept: Record<string, AutopilotRequest> = {};
+  for (const [id, request] of Object.entries(requests)) {
+    if (drop(request)) {
+      clearAutopilotRequestTimer(id);
+      autopilotRequestGenerations.delete(id);
+      changed = true;
+    } else {
+      kept[id] = request;
+    }
+  }
+  return changed ? kept : requests;
+}
+
+/** Report requests whose receipt can no longer be relied on. They are kept
+ *  visible and never sent again. */
+function markAutopilotRequestsUnconfirmed(
+  set: StoreSet,
+  cause: NonNullable<AutopilotRequest["cause"]>,
+  shouldMark: (request: AutopilotRequest) => boolean,
+) {
+  set((state) => {
+    let changed = false;
+    const next = { ...state.autopilotRequests };
+    for (const [id, request] of Object.entries(state.autopilotRequests)) {
+      if (!shouldMark(request)) continue;
+      clearAutopilotRequestTimer(id);
+      next[id] = { ...request, status: "unconfirmed", cause, reason: undefined };
+      changed = true;
+    }
+    return changed ? { autopilotRequests: next } : {};
+  });
+}
+
+/** Apply a `pane_autopilot_receipt`. It answers one request and says only
+ *  whether the tab took it; the displayed state changes when the tab reports.
+ *  A receipt for a request that already has its answer is ignored. */
+function applyAutopilotReceipt(data: Record<string, unknown>, set: StoreSet, get: () => AppState) {
+  const requestId = data.request_id;
+  if (typeof requestId !== "string") return;
+  const request = get().autopilotRequests[requestId];
+  if (!request || request.sessionId !== data.session_id || request.paneId !== data.pane_id) return;
+  // A late receipt still settles a request that timed out here.
+  if (request.status !== "pending" && request.status !== "unconfirmed") return;
+  clearAutopilotRequestTimer(requestId);
+  const reason = typeof data.reason === "string" && data.reason.trim() ? data.reason : undefined;
+  const settled: AutopilotRequest = data.outcome === "accepted"
+    ? { ...request, status: "accepted", cause: undefined, reason: undefined }
+    : data.outcome === "refused"
+      ? { ...request, status: "refused", cause: undefined, reason }
+      : { ...request, status: "unconfirmed", cause: "uncertain", reason: undefined };
+  set((state) => state.autopilotRequests[requestId]
+    ? { autopilotRequests: { ...state.autopilotRequests, [requestId]: settled } }
+    : {});
+  if (settled.status === "accepted") {
+    scheduleAutopilotRequestTimer(requestId, AUTOPILOT_ACCEPTED_SETTLE_MS, () => {
+      set((state) => {
+        const autopilotRequests = withoutAutopilotRequests(state.autopilotRequests, (candidate) =>
+          candidate.requestId === requestId && candidate.status === "accepted");
+        return autopilotRequests === state.autopilotRequests ? {} : { autopilotRequests };
+      });
+    });
+  } else if (settled.status === "refused") {
+    get().showToast(settled.reason ?? "The autopilot request was refused.", "error");
+  }
+}
+
+/** Forget what is held about tabs the roster no longer lists. Pane ids are
+ *  reused, so a later tab must not inherit a closed one's autopilot. */
+function pruneAutopilotToRoster(state: AppState, sessionId: string, listedPaneIds: Set<number>): Partial<AppState> {
+  const prefix = `${sessionId}/`;
+  const kept = Object.fromEntries(Object.entries(state.paneAutopilot).filter(([key]) =>
+    !key.startsWith(prefix) || listedPaneIds.has(Number(key.slice(prefix.length)))));
+  const autopilotRequests = withoutAutopilotRequests(state.autopilotRequests, (request) =>
+    request.sessionId === sessionId && !listedPaneIds.has(request.paneId));
+  return {
+    ...(Object.keys(kept).length === Object.keys(state.paneAutopilot).length ? {} : { paneAutopilot: kept }),
+    ...(autopilotRequests === state.autopilotRequests ? {} : { autopilotRequests }),
+  };
+}
+
+/** Forget every autopilot state and request of the given sessions. */
+function withoutAutopilotOfSessions(state: AppState, sessionIds: Set<string>): Pick<AppState, "paneAutopilot" | "autopilotRequests"> {
+  return {
+    paneAutopilot: Object.fromEntries(Object.entries(state.paneAutopilot).filter(([key]) =>
+      !sessionIds.has(key.slice(0, key.lastIndexOf("/"))))),
+    autopilotRequests: withoutAutopilotRequests(state.autopilotRequests, (request) =>
+      sessionIds.has(request.sessionId)),
+  };
 }
 
 /** Where this browser tab keeps its launches across a reload. Per tab, like
@@ -1824,6 +1983,8 @@ export const useStore = create<AppState>((set, get) => ({
   sessions: [],
   sessionInstances: {},
   addPaneRequests: loadAddPaneRequests(),
+  paneAutopilot: {},
+  autopilotRequests: {},
   messages: [],
   hasMoreMessages: false,
   isLoadingMore: false,
@@ -1943,6 +2104,8 @@ export const useStore = create<AppState>((set, get) => ({
       sessions: [],
       sessionInstances: {},
       addPaneRequests: withoutAddPaneRequests(get().addPaneRequests, () => true),
+      paneAutopilot: {},
+      autopilotRequests: withoutAutopilotRequests(get().autopilotRequests, () => true),
       workingPanesBySession: new Map(),
       machines: [],
       machineListReceived: false,
@@ -2032,6 +2195,7 @@ export const useStore = create<AppState>((set, get) => ({
           "autonomous_jobs_v1",
           "autonomous_workers_v1",
           PROJECT_INSTANCES_CAPABILITY,
+          TAB_AUTOPILOT_CAPABILITY,
         ],
         client_kind: "web",
         app_version: process.env.NEXT_PUBLIC_WEB_UI_VERSION || "development",
@@ -2081,7 +2245,17 @@ export const useStore = create<AppState>((set, get) => ({
         // Pushed instance sets stop arriving with the socket; the next
         // attach replays them.
         sessionInstances: {},
+        // So do autopilot states. Until they are replayed every tab reads as
+        // not reported, which is what is known.
+        paneAutopilot: {},
       }));
+      // An autopilot receipt goes only to the connection that asked. A request
+      // still waiting for one is reported as not confirmed; it is never
+      // resent, because a pause or stop stays in force on the tab's machine
+      // and a start or resume may already have been taken.
+      markAutopilotRequestsUnconfirmed(set, "connection", (request) =>
+        request.status === "pending"
+          && (autopilotRequestGenerations.get(request.requestId) ?? 0) <= generation);
       // New-tab answers go only to the connection that asked, so any still
       // outstanding on this socket are lost. Report them; never resend.
       markAddPaneRequestsUnconfirmed(set, get, (_request, sentOn) =>
@@ -2457,6 +2631,7 @@ export const useStore = create<AppState>((set, get) => ({
         state.addPaneRequests,
         (request) => removedSessionIds.has(request.sessionId),
       );
+      const autopilot = withoutAutopilotOfSessions(state, removedSessionIds);
       for (const id of removedSessionIds) {
         sessionCache.delete(id);
         teamRecordsBySession.delete(id);
@@ -2486,6 +2661,7 @@ export const useStore = create<AppState>((set, get) => ({
         cliLifecycleLatestBySession,
         sessionInstances,
         addPaneRequests,
+        ...autopilot,
         ...(pendingRemoved
           ? {
               pendingSessionAttachment: null,
@@ -3763,6 +3939,57 @@ export const useStore = create<AppState>((set, get) => ({
       // "current" session (or is dropped). Matters for "Stop team".
       ws.send(JSON.stringify({ type: "interrupt_pane", session_id: sessionId, pane_id: paneId }));
     }
+  },
+
+  controlPaneAutopilot: (sessionId, paneId, action) => {
+    const state = get();
+    if (!state.negotiatedCapabilities.has(TAB_AUTOPILOT_CAPABILITY)) {
+      return { success: false, error: "This APAS server does not support autopilot." };
+    }
+    const { ws } = state;
+    // Nothing is queued for a later connection: a start that arrives minutes
+    // after it was asked for is not what the person asked for.
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
+      return { success: false, error: AUTOPILOT_OFFLINE_TEXT };
+    }
+    const requestId = generateId();
+    try {
+      ws.send(JSON.stringify({
+        type: "control_pane_autopilot",
+        session_id: sessionId,
+        pane_id: paneId,
+        request_id: requestId,
+        action,
+      }));
+    } catch {
+      return { success: false, error: "The autopilot request could not be sent. Try again." };
+    }
+    set((current) => ({
+      autopilotRequests: {
+        ...current.autopilotRequests,
+        [requestId]: {
+          requestId,
+          sessionId,
+          paneId,
+          kind: autopilotRequestKind(action),
+          status: "pending",
+          sentAt: Date.now(),
+        },
+      },
+    }));
+    autopilotRequestGenerations.set(requestId, wsGeneration);
+    scheduleAutopilotRequestTimer(requestId, AUTOPILOT_RECEIPT_TIMEOUT_MS, () =>
+      markAutopilotRequestsUnconfirmed(set, "timeout", (request) =>
+        request.requestId === requestId && request.status === "pending"));
+    return { success: true, requestId };
+  },
+
+  dismissAutopilotRequest: (requestId) => {
+    set((state) => {
+      const autopilotRequests = withoutAutopilotRequests(state.autopilotRequests, (request) =>
+        request.requestId === requestId && request.status !== "pending" && request.status !== "accepted");
+      return autopilotRequests === state.autopilotRequests ? {} : { autopilotRequests };
+    });
   },
 
   reorderPanes: (paneIds: number[]) => {
@@ -5283,6 +5510,7 @@ export function handleServerMessage(
                 state.addPaneRequests,
                 (request) => request.sessionId === rejectedSessionId,
               ),
+              ...withoutAutopilotOfSessions(state, new Set([rejectedSessionId])),
               sessionId: null,
               cliClientId: null,
               isAttached: false,
@@ -5363,6 +5591,47 @@ export function handleServerMessage(
     case "add_pane_result":
       applyAddPaneResult(data, set, get);
       break;
+
+    case "pane_autopilot_receipt":
+      applyAutopilotReceipt(data, set, get);
+      break;
+
+    case "pane_autopilot_state": {
+      const reported = parsePaneAutopilotFrame(data);
+      if (!reported) break;
+      const { sessionId: reportedSessionId, paneId: reportedPaneId, entry } = reported;
+      const summary = autopilotSummaryFromState(entry.support, entry.state);
+      set((state) => ({
+        paneAutopilot: {
+          ...state.paneAutopilot,
+          [paneAutopilotKey(reportedSessionId, reportedPaneId)]: entry,
+        },
+        // The tab has reported since these were accepted, so what they did
+        // is on screen.
+        autopilotRequests: withoutAutopilotRequests(state.autopilotRequests, (request) =>
+          request.status === "accepted"
+            && request.sessionId === reportedSessionId
+            && request.paneId === reportedPaneId),
+        // Lists read the session entry's block; keep it current between two
+        // polls of the session list, as `pane_status` does for activity. A
+        // report that changes nothing a list shows leaves the list alone.
+        ...(state.sessions.some((session) => session.id === reportedSessionId
+          && session.panes?.some((pane) => pane.pane_id === reportedPaneId
+            && JSON.stringify(pane.autopilot ?? null) !== JSON.stringify(summary)))
+          ? {
+              sessions: state.sessions.map((session) => session.id === reportedSessionId && session.panes
+                ? {
+                    ...session,
+                    panes: session.panes.map((pane) => pane.pane_id === reportedPaneId
+                      ? { ...pane, autopilot: summary }
+                      : pane),
+                  }
+                : session),
+            }
+          : {}),
+      }));
+      break;
+    }
 
     case "plan_review_request": {
       const paneId = data.pane_id as number | undefined;
@@ -5742,6 +6011,17 @@ export function handleServerMessage(
           );
           return addPaneRequests === state.addPaneRequests ? {} : { addPaneRequests };
         });
+      }
+      // Autopilot state is held for every attached session, so it is pruned
+      // to the roster of whichever session this list is for.
+      {
+        const rosterSid = msgSid ?? curSid;
+        if (rosterSid && Array.isArray(data.panes)) {
+          const listedPaneIds = new Set(
+            (data.panes as PaneConfig[]).map((pane) => pane.pane_id),
+          );
+          set((state) => pruneAutopilotToRoster(state, rosterSid, listedPaneIds));
+        }
       }
       // Drop pane_list events for sessions we're not currently viewing.
       if (msgSid && curSid && msgSid !== curSid) {

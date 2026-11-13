@@ -4,9 +4,14 @@ import { useStore } from "@/lib/store";
 import ClusterInvitationPage from "./page";
 
 const replace = vi.hoisted(() => vi.fn());
+// One router for the file, as Next's is the same object on every render. A
+// new one per render re-ran the page's lookup effect after every state
+// change, so lookups never stopped, and one still in flight when the test
+// environment was torn down set state without a `window` and failed the run.
+const router = vi.hoisted(() => ({ replace, push: vi.fn() }));
 vi.mock("next/navigation", () => ({
   useParams: () => ({ token: "invite-token" }),
-  useRouter: () => ({ replace, push: vi.fn() }),
+  useRouter: () => router,
 }));
 
 const initialStore = useStore.getState();
@@ -62,5 +67,7 @@ describe("shared cluster invitation", () => {
       expect.objectContaining({ method: "POST", body: JSON.stringify({ trust_confirmed: true }) }),
     ));
     expect(replace).toHaveBeenCalledWith("/machines");
+    // One lookup and one acceptance: nothing is left in flight.
+    expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 });

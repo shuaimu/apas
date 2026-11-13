@@ -1,5 +1,6 @@
 import type { MachineWithProjects, SessionPaneSummary } from "@/lib/store";
 import { paneNotRunning, type SessionInstance } from "@/lib/projectInstances";
+import { paneIsOnAutopilot } from "@/lib/autopilot";
 
 interface PaneStatusDotsProps {
   panes?: readonly SessionPaneSummary[];
@@ -36,20 +37,25 @@ export function PaneStatusDots({ panes, isActive, instances, machines }: PaneSta
                 : "Idle";
         const name = pane.label?.trim()
           || `${pane.kind === "terminal" ? "Terminal" : "Pane"} ${pane.pane_id}`;
-        const label = `${name}: ${status}`;
+        // Autopilot is a second attribute, never a status: the dot keeps its
+        // colour and its status word, and gains a ring. Only for a pane that
+        // is running; a stopped machine's last report says nothing now.
+        const onAutopilot = !status.startsWith("Not running") && paneIsOnAutopilot(pane.autopilot);
+        const label = `${name}: ${status}${onAutopilot ? ", on autopilot" : ""}`;
         return (
           <span
             key={pane.pane_id}
             role="img"
             aria-label={label}
             title={label}
+            data-autopilot={onAutopilot ? "on" : undefined}
             className={`h-1.5 w-1.5 shrink-0 rounded-full ${
               status === "Pending answer"
                 ? "bg-red-500"
                 : status === "Working"
                   ? "bg-blue-500"
                   : "bg-gray-400"
-            }`}
+            }${onAutopilot ? " outline outline-1 outline-offset-1 outline-indigo-500" : ""}`}
           />
         );
       })}
