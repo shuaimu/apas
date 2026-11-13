@@ -85,7 +85,7 @@ Notifications SHALL use the existing preference, outbox, deduplication, and curr
 - **THEN** the next-check state updates in the worker view
 - **AND** the user does not receive a completed-task notification for each inspection
 
-### Requirement: One unattended product replaces legacy creation paths
+### Requirement: The worker flow replaces legacy creation paths
 All supported clients SHALL remove Start bot and new standalone-job creation after cutover and expose the worker flow instead. Earlier result links SHALL remain read-only. Reusable finite-job instructions and saved standalone-job drafts MAY open an unapproved conversion draft with explicit provider and recurring-budget review; bot records SHALL remain read-only without a conversion action. Old cached drafts SHALL not become approved mandates. Unsupported clients SHALL receive an upgrade-required refusal for retired unattended mutations rather than a differently interpreted operation.
 
 #### Scenario: A client sends an old Start bot request

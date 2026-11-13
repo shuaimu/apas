@@ -255,3 +255,7 @@ build and lint with zero errors and three existing warnings. These checks use
 synthetic records and a local transport fixture, not a live worker, physical
 mobile device, verifier or publisher. No deployment or job enablement was
 performed. The seven earlier operational qualification gates remain open.
+
+### Production state — 2026-11-13
+
+Server and web release `20261113T013925Z`, built at e02c0f7, has run in production since 2026-11-13 01:48 UTC. It carries this change together with the persistent-worker cutover of `unify-autonomous-workers`. Web release `20261113T193707Z` followed at 19:39 UTC. No job policy row exists and there is no worker, so admission and recurring execution stay disabled. No worker, verifier or publisher profile has been qualified, and no real job has run. The seven operational qualification gates above remain open.

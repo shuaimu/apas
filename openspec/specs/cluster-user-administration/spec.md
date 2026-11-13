@@ -3,13 +3,11 @@
 ## Purpose
 
 Defines the virtual cluster each account operates — the machines it registered and the projects hosted on them — including how cluster identity is established, what an operator may administer without project membership, and how those control-plane actions are audited. Deployment-wide administration lives in `system-administration`.
-
 ## Requirements
-
 ### Requirement: Cluster identity is server-authoritative
 Every authenticated account SHALL have exactly one account state (`active` or `suspended`) stored by the server, and authorization SHALL use the stored state rather than hard-coded emails or user IDs. Identity responses SHALL include that state. No account attribute SHALL confer deployment-wide authority: an account's authority SHALL be limited to its own virtual cluster, and deployment-wide authority SHALL exist only behind the separate system-administrator credential.
 
-#### Scenario: Active cluster user authenticates
+#### Scenario: Active account authenticates
 - **WHEN** an active account completes authentication
 - **THEN** the system returns its active state with its identity
 - **AND** server authorization uses that persisted state for subsequent requests
@@ -23,39 +21,48 @@ Every authenticated account SHALL have exactly one account state (`active` or `s
 - **THEN** the system denies the operation and grants no project or cluster access
 
 ### Requirement: Every account operates one virtual cluster
-Every account SHALL operate exactly one virtual cluster, consisting of the machines whose client registered under that account together with the projects hosted in it. A project SHALL be hosted in an account's virtual cluster when the account owns it or when at least one of its sessions was created under that account. Belonging to a project SHALL NOT place that project in the member's own cluster, and hosting a project SHALL NOT create or imply project membership. A project MAY be owned by one account while being hosted in another account's virtual cluster, and MAY be hosted in more than one virtual cluster.
+Every account SHALL own exactly one virtual cluster consisting of the machines whose clients registered under that account and the projects durably placed in it. An active account MAY also be a member of several other account-owned clusters. Project hosting SHALL be represented independently from project ownership, project membership, daemon identity, and session identity. Owning or belonging to a project SHALL NOT by itself create a hosting placement, and hosting a project SHALL NOT create project membership. A project MAY be owned by one account while hosted in another account's virtual cluster and MAY have placements in more than one virtual cluster.
 
 #### Scenario: Project owned elsewhere is hosted in my cluster
-- **WHEN** a project owned by another account has a session created under my account
-- **THEN** the project appears in my virtual cluster
-- **AND** its ownership and member list are unchanged
+- **WHEN** a cluster member creates a project on a machine in my cluster
+- **THEN** the project is durably placed in my virtual cluster
+- **AND** the member remains its project owner
 
 #### Scenario: Foreign project is not in my cluster
-- **WHEN** a project has no session created under my account and I do not own it
-- **THEN** the project is absent from my virtual cluster and from my cluster listings
-- **AND** belonging to that project does not place it in my cluster
+- **WHEN** a project has no durable placement in my virtual cluster
+- **THEN** the project is absent from my cluster listings even if I belong to it
 
 #### Scenario: Cluster inclusion is not membership
 - **WHEN** I administer a project hosted in my cluster that I do not belong to
 - **THEN** the system does not add me to the project's membership
 
+#### Scenario: Account belongs to another cluster
+- **WHEN** a cluster owner adds an account to their cluster
+- **THEN** it retains its own virtual cluster
+- **AND** gains only the member capabilities of the shared cluster
+
 ### Requirement: Cluster operators administer their own cluster from the machines surface
-The machines surface SHALL be available to every active account and SHALL present that account's own virtual cluster: its machines, its hosted projects with owner, member count, connection state, lifecycle state, and effective policy, its cluster default policy, and its cluster audit history. The surface SHALL NOT require any deployment-wide authority, and SHALL NOT expose any other account's cluster.
+The machines surface SHALL be available to every active account. For a cluster owner, it SHALL present that account's machines, every durably placed hosted project with owner, member count, connection state, lifecycle state, effective policy and usage, cluster members with their machine access and default launch profile, cluster default policy, and cluster audit history. For a cluster member, it SHALL present the shared machines its membership permits as provisioning choices and only projects and usage otherwise available through project access. Owner-only controls and unrelated projects SHALL be absent from member responses and interfaces. No cluster surface SHALL require deployment-wide authority.
 
 #### Scenario: Ordinary account opens the machines surface
-- **WHEN** an active account with no deployment-wide authority opens the machines surface
-- **THEN** the system presents its machines and the projects hosted in its virtual cluster
+- **WHEN** an active account opens the machines surface for its own cluster
+- **THEN** the system presents its machines, membership administration, and all projects durably placed in the cluster
+
+#### Scenario: Member opens a shared cluster
+- **WHEN** an active cluster member opens a cluster shared with them
+- **THEN** the system presents eligible shared machines and the member's accessible hosted projects
+- **AND** omits owner-only controls and unrelated hosted projects
 
 #### Scenario: Another cluster's project is requested
-- **WHEN** an account requests cluster details for a project outside its own virtual cluster
+- **WHEN** an account requests cluster-administration details for a project outside a cluster it owns
 - **THEN** the system denies the request
 
 #### Scenario: Suspended account opens the machines surface
-- **WHEN** a suspended account requests its cluster inventory
+- **WHEN** a suspended account requests any owned or shared cluster inventory
 - **THEN** the system denies the request
 
 ### Requirement: Cluster operators control the lifecycle of projects in their cluster
-Every project SHALL have an active or suspended administrative state. The operator of the virtual cluster hosting a project SHALL be able to suspend or reactivate that project and stop its active runtime without being a project member or owner. Suspension SHALL preserve project data and membership while denying new member attachments, client registrations, and pane or team launches for that project.
+Every project SHALL have an active or suspended administrative state. The operator of the virtual cluster hosting a project SHALL be able to suspend or reactivate that project and stop its active runtime without being a project member or owner. Suspension SHALL preserve project data and membership while denying new member attachments, client registrations, and pane launches for that project.
 
 #### Scenario: Operator suspends a hosted project
 - **WHEN** a cluster operator suspends a running project hosted in their cluster
@@ -103,3 +110,4 @@ On upgrade, every existing account SHALL become an active ordinary account whose
 - **WHEN** the deployment containing a previously configured administrator email is upgraded
 - **THEN** that account receives no deployment-wide authority
 - **AND** deployment-wide operations require the separate system-administrator credential
+

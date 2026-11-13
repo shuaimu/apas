@@ -3,9 +3,7 @@
 ## Purpose
 
 Ensures terminal panes preserve their last useful presentation and accurately communicate process state when CLI or browser transports disconnect and reconnect.
-
 ## Requirements
-
 ### Requirement: Transport loss preserves terminal presentation
 The system SHALL treat loss of the CLI transport as distinct from termination of the terminal process. When a connected terminal loses its CLI transport, the system SHALL retain its bounded in-memory scrollback and mark its lifecycle as disconnected rather than discarding its presentation or claiming that the process exited.
 
@@ -131,7 +129,7 @@ When an APAS CLI process restores a persisted OpenCode terminal pane, it SHALL s
 - **AND** it does not submit the original prompt again
 
 ### Requirement: Supported terminal runtimes survive project CLI replacement
-The project host SHALL keep live unmanaged Claude, Codex, and OpenCode terminal runtimes outside the replaceable project CLI process. A successful full CLI reboot SHALL preserve the provider process, PTY state, terminal process-instance identifier, active turn, and descendant processes, then reconnect the replacement CLI to that same runtime.
+The project host SHALL keep every live terminal runtime it can host persistently, for the Claude, Codex, OpenCode, Pi and OMP providers, outside the replaceable project CLI process. A successful full CLI reboot SHALL preserve the provider process, PTY state, terminal process-instance identifier, active turn, and descendant processes, then reconnect the replacement CLI to that same runtime.
 
 #### Scenario: CLI reboots while a terminal agent is working
 - **WHEN** a supported terminal pane is running a turn during a full project CLI reboot
@@ -218,3 +216,253 @@ If a configured terminal pane has no valid persistent runtime during CLI startup
 - **WHEN** the host cannot provide a validated persistent runtime mechanism
 - **THEN** new terminal panes remain usable through the existing CLI-owned PTY path
 - **AND** full reboot warns that those panes will restart rather than claiming preservation
+
+### Requirement: Terminal conversations surface agent questions
+
+A terminal pane's conversation history SHALL include a question the agent asks, carrying the question text and every offered option, even when the underlying turn contains no prose. A question that has been answered SHALL also carry the recorded answer. Turns that are only tool activity and ask nothing SHALL continue to be omitted.
+
+#### Scenario: Agent asks a question in a terminal pane
+
+- **WHEN** an agent in a terminal pane asks the human a question
+- **THEN** the conversation view shows that question with its options
+- **AND** shows it as awaiting an answer
+
+#### Scenario: Question is answered outside the conversation view
+
+- **WHEN** the question is answered directly in the terminal instead
+- **THEN** the conversation view shows the question with the answer that was recorded
+- **AND** no longer presents it as awaiting an answer
+
+#### Scenario: Ordinary tool activity stays out of the history
+
+- **WHEN** the agent runs a tool without asking anything
+- **THEN** that activity does not appear as a conversation turn
+
+### Requirement: A pending terminal question can be answered from the conversation view
+
+The conversation view SHALL let the human answer a pending question, and the system SHALL deliver that answer to the agent running in the pane. Delivery SHALL be reported as complete only once the agent has recorded the answer, and the recorded answer SHALL be what the view then shows. An answer that cannot be delivered SHALL leave the question pending rather than appear answered.
+
+#### Scenario: Human answers from the conversation view
+
+- **WHEN** the human selects an option for a pending question in the conversation view
+- **THEN** the system delivers that selection to the agent in that pane
+- **AND** the question settles once the agent records an answer
+- **AND** the view shows the answer the agent recorded
+
+#### Scenario: Recorded answer differs from the submitted one
+
+- **WHEN** the answer the agent records is not the option that was submitted
+- **THEN** the conversation view shows the recorded answer rather than the submitted one
+
+#### Scenario: Answer is submitted while the pane is unreachable
+
+- **WHEN** the human answers a question whose pane cannot currently be reached
+- **THEN** the system does not present the question as answered
+- **AND** the question remains answerable once the pane is reachable again
+
+### Requirement: An answered terminal question is never answered twice
+
+Once an answer has been recorded for a question, the system SHALL refuse further answers to that same question and SHALL send nothing to the pane for it. Input on behalf of an answer SHALL only ever be delivered for a question that is still pending.
+
+#### Scenario: Stale client answers an already-answered question
+
+- **WHEN** a client that has not seen the answer submits one for a question the agent already answered
+- **THEN** the system refuses the submission
+- **AND** sends nothing to the pane
+- **AND** the recorded answer is unchanged
+
+#### Scenario: The same answer arrives twice
+
+- **WHEN** an answer for a pending question is submitted more than once
+- **THEN** the agent receives the selection at most once
+
+### Requirement: A pane waiting on a question has a distinct status
+
+The application SHALL report an unresolved agent question as Pending answer rather than Working or Idle. The status SHALL remain pending while delivery is unconfirmed, and SHALL return to Working when the provider records the answer and continues the turn. Project lists, waiting-agent lists, pane selectors, and conversation status surfaces SHALL preserve this distinction. Pending answer SHALL take presentation precedence over provider availability because it names the action the human can take now.
+
+#### Scenario: Agent blocks on a question
+
+- **WHEN** a pane publishes an `AskUserQuestion` without a matching recorded answer
+- **THEN** the pane and its project are presented as Pending answer
+- **AND** the pane is not presented as actively working or ordinarily idle
+
+#### Scenario: Submitted answer is not yet recorded
+
+- **WHEN** an answer has been routed to the pane but no matching tool result has been recorded
+- **THEN** the pane remains Pending answer
+
+#### Scenario: Provider records the answer
+
+- **WHEN** the matching tool result is recorded
+- **THEN** the Pending answer state clears
+- **AND** the pane is presented as Working until the provider completes the resumed turn
+
+#### Scenario: Pending pane is visible among waiting agents
+
+- **WHEN** a running project has a pane awaiting an answer
+- **THEN** that pane appears ahead of ordinary idle and usage-limited panes in the waiting-agent list
+- **AND** its badge reads Pending answer
+
+### Requirement: OMP questions use structured native answers
+
+OMP terminal conversations SHALL expose native `ask` questions and results using the existing question-card surface. Answers SHALL preserve native question IDs, selected-option arrays, and custom text separately. The answer bridge SHALL resolve the current native dialog without sending terminal keystrokes or changing the provider to RPC mode.
+
+#### Scenario: Multiple questions with ambiguous display text
+
+- **WHEN** an OMP ask contains repeated question text, comma-containing labels, multiple selections, or a custom response
+- **THEN** the conversation view preserves each native question ID and exact answer fields
+- **AND** OMP records those values in its native tool result before the card confirms them
+
+#### Scenario: Native terminal wins the answer race
+
+- **WHEN** a question is answered in the terminal before a submitted web answer is consumed
+- **THEN** the native terminal answer wins
+- **AND** the web displays that recorded answer rather than its submitted selection
+- **AND** no answer bytes enter the provider's ordinary input
+
+#### Scenario: A question is cancelled or leaves the active branch
+
+- **WHEN** a native question is cancelled, its session changes, or its branch is abandoned
+- **THEN** the old card becomes cancelled or unavailable, not successfully answered
+- **AND** an old web submission cannot answer a newer dialog
+
+#### Scenario: Invalid or duplicate submission
+
+- **WHEN** an OMP answer has an invalid question ID, option, pane, session, or dialog generation, or repeats a settled request
+- **THEN** the system rejects it without altering native input
+- **AND** a still-valid native question remains answerable
+
+#### Scenario: CLI restore or metadata update
+
+- **WHEN** the CLI restores a pending OMP question or discovers its current answer bridge
+- **THEN** the pending card and answerability recover without replaying ordinary historical turns
+- **AND** repeated metadata does not create duplicate cards
+
+#### Scenario: Native bridge is unavailable
+
+- **WHEN** an older OMP process has no compatible loaded question bridge
+- **THEN** its captured question remains readable with terminal fallback
+- **AND** the conversation view does not claim it can submit an answer
+- **AND** deployment does not silently restart the active provider
+
+### Requirement: Claude terminal conversations follow in-TUI session switches
+
+For a Claude terminal pane, the transcript watcher SHALL follow the conversation the user is in. When the provider reports the transcript it writes, that report SHALL decide which file the watcher reads, and a changed report SHALL move the watcher at once. A search for a more recently written session file SHALL be a fallback only. It SHALL run only after the tracked file has been unchanged for two consecutive polls, SHALL look in the directory of the tracked file, SHALL NOT select a file named for the conversation of another pane that the runtime runs or that `.apas` records for any machine, and SHALL NOT select a file that has not advanced since the watch began. A file selected by the fallback SHALL NOT keep the watcher away from a reported or assigned transcript that exists. Every change of source SHALL re-baseline to the new source's end without replaying prior turns.
+
+#### Scenario: User resumes a different Claude session inside the TUI
+
+- **WHEN** a user switches to another Claude session inside a terminal pane and the provider reports the new transcript
+- **THEN** the watcher reads the reported file and later turns appear in the pane's conversation history
+- **AND** the conversation history does not replay the turns from before the switch
+
+#### Scenario: The tracked conversation is still in flight
+
+- **WHEN** the tracked file changed in size or modification time within the two most recent polls
+- **THEN** the watcher does not look for another file
+
+#### Scenario: Another pane's conversation is never adopted
+
+- **WHEN** a newer session file in the same directory is named for the conversation of another pane of the project, on this machine or on another machine that shares the home directory
+- **THEN** the watcher never switches to that file
+
+#### Scenario: A new pane has written nothing yet
+
+- **WHEN** a pane's own transcript does not exist yet and older session files are present in its directory
+- **THEN** the watcher adopts none of them unless one advances after the watch began
+
+#### Scenario: User switches back to the assigned session
+
+- **WHEN** a user resumes the pane's assigned session again inside the TUI
+- **THEN** the watcher returns to that session's file
+- **AND** the conversation history continues from its end without duplicates
+
+### Requirement: A pane's transcript is identified by what the provider reports
+
+Where a provider can report which transcript it is writing, the system SHALL use that report to identify the pane's transcript, in preference to inferring it from the pane's working directory or from an identifier the system assigned. A report SHALL be treated as the provider stating that its session changed, and SHALL re-point the pane immediately.
+
+#### Scenario: The provider moves its session
+
+- **WHEN** a provider relocates its session so that it writes somewhere other than where the pane's working directory implies
+- **THEN** the pane follows the reported location
+
+#### Scenario: The user resumes a different session
+
+- **WHEN** a user switches the pane's provider onto a different session
+- **THEN** the pane follows the transcript that session writes
+- **AND** does not continue reading the session the system originally assigned
+
+#### Scenario: Nothing has been reported
+
+- **WHEN** no report exists for a pane, because its provider is older or the report could not be made
+- **THEN** the system falls back to inferring the transcript as it did before
+- **AND** the pane is no worse off than without the mechanism
+
+#### Scenario: A report that names nothing usable
+
+- **WHEN** a report carries no usable transcript location
+- **THEN** it is ignored rather than followed
+
+### Requirement: Reporting is scoped to the system's own panes
+
+The reporting mechanism SHALL identify which pane a report belongs to, and SHALL record nothing for a provider the system did not start. Installing the mechanism SHALL NOT change any other behaviour the pane's owner has configured for that provider.
+
+#### Scenario: A provider the user started themselves
+
+- **WHEN** a person runs the provider by hand, outside the system
+- **THEN** nothing is recorded for any pane
+- **AND** that session cannot be mistaken for a pane's own
+
+#### Scenario: The owner's configuration is preserved
+
+- **WHEN** the mechanism is installed for a pane
+- **THEN** the provider still honours the settings its owner configured
+
+#### Scenario: The mechanism cannot be installed
+
+- **WHEN** the mechanism cannot be installed for a pane
+- **THEN** the pane still starts
+
+### Requirement: Pi terminal conversations are recovered from the provider's session files
+For a Pi terminal pane, the project host SHALL recover conversation turns from the session file carrying the pane's exact pinned identity. It SHALL expose real user and completed assistant text as pane conversation history, SHALL exclude thinking, tool-result, shell-execution, extension, compaction, branch-summary, label, and model bookkeeping entries, and SHALL preserve reported model, token usage, and cost when available.
+
+#### Scenario: Pane session contains conversation turns
+- **WHEN** the transcript watcher reads the session file for a Pi terminal pane
+- **THEN** it emits each real user message and each assistant text response as conversation history for that pane
+
+#### Scenario: Session contains non-conversation entries
+- **WHEN** a Pi session includes thinking blocks, tool results, shell-execution records, extension entries, compaction or branch summaries, labels, or model and thinking-level changes
+- **THEN** APAS does not expose those entries as conversation messages
+- **AND** internal data is not published as user or assistant text
+
+#### Scenario: Assistant response continues into tool use
+- **WHEN** a persisted assistant message records a tool-use continuation rather than a completed turn
+- **THEN** APAS records the assistant text but does not mark the pane idle
+- **AND** the pane leaves working state only at a provider-confirmed terminal completion
+
+#### Scenario: Completed response reports usage and cost
+- **WHEN** a completed assistant message carries model, token usage, or cost metadata
+- **THEN** APAS attributes that metadata to the owning pane
+- **AND** reports the recorded cost rather than a fabricated value when the provider supplies one
+
+#### Scenario: Multiple Pi panes share a working directory
+- **WHEN** more than one Pi terminal pane runs in the same working directory
+- **THEN** each pane's history is recovered from its own pinned session identity
+- **AND** no pane displays another pane's conversation
+
+### Requirement: Pi terminal restoration continues the exact retained session
+When an APAS CLI process restores a persisted Pi terminal pane, it SHALL start a new PTY process attached to the pane's exact retained session and SHALL NOT replay the pane's original initial instruction.
+
+#### Scenario: APAS CLI restores a Pi terminal pane
+- **WHEN** the APAS CLI restarts with a persisted Pi terminal pane whose exact session is retained
+- **THEN** it re-executes the configured Pi CLI in the pane working directory attached to that session
+- **AND** it reports the new terminal process instance through normal lifecycle reconciliation
+- **AND** it does not submit the original prompt again
+
+### Requirement: Pi structured questions are not answered from the conversation view
+APAS SHALL NOT treat a Pi tool call as an answerable question until a provider-confirmed structured question interface can be verified against the real TUI. Pi assistant text SHALL still be published normally, and APAS SHALL NOT deliver blind keystrokes to a Pi pane on behalf of a question.
+
+#### Scenario: Pi session contains a tool call the agent used to ask something
+- **WHEN** a Pi session records a tool call that is not a proven structured question interface
+- **THEN** APAS does not publish it as an answerable question card
+- **AND** does not write arbitrary keystrokes into the pane's terminal on the human's behalf
+

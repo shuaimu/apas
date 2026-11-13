@@ -130,7 +130,7 @@ The system-administration surface SHALL list every virtual cluster in the deploy
 
 ### Requirement: The system administrator controls any project's lifecycle
 
-The system administrator SHALL be able to suspend or reactivate any project in the deployment and stop any project's active runtime, regardless of which virtual cluster hosts it. Suspension SHALL preserve project data and membership while denying new member attachments, client registrations, and pane or team launches.
+The system administrator SHALL be able to suspend or reactivate any project in the deployment and stop any project's active runtime, regardless of which virtual cluster hosts it. Suspension SHALL preserve project data and membership while denying new member attachments, client registrations, and pane launches.
 
 #### Scenario: Administrator suspends a project in another cluster
 

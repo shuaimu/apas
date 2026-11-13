@@ -169,3 +169,7 @@ evidence for an execution profile.
 No production deployment, policy enablement, real-worker approval or archive was
 performed. Continue the four open tasks only in the separately authorized
 operational environment.
+
+### Production state — 2026-11-13
+
+The persistent-worker cutover reached production with server and web release `20261113T013925Z`, built at e02c0f7, at 01:48 UTC on 2026-11-13. Web release `20261113T193707Z` followed at 19:39 UTC. No job policy row exists and there is no worker, so recurring execution stays disabled. No policy was enabled, no real worker was approved and no execution profile was qualified. The four open tasks above remain open. Task 8.6 of `add-omp-tab-autopilot` was applied here on the same day: the proposal gained the section "Applicability after `add-omp-tab-autopilot`" and one requirement in `autonomous-worker-surfaces` was retitled "The worker flow replaces legacy creation paths".

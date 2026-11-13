@@ -32,7 +32,7 @@ Transport recovery SHALL NOT be exposed as a user-facing control. It is plumbing
 - **AND** the interface does not substitute a full reboot for connection recovery
 
 ### Requirement: Full CLI reboot remains a distinct operation
-The system SHALL retain a separate full CLI reboot operation for installing or activating a new APAS binary. Before starting it, the interface SHALL explain which live pane kinds the connected CLI can preserve and which pane kinds will restart or resume. A full reboot SHALL NOT be presented as the normal remedy for a transport-only problem.
+The system SHALL retain a separate full CLI reboot operation for installing or activating a new APAS binary. A full CLI reboot replaces the resident instance of the machine it is sent to, so every project that instance runs is started again with it, as `host-supervision` defines. Before starting it, the interface SHALL explain which live pane kinds the connected CLI can preserve and which pane kinds will restart or resume. A full reboot SHALL NOT be presented as the normal remedy for a transport-only problem.
 
 #### Scenario: Project supports persistent terminal adoption
 - **WHEN** a user initiates a full CLI reboot for a project whose terminal runtimes can be adopted
@@ -63,7 +63,7 @@ Reboot operations SHALL be correlated to one project and one request identifier.
 - **AND** the system does not claim that terminal adoption succeeded
 
 ### Requirement: Lifecycle controls are authorized and rollout-compatible
-The server SHALL authorize each lifecycle request against current project access and route it only to the requested project's owning CLI. New controls SHALL be capability-gated so mixed-version participants fail safely without disconnecting compatible sessions.
+The server SHALL authorize each lifecycle request against current project access and route it only to the requested project's instance on the machine the request names, or to its primary instance when it names none. New controls SHALL be capability-gated so mixed-version participants fail safely without disconnecting compatible sessions.
 
 #### Scenario: User lacks current project access
 - **WHEN** a non-member or user whose membership was revoked requests a reboot
@@ -73,4 +73,4 @@ The server SHALL authorize each lifecycle request against current project access
 #### Scenario: Request targets another project
 - **WHEN** a lifecycle request carries a stale or mismatched project session identifier
 - **THEN** the server rejects or routes it only after resolving current project ownership and attachment
-- **AND** no other project's transport or processes are affected
+- **AND** a rejected request affects no project's transport or processes

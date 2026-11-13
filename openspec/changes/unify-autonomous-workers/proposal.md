@@ -31,3 +31,11 @@ Affects shared Rust/protocol contracts; server job storage, scheduling, policy, 
 This is a successor to `add-autonomous-jobs`, not a claim that its seven remaining operational gates are complete. Its implementation/history remain intact; this change supersedes its task-only product/admission boundary for worker-originated execution while preserving its containment and delivery guarantees. Reconcile that explicit dependency before either change's final spec synchronization/archive. The parallel `run-project-tabs-across-machines` proposal does not grant worker failover or change worker identity.
 
 This proposal neither implements nor deploys the feature, enables recurring spend, restarts providers, nor introduces managed teams, automatic merge, arbitrary external issue integrations, or additional worker providers beyond the qualified OMP execution backend.
+
+## Applicability after `add-omp-tab-autopilot`
+
+This change's "one unattended product" position covers contained, approved, recurring work: a worker with a mandate, a budget, independent verification and draft-PR publication. Since `add-omp-tab-autopilot` (deployed and archived on 2026-11-13), a person can also leave one interactive OMP terminal tab repeating a prompt on autopilot, under that change's requirements in `omp-tab-autopilot`.
+
+Autopilot is not a worker and not the bot restored. It shares no job, policy, ledger, verifier, publisher or wire type with this change and satisfies none of its gates. The binding statements here still hold: Start bot stays removed, no legacy path starts a loop, a bot pane cannot be put on autopilot, and no terminal is adopted as a worker.
+
+The requirement formerly titled "One unattended product replaces legacy creation paths" in `autonomous-worker-surfaces` is now titled "The worker flow replaces legacy creation paths". Its text is unchanged. The owner agreed to both edits on 2026-11-13.
