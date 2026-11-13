@@ -43,24 +43,32 @@ person ends up believing a tab was sandboxed.
   project state, and repeating a slash command; the design lists it.
 - Pause, Resume, Stop and Stop now work from the desktop web and the mobile
   browser. A request is answered as accepted, refused or not confirmed. The
-  displayed state changes only when the tab reports it, and a request is never
-  resent. A stop that was not confirmed still applies when the tab next reads
-  its requests; a start that was not confirmed never applies later.
-- Interrupting a turn in the terminal (Esc) pauses autopilot, as it pauses
-  OMP's own loop. Without this rule the prompt would come back five seconds
-  later.
+  displayed state changes only when the tab reports it, or when its machine
+  reports that the tab's agent process exited, and a request is never resent.
+  A stop that was not confirmed still applies when the tab next reads its
+  requests, unless its agent is restarted first, and then autopilot comes
+  back paused anyway. A start is never left pending: the tab takes it within
+  a few seconds or never, and one it did not take is answered as refused.
+- An interrupt in the terminal pauses autopilot. Esc during a turn does, as
+  it pauses OMP's own loop. So does Esc that cancels a retry the agent is
+  waiting to make, and Esc that ends a wait for background work, once that
+  work has finished. Killing the work a turn was waiting for pauses autopilot
+  too, because the tab cannot tell the two apart. Without this rule the
+  prompt would come back seconds later.
 - Autopilot state is its own attribute of a tab, beside Working, Pending answer
   and Idle. A tab waiting for its next iteration is not listed as an idle tab,
   and a paused or ended autopilot says why.
 - Only the account that hosts a tab can start or resume its autopilot through
   APAS. On a shared machine that is the machine's owner, also for a project a
-  cluster member created there. Anyone who may type into the tab can pause or
-  stop it.
+  cluster member created there, and the owner can do it only for a project
+  that has been shared with them. Anyone who may type into the tab can pause
+  or stop it.
 - Autopilot starts no new iteration without its controller. It holds once the
   tab's APAS process has been absent for a minute or its machine has been off
-  the server for ten minutes. It continues when contact returns within an
-  hour and pauses after that. It comes back paused after the agent process
-  restarts, and it ends when the tab is switched to another conversation.
+  the server for ten minutes, whether or not an iteration is due then. It
+  continues when that hold ends within an hour and pauses once the hold has
+  lasted an hour. It comes back paused after the agent process restarts, and
+  it ends when the tab is switched to another conversation.
 - Iterations are recorded as autopilot's, not as the person's messages.
 - Three consecutive failed iterations pause autopilot instead of retrying
   without end. Reaching the login's usage limit therefore pauses a
@@ -75,10 +83,12 @@ person ends up believing a tab was sandboxed.
   listed or offered as a worker, and legacy bot history stays read-only. A
   retired bot is not converted: its owner recreates it by hand on an OMP tab.
 - Autopilot is offered only where the server, the tab's machine, the tab's own
-  agent process and its OMP version (18.18.2 or later) support it. A machine
-  gains it when its daemon is rebooted to update. A tab started earlier needs
-  an agent reboot, which ends that tab's turn in progress and is never done
-  automatically. Older clients are unaffected.
+  agent process and its OMP version support it. The OMP version must be at
+  least 18.18.2; the first task group finds the real minimum. A machine gains
+  autopilot when its daemon is rebooted to update. A tab started earlier
+  needs an agent reboot, which ends that tab's turn in progress and is never
+  done automatically. Older clients receive no new frame. They show each
+  iteration as a generic tool entry and cannot see or stop the autopilot.
 - The pane toolbar stops showing Interrupt on terminal tabs. The button has
   never had an effect there, and it would now sit beside the autopilot
   control.
@@ -118,8 +128,9 @@ person ends up believing a tab was sandboxed.
 - **CLI:** the OMP extension gains the loop, its limits, interrupt handling,
   two request files, a state report and the journal entries that survive a
   restart. The CLI gains the exchange with it, a controller heartbeat written
-  by its own thread with real connection state, the state relay, a feature
-  marker in the tab's launch record, and the transcript handling that marks
+  by its own thread with real connection state, the state relay, the pause
+  it reports itself after an agent process has exited, a feature marker in
+  the tab's launch record, and the transcript handling that marks
   iterations. The extension's JavaScript tests join a real gate.
 - **Server:** authorization and routing of the requests to the tab's own
   machine, a cached per-tab state with the same pruning as pane status, the
@@ -131,10 +142,14 @@ person ends up believing a tab was sandboxed.
   notice and details.
 - **Documentation:** `AGENTS.md` gains the autopilot section, and several of
   its existing sentences become incomplete and are corrected. The unarchived
-  worker change needs a reconciliation note, with its owner's agreement.
+  worker change needs a reconciliation note and, with its owner's agreement,
+  the retitle of one of its requirements; if that change is archived first,
+  a RENAMED delta on `autonomous-worker-surfaces` is added here.
 - **Depends on:** the worker cutover (e02c0f7) and multi-machine tabs
-  (`run-project-tabs-across-machines`), both committed and neither deployed.
-  Nothing here deploys, enables a policy or restarts a running agent.
+  (`run-project-tabs-across-machines`). Both have run on the production
+  server and web since 2026-11-13, and their CLI is published; a machine
+  takes it at its next daemon reboot. Nothing here deploys, enables a policy
+  or restarts a running agent.
 - **Should land first, as its own change:** a repair of the OMP question
   bridge. Since OMP 18.18.3 the `ask` tool sends one HTML form, which APAS's
   question bridge does not recognise, so question cards and remote answers for
