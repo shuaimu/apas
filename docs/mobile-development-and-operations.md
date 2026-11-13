@@ -121,78 +121,95 @@ Enable in this order after each acceptance gate: `bootstrap` (read-only),
 flag is the first rollback action. Protocol negotiation also advertises bounds
 and capabilities; incompatible apps remain read-only.
 
-## Autonomous jobs and native qualification
+## Autonomous workers and native qualification
 
-Jobs/Attention is separate from the interactive session home. Protected native
-composer, detail, all-question, cancellation and retained-review screens resolve
-`/code/jobs/...` links to the exact authorized job; they never attach an unrelated
-session or embed the web job UI. An in-app Attention inbox does not require push
-permission.
+Workers/Attention is separate from the interactive session home. Native
+`/code/workers/...` screens cover approved responsibilities, standing checklists,
+backlog editing, recurring/per-run budgets, lifecycle requests and exact-run
+questions/review. They use canonical protocol contracts, not a WebView.
+Worker/run/question identities remain exact across cold links and reconnect;
+an older review never opens the newest candidate instead. Attention does not
+require push permission.
 
 The responsive **web** project screen has its own `+` → Interactive agent /
-Autonomous agent chooser and embedded job tabs. Its project-fixed composer,
-question and review views reuse the web job components. A visible **Overview**
-lists autonomous jobs with full expandable descriptions, confirmed status, host
-and update time; hidden/completed jobs remain reachable through bounded paging.
-Selecting or hiding a view never closes an interactive terminal or cancels
-execution, and stale cached status is labeled. Global web Jobs/Attention remain
-cross-project views. This integration is not
-a change to the native stack or evidence that native device gates have passed.
+Autonomous worker chooser and embedded worker views. **Overview** is present
+with zero interactive panes. Responsibilities, project history, backlog and runs
+use bounded pagination rather than treating a loaded page as a total. Selecting
+or hiding a worker does not unmount an interactive terminal or change execution.
+Global Workers/Attention remain cross-project views.
 
-Host provisioning, pinned images, scoped credentials, finite allowances,
-retention and stop/recovery rules are canonical in `AGENTS.md`, under
-**Autonomous jobs: deployment remains qualification-gated**. There is no
-qualified image/profile to enable yet. Do not infer qualification from the OMP
-18.18.0 source pin, container metadata, unit tests or Android export.
+`/code/jobs/...` is read-only Earlier results. A safely stopped finite job or
+saved standalone draft can prefill a fresh worker proposal; admission still
+requires a new preview and approval. Old bot prompt/provider/cadence/history is
+read-only and cannot be converted or restarted. No migration creates a grant or
+restarts an unrelated pane.
 
-The additive bootstrap `autonomous_jobs` field advertises server support;
-effective policy and fresh machine readiness decide whether a target is usable.
-Admission defaults disabled and project content visibility alone is not compute
-authority. Existing `bootstrap` and `coding_mutations` gates remain in force;
-notifications and deep links require their own existing flags. No mobile flag
-can widen the deployment/cluster/project job policy. Show unavailability rather
-than falling back to an interactive pane or replaying a mutation.
+Host provisioning, pinned images, scoped credentials, recurring accounting,
+structured results, retention and recovery remain canonical in `AGENTS.md`,
+under **Autonomous workers: deployment remains qualification-gated**. No
+recurring execution profile has been qualified. OMP 18.18.0 source pins,
+container metadata, unit tests and Android export are not qualification.
 
-Composer/answer drafts and request identities are persisted in SQLCipher before
-submission. Event bytes and the applied cursor commit together. Foreground,
-network recovery and receipt resolution recheck authority; reconnect does not
-automatically resend prompts, answers or cancellation. Unknown outcomes stay
-visible until the actor-scoped receipt resolves them. Recommendations in a
-multi-question dialog are not preselected consent.
+The additive `autonomous_workers` bootstrap and `autonomous_workers_v1`
+capability advertise worker-aware client support. New execution requires
+`omp_persistent_worker_v1`, protocol v2 and current profile/bootstrap evidence.
+Effective recurring policy and fresh machine readiness decide target usability.
+Finite-job policy alone never enables recurrence; deployment, cluster and
+project controls narrow the same allowance. Existing bootstrap,
+coding-mutations, notifications and deep-link flags still apply, and none can
+widen compute authority. Unavailable targets remain unavailable rather than
+falling back to an interactive pane.
 
-Account changes, logout and discovered project revocation purge protected job
-records and in-memory/download caches. Offline devices cannot discover a new
-revocation until they reconnect. Revoking one device session invalidates that
-device's credentials, not an otherwise authorized account's running jobs;
-account/runtime-grant revocation is the separate execution-stop path.
+Composer/backlog/answer drafts and request identities are persisted in SQLCipher
+before submission; event bytes and the applied cursor commit together.
+Foreground, reconnect and receipt resolution recheck authority. Reconnect never
+automatically resends approval, prompts, answers or controls. Unknown outcomes
+remain visible until the original actor-scoped receipt resolves them. Offline
+snapshots are stale and controls are read-only. Recommended question choices
+are not preselected consent.
 
-Notifications carry privacy-safe job/question identities, not task text, answers
-or diffs. Cold-start and foreground routing first reauthenticate and authorize
-the exact target. Stale, answered or inaccessible questions must stay
-read-only or return to the nearest authorized Code screen, never trigger an
-answer or select another session.
+**Pause after this run** fences new dispatch; **Stop now** also requests complete
+termination and fences publication. Neither accepted receipt proves execution
+has stopped. Resume retains consumed allowance and item attempts; an explicit
+item retry is distinct from resuming a worker. Idle and review-wait retain the
+responsibility without a provider process. Inspection completion is not a
+delivered change.
 
-Before enabling jobs for mobile users, run **both iOS and Android development
-builds** through creation, every question in a multi-question form, cancellation,
-retained diff/check/log review and draft-PR handoff. Include interrupted replies,
+Account changes, logout and discovered revocation purge worker/job records and
+in-memory/download caches. An offline device cannot discover revocation until
+reconnect. Revoking a device invalidates that device's credentials, not an
+otherwise authorized account's worker; account/runtime-grant revocation is the
+separate stop path.
+
+Notifications use privacy-safe worker/run/question identities, never task text,
+answers or diffs. Decisions, failures/recovery and draft review are actionable;
+routine inspection/wakeup completion is not notification-worthy. Routing first
+reauthenticates and authorizes the exact target. Stale or inaccessible questions
+remain read-only or return to the nearest authorized Code screen, never answer
+automatically or attach another session.
+
+Before enabling, run **both iOS and Android development builds** through mandate
+approval/replacement, backlog editing, every question, pause/stop/resume, retained
+checks/diff/log review and draft-PR handoff. Include lost responses,
 offline/background/reconnect, stale/cold notification links, account switching,
-revoked access, 320dp layouts, 48dp targets, keyboard/safe areas, enlarged text and
-VoiceOver/TalkBack. Verify visible focus and exact answer confirmation, and that
-unknown/expired verification cannot appear as a passing check.
+revocation, 320dp layouts, 48dp targets, keyboard/safe areas, enlarged text and
+VoiceOver/TalkBack. Unknown/expired verification must never appear as passing.
 
-On 2026-11-08, native lint, TypeScript and 81 tests passed, as did Android
-Hermes export. No native device or emulator was available, so **none of the
-device interaction gates above is claimed complete**. Chromium viewport and
-zoom emulation do not substitute for a real mobile keyboard, safe area or screen
-reader. The local web/API smoke used explicitly synthetic retained job data;
-no model-driven job or real PR was executed.
+Local successor checks passed native lint, TypeScript and all **136 tests**,
+plus Android Hermes export. No native device/emulator was available; **device
+interaction qualification remains open**. Desktop Chromium viewport emulation
+does not qualify mobile keyboards, zoom/safe areas or screen readers. Local
+browser/API checks use explicitly synthetic retained records, not actual
+qualified OMP execution, independent verification or real PR publication.
 
-Roll out the job-aware server first, web/native clients second and daemon/CLI
-last, with admission disabled until qualification succeeds. To roll back,
-disable admission and affected mobile flags, keep capable controllers until
-whole-unit termination and required host purges are confirmed, and preserve
-durable receipts/journals/evidence before installing older binaries. An
-unreachable host must remain pending cleanup, not become a successful deletion.
+Roll out server/shared protocol first, web/native clients second, CLI/daemon
+last, with recurrence and host execution disabled until qualification. Drain
+known-live legacy runtimes before enabling and separately approve new workers.
+For rollback, disable new admission and affected mobile flags, retain capable
+controllers until whole-unit termination and every required host purge is
+confirmed, and preserve durable receipts/journals/evidence before downgrading.
+An unreachable host stays pending cleanup. Deployment, policy enablement and
+real-worker approval require separate authorization.
 
 ## Device-session administration
 

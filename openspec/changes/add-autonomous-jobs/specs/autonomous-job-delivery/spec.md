@@ -2,6 +2,13 @@
 
 Ensure autonomous job results are independently checked, tied to immutable candidate content and delivered as reviewable draft pull requests without granting the coding worker publishing or merge authority.
 
+After persistent-worker cutover, these delivery requirements apply to
+implementation executions with an accepted `candidate_ready` result. Successful
+read-only inspections and implementation `no_change`/`blocked` results never
+enter this pipeline. The worker's one-unresolved-draft and external-review
+continuation rules add constraints; they do not weaken candidate verification or
+permit automatic merge. Historical finite-job evidence remains readable.
+
 ## ADDED Requirements
 
 ### Requirement: Candidate content is frozen and complete before verification

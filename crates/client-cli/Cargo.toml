@@ -70,11 +70,6 @@ sha2 = "0.10"
 # Home directory detection
 dirs = "5.0"
 
-# File-change watcher for event-driven deadloop wake-ups (replaces the
-# pure sleep between iterations so panes wake on team-todo.md /
-# .apas-team.jsonl / project_goal.md edits instead of paying tokens
-# every cycle just to confirm "nothing changed").
-notify = "6"
 
 # Pty host for `PaneKind::Terminal` panes, which run the provider's real
 # interactive TUI instead of the headless stream-json worker. wezterm's

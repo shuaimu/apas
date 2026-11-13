@@ -40,7 +40,8 @@ fn validate_policy(policy: &mut JobPolicy) -> Result<()> {
             && policy.max_active_project > 0
             && policy.max_active_machine > 0
             && policy.max_active_cluster > 0
-            && policy.max_queued_project > 0,
+            && policy.max_queued_project > 0
+            && policy.recurring.is_finite_positive(),
         "job_policy_invalid: finite positive ceilings required"
     );
     Ok(())
@@ -69,7 +70,11 @@ fn normalize_override(policy: &mut JobPolicyOverride) -> Result<()> {
                 policy.max_queued_project
             ]
             .iter()
-            .all(|v| v.is_none_or(|n| n > 0)),
+            .all(|v| v.is_none_or(|n| n > 0))
+            && policy
+                .recurring
+                .as_ref()
+                .is_none_or(|value| value.is_finite_positive()),
         "job_policy_invalid: finite positive ceilings required"
     );
     Ok(())
@@ -108,6 +113,9 @@ fn narrow(policy: &mut JobPolicy, value: &JobPolicyOverride) {
     }
     if let Some(n) = value.max_queued_project {
         policy.max_queued_project = policy.max_queued_project.min(n);
+    }
+    if let Some(recurring) = &value.recurring {
+        policy.recurring = policy.recurring.narrowed_by(recurring);
     }
 }
 
@@ -150,6 +158,13 @@ fn ensure_narrows(value: &JobPolicyOverride, bound: &JobPolicy) -> Result<()> {
             "job policy concurrency exceeds inherited policy"
         );
     }
+    anyhow::ensure!(
+        value
+            .recurring
+            .as_ref()
+            .is_none_or(|value| value.fits_within(&bound.recurring)),
+        "recurring worker policy exceeds inherited policy"
+    );
     Ok(())
 }
 

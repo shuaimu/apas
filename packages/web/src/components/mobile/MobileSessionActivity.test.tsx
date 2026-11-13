@@ -202,6 +202,76 @@ describe("MobileSessionActivity", () => {
     expect(overview.getAttribute("aria-pressed")).toBe("false");
   });
 
+  it("keeps the raw terminal mounted while visiting the worker Overview and returning", async () => {
+    const actions = seedStore({
+      paneConfigs: [pane({ pane_id: 9, kind: "terminal", label: "Retained TTY" })],
+      paneMessages: { "9": [] }, projectPolicies: {},
+    });
+    renderActivity();
+    fireEvent.click(screen.getByRole("button", { name: "More actions" }));
+    fireEvent.click(screen.getByRole("button", { name: "Open raw terminal" }));
+    const terminal = await screen.findByText("Raw terminal pane 9");
+    fireEvent.click(screen.getByRole("button", { name: "Project overview" }));
+    expect(screen.getByText("Raw terminal pane 9")).toBe(terminal);
+    expect(terminal.closest("[hidden]")).not.toBeNull();
+    expect(screen.getByRole("region", { name: "Interactive project" })).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Back to interactive agents" }));
+    expect(screen.getByText("Raw terminal pane 9")).toBe(terminal);
+    expect(useStore.getState().sessionId).toBe("session-a");
+    expect(actions.addPane).not.toHaveBeenCalled();
+    expect(actions.removePane).not.toHaveBeenCalled();
+    expect(actions.rebootPane).not.toHaveBeenCalled();
+    expect(actions.sendTerminalInput).not.toHaveBeenCalled();
+  });
+
+  it("hides the previous terminal when selecting read-only bot history without destroying it", async () => {
+    const actions = seedStore({
+      paneConfigs: [
+        pane({ pane_id: 9, kind: "terminal", label: "Retained TTY" }),
+        pane({ pane_id: 3, mode: "deadloop", label: "Earlier bot" }),
+      ],
+      paneMessages: { "9": [], "3": [] },
+    });
+    renderActivity();
+    fireEvent.click(screen.getByRole("button", { name: "Retained TTY" }));
+    fireEvent.click(screen.getByRole("button", { name: "More actions" }));
+    fireEvent.click(screen.getByRole("button", { name: "Open raw terminal" }));
+    const terminal = await screen.findByText("Raw terminal pane 9");
+
+    fireEvent.click(screen.getByRole("button", { name: "Earlier bot" }));
+    expect(screen.queryByRole("region", { name: "Mobile terminal" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Send Enter" })).toBeNull();
+    expect(screen.getByPlaceholderText("Legacy bot history is read-only")).toHaveProperty("disabled", true);
+    expect(terminal.isConnected).toBe(true);
+    expect(actions.sendTerminalInput).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByRole("button", { name: "Retained TTY" }));
+    expect(screen.getByRole("region", { name: "Mobile terminal" })).toBeTruthy();
+    expect(screen.getByText("Raw terminal pane 9")).toBe(terminal);
+  });
+
+  it("keeps an empty pane roster in the mobile worker Overview", () => {
+    const actions = seedStore({ paneConfigs: [], paneMessages: {}, paneListReceived: true, projectPolicies: {} });
+    renderActivity();
+    fireEvent.click(screen.getByRole("button", { name: "Project overview" }));
+    expect(screen.getByText(/No interactive panes/)).toBeTruthy();
+    expect(useStore.getState().paneConfigs).toEqual([]);
+    expect(actions.addPane).not.toHaveBeenCalled();
+    expect(useStore.getState().sessionId).toBe("session-a");
+  });
+
+  it("retains legacy bot instructions without offering bot sends or steering", () => {
+    const actions = seedStore({ paneConfigs: [pane({ pane_id: 3, mode: "deadloop", prompt: "Original bot responsibility" })] });
+    renderActivity();
+    expect(screen.getByPlaceholderText("Legacy bot history is read-only")).toHaveProperty("disabled", true);
+    fireEvent.click(screen.getByText("Earlier bot instructions"));
+    expect(screen.getByText("Original bot responsibility")).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Draft autonomous worker from this bot" })).toBeNull();
+    expect(screen.queryByRole("button", { name: /^(Start Bot|Stop Bot|Force Stop)$/ })).toBeNull();
+    expect(actions.sendMessageToPane).not.toHaveBeenCalled();
+    expect(actions.sendTerminalInput).not.toHaveBeenCalled();
+  });
+
   it("answers native OMP questions from the mobile pane and settles from the recorded result without a duplicate result card", () => {
     const sent: Record<string, unknown>[] = [];
     seedStore({

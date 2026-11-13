@@ -3,6 +3,12 @@
 ### Requirement: Autonomous jobs have independent default-deny policy
 The system SHALL govern autonomous jobs through a separately typed policy, disabled when deployment enablement is absent, false or malformed. Job policy SHALL define allowed worker/model, sandbox and verification profiles, draft-publication permission, finite resource/time/spend/attempt ceilings and concurrency bounds. Existing terminal launch permissions, team compatibility fields, managed flags and legacy automatic-approval or auto-merge flags SHALL NOT enable jobs. Existing policy administration authority SHALL remain unchanged.
 
+Persistent-worker activation SHALL also require the independently default-denied
+recurring policy from `unify-autonomous-workers`. The finite enablement above
+alone SHALL NOT grant recurrence. Rolling ceilings narrow by minimum,
+minimum inspection cadence narrows by maximum, and every hosting placement
+participates in the same policy/source-revision digest.
+
 #### Scenario: Existing deployment upgrades
 - **WHEN** existing configuration and projects contain no autonomous-job policy
 - **THEN** no autonomous job can start until explicitly enabled and provisioned

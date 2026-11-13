@@ -1,8 +1,10 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { validateJobContract } from "@apas/protocol";
-import type { JobLimits, JobPolicy, JobPolicyManagement } from "@apas/protocol";
+import type { JobLimits, JobPolicy, JobPolicyManagement, JobPolicyOverride, RecurringWorkerPolicy } from "@apas/protocol";
+import { useStore } from "@/lib/store";
+import { onWorkerCachePurge, workerCacheRevision } from "@/lib/workerCache";
 
 type PolicyRequest = <T>(path: string, init?: RequestInit) => Promise<T>;
 type Props = {
@@ -30,6 +32,12 @@ const capacityFields = [
   { key: "max_active_cluster", label: "Concurrent runs per cluster" },
   { key: "max_queued_project", label: "Queued jobs per project" },
 ] as const;
+const recurringFields: { key: Exclude<keyof RecurringWorkerPolicy, "enabled">; label: string }[] = [
+  { key: "max_elapsed_seconds_24h", label: "Rolling 24-hour elapsed allowance (seconds)" },
+  { key: "max_spend_micro_usd_24h", label: "Rolling 24-hour reported spend (micro-USD)" },
+  { key: "max_runs_24h", label: "Maximum runs per rolling 24 hours" },
+  { key: "min_interval_seconds", label: "Minimum inspection interval (seconds)" },
+];
 const profileFields = [
   { key: "worker_profiles", label: "Worker profile keys" },
   { key: "model_profiles", label: "Model profile keys" },
@@ -45,30 +53,43 @@ function policyDocument(value: unknown): JobPolicyManagement {
 }
 
 export function AutonomousJobPolicyEditor({ title, endpoint, deployment = false, request }: Props) {
-  const [document, setDocument] = useState<JobPolicyManagement | null>(null);
+  const account = useStore((state) => state.userId);
+  const generation = useRef(0);
+  const [loaded, setLoaded] = useState<{ document: JobPolicyManagement; account: string | null; revision: number; endpoint: string } | null>(null);
+  const document = loaded && loaded.account === account && loaded.endpoint === endpoint && loaded.revision === workerCacheRevision() ? loaded.document : null;
   const [error, setError] = useState("");
   const [refresh, setRefresh] = useState(0);
   const [notice, setNotice] = useState("");
 
+  useEffect(() => onWorkerCachePurge(() => {
+    generation.current++;
+    setLoaded(null);
+    setNotice("");
+    setError("Access changed. Reload to check current policy authority.");
+  }), []);
   useEffect(() => {
     const controller = new AbortController();
-    setDocument(null);
+    const current = ++generation.current;
+    const revision = workerCacheRevision();
+    const valid = () => !controller.signal.aborted && current === generation.current
+      && revision === workerCacheRevision() && useStore.getState().userId === account;
+    setLoaded(null);
     setError("");
     void request<unknown>(endpoint, { signal: controller.signal })
       .then(policyDocument)
-      .then((value) => { if (!controller.signal.aborted) setDocument(value); })
+      .then((value) => { if (valid()) setLoaded({ document: value, account, revision, endpoint }); })
       .catch((cause) => {
-        if (!controller.signal.aborted) setError(cause instanceof Error ? cause.message : "Cannot load job policy.");
+        if (valid()) setError(cause instanceof Error ? cause.message : "Cannot load job policy.");
       });
-    return () => controller.abort();
-  }, [endpoint, request, refresh]);
+    return () => { controller.abort(); generation.current++; };
+  }, [endpoint, request, refresh, account]);
 
   return (
     <section className="min-w-0 space-y-3 rounded-xl border border-gray-200 bg-white p-4 dark:border-gray-800 dark:bg-gray-900">
       <h2 className="font-semibold">{title}</h2>
       <p className="text-sm text-gray-600 dark:text-gray-300">
-        Autonomous jobs are separate from terminal panes. Policies only narrow deployment and hosting-cluster bounds;
-        a profile also needs a qualified, ready host. No job starts when policy or readiness is unresolved.
+        Autonomous workers are separate from terminal panes. Recurring permission is independently default denied.
+        Policies only narrow deployment and hosting-cluster bounds; permission never substitutes for a qualified, ready host.
       </p>
       {notice && <p role="status" className="text-sm">{notice}</p>}
       {error ? <div role="alert" className="space-y-2 text-sm text-red-700 dark:text-red-300">
@@ -89,8 +110,12 @@ export function AutonomousJobPolicyEditor({ title, endpoint, deployment = false,
           document={document}
           deployment={deployment}
           save={async (value) => {
+            const current = generation.current;
+            const revision = workerCacheRevision();
+            if (!document || loaded?.revision !== revision || loaded.account !== useStore.getState().userId) throw new Error("Policy authority changed. Reload before saving.");
             policyDocument(await request<unknown>(endpoint, { method: "PUT", body: JSON.stringify(value) }));
-            setNotice("Autonomous job policy saved. Existing and queued jobs are re-authorized by the server.");
+            if (current !== generation.current || revision !== workerCacheRevision() || useStore.getState().userId !== account) return;
+            setNotice("Autonomous worker policy saved. Existing and queued work is re-authorized by the server.");
             setRefresh((current) => current + 1);
           }}
         /> : <p className="text-sm text-gray-600 dark:text-gray-300">Your current authority permits viewing this policy, not changing it.</p>}
@@ -102,7 +127,7 @@ export function AutonomousJobPolicyEditor({ title, endpoint, deployment = false,
 function PolicyForm({ document, deployment, save }: {
   document: JobPolicyManagement;
   deployment: boolean;
-  save: (value: JobPolicy | Record<string, never>) => Promise<void>;
+  save: (value: JobPolicy | JobPolicyOverride | Record<string, never>) => Promise<void>;
 }) {
   const seed = document.effective?.policy ?? document.inherited?.policy;
   const [enabled, setEnabled] = useState(seed?.enabled ?? false);
@@ -112,6 +137,12 @@ function PolicyForm({ document, deployment, save }: {
     ...limitFields.map(({ key }) => [key, String(seed?.limits[key] ?? "")]),
     ...capacityFields.map(({ key }) => [key, String(seed?.[key] ?? "")]),
   ]));
+  const requestedRecurring = document.requested?.recurring;
+  const recurringSeed = requestedRecurring ?? seed?.recurring;
+  const [overrideRecurring, setOverrideRecurring] = useState(deployment || requestedRecurring != null);
+  const [recurringEnabled, setRecurringEnabled] = useState(recurringSeed?.enabled ?? false);
+  const [recurringNumbers, setRecurringNumbers] = useState<Record<string, string>>(() =>
+    Object.fromEntries(recurringFields.map(({ key }) => [key, String(recurringSeed?.[key] ?? "")])));
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
 
@@ -124,8 +155,8 @@ function PolicyForm({ document, deployment, save }: {
         await save({});
         return;
       }
-      const number = (key: string) => {
-        const text = numbers[key]?.trim() ?? "";
+      const number = (key: string, values = numbers) => {
+        const text = values[key]?.trim() ?? "";
         const value = Number(text);
         const minimum = 1;
         if (!/^\d+$/.test(text) || !Number.isSafeInteger(value) || value < minimum) {
@@ -134,7 +165,7 @@ function PolicyForm({ document, deployment, save }: {
         return value;
       };
       const profileKeys = (key: string) => [...new Set(profiles[key].split(/[\s,]+/).filter(Boolean))];
-      const policy: JobPolicy = {
+      const policy: JobPolicy | JobPolicyOverride = {
         enabled,
         publish_enabled: publish,
         worker_profiles: profileKeys("worker_profiles"),
@@ -145,6 +176,13 @@ function PolicyForm({ document, deployment, save }: {
         max_active_machine: number("max_active_machine"),
         max_active_cluster: number("max_active_cluster"),
         max_queued_project: number("max_queued_project"),
+        ...(overrideRecurring ? { recurring: {
+          enabled: recurringEnabled,
+          max_elapsed_seconds_24h: number("max_elapsed_seconds_24h", recurringNumbers),
+          max_spend_micro_usd_24h: number("max_spend_micro_usd_24h", recurringNumbers),
+          max_runs_24h: number("max_runs_24h", recurringNumbers),
+          min_interval_seconds: number("min_interval_seconds", recurringNumbers),
+        } } : {}),
       };
       if (!validateJobContract(deployment ? "deployment_policy" : "policy_override", policy).valid) {
         throw new Error("These values do not satisfy the autonomous job policy contract.");
@@ -167,6 +205,16 @@ function PolicyForm({ document, deployment, save }: {
         {profileFields.map(({ key, label }) => <label key={key} className="min-w-0 space-y-1 text-sm"><span>{label}</span><input className={inputClass} value={profiles[key]} onChange={(event) => setProfiles((current) => ({ ...current, [key]: event.target.value }))} /></label>)}
         {[...limitFields, ...capacityFields].map(({ key, label }) => <label key={key} className="min-w-0 space-y-1 text-sm"><span>{label}</span><input required inputMode="numeric" pattern="[0-9]+" className={inputClass} value={numbers[key]} onChange={(event) => setNumbers((current) => ({ ...current, [key]: event.target.value }))} /></label>)}
       </div>
+      <fieldset className="min-w-0 space-y-3">
+        <legend>Recurring autonomous workers</legend>
+        {!deployment && <label className="flex min-h-11 items-center gap-3 text-sm"><input type="checkbox" checked={overrideRecurring} onChange={(event) => setOverrideRecurring(event.target.checked)} />Set explicit recurring override (otherwise inherit)</label>}
+        <p className="text-sm">Requested recurring permission: {requestedRecurring == null ? "Inherited" : requestedRecurring.enabled ? "Enabled" : "Disabled"}. Effective recurring permission: {document.effective?.policy.recurring?.enabled ? "Enabled" : "Disabled"}.</p>
+        <fieldset disabled={!overrideRecurring} className="space-y-3">
+          <label className="flex min-h-11 items-center gap-3 text-sm"><input type="checkbox" checked={recurringEnabled} onChange={(event) => setRecurringEnabled(event.target.checked)} />Allow recurring autonomous workers</label>
+          {recurringFields.map(({ key, label }) => <label key={key} className="block min-w-0 space-y-1 text-sm"><span>{label}</span><input required={overrideRecurring} inputMode="numeric" pattern="[0-9]+" className={inputClass} value={recurringNumbers[key]} onChange={(event) => setRecurringNumbers((current) => ({ ...current, [key]: event.target.value }))} /></label>)}
+        </fieldset>
+        <p className="text-sm">Eligible work can spend the allowance again as earlier usage leaves the rolling window until paused or stopped. Reported spend is not an exact invoice cap. Lower levels may reduce ceilings or increase the minimum interval, never widen authority.</p>
+      </fieldset>
       {!deployment && <p className="text-sm text-gray-600 dark:text-gray-300">Saving sets explicit bounds. Inherit removes this override so future upstream changes apply directly.</p>}
       <div className="flex flex-wrap gap-3">
         <button type="submit" className="min-h-11 rounded bg-blue-600 px-4 py-2 text-sm text-white">{busy ? "Saving…" : "Save autonomous job policy"}</button>

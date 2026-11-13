@@ -1,18 +1,38 @@
 /* Generated from Rust JSON Schema. Do not edit by hand. */
 
 export type JobState =
+  | (
+      | "queued"
+      | "preparing"
+      | "running"
+      | "needs_input"
+      | "verifying"
+      | "publishing"
+      | "review_ready"
+      | "blocked"
+      | "recovery_required"
+      | "cancelling"
+      | "cancelled"
+      | "failed"
+    )
+  | "completed";
+export type WorkerDesiredState = "active" | "paused";
+export type WorkerState =
   | "queued"
   | "preparing"
-  | "running"
+  | "inspecting"
+  | "working"
   | "needs_input"
   | "verifying"
   | "publishing"
-  | "review_ready"
+  | "idle"
+  | "waiting_review"
+  | "waiting_budget"
+  | "pausing"
+  | "paused"
+  | "stopping"
   | "blocked"
-  | "recovery_required"
-  | "cancelling"
-  | "cancelled"
-  | "failed";
+  | "recovery_required";
 /**
  * How a pane hosts its agent process. Orthogonal to [`Provider`] (which
  * binary) and [`PaneMode`] (how autonomous).
@@ -64,6 +84,9 @@ export type MobilePlatform = "ios" | "android";
 export type JobArtifactKind = "candidate" | "diff" | "check_log" | "worker_log" | "verification" | "publication";
 export type JobQuestionState =
   "pending" | "answer_accepted" | "answer_delivered" | "confirmed" | "uncertain" | "cancelled";
+export type WorkerItemOrigin = "human" | "inspection" | "implementation";
+export type WorkerItemState = "ready" | "selected" | "running" | "awaiting_review" | "done" | "blocked" | "dismissed";
+export type WorkerRunPurpose = "inspection" | "implementation";
 export type JobEventKind =
   | "admitted"
   | "phase_changed"
@@ -84,6 +107,28 @@ export type JobReceiptStatus = "pending" | "accepted" | "completed" | "rejected"
 export type JobCheckStatus = "passed" | "failed" | "timed_out" | "missing" | "cancelled";
 export type JobModelApi = "openai_responses" | "anthropic_messages";
 export type ServerToWeb =
+  | {
+      detail: WorkerDetail;
+      type: "worker_snapshot";
+      [k: string]: unknown;
+    }
+  | {
+      event: WorkerEvent;
+      type: "worker_event";
+      [k: string]: unknown;
+    }
+  | {
+      type: "worker_inbox_changed";
+      [k: string]: unknown;
+    }
+  | {
+      code: string;
+      project_id: string;
+      resync_required: boolean;
+      type: "worker_subscription_rejected";
+      worker_id: string;
+      [k: string]: unknown;
+    }
   | {
       detail: JobDetail;
       type: "job_snapshot";
@@ -536,6 +581,16 @@ export type ServerToWeb =
       type: "heartbeat";
       [k: string]: unknown;
     };
+export type WorkerEventKind =
+  | "approved"
+  | "mandate_changed"
+  | "state_changed"
+  | "backlog_changed"
+  | "checkpoint"
+  | "run_changed"
+  | "question"
+  | "review"
+  | "budget";
 /**
  * What a [`ServerToWeb::MutationAck`] answers. Its `request_id` is the id the
  * request carried: `request_id` on approvals, answers and interrupts, and
@@ -668,6 +723,18 @@ export type LocalProjectRegistrationResult =
  * Messages sent from web client to server
  */
 export type WebToServer =
+  | {
+      after_seq: number;
+      project_id: string;
+      type: "subscribe_worker";
+      worker_id: string;
+      [k: string]: unknown;
+    }
+  | {
+      type: "unsubscribe_worker";
+      worker_id: string;
+      [k: string]: unknown;
+    }
   | {
       after_seq: number;
       job_id: string;
@@ -1268,6 +1335,23 @@ export type PlanReviewMode = "always" | "risky_only" | "never";
  */
 export type MobileTelemetryEvent =
   "terminal_bridge_ready" | "terminal_bridge_rejected_message" | "terminal_bridge_crash";
+export type WorkerResultDisposition = "select_work" | "no_work" | "candidate_ready" | "blocked" | "no_change";
+export type WorkerConversionSource = {
+  job_id: string;
+  kind: "job";
+};
+export type WorkerMutationKind =
+  | "approve"
+  | "edit_mandate"
+  | "pause"
+  | "stop"
+  | "resume"
+  | "wake"
+  | "upsert_item"
+  | "dismiss_item"
+  | "retry_item"
+  | "answer"
+  | "retry_publication";
 
 export interface MobileProtocolContract {
   auth_response: MobileAuthResponse;
@@ -1284,6 +1368,7 @@ export interface MobileProtocolContract {
   task_launch_request: MobileTaskLaunchRequest;
   task_launch_response: MobileTaskLaunchResponse;
   web_to_server: WebToServer;
+  workers: WorkerProtocolContract;
   [k: string]: unknown;
 }
 export interface MobileAuthResponse {
@@ -1300,6 +1385,7 @@ export interface MobileAuthResponse {
 export interface MobileBootstrapResponse {
   account_status: string;
   autonomous_jobs?: MobileJobsBootstrap;
+  autonomous_workers?: MobileWorkersBootstrap;
   cluster_role: string;
   features: MobileFeatureFlags;
   launch_targets: MobileLaunchTarget[];
@@ -1371,6 +1457,38 @@ export interface JobUsage {
    * None is unknown, not zero.
    */
   spend_micro_usd?: number | null;
+  [k: string]: unknown;
+}
+export interface MobileWorkersBootstrap {
+  enabled: boolean;
+  next_cursor?: string | null;
+  workers: WorkerSummary[];
+  [k: string]: unknown;
+}
+export interface WorkerSummary {
+  active_job_id?: string | null;
+  active_run_id?: string | null;
+  attention: boolean;
+  attention_question_id?: string | null;
+  attention_run_id?: string | null;
+  backlog_revision: number;
+  cluster_owner_user_id: string;
+  created_at: string;
+  current_item_id?: string | null;
+  description: string;
+  desired_state: WorkerDesiredState;
+  high_watermark: number;
+  hostname: string;
+  id: string;
+  machine_id: string;
+  mandate_revision: number;
+  next_check_at?: string | null;
+  project_id: string;
+  reason?: string | null;
+  state: WorkerState;
+  state_version: number;
+  title: string;
+  updated_at: string;
   [k: string]: unknown;
 }
 export interface MobileFeatureFlags {
@@ -1641,6 +1759,10 @@ export interface MobilePaneSummary {
    */
   machine_id?: string | null;
   /**
+   * Historical deadloop panes remain readable but cannot accept new input.
+   */
+  mode?: PaneMode | null;
+  /**
    * Model/backend override used to associate provider-scoped availability
    * with the same usage account the pane actually consumes.
    */
@@ -1775,8 +1897,16 @@ export interface JobPolicy {
   max_queued_project: number;
   model_profiles: string[];
   publish_enabled: boolean;
+  recurring?: RecurringWorkerPolicy;
   verification_profiles: string[];
   worker_profiles: string[];
+}
+export interface RecurringWorkerPolicy {
+  enabled: boolean;
+  max_elapsed_seconds_24h: number;
+  max_runs_24h: number;
+  max_spend_micro_usd_24h: number;
+  min_interval_seconds: number;
 }
 export interface JobDetail {
   high_watermark: number;
@@ -1863,9 +1993,82 @@ export interface JobTaskSpec {
   source_url?: string | null;
   verification_profile: string;
   verification_profile_digest: string;
+  worker?: WorkerExecutionContext | null;
   worker_profile: string;
   worker_profile_digest: string;
   [k: string]: unknown;
+}
+export interface WorkerExecutionContext {
+  backlog_revision: number;
+  checkpoint?: WorkerCheckpoint | null;
+  items: WorkerItem[];
+  mandate: WorkerMandateSpec;
+  mandate_revision: number;
+  purpose: WorkerRunPurpose;
+  reservation_id: string;
+  schedule_generation: number;
+  selected_item_id?: string | null;
+  worker_id: string;
+  [k: string]: unknown;
+}
+export interface WorkerCheckpoint {
+  backlog_revision: number;
+  base_sha: string;
+  checklist: WorkerChecklistObservation[];
+  id: string;
+  mandate_revision: number;
+  recorded_at: string;
+  run_id: string;
+  summary: string;
+  worker_id: string;
+  [k: string]: unknown;
+}
+export interface WorkerChecklistObservation {
+  index: number;
+  observation: string;
+}
+export interface WorkerItem {
+  attempts: number;
+  created_at: string;
+  id: string;
+  item: WorkerItemDraft;
+  job_id?: string | null;
+  origin: WorkerItemOrigin;
+  outcome?: string | null;
+  revision: number;
+  run_id?: string | null;
+  state: WorkerItemState;
+  updated_at: string;
+  worker_id: string;
+  [k: string]: unknown;
+}
+export interface WorkerItemDraft {
+  acceptance_criteria: string[];
+  dependencies: string[];
+  evidence: string[];
+  instruction: string;
+  priority: number;
+  scope_rationale: string;
+  title: string;
+}
+export interface WorkerMandateSpec {
+  base_ref: string;
+  checklist: string[];
+  description: string;
+  interval_seconds: number;
+  limits: WorkerLimits;
+  machine_id: string;
+  model_profile: string;
+  title: string;
+  verification_profile: string;
+  worker_profile: string;
+}
+export interface WorkerLimits {
+  attempts_per_item: number;
+  elapsed_seconds_24h: number;
+  per_run: JobLimits;
+  runs_24h: number;
+  spend_micro_usd_24h: number;
 }
 export interface JobApiError {
   code: string;
@@ -1918,8 +2121,16 @@ export interface JobPolicyOverride {
   max_queued_project?: number | null;
   model_profiles?: string[] | null;
   publish_enabled?: boolean | null;
+  recurring?: RecurringWorkerPolicy1 | null;
   verification_profiles?: string[] | null;
   worker_profiles?: string[] | null;
+}
+export interface RecurringWorkerPolicy1 {
+  enabled: boolean;
+  max_elapsed_seconds_24h: number;
+  max_runs_24h: number;
+  max_spend_micro_usd_24h: number;
+  min_interval_seconds: number;
 }
 export interface JobPolicySource {
   id: string;
@@ -2108,6 +2319,62 @@ export interface MobilePushTokenRequest {
 export interface MobileRefreshRequest {
   installation_id: string;
   refresh_token: string;
+  [k: string]: unknown;
+}
+export interface WorkerDetail {
+  allowed_actions: WorkerAllowedActions;
+  budget: WorkerBudget;
+  checkpoint?: WorkerCheckpoint | null;
+  current_job?: JobDetail | null;
+  mandate: WorkerMandate;
+  worker: WorkerSummary;
+  [k: string]: unknown;
+}
+export interface WorkerAllowedActions {
+  answer: boolean;
+  edit_backlog: boolean;
+  edit_mandate: boolean;
+  pause: boolean;
+  resume: boolean;
+  retry: boolean;
+  retry_publication: boolean;
+  stop: boolean;
+  wake: boolean;
+  [k: string]: unknown;
+}
+export interface WorkerBudget {
+  accounting_uncertain: boolean;
+  eligible_at?: string | null;
+  reserved_elapsed_seconds: number;
+  reserved_runs: number;
+  reserved_spend_micro_usd: number;
+  runs: number;
+  usage: JobUsage;
+  window_started_at: string;
+  [k: string]: unknown;
+}
+export interface WorkerMandate {
+  approved_at: string;
+  approved_by: string;
+  policy_digest: string;
+  repository: string;
+  revision: number;
+  spec: WorkerMandateSpec;
+  verification_profile_digest: string;
+  worker_profile_digest: string;
+  [k: string]: unknown;
+}
+export interface WorkerEvent {
+  created_at: string;
+  job_id?: string | null;
+  kind: WorkerEventKind;
+  project_id: string;
+  question_id?: string | null;
+  run_id?: string | null;
+  seq: number;
+  state_version: number;
+  summary: string;
+  worker_id: string;
   [k: string]: unknown;
 }
 /**
@@ -2700,5 +2967,132 @@ export interface OmpQuestionAnswer {
   customInput?: string | null;
   id: string;
   selectedOptions: string[];
+  [k: string]: unknown;
+}
+export interface WorkerProtocolContract {
+  approval_request: WorkerApprovalRequest;
+  bootstrap: MobileWorkersBootstrap1;
+  detail: WorkerDetail;
+  events: WorkerEventsResponse;
+  execution_result: WorkerResult;
+  item_request: WorkerItemRequest;
+  items: WorkerItemsResponse;
+  list: WorkerListResponse;
+  mutation_request: WorkerMutationRequest;
+  preview: WorkerPreview;
+  preview_request: WorkerPreviewRequest;
+  receipt: WorkerMutationReceipt;
+  runs: WorkerRunsResponse;
+  targets: WorkerTargetsResponse;
+  [k: string]: unknown;
+}
+export interface WorkerApprovalRequest {
+  fingerprint: string;
+  preview_id: string;
+  request_id: string;
+}
+export interface MobileWorkersBootstrap1 {
+  enabled: boolean;
+  next_cursor?: string | null;
+  workers: WorkerSummary[];
+  [k: string]: unknown;
+}
+export interface WorkerEventsResponse {
+  events: WorkerEvent[];
+  has_more: boolean;
+  high_watermark: number;
+  resync_required: boolean;
+  [k: string]: unknown;
+}
+export interface WorkerResult {
+  backlog_revision: number;
+  checklist: WorkerChecklistObservation[];
+  disposition: WorkerResultDisposition;
+  mandate_revision: number;
+  purpose: WorkerRunPurpose;
+  reservation_id: string;
+  schedule_generation: number;
+  selected_item_id?: string | null;
+  summary: string;
+  upserts: WorkerItemProposal[];
+  version: number;
+  worker_id: string;
+}
+export interface WorkerItemProposal {
+  expected_revision?: number | null;
+  id: string;
+  item: WorkerItemDraft;
+}
+export interface WorkerItemRequest {
+  expected_item_revision?: number | null;
+  expected_version: number;
+  item: WorkerItemDraft;
+  item_id: string;
+  request_id: string;
+}
+export interface WorkerItemsResponse {
+  backlog_revision: number;
+  items: WorkerItem[];
+  next_cursor?: string | null;
+  [k: string]: unknown;
+}
+export interface WorkerListResponse {
+  next_cursor?: string | null;
+  workers: WorkerSummary[];
+  [k: string]: unknown;
+}
+export interface WorkerMutationRequest {
+  expected_version: number;
+  request_id: string;
+}
+export interface WorkerPreview {
+  base_sha: string;
+  cluster_owner_user_id: string;
+  expected_version?: number | null;
+  expires_at: string;
+  fingerprint: string;
+  hostname: string;
+  id: string;
+  mandate: WorkerMandate;
+  policy: EffectiveJobPolicy;
+  project_id: string;
+  source?: WorkerConversionSource | null;
+  worker_id?: string | null;
+  [k: string]: unknown;
+}
+export interface WorkerPreviewRequest {
+  expected_version?: number | null;
+  source?: WorkerConversionSource | null;
+  spec: WorkerMandateSpec;
+  worker_id?: string | null;
+}
+export interface WorkerMutationReceipt {
+  error_code?: string | null;
+  operation: WorkerMutationKind;
+  project_id: string;
+  request_id: string;
+  state_version?: number | null;
+  status: JobReceiptStatus;
+  worker_id?: string | null;
+  [k: string]: unknown;
+}
+export interface WorkerRunsResponse {
+  next_cursor?: string | null;
+  runs: WorkerRunSummary[];
+  [k: string]: unknown;
+}
+export interface WorkerRunSummary {
+  item_id?: string | null;
+  job_id: string;
+  mandate_revision: number;
+  purpose: WorkerRunPurpose;
+  run: JobRun;
+  worker_id: string;
+  [k: string]: unknown;
+}
+export interface WorkerTargetsResponse {
+  project_id: string;
+  targets: JobTarget[];
+  unavailable_reasons: string[];
   [k: string]: unknown;
 }

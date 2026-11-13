@@ -135,7 +135,10 @@ async fn fixture() -> (
 }
 
 fn inventory_instruction(id: Uuid) -> String {
-    format!("Agent {id}: {}\nVerify the complete approved task.", "检查完整说明。".repeat(30))
+    format!(
+        "Agent {id}: {}\nVerify the complete approved task.",
+        "检查完整说明。".repeat(30)
+    )
 }
 
 async fn interleaved_inventory() -> (AppState, StoredJob, Vec<JobSummary>) {
@@ -186,10 +189,17 @@ async fn project_job_pages_filter_interleaved_projects_before_the_page_boundary(
         .unwrap();
     assert_eq!(first.jobs.len(), 50);
     assert_eq!(
-        first.jobs.iter().map(|job| job.summary.id).collect::<Vec<_>>(),
+        first
+            .jobs
+            .iter()
+            .map(|job| job.summary.id)
+            .collect::<Vec<_>>(),
         expected[..50]
     );
-    assert!(first.jobs.iter().all(|job| job.summary.allowed_actions.cancel));
+    assert!(first
+        .jobs
+        .iter()
+        .all(|job| job.summary.allowed_actions.cancel));
     let second = list_project_jobs(
         &state,
         seed.initiator,
@@ -200,7 +210,11 @@ async fn project_job_pages_filter_interleaved_projects_before_the_page_boundary(
     .await
     .unwrap();
     assert_eq!(
-        second.jobs.iter().map(|job| job.summary.id).collect::<Vec<_>>(),
+        second
+            .jobs
+            .iter()
+            .map(|job| job.summary.id)
+            .collect::<Vec<_>>(),
         expected[50..]
     );
     assert!(second.next_cursor.is_none());
@@ -222,7 +236,12 @@ async fn project_job_pages_filter_interleaved_projects_before_the_page_boundary(
 #[tokio::test]
 async fn project_job_status_filters_match_the_unchanged_global_listing() {
     let (state, seed, expected) = interleaved_inventory().await;
-    for status in [None, Some("attention"), Some("needs_input"), Some("unknown")] {
+    for status in [
+        None,
+        Some("attention"),
+        Some("needs_input"),
+        Some("unknown"),
+    ] {
         let matching: Vec<_> = expected
             .iter()
             .filter(|job| match status {
@@ -237,7 +256,11 @@ async fn project_job_status_filters_match_the_unchanged_global_listing() {
             .unwrap();
         assert_eq!(
             global.jobs.iter().map(|job| job.id).collect::<Vec<_>>(),
-            matching.iter().take(50).map(|job| job.id).collect::<Vec<_>>()
+            matching
+                .iter()
+                .take(50)
+                .map(|job| job.id)
+                .collect::<Vec<_>>()
         );
         assert_eq!(global.next_cursor.is_some(), matching.len() >= 50);
         if let Some(cursor) = global.next_cursor.as_deref() {
@@ -246,7 +269,12 @@ async fn project_job_status_filters_match_the_unchanged_global_listing() {
                 .unwrap();
             assert_eq!(
                 next.jobs.iter().map(|job| job.id).collect::<Vec<_>>(),
-                matching.iter().skip(50).take(50).map(|job| job.id).collect::<Vec<_>>()
+                matching
+                    .iter()
+                    .skip(50)
+                    .take(50)
+                    .map(|job| job.id)
+                    .collect::<Vec<_>>()
             );
         }
         let project = &seed.detail.job.project_id;
@@ -254,7 +282,11 @@ async fn project_job_status_filters_match_the_unchanged_global_listing() {
             .await
             .unwrap();
         assert_eq!(
-            scoped.jobs.iter().map(|job| job.summary.id).collect::<Vec<_>>(),
+            scoped
+                .jobs
+                .iter()
+                .map(|job| job.summary.id)
+                .collect::<Vec<_>>(),
             matching
                 .iter()
                 .filter(|job| &job.project_id == project)
@@ -710,35 +742,19 @@ async fn full_multi_question_answer_is_reserved_once_and_never_provider_confirme
 }
 
 #[tokio::test]
-async fn changed_preview_returns_a_durable_rejection_not_an_uncertain_receipt_gap() {
+async fn retired_admission_returns_a_durable_upgrade_rejection() {
     let (state, job, _) = fixture().await;
-    let preview = JobPreview {
-        id: Uuid::new_v4(),
-        project_id: job.detail.job.project_id.clone(),
-        fingerprint: "fingerprint".into(),
-        expires_at: (Utc::now() - Duration::seconds(1)).to_rfc3339(),
-        task: job.detail.task.clone(),
-        machine_id: job.detail.job.machine_id,
-        cluster_owner_user_id: job.detail.job.cluster_owner_user_id,
-        hostname: "test-host".into(),
-        limits: job.detail.job.limits.clone(),
-        policy_digest: job.detail.policy_digest.clone(),
-    };
-    state
-        .db
-        .store_job_preview(job.initiator, &preview)
-        .await
-        .unwrap();
+    let project = &job.detail.job.project_id;
     let request = JobAdmissionRequest {
         request_id: Uuid::new_v4(),
-        preview_id: preview.id,
-        fingerprint: preview.fingerprint.clone(),
+        preview_id: Uuid::new_v4(),
+        fingerprint: "retired-preview".into(),
     };
-    let result = admit(&state, job.initiator, &preview.project_id, request.clone())
+    let result = admit(&state, job.initiator, project, request.clone())
         .await
         .unwrap();
     assert_eq!(result.status, JobReceiptStatus::Rejected);
-    assert_eq!(result.error_code.as_deref(), Some("preview_changed"));
+    assert_eq!(result.error_code.as_deref(), Some("upgrade_required"));
     assert_eq!(
         receipt(&state, job.initiator, request.request_id)
             .await
@@ -747,7 +763,7 @@ async fn changed_preview_returns_a_durable_rejection_not_an_uncertain_receipt_ga
         JobReceiptStatus::Rejected
     );
     assert_eq!(
-        admit(&state, job.initiator, &preview.project_id, request.clone())
+        admit(&state, job.initiator, project, request.clone())
             .await
             .unwrap()
             .status,
@@ -755,7 +771,7 @@ async fn changed_preview_returns_a_durable_rejection_not_an_uncertain_receipt_ga
     );
     let mut changed = request;
     changed.fingerprint = "different".into();
-    assert!(admit(&state, job.initiator, &preview.project_id, changed)
+    assert!(admit(&state, job.initiator, project, changed)
         .await
         .is_err());
 }
@@ -779,7 +795,7 @@ async fn unauthorized_socket_fanout_drops_queued_private_content() {
         ),
     );
     let message = ServerToWeb::JobSnapshot {
-        detail: job.detail.clone(),
+        detail: Box::new(job.detail.clone()),
     };
     assert!(web_outbound_allowed(&state, connection, &message).await);
     state.jobs.connection_auth.insert(
@@ -806,90 +822,29 @@ async fn unauthorized_socket_fanout_drops_queued_private_content() {
 }
 
 #[tokio::test]
-async fn concurrent_confirmations_create_one_job_and_one_actor_receipt() {
-    let (state, job, mut daemon) = fixture().await;
-    let preview = JobPreview {
-        id: Uuid::new_v4(),
-        project_id: job.detail.job.project_id.clone(),
-        fingerprint: "reviewed".into(),
-        expires_at: (Utc::now() + Duration::minutes(5)).to_rfc3339(),
-        task: job.detail.task.clone(),
-        machine_id: job.detail.job.machine_id,
-        cluster_owner_user_id: job.detail.job.cluster_owner_user_id,
-        hostname: "test-host".into(),
-        limits: job.detail.job.limits.clone(),
-        policy_digest: job.detail.policy_digest.clone(),
-    };
-    state
-        .db
-        .store_job_preview(job.initiator, &preview)
-        .await
-        .unwrap();
-    let responder_state = state.clone();
-    let approved = preview.clone();
-    let responder = tokio::spawn(async move {
-        while let Some(message) = daemon.recv().await {
-            if let ServerToDaemon::AutonomousJob {
-                command:
-                    JobWorkerCommand::Prepare {
-                        command_id,
-                        project_id,
-                        machine_id,
-                        cluster_owner_user_id,
-                        base_ref,
-                        ..
-                    },
-            } = message
-            {
-                let profile = responder_state
-                    .jobs
-                    .readiness
-                    .get(&machine_id)
-                    .unwrap()
-                    .profiles[0]
-                    .clone();
-                report(
-                    &responder_state,
-                    machine_id,
-                    JobWorkerReport::Prepared {
-                        command_id,
-                        project_id,
-                        machine_id,
-                        cluster_owner_user_id,
-                        repository: approved.task.repository.clone(),
-                        base_ref,
-                        base_sha: approved.task.base_sha.clone(),
-                        profile,
-                    },
-                )
-                .await
-                .unwrap();
-            }
-        }
-    });
+async fn concurrent_retired_confirmations_preserve_one_rejection_without_dispatch() {
+    let (state, job, _) = fixture().await;
     let request = JobAdmissionRequest {
         request_id: Uuid::new_v4(),
-        preview_id: preview.id,
-        fingerprint: preview.fingerprint.clone(),
+        preview_id: Uuid::new_v4(),
+        fingerprint: "reviewed".into(),
     };
+    let project = &job.detail.job.project_id;
     let (one, two) = tokio::join!(
-        admit(&state, job.initiator, &preview.project_id, request.clone()),
-        admit(&state, job.initiator, &preview.project_id, request.clone())
+        admit(&state, job.initiator, project, request.clone()),
+        admit(&state, job.initiator, project, request.clone())
     );
-    responder.abort();
     let one = one.unwrap();
     let two = two.unwrap();
-    assert_eq!(one.status, JobReceiptStatus::Accepted);
-    assert_eq!(one.job_id, two.job_id);
-    assert_eq!(state.db.all_jobs().await.unwrap().len(), 2);
+    assert_eq!(one.status, JobReceiptStatus::Rejected);
+    assert_eq!(one.error_code.as_deref(), Some("upgrade_required"));
+    assert_eq!(one.request_id, two.request_id);
+    assert_eq!(state.db.all_jobs().await.unwrap().len(), 1);
     let recovered = receipt(&state, job.initiator, request.request_id)
         .await
         .unwrap();
-    assert_eq!(recovered.job_id, one.job_id);
-    assert!(
-        state.db.job_outbox().await.unwrap().is_empty(),
-        "confirmation itself must not launch a prompt"
-    );
+    assert_eq!(recovered.error_code, one.error_code);
+    assert!(state.db.job_outbox().await.unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -1085,5 +1040,479 @@ async fn notification_intent_commits_with_event_and_survives_restart_before_enqu
         .pending_job_notifications()
         .await
         .unwrap()
+        .is_empty());
+}
+
+fn worker_context(job: &StoredJob) -> WorkerExecutionContext {
+    WorkerExecutionContext {
+        worker_id: Uuid::new_v4(),
+        mandate_revision: 1,
+        backlog_revision: 1,
+        schedule_generation: 1,
+        reservation_id: Uuid::new_v4(),
+        purpose: WorkerRunPurpose::Inspection,
+        mandate: WorkerMandateSpec {
+            title: "Inspect the repository".into(),
+            description: "Find concrete maintenance work".into(),
+            checklist: vec!["Review tests".into()],
+            machine_id: job.detail.job.machine_id,
+            worker_profile: job.detail.task.worker_profile.clone(),
+            verification_profile: job.detail.task.verification_profile.clone(),
+            model_profile: job.detail.task.model_profile.clone(),
+            base_ref: job.detail.task.base_ref.clone(),
+            interval_seconds: 900,
+            limits: WorkerLimits {
+                per_run: JobLimits {
+                    attempts: 1,
+                    ..JobLimits::default()
+                },
+                elapsed_seconds_24h: 7200,
+                spend_micro_usd_24h: 20_000_000,
+                runs_24h: 24,
+                attempts_per_item: 1,
+            },
+        },
+        items: vec![],
+        selected_item_id: None,
+        checkpoint: None,
+    }
+}
+
+async fn internal_job(state: &AppState, seed: &StoredJob) -> StoredJob {
+    let mut job = seed.clone();
+    job.detail.job.id = Uuid::new_v4();
+    job.detail.job.current_run_id = Uuid::new_v4();
+    job.detail.runs[0].id = job.detail.job.current_run_id;
+    job.detail.runs[0].job_id = job.detail.job.id;
+    job.detail.task.worker = Some(worker_context(&job));
+    let mut tx = state.db.job_transaction().await.unwrap();
+    store::save(&mut tx, &job).await.unwrap();
+    tx.commit().await.unwrap();
+    job
+}
+
+fn worker_result_report(job: &StoredJob, source_seq: u64) -> JobWorkerReport {
+    let context = job.detail.task.worker.as_ref().unwrap();
+    JobWorkerReport::WorkerResult {
+        identity: job.identity(),
+        source_seq,
+        result: WorkerResult {
+            version: WORKER_RESULT_VERSION,
+            worker_id: context.worker_id,
+            mandate_revision: context.mandate_revision,
+            backlog_revision: context.backlog_revision,
+            schedule_generation: context.schedule_generation,
+            reservation_id: context.reservation_id,
+            purpose: context.purpose,
+            disposition: WorkerResultDisposition::NoWork,
+            summary: "No maintenance required".into(),
+            checklist: vec![],
+            upserts: vec![],
+            selected_item_id: None,
+        },
+        evidence: JobStopEvidence {
+            boot_id: "boot".into(),
+            container_id: "inspection".into(),
+            stopped_at: Utc::now().to_rfc3339(),
+            reason: "settled".into(),
+            descendants_stopped: true,
+        },
+        usage: JobUsage {
+            spend_micro_usd: Some(0),
+            ..Default::default()
+        },
+    }
+}
+
+#[tokio::test]
+async fn worker_readiness_requires_v2_and_separate_capability() {
+    let (state, seed, _) = fixture().await;
+    let mut job = seed.clone();
+    job.detail.task.worker = Some(worker_context(&job));
+    assert!(ready_for_job(&state, &seed));
+    assert!(!ready_for_job(&state, &job));
+    let machine = job.detail.job.machine_id;
+    state
+        .jobs
+        .readiness
+        .get_mut(&machine)
+        .unwrap()
+        .protocol_version = WORKER_EXECUTION_PROTOCOL_VERSION;
+    assert!(ready_for_job(&state, &seed));
+    assert!(!ready_for_job(&state, &job));
+    state.sessions.set_daemon_capabilities(
+        machine,
+        vec![
+            OMP_JOB_WORKER_CAPABILITY.into(),
+            OMP_PERSISTENT_WORKER_CAPABILITY.into(),
+        ],
+    );
+    assert!(ready_for_job(&state, &job));
+}
+
+#[tokio::test]
+async fn worker_result_authentication_and_sequence_gates_survive_readiness_reset() {
+    let (state, seed, _) = fixture().await;
+    let job = internal_job(&state, &seed).await;
+    let machine = job.detail.job.machine_id;
+    let message = worker_result_report(&job, 0);
+    assert_eq!(report_identity(&message), Some(&job.identity()));
+    assert_eq!(report_source(&message), Some(0));
+    assert_eq!(
+        report(&state, machine, message.clone())
+            .await
+            .unwrap_err()
+            .to_string(),
+        "worker_result_protocol_required"
+    );
+    state.sessions.set_daemon_capabilities(
+        machine,
+        vec![
+            OMP_JOB_WORKER_CAPABILITY.into(),
+            OMP_PERSISTENT_WORKER_CAPABILITY.into(),
+        ],
+    );
+    state.jobs.readiness.remove(&machine);
+    assert_eq!(
+        report(&state, machine, message.clone())
+            .await
+            .unwrap_err()
+            .to_string(),
+        "worker_result_conflict"
+    );
+    assert_eq!(
+        report(&state, machine, worker_result_report(&job, 2))
+            .await
+            .unwrap_err()
+            .to_string(),
+        "source_sequence_gap"
+    );
+    let mut wrong_epoch = worker_result_report(&job, 1);
+    if let JobWorkerReport::WorkerResult { identity, .. } = &mut wrong_epoch {
+        identity.epoch += 1;
+    }
+    assert_eq!(
+        report(&state, machine, wrong_epoch)
+            .await
+            .unwrap_err()
+            .to_string(),
+        "stale_epoch"
+    );
+    let mut unstopped = worker_result_report(&job, 1);
+    if let JobWorkerReport::WorkerResult { evidence, .. } = &mut unstopped {
+        evidence.descendants_stopped = false;
+    }
+    assert_eq!(
+        report(&state, machine, unstopped)
+            .await
+            .unwrap_err()
+            .to_string(),
+        "stop_unconfirmed"
+    );
+    let retained = state.db.job(job.detail.job.id).await.unwrap().unwrap();
+    assert_eq!(retained.source_seq, 0);
+    assert_eq!(retained.detail.job.state, JobState::Queued);
+    assert!(retained.detail.runs[0].stop_evidence.is_none());
+    assert!(state
+        .db
+        .job_events(job.detail.job.id, 0)
+        .await
+        .unwrap()
+        .events
+        .is_empty());
+}
+
+#[tokio::test]
+async fn internal_worker_jobs_do_not_leak_into_standalone_inventories() {
+    let (state, seed, _) = fixture().await;
+    internal_job(&state, &seed).await;
+    let global = list_jobs(&state, seed.initiator, None, None).await.unwrap();
+    assert_eq!(global.jobs.len(), 1);
+    assert_eq!(global.jobs[0].id, seed.detail.job.id);
+    let project = state
+        .db
+        .project_jobs(&seed.detail.job.project_id, None, None)
+        .await
+        .unwrap();
+    assert_eq!(project.len(), 1);
+    assert_eq!(project[0].detail.job.id, seed.detail.job.id);
+    assert_eq!(state.db.all_jobs().await.unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn terminal_inventory_keeps_late_usage_and_positive_stop_evidence() {
+    let (state, mut job, _) = fixture().await;
+    job.transition(JobState::Completed, None);
+    let mut tx = state.db.job_transaction().await.unwrap();
+    store::save(&mut tx, &job).await.unwrap();
+    tx.commit().await.unwrap();
+    let inventory = JobRunInventory {
+        identity: job.identity(),
+        state: JobState::Failed,
+        boot_id: "boot".into(),
+        container_id: Some("inspection".into()),
+        last_source_seq: 0,
+        prompt_confirmed: true,
+        usage: JobUsage {
+            elapsed_seconds: 7,
+            input_tokens: 10,
+            spend_micro_usd: Some(30),
+            ..Default::default()
+        },
+        stop_evidence: Some(JobStopEvidence {
+            boot_id: "boot".into(),
+            container_id: "inspection".into(),
+            stopped_at: Utc::now().to_rfc3339(),
+            reason: "settled".into(),
+            descendants_stopped: true,
+        }),
+    };
+    reconcile_inventory(
+        &state,
+        job.detail.job.machine_id,
+        job.detail.job.cluster_owner_user_id,
+        &inventory,
+    )
+    .await
+    .unwrap();
+    let retained = state.db.job(job.detail.job.id).await.unwrap().unwrap();
+    assert_eq!(retained.detail.job.state, JobState::Completed);
+    assert_eq!(retained.detail.job.usage.elapsed_seconds, 7);
+    assert_eq!(retained.detail.job.usage.spend_micro_usd, Some(30));
+    assert!(
+        retained.detail.runs[0]
+            .stop_evidence
+            .as_ref()
+            .unwrap()
+            .descendants_stopped
+    );
+}
+
+#[tokio::test]
+async fn retained_admission_and_retry_receipts_replay_before_upgrade_rejection() {
+    let (state, job, _) = fixture().await;
+    let project = &job.detail.job.project_id;
+    let admission = JobAdmissionRequest {
+        request_id: Uuid::new_v4(),
+        preview_id: Uuid::new_v4(),
+        fingerprint: "previously-approved".into(),
+    };
+    let retry = JobMutationRequest {
+        request_id: Uuid::new_v4(),
+        expected_version: job.detail.job.state_version,
+    };
+    let mut tx = state.db.job_transaction().await.unwrap();
+    for (request_id, operation, fingerprint) in [
+        (
+            admission.request_id,
+            JobMutationKind::Admit,
+            digest(&("admit", project, &admission)).unwrap(),
+        ),
+        (
+            retry.request_id,
+            JobMutationKind::Retry,
+            digest(&(project, job.detail.job.id, JobMutationKind::Retry, &retry)).unwrap(),
+        ),
+    ] {
+        store::save_receipt(
+            &mut tx,
+            job.initiator,
+            project,
+            &fingerprint,
+            &JobMutationReceipt {
+                request_id,
+                operation,
+                job_id: Some(job.detail.job.id),
+                run_id: Some(job.detail.job.current_run_id),
+                status: JobReceiptStatus::Accepted,
+                error_code: None,
+                message: None,
+            },
+        )
+        .await
+        .unwrap();
+    }
+    tx.commit().await.unwrap();
+    assert_eq!(
+        admit(&state, job.initiator, project, admission)
+            .await
+            .unwrap()
+            .status,
+        JobReceiptStatus::Accepted
+    );
+    assert_eq!(
+        mutate(
+            &state,
+            job.initiator,
+            project,
+            job.detail.job.id,
+            JobMutationKind::Retry,
+            retry
+        )
+        .await
+        .unwrap()
+        .status,
+        JobReceiptStatus::Accepted
+    );
+    let rejected = mutate(
+        &state,
+        job.initiator,
+        project,
+        job.detail.job.id,
+        JobMutationKind::Retry,
+        JobMutationRequest {
+            request_id: Uuid::new_v4(),
+            expected_version: 0,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(rejected.error_code.as_deref(), Some("upgrade_required"));
+    assert!(state.db.job_outbox().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn worker_settlement_without_candidate_result_never_queues_verification() {
+    let (state, seed, _) = fixture().await;
+    let job = internal_job(&state, &seed).await;
+    let error = report(
+        &state,
+        job.detail.job.machine_id,
+        JobWorkerReport::Settled {
+            identity: job.identity(),
+            source_seq: 1,
+            usage: JobUsage::default(),
+        },
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(error.to_string(), "worker_candidate_result_required");
+    assert!(state.db.job_outbox().await.unwrap().is_empty());
+    assert_eq!(
+        state
+            .db
+            .job(job.detail.job.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .source_seq,
+        0
+    );
+}
+
+#[tokio::test]
+async fn duplicate_worker_results_compare_retained_payload_after_readiness_reset() {
+    let (state, seed, _) = fixture().await;
+    let mut job = internal_job(&state, &seed).await;
+    let context = job.detail.task.worker.as_ref().unwrap().clone();
+    let message = worker_result_report(&job, 1);
+    let JobWorkerReport::WorkerResult {
+        result,
+        evidence,
+        usage,
+        ..
+    } = &message
+    else {
+        unreachable!()
+    };
+    job.source_seq = 3;
+    job.transition(JobState::Completed, None);
+    job.current().stop_evidence = Some(evidence.clone());
+    job.current().ended_at = Some(evidence.stopped_at.clone());
+    merge_usage(&mut job, usage.clone()).unwrap();
+    let worker = crate::db::workers::StoredWorker {
+        detail: WorkerDetail {
+            worker: WorkerSummary {
+                id: context.worker_id,
+                project_id: job.detail.job.project_id.clone(),
+                title: context.mandate.title.clone(),
+                description: context.mandate.description.clone(),
+                state: WorkerState::Paused,
+                reason: None,
+                desired_state: WorkerDesiredState::Paused,
+                mandate_revision: context.mandate_revision,
+                backlog_revision: context.backlog_revision,
+                state_version: 1,
+                high_watermark: 0,
+                next_check_at: None,
+                active_job_id: None,
+                active_run_id: None,
+                current_item_id: None,
+                machine_id: job.detail.job.machine_id,
+                cluster_owner_user_id: job.detail.job.cluster_owner_user_id,
+                hostname: job.detail.job.hostname.clone(),
+                attention: false,
+                attention_run_id: None,
+                attention_question_id: None,
+                created_at: job.detail.job.created_at.clone(),
+                updated_at: job.detail.job.updated_at.clone(),
+            },
+            mandate: WorkerMandate {
+                revision: context.mandate_revision,
+                spec: context.mandate.clone(),
+                repository: job.detail.task.repository.clone(),
+                worker_profile_digest: job.detail.task.worker_profile_digest.clone(),
+                verification_profile_digest: job.detail.task.verification_profile_digest.clone(),
+                policy_digest: job.detail.policy_digest.clone(),
+                approved_by: job.initiator,
+                approved_at: job.detail.job.created_at.clone(),
+            },
+            checkpoint: None,
+            budget: WorkerBudget::default(),
+            allowed_actions: WorkerAllowedActions::default(),
+            current_job: None,
+        },
+        schedule_generation: context.schedule_generation,
+        grant_active: true,
+        stop_requested: false,
+        accounting_at: Utc::now().to_rfc3339(),
+    };
+    let mut tx = state.db.job_transaction().await.unwrap();
+    crate::db::workers::save(&mut tx, &worker).await.unwrap();
+    store::save(&mut tx, &job).await.unwrap();
+    sqlx::query(
+        "INSERT INTO autonomous_worker_results(run_id,worker_id,document,applied) VALUES(?,?,?,1)",
+    )
+    .bind(job.detail.job.current_run_id.to_string())
+    .bind(context.worker_id.to_string())
+    .bind(serde_json::to_string(result).unwrap())
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+    let machine = job.detail.job.machine_id;
+    state.sessions.set_daemon_capabilities(
+        machine,
+        vec![
+            OMP_JOB_WORKER_CAPABILITY.into(),
+            OMP_PERSISTENT_WORKER_CAPABILITY.into(),
+        ],
+    );
+    state.jobs.readiness.remove(&machine);
+    report(&state, machine, message.clone()).await.unwrap();
+    let mut conflict = message;
+    if let JobWorkerReport::WorkerResult { result, .. } = &mut conflict {
+        result.summary = "A different result cannot replace accepted evidence".into();
+    }
+    assert_eq!(
+        report(&state, machine, conflict)
+            .await
+            .unwrap_err()
+            .to_string(),
+        "worker_result_conflict"
+    );
+    let retained = state.db.job(job.detail.job.id).await.unwrap().unwrap();
+    assert_eq!(retained.source_seq, 3);
+    assert_eq!(retained.detail.job.state, JobState::Completed);
+    assert_eq!(
+        retained.detail.job.state_version,
+        job.detail.job.state_version
+    );
+    assert!(state
+        .db
+        .job_events(job.detail.job.id, 0)
+        .await
+        .unwrap()
+        .events
         .is_empty());
 }

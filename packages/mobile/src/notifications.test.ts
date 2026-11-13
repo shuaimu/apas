@@ -1,4 +1,4 @@
-import type { MobileBootstrapResponse, MobileSessionSummary } from "@apas/protocol";
+import type { JobDetail, MobileBootstrapResponse, MobileSessionSummary, WorkerDetail } from "@apas/protocol";
 
 import { handleAuthorizedLink } from "@/notifications";
 
@@ -6,8 +6,18 @@ const sessionId = "58dbd62d-c40f-4b5b-a1d4-96aca52ea595";
 const mockBootstrap = jest.fn<Promise<MobileBootstrapResponse>, []>();
 const mockReplaceSessions = jest.fn<Promise<void>, [MobileSessionSummary[]]>();
 const mockRouterPush = jest.fn();
+const workerId = "68dbd62d-c40f-4b5b-a1d4-96aca52ea595";
+const runId = "78dbd62d-c40f-4b5b-a1d4-96aca52ea595";
+const questionId = "88dbd62d-c40f-4b5b-a1d4-96aca52ea595";
+const mockResolveWorker = jest.fn();
+const mockRun = jest.fn();
+const mockReview = jest.fn();
+const mockWorkerError = jest.fn();
+jest.mock("@/workers/api", () => ({ workersApi: { resolve: (...args: unknown[]) => mockResolveWorker(...args), run: (...args: unknown[]) => mockRun(...args), review: (...args: unknown[]) => mockReview(...args) } }));
+jest.mock("@/workers/runtime", () => ({ workerAuthority: () => ({ account: "actor", generation: 1 }), authorityCurrent: () => true, handleWorkerError: (...args: unknown[]) => mockWorkerError(...args), acceptWorkersBootstrap: jest.fn() }));
 
 jest.mock("@/api/client", () => ({
+  ApiError: class extends Error { status: number; constructor(message: string, code: number) { super(message); this.status = code; } },
   bootstrap: () => mockBootstrap(),
   registerPushToken: jest.fn(),
 }));
@@ -61,6 +71,7 @@ describe("notification and link authorization refresh", () => {
     mockBootstrap.mockReset();
     mockReplaceSessions.mockReset().mockResolvedValue();
     mockRouterPush.mockReset();
+    mockResolveWorker.mockReset(); mockRun.mockReset(); mockReview.mockReset(); mockWorkerError.mockReset();
   });
 
   it("refreshes bootstrap and cache before navigating to an accessible target", async () => {
@@ -89,6 +100,26 @@ describe("notification and link authorization refresh", () => {
 
     await expect(handleAuthorizedLink("apas://code")).rejects.toBeInstanceOf(Error);
     expect(mockReplaceSessions).not.toHaveBeenCalled();
+    expect(mockRouterPush).not.toHaveBeenCalled();
+  });
+
+  it("authorizes exact earlier worker questions without selecting or attaching a session", async () => {
+    mockBootstrap.mockResolvedValue(bootstrap([]));
+    mockResolveWorker.mockResolvedValue({ worker: { id: workerId, project_id: "project" } } as WorkerDetail);
+    mockRun.mockResolvedValue({ job: { id: "job", current_run_id: "later" }, task: { worker: { worker_id: workerId } }, runs: [{ id: runId, job_id: "job" }], questions: [{ id: questionId, run_id: runId }] } as JobDetail);
+    await expect(handleAuthorizedLink(`apas://code/workers/${workerId}/runs/${runId}/questions/${questionId}`)).resolves.toBe(true);
+    expect(mockRun).toHaveBeenCalledWith("project", workerId, runId);
+    expect(mockRouterPush).toHaveBeenCalledWith({ pathname: "/(code)/workers/[workerId]/runs/[runId]/questions/[questionId]", params: { project: "project", workerId, runId, questionId } });
+  });
+
+  it("never substitutes latest review or runs a notification action", async () => {
+    mockBootstrap.mockResolvedValue(bootstrap([]));
+    mockResolveWorker.mockResolvedValue({ worker: { id: workerId, project_id: "project" } } as WorkerDetail);
+    mockRun.mockResolvedValue({ job: { id: "job" }, task: { worker: { worker_id: workerId } }, runs: [{ id: runId, job_id: "job" }], questions: [] } as unknown as JobDetail);
+    mockReview.mockResolvedValue({ run_id: "later" });
+    await expect(handleAuthorizedLink(`apas://code/workers/${workerId}/runs/${runId}/review`)).resolves.toBe(false);
+    expect(mockRouterPush).not.toHaveBeenCalled();
+    await expect(handleAuthorizedLink(`apas://code/workers/${workerId}/resume`)).resolves.toBe(false);
     expect(mockRouterPush).not.toHaveBeenCalled();
   });
 });

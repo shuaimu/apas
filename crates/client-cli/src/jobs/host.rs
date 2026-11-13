@@ -331,6 +331,13 @@ pub fn reserve(
         bail!("start command required")
     };
     let sandbox = Sandbox::new(config)?;
+    super::result::validate_context(&task, &identity)?;
+    if let Some(context) = &task.worker {
+        ensure!(
+            limits.attempts == 1 && limits.fits_within(&context.mandate.limits.per_run),
+            "worker execution must be one attempt within the approved per-run allowance"
+        );
+    }
     let dir = sandbox.storage_root().join(identity.run_id.to_string());
     ensure!(
         !dir.exists(),
@@ -519,7 +526,7 @@ struct Running {
 enum Work {
     Started(Result<(Running, sandbox::PreparedWorkspace)>),
     Frame(Result<Value>),
-    Frozen(Result<JobStopEvidence>),
+    Frozen(Result<(JobStopEvidence, Option<WorkerResult>)>),
     Expired(String),
     Delivery(Uuid, Result<JobWorkerReport>),
 }
@@ -622,6 +629,11 @@ async fn launch(
             gateway.bridge_dir(),
             &env,
             &argv,
+            record
+                .task
+                .worker
+                .as_ref()
+                .is_some_and(|context| context.purpose == WorkerRunPurpose::Inspection),
         )
         .await?;
     if cancelled.load(Ordering::Acquire) {
@@ -1099,6 +1111,7 @@ async fn run_inner(dir: PathBuf) -> Result<()> {
                                     stop(&mut record,&dir,&mut running,&reason,false).await?;
                                 }
                                 JobWorkerCommand::Verify{..}|JobWorkerCommand::Publish{..}=>{
+                                    ensure!(record.task.worker.as_ref().is_none_or(|context| context.purpose == WorkerRunPurpose::Implementation),"inspection has no verification or publication authority");
                                     ensure!(record.rpc.settled && record.stop_evidence.as_ref().is_some_and(|e|e.descendants_stopped),"worker mutation has not positively stopped");
                                     ensure!(delivery_task.as_ref().is_none_or(|h|h.is_finished()),"delivery operation already in flight");
                                     let ctx=delivery_context(&record,&dir)?;let config=record.config.clone();let fence=delivery::DeliveryFence::new(cancelled.clone(),record.deadline);let send=tx.clone();let identity=record.identity.clone();
@@ -1161,7 +1174,7 @@ async fn run_inner(dir: PathBuf) -> Result<()> {
                                         rpc::Effect::Send(value)=>rpc::write_frame(&mut running.as_mut().context("worker stopped")?.stdin,&value).await?,
                                         rpc::Effect::Qualified=>{
                                             ensure!(!cancelled.load(Ordering::Acquire) && Utc::now()<record.lease_expires_at && Utc::now()<record.deadline,"prompt admission authority expired");
-                                            let message=format!("Implement the following approved task:\n{}\n\nAcceptance criteria:\n{}\n\nDelegated workers must return any human decision need to the root. Only the root may use ask; never guess an answer. Completion is independently verified by APAS.",record.task.instruction,record.task.acceptance_criteria.iter().map(|s|format!("- {s}")).collect::<Vec<_>>().join("\n"));
+                                            let message=super::result::prompt(&record.task,&record.identity)?;
                                             let frame=record.rpc.reserve_prompt(message)?;record.save(&dir)?;
                                             rpc::write_frame(&mut running.as_mut().context("worker stopped")?.stdin,&frame).await?;
                                         }
@@ -1182,9 +1195,15 @@ async fn run_inner(dir: PathBuf) -> Result<()> {
                                             record.delivery_in_flight=true;record.save(&dir)?;
                                             delivery_task=Some(tokio::spawn(async move {
                                                 let result=async {
-                                                    let evidence=stop_units(&owned,"Native session settled; freezing candidate").await?;
-                                                    delivery::freeze_candidate(&ctx,&evidence,&fence).await?;
-                                                    Ok(evidence)
+                                                    let evidence=stop_units(&owned,"Native session settled; validating bounded result").await?;
+                                                    let result=owned.task.worker.as_ref().map(|context| super::result::read_result(
+                                                        owned.workspace_root.as_deref().context("missing workspace reservation")?,
+                                                        owned.session_dir.as_deref().context("missing worker session")?,
+                                                        context,&evidence,owned.limits.output_bytes)).transpose()?;
+                                                    if result.as_ref().is_none_or(|result| result.disposition == WorkerResultDisposition::CandidateReady) {
+                                                        delivery::freeze_candidate(&ctx,&evidence,&fence).await?;
+                                                    }
+                                                    Ok((evidence,result))
                                                 }.await;
                                                 let _=send.send(Work::Frozen(result)).await;
                                             }));
@@ -1199,12 +1218,26 @@ async fn run_inner(dir: PathBuf) -> Result<()> {
                     Work::Frozen(result)=>{
                         record.delivery_in_flight=false;record.save(&dir)?;
                         match result {
-                        Ok(evidence) if !record.cancelled=>{
-                            record.stop_evidence=Some(evidence.clone());record.state=JobState::Verifying;
-                            record.event(&dir,JobEventKind::PhaseChanged,"Worker stopped and immutable candidate frozen",Some(json!({"state":"verifying","stop_evidence":evidence})))?;
-                            let seq=record.next_source();record.emit(&dir,JobWorkerReport::Settled{identity:record.identity.clone(),source_seq:seq,usage:record.usage.clone()})?;
+                        Ok((evidence,result)) if !record.cancelled=>{
+                            record.stop_evidence=Some(evidence.clone());
+                            let candidate_ready=result.as_ref().is_none_or(|result| result.disposition == WorkerResultDisposition::CandidateReady);
+                            if let Some(mut worker)=running.take(){
+                                worker.gateway.shutdown().await?;
+                                snapshot_usage(&mut record,&worker).await;
+                                let _=tokio::time::timeout(Duration::from_secs(3),worker.child.wait()).await;
+                            }
+                            record.state=if candidate_ready {JobState::Verifying}
+                                else if result.as_ref().is_some_and(|result| matches!(result.disposition,WorkerResultDisposition::NoWork|WorkerResultDisposition::SelectWork)) {JobState::Completed}
+                                else {JobState::Failed};
+                            if let Some(result)=result {
+                                let seq=record.next_source();record.emit(&dir,JobWorkerReport::WorkerResult{identity:record.identity.clone(),source_seq:seq,result,evidence:evidence.clone(),usage:record.usage.clone()})?;
+                            }
+                            record.event(&dir,JobEventKind::PhaseChanged,if candidate_ready {"Worker stopped and immutable candidate frozen"} else {"Worker stopped and bounded result retained"},Some(json!({"state":record.state,"stop_evidence":evidence})))?;
+                            if candidate_ready {
+                                let seq=record.next_source();record.emit(&dir,JobWorkerReport::Settled{identity:record.identity.clone(),source_seq:seq,usage:record.usage.clone()})?;
+                            }
                         }
-                        Err(error) if !record.cancelled=>{cancelled.store(true,Ordering::SeqCst);stop(&mut record,&dir,&mut running,&format!("Candidate freeze failed: {error}"),true).await?;}
+                        Err(error) if !record.cancelled=>{cancelled.store(true,Ordering::SeqCst);stop(&mut record,&dir,&mut running,&format!("Worker result validation or candidate freeze failed: {error}"),true).await?;}
                         _=>{
                             let reason=record.stop_reason.clone().unwrap_or_else(||"Cancelled during candidate freeze".into());
                             stop(&mut record,&dir,&mut running,&reason,false).await?;
@@ -1841,6 +1874,7 @@ mod tests {
             epoch: 4,
         };
         let task = JobTaskSpec {
+            worker: None,
             instruction: "Retained private task".into(),
             acceptance_criteria: vec![],
             source_url: None,
@@ -1897,6 +1931,19 @@ mod tests {
     fn same_attempt_adoption_preserves_opaque_input_and_allowance() {
         let dir = tempfile::tempdir().unwrap();
         let mut record = retained_record();
+        record.task.worker = Some(serde_json::from_value(json!({
+            "worker_id":Uuid::new_v4(),"mandate_revision":1,"backlog_revision":2,
+            "schedule_generation":7,"reservation_id":Uuid::new_v4(),"purpose":"inspection",
+            "mandate":{
+                "title":"Inspect","description":"Inspect assigned responsibility","checklist":["Check correctness"],
+                "machine_id":record.identity.machine_id,"worker_profile":"worker",
+                "verification_profile":"verify","model_profile":"model","base_ref":"main",
+                "interval_seconds":900,"limits":{"per_run":record.limits,
+                    "elapsed_seconds_24h":7200,"spend_micro_usd_24h":20_000_000,
+                    "runs_24h":2,"attempts_per_item":1}
+            },
+            "items":[],"selected_item_id":null,"checkpoint":null
+        })).unwrap());
         record.rpc.prompt = rpc::PromptAdmission::Uncertain;
         record.save(dir.path()).unwrap();
         let mut adopted = load(dir.path()).unwrap();
@@ -1905,6 +1952,7 @@ mod tests {
         adopted.save(dir.path()).unwrap();
         let mut reexec = load(dir.path()).unwrap();
         assert_eq!(reexec.identity, record.identity);
+        assert_eq!(reexec.task.worker, record.task.worker);
         assert_eq!(reexec.source_seq, 9);
         assert_eq!(reexec.usage, record.usage);
         assert_eq!(reexec.deadline, record.deadline);

@@ -8,10 +8,11 @@ use sqlx::{sqlite::SqlitePoolOptions, Row, SqlitePool};
 use std::path::Path;
 use std::time::Duration;
 
+pub mod job_policy;
+pub mod jobs;
 mod models;
 mod shared_cluster;
-pub mod jobs;
-pub mod job_policy;
+pub mod workers;
 
 pub use models::*;
 
@@ -1155,6 +1156,7 @@ impl Database {
         self.migrate_legacy_project_access_once().await?;
         self.migrate_jobs().await?;
         self.migrate_job_policy().await?;
+        self.migrate_workers().await?;
 
         tracing::info!("Database migrations completed");
         Ok(())
@@ -2314,6 +2316,82 @@ impl Database {
         Ok(true)
     }
 
+    /// Revalidate durable execution destinations, including historical runs. Project
+    /// membership alone cannot authorize a route into another project's execution.
+    async fn mobile_execution_route_exists(
+        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        project_id: Option<&str>,
+        routing_id: &str,
+    ) -> Result<bool> {
+        use crate::notifications::{
+            ExecutionNotificationDestination, ExecutionNotificationResource,
+            ExecutionNotificationRoute,
+        };
+        if !routing_id.starts_with("job:") && !routing_id.starts_with("worker:") {
+            return Ok(true);
+        }
+        let Some(route) = ExecutionNotificationRoute::parse(routing_id) else {
+            return Ok(false);
+        };
+        if let ExecutionNotificationResource::Worker(id) = route.resource {
+            if route.run_id.is_none() {
+                return Ok(sqlx::query_scalar::<_, i64>(
+                    "SELECT COUNT(*) FROM autonomous_workers WHERE id = ? AND project_id = ?",
+                )
+                .bind(id.to_string())
+                .bind(project_id)
+                .fetch_one(&mut **tx)
+                .await?
+                    > 0);
+            }
+        }
+        let question = match route.destination {
+            ExecutionNotificationDestination::Question(id) => Some(id.to_string()),
+            _ => None,
+        };
+        let (id, query) = match route.resource {
+            ExecutionNotificationResource::Job(id) => (
+                id,
+                r#"SELECT COUNT(*) FROM autonomous_jobs j
+                   WHERE j.id = ? AND j.project_id = ?
+                     AND (? IS NULL OR EXISTS (
+                         SELECT 1 FROM autonomous_job_runs r WHERE r.job_id = j.id AND r.id = ?
+                     ))
+                     AND (? IS NULL OR EXISTS (
+                         SELECT 1 FROM autonomous_job_questions q
+                         JOIN autonomous_job_runs r ON r.id = q.run_id
+                         WHERE q.id = ? AND r.job_id = j.id AND r.id = ?
+                     ))"#,
+            ),
+            ExecutionNotificationResource::Worker(id) => (
+                id,
+                r#"SELECT COUNT(*) FROM autonomous_workers w
+                   JOIN autonomous_worker_executions e ON e.worker_id = w.id
+                   JOIN autonomous_jobs j ON j.id = e.job_id AND j.project_id = w.project_id
+                   JOIN autonomous_job_runs r ON r.id = e.run_id AND r.job_id = j.id
+                   WHERE w.id = ? AND w.project_id = ?
+                     AND json_extract(j.document, '$.detail.task.worker.worker_id') = w.id
+                     AND ? IS NOT NULL AND r.id = ?
+                     AND (? IS NULL OR EXISTS (
+                         SELECT 1 FROM autonomous_job_questions q
+                         WHERE q.id = ? AND q.run_id = ?
+                     ))"#,
+            ),
+        };
+        let run = route.run_id.map(|id| id.to_string());
+        Ok(sqlx::query_scalar::<_, i64>(query)
+            .bind(id.to_string())
+            .bind(project_id)
+            .bind(&run)
+            .bind(&run)
+            .bind(&question)
+            .bind(&question)
+            .bind(&run)
+            .fetch_one(&mut **tx)
+            .await?
+            > 0)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub async fn enqueue_mobile_notification_event(
         &self,
@@ -2357,7 +2435,9 @@ impl Database {
         .fetch_one(&mut *tx)
         .await?
             > 0;
-        if !authorized {
+        if !authorized
+            || !Self::mobile_execution_route_exists(&mut tx, Some(project_id), routing_id).await?
+        {
             tx.commit().await?;
             return Ok(false);
         }
@@ -2452,7 +2532,7 @@ impl Database {
         )
         .execute(&mut *tx)
         .await?;
-        let rows = sqlx::query_as::<_, MobileNotificationDeliveryRecord>(
+        let mut rows = sqlx::query_as::<_, MobileNotificationDeliveryRecord>(
             r#"SELECT d.id, d.event_id, d.push_token_id, t.token, e.category,
                       e.routing_id, e.session_id, d.attempt_count, d.provider_ticket_id
                FROM mobile_notification_deliveries d
@@ -2478,6 +2558,30 @@ impl Database {
         .bind(limit.min(100) as i64)
         .fetch_all(&mut *tx)
         .await?;
+        // Routes are durable, not authority: erase deleted or mismatched execution
+        // destinations before they can reach the push provider, even after restart.
+        for index in (0..rows.len()).rev() {
+            let row = &rows[index];
+            if !row.routing_id.starts_with("job:") && !row.routing_id.starts_with("worker:") {
+                continue;
+            }
+            let project = sqlx::query_scalar::<_, Option<String>>(
+                "SELECT project_id FROM mobile_notification_events WHERE id = ?",
+            )
+            .bind(&row.event_id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .flatten();
+            if !Self::mobile_execution_route_exists(&mut tx, project.as_deref(), &row.routing_id)
+                .await?
+            {
+                sqlx::query("DELETE FROM mobile_notification_events WHERE id = ?")
+                    .bind(&row.event_id)
+                    .execute(&mut *tx)
+                    .await?;
+                rows.swap_remove(index);
+            }
+        }
         for row in &rows {
             sqlx::query(
                 "UPDATE mobile_notification_deliveries SET status = 'sending', attempt_count = attempt_count + 1, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
@@ -3728,7 +3832,7 @@ impl Database {
     /// artifacts must be removed first while the session rows still form the
     /// durable cleanup manifest.
     pub async fn delete_project_records(&self, project_id: &str) -> Result<bool> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.job_transaction().await?;
         let lifecycle =
             sqlx::query_scalar::<_, String>("SELECT lifecycle_status FROM projects WHERE id = ?")
                 .bind(project_id)
@@ -3742,14 +3846,22 @@ impl Database {
             ProjectLifecycle::parse(&lifecycle) == ProjectLifecycle::Deleting,
             "project deletion has not started"
         );
-        let unresolved: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM autonomous_jobs WHERE project_id=? AND (state NOT IN ('review_ready','cancelled','failed') OR EXISTS (SELECT 1 FROM autonomous_job_runs r WHERE r.job_id=autonomous_jobs.id AND r.unresolved=1))")
+        let workers_pending: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM autonomous_workers w WHERE w.project_id=? AND (w.grant_active=1 OR w.desired_state<>'paused' OR w.active_job_id IS NOT NULL OR EXISTS(SELECT 1 FROM autonomous_worker_executions e WHERE e.worker_id=w.id AND e.active=1))")
+            .bind(project_id).fetch_one(&mut *tx).await?;
+        anyhow::ensure!(
+            workers_pending == 0,
+            "autonomous worker stop reconciliation pending"
+        );
+        let unresolved: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM autonomous_jobs WHERE project_id=? AND (state NOT IN ('review_ready','completed','cancelled','failed') OR EXISTS (SELECT 1 FROM autonomous_job_runs r WHERE r.job_id=autonomous_jobs.id AND r.unresolved=1))")
             .bind(project_id).fetch_one(&mut *tx).await?;
         anyhow::ensure!(unresolved == 0, "autonomous job stop evidence pending");
         let unpurged: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM autonomous_job_runs r JOIN autonomous_jobs j ON j.id=r.job_id WHERE j.project_id=? AND json_extract(r.document,'$.started_at') IS NOT NULL AND NOT EXISTS(SELECT 1 FROM autonomous_job_purges p WHERE p.run_id=r.id AND p.confirmed=1)")
             .bind(project_id).fetch_one(&mut *tx).await?;
         anyhow::ensure!(unpurged == 0, "autonomous job host-content purge pending");
         sqlx::query("DELETE FROM autonomous_job_policies WHERE scope='project' AND scope_id=?")
-            .bind(project_id).execute(&mut *tx).await?;
+            .bind(project_id)
+            .execute(&mut *tx)
+            .await?;
 
         for statement in [
             "DELETE FROM messages WHERE session_id IN (SELECT id FROM sessions WHERE COALESCE(project_id, id) = ?)",
@@ -5510,6 +5622,7 @@ fn aggregate_usage_rows(rows: &[PaneUsageDayRow]) -> shared::ProjectUsageStats {
 #[cfg(test)]
 mod mobile_notification_tests {
     use super::*;
+    use uuid::Uuid;
 
     async fn database() -> Database {
         let dir = std::env::temp_dir().join(format!(
@@ -5544,6 +5657,325 @@ mod mobile_notification_tests {
         .await
         .unwrap();
         db
+    }
+
+    async fn worker_notification_fixture(db: &Database) -> (Uuid, Uuid, Uuid, Uuid) {
+        db.authorize_project_registration("worker-project", "mobile-user")
+            .await
+            .unwrap();
+        db.register_mobile_push_token(
+            "worker-push",
+            "mobile-user",
+            "device-session",
+            "installation",
+            "ios",
+            "ExponentPushToken[worker]",
+            "worker-token-hash",
+        )
+        .await
+        .unwrap();
+        let worker = Uuid::new_v4();
+        let job = Uuid::new_v4();
+        let run = Uuid::new_v4();
+        let question = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO autonomous_workers(id,project_id,state,desired_state,grant_active,stop_requested,schedule_generation,mandate_revision,state_version,high_watermark,accounting_at,created_at,document,budget) VALUES(?,'worker-project','needs_input','active',1,0,1,1,1,1,'now','now','{}','{}')",
+        ).bind(worker.to_string()).execute(&db.pool).await.unwrap();
+        sqlx::query(
+            "INSERT INTO autonomous_jobs(id,project_id,initiator,owner,machine,state,created_at,document) VALUES(?,'worker-project','mobile-user','mobile-user','machine','needs_input','now',?)",
+        ).bind(job.to_string()).bind(serde_json::json!({"detail":{"task":{"worker":{"worker_id":worker}}}}).to_string())
+            .execute(&db.pool).await.unwrap();
+        sqlx::query(
+            "INSERT INTO autonomous_job_runs(id,job_id,attempt,epoch,unresolved,document) VALUES(?,?,1,1,0,'{}')",
+        ).bind(run.to_string()).bind(job.to_string()).execute(&db.pool).await.unwrap();
+        sqlx::query(
+            "INSERT INTO autonomous_worker_executions(worker_id,job_id,run_id,reservation_id,purpose,mandate_revision,active,created_at) VALUES(?,?,?,?,'inspection',1,0,'now')",
+        ).bind(worker.to_string()).bind(job.to_string()).bind(run.to_string())
+            .bind(Uuid::new_v4().to_string()).execute(&db.pool).await.unwrap();
+        sqlx::query(
+            "INSERT INTO autonomous_job_questions(id,run_id,dialog_id,document) VALUES(?,?,'dialog','{}')",
+        ).bind(question.to_string()).bind(run.to_string()).execute(&db.pool).await.unwrap();
+        (worker, job, run, question)
+    }
+
+    #[tokio::test]
+    async fn worker_notifications_preserve_preferences_dedup_and_exact_historical_identity() {
+        let db = database().await;
+        let (worker, job, run, question) = worker_notification_fixture(&db).await;
+        let route = format!("worker:{worker}:{run}:{question}");
+        assert!(db
+            .enqueue_mobile_notification_event(
+                "worker-decision",
+                "mobile-user",
+                "worker-project",
+                None,
+                None,
+                "decision",
+                &route,
+                "worker-decision-key"
+            )
+            .await
+            .unwrap());
+        assert!(!db
+            .enqueue_mobile_notification_event(
+                "worker-decision-replayed",
+                "mobile-user",
+                "worker-project",
+                None,
+                None,
+                "decision",
+                &route,
+                "worker-decision-key"
+            )
+            .await
+            .unwrap());
+        for (index, invalid) in [
+            format!("worker:{}:{run}:{question}", Uuid::new_v4()),
+            format!("worker:{worker}:{}:{question}", Uuid::new_v4()),
+            format!("worker:{worker}:{run}:{}", Uuid::new_v4()),
+            format!("worker:{worker}:-:review"),
+        ]
+        .iter()
+        .enumerate()
+        {
+            assert!(!db
+                .enqueue_mobile_notification_event(
+                    &format!("bad-{index}"),
+                    "mobile-user",
+                    "worker-project",
+                    None,
+                    None,
+                    "decision",
+                    invalid,
+                    &format!("bad-{index}")
+                )
+                .await
+                .unwrap());
+        }
+        db.authorize_project_registration("other-project", "mobile-user")
+            .await
+            .unwrap();
+        assert!(!db
+            .enqueue_mobile_notification_event(
+                "wrong-project",
+                "mobile-user",
+                "other-project",
+                None,
+                None,
+                "decision",
+                &route,
+                "wrong-project"
+            )
+            .await
+            .unwrap());
+        let preferences = shared::MobileNotificationPreferences {
+            decisions: false,
+            failures: true,
+            pull_requests: true,
+            completions: true,
+        };
+        db.update_mobile_notification_preferences("mobile-user", "device-session", &preferences)
+            .await
+            .unwrap();
+        assert!(db
+            .claim_mobile_notification_deliveries(100)
+            .await
+            .unwrap()
+            .is_empty());
+        db.update_mobile_notification_preferences(
+            "mobile-user",
+            "device-session",
+            &shared::MobileNotificationPreferences {
+                decisions: true,
+                ..preferences
+            },
+        )
+        .await
+        .unwrap();
+        let rows = db.claim_mobile_notification_deliveries(100).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].routing_id, route);
+        // Legacy result links remain valid independently of the new worker route.
+        assert!(db
+            .enqueue_mobile_notification_event(
+                "legacy-history",
+                "mobile-user",
+                "worker-project",
+                None,
+                None,
+                "pull_request",
+                &format!("job:{job}:{run}:review"),
+                "legacy-history"
+            )
+            .await
+            .unwrap());
+        assert_eq!(
+            db.claim_mobile_notification_deliveries(100)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn queued_worker_notifications_reauthorize_content_after_restart_and_deletion() {
+        let db = database().await;
+        let (worker, _, run, question) = worker_notification_fixture(&db).await;
+        let route = format!("worker:{worker}:{run}:{question}");
+        assert!(db
+            .enqueue_mobile_notification_event(
+                "queued-worker",
+                "mobile-user",
+                "worker-project",
+                None,
+                None,
+                "decision",
+                &route,
+                "queued-worker"
+            )
+            .await
+            .unwrap());
+        assert_eq!(
+            db.claim_mobile_notification_deliveries(100)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(db.recover_mobile_notification_outbox().await.unwrap(), 1);
+        sqlx::query("DELETE FROM autonomous_job_questions WHERE id = ?")
+            .bind(question.to_string())
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        assert!(db
+            .claim_mobile_notification_deliveries(100)
+            .await
+            .unwrap()
+            .is_empty());
+        let remaining: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM mobile_notification_events WHERE id='queued-worker'",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(remaining, 0);
+        assert!(db
+            .enqueue_mobile_notification_event(
+                "worker-failure",
+                "mobile-user",
+                "worker-project",
+                None,
+                None,
+                "failure",
+                &format!("worker:{worker}:{run}:detail"),
+                "worker-failure"
+            )
+            .await
+            .unwrap());
+        sqlx::query("UPDATE users SET account_status='suspended' WHERE id='mobile-user'")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        assert!(db
+            .claim_mobile_notification_deliveries(100)
+            .await
+            .unwrap()
+            .is_empty());
+        sqlx::query("UPDATE users SET account_status='active' WHERE id='mobile-user'")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        assert!(db
+            .claim_mobile_notification_deliveries(100)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn worker_only_blockers_keep_preferences_and_reauthorize_deleted_responsibilities() {
+        let db = database().await;
+        let (worker, _, _, _) = worker_notification_fixture(&db).await;
+        let route = format!("worker:{worker}:-:detail");
+        assert!(db
+            .enqueue_mobile_notification_event(
+                "idle-grant-revoked",
+                "mobile-user",
+                "worker-project",
+                None,
+                None,
+                "failure",
+                &route,
+                "idle-grant-revoked"
+            )
+            .await
+            .unwrap());
+        assert!(!db
+            .enqueue_mobile_notification_event(
+                "idle-grant-replayed",
+                "mobile-user",
+                "worker-project",
+                None,
+                None,
+                "failure",
+                &route,
+                "idle-grant-revoked"
+            )
+            .await
+            .unwrap());
+        db.update_mobile_notification_preferences(
+            "mobile-user",
+            "device-session",
+            &shared::MobileNotificationPreferences {
+                decisions: true,
+                failures: false,
+                pull_requests: true,
+                completions: true,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(db
+            .claim_mobile_notification_deliveries(100)
+            .await
+            .unwrap()
+            .is_empty());
+        db.update_mobile_notification_preferences(
+            "mobile-user",
+            "device-session",
+            &shared::MobileNotificationPreferences {
+                decisions: true,
+                failures: true,
+                pull_requests: true,
+                completions: true,
+            },
+        )
+        .await
+        .unwrap();
+        let rows = db.claim_mobile_notification_deliveries(100).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].routing_id, route);
+        assert_eq!(rows[0].category, "failure");
+        assert_eq!(db.recover_mobile_notification_outbox().await.unwrap(), 1);
+        sqlx::query("DELETE FROM autonomous_workers WHERE id=?")
+            .bind(worker.to_string())
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        assert!(db
+            .claim_mobile_notification_deliveries(100)
+            .await
+            .unwrap()
+            .is_empty());
+        let remaining: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM mobile_notification_events WHERE id='idle-grant-revoked'",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(remaining, 0);
     }
 
     #[tokio::test]
@@ -6890,7 +7322,10 @@ mod cluster_administration_tests {
         let settled = persisted.version;
         db.run_migrations().await.unwrap();
         let again = db.get_deployment_default_policy().await.unwrap();
-        assert_eq!(again.allowed_launch_profiles, persisted.allowed_launch_profiles);
+        assert_eq!(
+            again.allowed_launch_profiles,
+            persisted.allowed_launch_profiles
+        );
         assert_eq!(again.version, settled, "migration must be idempotent");
     }
 

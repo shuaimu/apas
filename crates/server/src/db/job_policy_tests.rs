@@ -253,6 +253,126 @@ async fn all_host_policies_narrow_and_source_revisions_pin_previews() {
 }
 
 #[tokio::test]
+async fn recurring_authority_is_not_inherited_from_finite_job_enablement() {
+    let (state, _, host, _, project, _) = fixture().await;
+    enable(&state).await;
+    let initial = effective_job_policy(&state.db, &project).await.unwrap();
+    assert!(initial.policy.enabled);
+    assert!(!initial.policy.recurring.enabled);
+    let requested = RecurringWorkerPolicy {
+        enabled: true,
+        ..RecurringWorkerPolicy::default()
+    };
+    assert!(state
+        .db
+        .set_job_policy(
+            &host.to_string(),
+            "cluster",
+            &host.to_string(),
+            serde_json::json!({ "recurring": requested }),
+        )
+        .await
+        .is_err());
+    let unchanged = effective_job_policy(&state.db, &project).await.unwrap();
+    assert_eq!(initial.digest, unchanged.digest);
+    assert!(!unchanged.policy.recurring.enabled);
+}
+
+#[tokio::test]
+async fn recurring_host_intersection_rejects_faster_cadence_and_larger_allowances() {
+    let (state, owner, host, _, project, _) = fixture().await;
+    let deployment = JobPolicy {
+        enabled: true,
+        recurring: RecurringWorkerPolicy {
+            enabled: true,
+            ..RecurringWorkerPolicy::default()
+        },
+        ..JobPolicy::default()
+    };
+    state
+        .db
+        .set_job_policy(
+            SYSTEM_ADMIN_ACTOR,
+            "deployment",
+            "deployment",
+            serde_json::to_value(deployment).unwrap(),
+        )
+        .await
+        .unwrap();
+    let host_bound = RecurringWorkerPolicy {
+        enabled: true,
+        max_spend_micro_usd_24h: 6_000_000,
+        max_runs_24h: 8,
+        min_interval_seconds: 1800,
+        ..RecurringWorkerPolicy::default()
+    };
+    let owner_bound = RecurringWorkerPolicy {
+        enabled: true,
+        max_elapsed_seconds_24h: 3600,
+        min_interval_seconds: 1200,
+        ..RecurringWorkerPolicy::default()
+    };
+    for (actor, bound) in [(host, &host_bound), (owner, &owner_bound)] {
+        state
+            .db
+            .set_job_policy(
+                &actor.to_string(),
+                "cluster",
+                &actor.to_string(),
+                serde_json::json!({ "recurring": bound }),
+            )
+            .await
+            .unwrap();
+    }
+    let effective = effective_job_policy(&state.db, &project).await.unwrap();
+    assert_eq!(
+        effective.policy.recurring,
+        RecurringWorkerPolicy {
+            enabled: true,
+            max_elapsed_seconds_24h: 3600,
+            max_spend_micro_usd_24h: 6_000_000,
+            max_runs_24h: 8,
+            min_interval_seconds: 1800,
+        }
+    );
+    for invalid in [
+        RecurringWorkerPolicy {
+            max_runs_24h: 9,
+            ..effective.policy.recurring.clone()
+        },
+        RecurringWorkerPolicy {
+            min_interval_seconds: 1799,
+            ..effective.policy.recurring.clone()
+        },
+        RecurringWorkerPolicy {
+            max_elapsed_seconds_24h: 0,
+            ..effective.policy.recurring.clone()
+        },
+    ] {
+        assert!(state
+            .db
+            .set_job_policy(
+                &host.to_string(),
+                "project",
+                &project,
+                serde_json::json!({ "recurring": invalid }),
+            )
+            .await
+            .is_err());
+    }
+    let unchanged = effective_job_policy(&state.db, &project).await.unwrap();
+    assert_eq!(effective.digest, unchanged.digest);
+    state.db.set_job_policy(
+        &owner.to_string(), "cluster", &owner.to_string(),
+        serde_json::json!({ "recurring": RecurringWorkerPolicy { enabled: false, ..owner_bound } }),
+    ).await.unwrap();
+    let denied = effective_job_policy(&state.db, &project).await.unwrap();
+    assert!(!denied.policy.recurring.enabled);
+    assert!(denied.policy.enabled);
+    assert_ne!(effective.digest, denied.digest);
+}
+
+#[tokio::test]
 async fn malformed_policy_denies_and_interactive_policy_never_enables_jobs() {
     let (state, owner, host, member, project, machine) = fixture().await;
     let interactive = state

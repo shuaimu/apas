@@ -87,23 +87,13 @@ pub enum TuiEvent {
         request_id: uuid::Uuid,
         result: Result<std::path::PathBuf, String>,
     },
-    StartBot {
-        pane_id: u32,
-        prompt: Option<String>,
-        min_iteration_interval_minutes: Option<u64>,
-        effort: Option<String>,
-    },
     StopBot {
         pane_id: u32,
-    },
-    FinalizeStopBot {
-        pane_id: u32,
-        stop_flag: Arc<AtomicBool>,
     },
 }
 
 /// Commands sent into the TUI from event handlers — used by dual_pane to
-/// reflect pane lifecycle (add / remove / mode change) into the status
+/// reflect pane lifecycle (add / remove) into the status
 /// display.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum TuiCommand {
@@ -114,10 +104,6 @@ pub enum TuiCommand {
     },
     RemoveTab {
         pane_id: u32,
-    },
-    SetMode {
-        pane_id: u32,
-        mode: PaneMode,
     },
 }
 
@@ -299,11 +285,6 @@ impl App {
                 TuiCommand::RemoveTab { pane_id } => {
                     self.panes.remove(&pane_id);
                 }
-                TuiCommand::SetMode { pane_id, mode } => {
-                    if let Some(p) = self.panes.get_mut(&pane_id) {
-                        p.mode = mode;
-                    }
-                }
             }
         }
     }
@@ -394,7 +375,7 @@ impl App {
             .map(|(id, p)| {
                 let mode = match p.mode {
                     PaneMode::Interactive => "interactive",
-                    PaneMode::Deadloop => "deadloop",
+                    PaneMode::Deadloop => "bot history",
                 };
                 let last = humanize_age(p.last_activity.elapsed());
                 let err_style = if p.error_count > 0 {

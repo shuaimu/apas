@@ -1080,9 +1080,7 @@ impl DaemonState {
             let running: Vec<(String, String)> = self
                 .running
                 .iter()
-                .filter(|(_, project)| {
-                    !project.handle.is_finished() && project.claims == claims
-                })
+                .filter(|(_, project)| !project.handle.is_finished() && project.claims == claims)
                 .filter_map(|(project_id, _)| {
                     self.projects
                         .get(project_id)
@@ -2179,6 +2177,7 @@ fn daemon_capabilities(claim_mode: ClaimMode) -> Vec<String> {
         shared::SHARED_PROJECT_PROVISIONING_CAPABILITY.to_string(),
         shared::LOCAL_PROJECT_REGISTRATION_CAPABILITY.to_string(),
         shared::OMP_JOB_WORKER_CAPABILITY.to_string(),
+        shared::OMP_PERSISTENT_WORKER_CAPABILITY.to_string(),
     ];
     if claim_mode == ClaimMode::Instances {
         capabilities.push(shared::PROJECT_INSTANCES_CAPABILITY.to_string());
@@ -3406,8 +3405,11 @@ mod resume_tests {
         );
         assert_eq!(take_resume_manifest_at(&path), projects);
 
-        std::fs::write(&path, br#"[{"project_id":"alpha","path":"/projects/alpha"}]"#)
-            .expect("write an earlier manifest");
+        std::fs::write(
+            &path,
+            br#"[{"project_id":"alpha","path":"/projects/alpha"}]"#,
+        )
+        .expect("write an earlier manifest");
         assert_eq!(
             take_resume_manifest_at(&path),
             vec![ResumeProject {

@@ -28,4 +28,5 @@ export const MOBILE_CAPABILITIES = [
   "terminal",
   "pane_work_summary_v1",
   "project_instances_v1",
+  "autonomous_workers_v1",
 ] as const;

@@ -12,8 +12,8 @@ pub mod auth;
 mod authz;
 pub(crate) mod cluster;
 mod health;
-mod jobs;
 pub(crate) mod job_policy;
+mod jobs;
 mod local_projects;
 mod mobile;
 pub(crate) mod mobile_auth;
@@ -22,6 +22,7 @@ mod project_join;
 pub(crate) mod projects;
 pub(crate) mod share;
 pub mod system_admin;
+pub(crate) mod workers;
 mod ws_cli;
 mod ws_daemon;
 mod ws_web;
@@ -36,6 +37,7 @@ pub fn create_router(state: AppState) -> Router {
 
     Router::new()
         .merge(jobs::router())
+        .merge(workers::router())
         .merge(job_policy::router())
         // Health check
         .route("/health", get(health::health_check))

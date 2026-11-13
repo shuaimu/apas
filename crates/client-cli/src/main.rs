@@ -13,7 +13,6 @@ mod claude_session_hook;
 mod config;
 mod conversation;
 mod daemon_registry;
-mod file_watcher;
 mod host_storage;
 mod jobs;
 mod mode;
@@ -202,7 +201,7 @@ enum Commands {
 enum WorktreeAction {
     /// Create a git worktree for a pane and persist its path into .apas
     Add {
-        /// Pane id (0 = deadloop, 1 = interactive, or a dynamic-tab id)
+        /// Existing pane id
         pane_id: u32,
         /// Branch name (default: `apas-pane-<id>`)
         branch: Option<String>,
@@ -258,7 +257,11 @@ async fn main() -> Result<()> {
         },
         _ => None,
     };
-    let default_filter = if host_log.is_some() { "apas=info" } else { "apas=warn" };
+    let default_filter = if host_log.is_some() {
+        "apas=info"
+    } else {
+        "apas=warn"
+    };
     if let Some(log) = &host_log {
         pane_host::install_host_diagnostics(log);
     }
@@ -386,7 +389,10 @@ async fn main() -> Result<()> {
                     Err(err) => {
                         // Said once, here: returning the error as well had
                         // `main` print the same reason a second time.
-                        eprintln!("\x1b[31mCould not register {}: {err:#}\x1b[0m", dir.display());
+                        eprintln!(
+                            "\x1b[31mCould not register {}: {err:#}\x1b[0m",
+                            dir.display()
+                        );
                         std::process::exit(1);
                     }
                 }
@@ -429,7 +435,11 @@ async fn main() -> Result<()> {
                 return result;
             }
             Commands::JobHost { run_dir } => return jobs::host::run(run_dir).await,
-            Commands::JobGatewayBridge { socket, token_file, listen } => {
+            Commands::JobGatewayBridge {
+                socket,
+                token_file,
+                listen,
+            } => {
                 return jobs::gateway::run_bridge(socket, token_file, listen).await;
             }
             Commands::Daemon { roots } => {

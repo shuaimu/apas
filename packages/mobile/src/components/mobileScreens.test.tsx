@@ -1,6 +1,7 @@
 import { FlatList, ScrollView, StyleSheet } from "react-native";
 import { act, cleanup, fireEvent, render, waitFor } from "@testing-library/react-native";
 import type { CodeEvent, MobileLaunchTarget, MobileSessionSummary, PaneConfig, PaneWorkSummary, SessionInstanceInfo, WebToServer } from "@apas/protocol";
+import { router } from "expo-router";
 
 import CodeHomeScreen from "@/../app/(code)/(tabs)/index";
 import NewTaskScreen from "@/../app/(code)/new";
@@ -794,6 +795,26 @@ describe("mobile code screens", () => {
     fireEvent.press(view.getByText("Approve"));
     expect(mockSendAcknowledged).not.toHaveBeenCalled();
     expect(view.getByText("Claude 3 · zoo-005")).toBeTruthy();
+  });
+
+  it("preserves retired bot instructions and provider read-only without a conversion path", async () => {
+    mockParams = { sessionId: session.id, paneId: "8" };
+    mockReadCachedSnapshot.mockReturnValue(Promise.withResolvers().promise);
+    useMobileStore.setState({
+      sessions: [session], features: { terminal: true, coding_mutations: true },
+      panesBySession: { [session.id]: [{ ...terminalPane, provider: "claude", mode: "deadloop", prompt: "Keep the original responsibility text", min_iteration_interval_minutes: 15 }] },
+    });
+    const view = render(<SessionActivityScreen />);
+    await waitFor(() => expect(view.getByText(/original provider claude/)).toBeTruthy());
+    fireEvent.press(view.getByText("Read original bot instructions"));
+    expect(view.getByText("Keep the original responsibility text")).toBeTruthy();
+    expect(view.getByRole("button", { name: "Send message" })).toBeDisabled();
+    fireEvent.press(view.getByText("Send message"));
+    expect(mockSendAcknowledged).not.toHaveBeenCalled();
+    const selectedSession = useMobileStore.getState().activeSessionId;
+    fireEvent.press(view.getByText("Approve a separate fresh worker"));
+    expect(router.push).toHaveBeenLastCalledWith({ pathname: "/(code)/workers/new", params: { project: session.project_id } });
+    expect(useMobileStore.getState().activeSessionId).toBe(selectedSession);
   });
 
   it("shows the server's own reason when it refuses typed input for a tab's machine", async () => {

@@ -175,8 +175,8 @@ describe("TabbedView pane input drafts", () => {
     expect(localStorage.getItem(draftKey())).toBe("keep this draft");
   });
 
-  it("hides input on Overview and shows bot status instead of input for deadloop panes", async () => {
-    seedTabbedView({
+  it("hides input on Overview and keeps deadloop history read-only", async () => {
+    const { sendMessageToPane } = seedTabbedView({
       panes: [
         pane({ pane_id: ACTIVE_PANE_ID, label: "Worker" }),
         pane({ pane_id: 77, label: "Reviewer", mode: "deadloop" }),
@@ -194,9 +194,7 @@ describe("TabbedView pane input drafts", () => {
     fireEvent.click(screen.getByText("Reviewer (Bot)"));
     await waitFor(() => {
       expect(screen.queryByPlaceholderText("Type a message...")).toBeNull();
-      expect(
-        screen.getByText("Bot is running autonomously. Click Stop Bot to switch to interactive mode after current work finishes."),
-      ).toBeTruthy();
     });
+    expect(sendMessageToPane).not.toHaveBeenCalled();
   });
 });

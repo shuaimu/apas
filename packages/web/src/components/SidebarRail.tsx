@@ -53,8 +53,8 @@ export function SidebarRail({ onExpand }: SidebarRailProps) {
           <ChevronsRight className="h-5 w-5" />
         </button>
       </div>
-      <Link href="/code/jobs" className="flex min-h-11 w-11 items-center justify-center rounded text-xs font-semibold" title="Autonomous jobs" aria-label="Autonomous jobs">Jobs</Link>
-      <Link href="/code/jobs?view=attention" className="flex min-h-11 w-11 items-center justify-center rounded text-xs font-semibold" title="Job attention" aria-label="Job attention">Inbox</Link>
+      <Link href="/code/workers" className="flex min-h-11 w-11 items-center justify-center rounded text-xs font-semibold" title="Autonomous workers" aria-label="Autonomous workers">Work</Link>
+      <Link href="/code/workers?view=attention" className="flex min-h-11 w-11 items-center justify-center rounded text-xs font-semibold" title="Worker attention" aria-label="Worker attention">Inbox</Link>
 
       {/* The rail is the project list; hide its scrollbar so the icons stay
           centred in a 56px column. */}

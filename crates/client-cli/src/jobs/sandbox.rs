@@ -106,6 +106,13 @@ pub fn profile_digest<T: Serialize>(profile: &T) -> Result<String> {
     ))
 }
 
+pub(super) fn bootstrap_digest() -> String {
+    format!(
+        "sha256:{:x}",
+        Sha256::digest(include_bytes!("omp-worker.mjs"))
+    )
+}
+
 /// Bind admission and operational qualification to resolved capabilities and
 /// policy, not merely the mutable keys referring to operator-owned profiles.
 pub fn worker_profile_digest(
@@ -150,7 +157,14 @@ pub fn worker_profile_digest(
         publishers.next().is_none(),
         "worker publisher profile key is ambiguous"
     );
-    profile_digest(&(worker, models, verifiers, publisher))
+    profile_digest(&(
+        worker,
+        models,
+        verifiers,
+        publisher,
+        shared::WORKER_EXECUTION_PROTOCOL_VERSION,
+        bootstrap_digest(),
+    ))
 }
 
 pub fn validate_image_pin(image: &str) -> Result<()> {
@@ -797,6 +811,7 @@ impl Sandbox {
         env: &[(String, String)],
         argv: &[String],
         lifetime_seconds: u64,
+        checkout_read_only: bool,
     ) -> Result<Command> {
         ensure!(
             !argv.is_empty() && !argv[0].is_empty(),
@@ -863,7 +878,11 @@ impl Sandbox {
             "--tmpfs",
             "/run:rw,nosuid,nodev,noexec,size=1048576,mode=755",
             "--volume",
-            &format!("{}:/workspace:rw,rprivate,nosuid,nodev", checkout.display()),
+            &format!(
+                "{}:/workspace:{},rprivate,nosuid,nodev",
+                checkout.display(),
+                if checkout_read_only { "ro" } else { "rw" }
+            ),
             "--volume",
             &format!("{}:/session:rw,rprivate,nosuid,nodev", session.display()),
             "--env=PATH=/usr/local/bin:/usr/bin:/bin",
@@ -959,6 +978,7 @@ impl Sandbox {
         bridge_dir: &Path,
         env: &[(String, String)],
         argv: &[String],
+        checkout_read_only: bool,
     ) -> Result<ContainerProcess> {
         ensure!(
             !self.recovery_only,
@@ -1000,6 +1020,7 @@ impl Sandbox {
             env,
             argv,
             lifetime_seconds,
+            checkout_read_only,
         )?;
         self.launch(command, &name, creation_timeout, deadline)
             .await
@@ -1134,6 +1155,7 @@ impl Sandbox {
             &[],
             &check.argv,
             lifetime_seconds,
+            false,
         )?;
         let mut process = self
             .launch(command, &name, creation_timeout, deadline)
@@ -1202,8 +1224,8 @@ impl Sandbox {
         create_private(&checkout)?;
         create_private(&session)?;
         let name = format!("apas-probe-{run_id}");
-        let argv = vec!["/usr/bin/python3".into(), "-c".into(), PROBE_SCRIPT.into(), profile.limits.memory_bytes.to_string(), profile.limits.pids.to_string(), profile.limits.cpu_millis.to_string(), profile.omp_binary.clone(), profile.omp_version.clone(), profile.limits.workspace_bytes.to_string()];
-        let command = self.create_command(&name, run_id, &profile.image, &profile.limits, &checkout, &session, None, &[], &argv, COMMAND_TIMEOUT.as_secs().min(profile.limits.elapsed_seconds))?;
+        let argv = vec!["/usr/bin/python3".into(), "-c".into(), PROBE_SCRIPT.into(), profile.limits.memory_bytes.to_string(), profile.limits.pids.to_string(), profile.limits.cpu_millis.to_string(), profile.omp_binary.clone(), profile.omp_version.clone(), profile.limits.workspace_bytes.to_string(), bootstrap_digest()];
+        let command = self.create_command(&name, run_id, &profile.image, &profile.limits, &checkout, &session, None, &[], &argv, COMMAND_TIMEOUT.as_secs().min(profile.limits.elapsed_seconds), false)?;
         let mut process = self.launch(command, &name, COMMAND_TIMEOUT, tokio::time::Instant::now() + COMMAND_TIMEOUT * 2).await?;
         drop(process.child.stdin.take());
         let stdout = process.child.stdout.take().context("probe stdout missing")?;
@@ -1216,10 +1238,24 @@ impl Sandbox {
         let (output, truncated) = out_task.await??;
         let _ = err_task.await??;
         ensure!(status.success() && !truncated && output == b"APAS_SANDBOX_OK\n", "sandbox behavioral probe failed: qualify non-root, readonly image, cgroup bounds, private namespaces, network denial and pinned OMP version");
+        // Prove the inspection mount differs from implementation while bounded
+        // session output remains writable. No model or provider is invoked.
+        let inspection_name = format!("apas-inspect-probe-{run_id}");
+        let argv = vec!["/usr/bin/python3".into(), "-c".into(), READONLY_PROBE_SCRIPT.into()];
+        let command = self.create_command(&inspection_name, run_id, &profile.image, &profile.limits, &checkout, &session, None, &[], &argv, COMMAND_TIMEOUT.as_secs().min(profile.limits.elapsed_seconds), true)?;
+        let mut inspection = self.launch(command, &inspection_name, COMMAND_TIMEOUT, tokio::time::Instant::now() + COMMAND_TIMEOUT * 2).await?;
+        drop(inspection.child.stdin.take());
+        let stdout = tokio::spawn(read_bounded(inspection.child.stdout.take().context("inspection probe stdout missing")?, 4096));
+        let stderr = tokio::spawn(read_bounded(inspection.child.stderr.take().context("inspection probe stderr missing")?, 4096));
+        let status = tokio::time::timeout(COMMAND_TIMEOUT, inspection.child.wait()).await;
+        self.stop(&inspection.container_id).await?;
+        let (output, truncated) = stdout.await??;
+        let _ = stderr.await??;
+        ensure!(status??.success() && !truncated && output == b"APAS_INSPECTION_OK\n", "read-only inspection and session output probe failed");
         // Separate live descendant test: an exited probe alone is not stop evidence.
         let stop_name = format!("apas-stop-probe-{run_id}");
         let argv = vec!["/usr/bin/python3".into(), "-c".into(), "import os,time; os.fork(); time.sleep(120)".into()];
-        let command = self.create_command(&stop_name, run_id, &profile.image, &profile.limits, &checkout, &session, None, &[], &argv, COMMAND_TIMEOUT.as_secs().min(profile.limits.elapsed_seconds))?;
+        let command = self.create_command(&stop_name, run_id, &profile.image, &profile.limits, &checkout, &session, None, &[], &argv, COMMAND_TIMEOUT.as_secs().min(profile.limits.elapsed_seconds), false)?;
         let mut descendants = self.launch(command, &stop_name, COMMAND_TIMEOUT, tokio::time::Instant::now() + COMMAND_TIMEOUT * 2).await?;
         tokio::time::sleep(Duration::from_millis(500)).await;
         let state: Value = serde_json::from_slice(&self.output(&["inspect", "--type=container", &descendants.container_id]).await?)?;
@@ -1272,16 +1308,24 @@ struct QualificationEvidence {
     omp_rpc: bool,
     child_questions: bool,
     gateway_metering: bool,
+    execution_protocol_version: u32,
+    bootstrap_digest: String,
+    readonly_inspection: bool,
+    inspection_results: bool,
+    implementation_results: bool,
 }
 
 fn check_qualification(profile: &WorkerProfileConfig, expected_digest: &str) -> Result<()> {
-    let path = profile.qualification_file.as_ref().context("record real pinned-image RPC, delegated-question and gateway-metering qualification before enabling this profile")?;
+    let path = profile.qualification_file.as_ref().context("record real pinned-bootstrap RPC, child-question, metering, read-only inspection and inspection/implementation result qualification before enabling this profile")?;
     validate_credential(path)
         .context("qualification evidence must be a private operator-owned regular file")?;
     let evidence: QualificationEvidence = serde_json::from_slice(&std::fs::read(path)?)?;
     ensure!(evidence.profile_digest == expected_digest && evidence.qualified_at <= Utc::now()
-        && evidence.omp_rpc && evidence.child_questions && evidence.gateway_metering,
-        "qualification evidence does not prove the selected immutable profile's RPC, child-question and gateway-metering behavior");
+        && evidence.omp_rpc && evidence.child_questions && evidence.gateway_metering
+        && evidence.execution_protocol_version == shared::WORKER_EXECUTION_PROTOCOL_VERSION
+        && evidence.bootstrap_digest == bootstrap_digest() && evidence.readonly_inspection
+        && evidence.inspection_results && evidence.implementation_results,
+        "qualification evidence does not prove the selected immutable bootstrap's RPC, metering, read-only inspection and result behavior");
     Ok(())
 }
 
@@ -1480,7 +1524,7 @@ pub async fn readiness(
     JobWorkerReadiness {
         machine_id,
         cluster_owner_user_id,
-        protocol_version: shared::JOB_PROTOCOL_VERSION,
+        protocol_version: shared::WORKER_EXECUTION_PROTOCOL_VERSION,
         checked_at: checked.to_rfc3339(),
         expires_at: (checked + ChronoDuration::seconds(shared::JOB_READINESS_SECONDS as i64))
             .to_rfc3339(),
@@ -1488,8 +1532,8 @@ pub async fn readiness(
     }
 }
 
-const PROBE_SCRIPT: &str = r#"import errno, os, pathlib, socket, subprocess, sys
-memory,pids,cpu,binary,version,workspace=sys.argv[1:]
+const PROBE_SCRIPT: &str = r#"import errno, json, os, pathlib, socket, subprocess, sys
+memory,pids,cpu,binary,version,workspace,bootstrap=sys.argv[1:]
 assert os.getuid()!=0
 status=pathlib.Path('/proc/self/status').read_text()
 assert 'NoNewPrivs:\t1' in status and 'CapEff:\t0000000000000000' in status
@@ -1519,12 +1563,81 @@ try:
 finally:
  os.unlink('/workspace/quota-probe')
 assert version in subprocess.check_output([binary,'--version'],stderr=subprocess.STDOUT,timeout=15).decode()
+if binary=='/usr/local/bin/apas-omp-worker':
+ contract=json.loads(subprocess.check_output([binary,'--worker-contract'],stderr=subprocess.STDOUT,timeout=15))
+ assert contract=={'version':2,'resultVersion':1,'resultPath':'/session/apas-worker-result.json','bootstrapDigest':bootstrap}
 print('APAS_SANDBOX_OK')
+"#;
+
+const READONLY_PROBE_SCRIPT: &str = r#"import errno, os, stat
+try:
+ open('/workspace/apas-inspection-probe','w')
+ raise AssertionError('inspection checkout is writable')
+except OSError as error:
+ assert error.errno==errno.EROFS
+path='/session/apas-worker-result.json'
+with open(path,'x') as output:output.write('{}')
+assert stat.S_ISREG(os.lstat(path).st_mode)
+os.unlink(path)
+print('APAS_INSPECTION_OK')
 "#;
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn qualification_requires_real_result_contract_for_exact_bootstrap() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("qualification.json");
+        let profile: WorkerProfileConfig = serde_json::from_value(serde_json::json!({
+            "key":"worker","label":"Worker","image":"pinned-test-image","omp_version":"18.18.0",
+            "omp_binary":"/usr/local/bin/apas-omp-worker","models":[],"verifiers":[],
+            "publisher":"publisher","limits":JobLimits::default(),"qualification_file":path
+        }))
+        .unwrap();
+        let original = serde_json::json!({
+            "profile_digest":"qualified-profile","qualified_at":Utc::now().to_rfc3339(),
+            "omp_rpc":true,"child_questions":true,"gateway_metering":true,
+            "execution_protocol_version":shared::WORKER_EXECUTION_PROTOCOL_VERSION,
+            "bootstrap_digest":bootstrap_digest(),"readonly_inspection":true,
+            "inspection_results":true,"implementation_results":true
+        });
+        let save = |value: &Value| {
+            std::fs::write(&path, serde_json::to_vec(value).unwrap()).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        };
+        save(&original);
+        assert!(check_qualification(&profile, "qualified-profile").is_ok());
+        assert!(check_qualification(&profile, "different-profile").is_err());
+        for field in [
+            "readonly_inspection",
+            "inspection_results",
+            "implementation_results",
+        ] {
+            let mut value = original.clone();
+            value[field] = Value::Bool(false);
+            save(&value);
+            assert!(
+                check_qualification(&profile, "qualified-profile").is_err(),
+                "{field}"
+            );
+            value.as_object_mut().unwrap().remove(field);
+            save(&value);
+            assert!(
+                check_qualification(&profile, "qualified-profile").is_err(),
+                "{field}"
+            );
+        }
+        let mut value = original.clone();
+        value["execution_protocol_version"] = serde_json::json!(1);
+        save(&value);
+        assert!(check_qualification(&profile, "qualified-profile").is_err());
+        value = original;
+        value["bootstrap_digest"] = serde_json::json!("different-bootstrap");
+        save(&value);
+        assert!(check_qualification(&profile, "qualified-profile").is_err());
+    }
 
     #[test]
     fn mutable_or_malformed_image_cannot_enter_sandbox() {

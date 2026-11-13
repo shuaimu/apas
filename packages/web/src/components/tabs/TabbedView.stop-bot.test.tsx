@@ -1,164 +1,32 @@
-import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { paneKey, useStore, type PaneConfig } from "@/lib/store";
+import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { afterEach, beforeEach, expect, it, vi } from "vitest";
+import { useStore } from "@/lib/store";
 import { TabbedView } from "./TabbedView";
 
-type StoreState = ReturnType<typeof useStore.getState>;
-
 const initialStore = useStore.getInitialState();
-const SESSION_ID = "session-stop-bot";
-const CLI_CLIENT_ID = "cli-stop-bot";
-const ACTIVE_PANE_ID = 42;
+beforeEach(() => { Element.prototype.scrollIntoView = vi.fn(); });
+afterEach(() => { cleanup(); localStorage.clear(); act(() => useStore.setState(initialStore, true)); vi.restoreAllMocks(); });
 
-function activeTabKey(): string {
-  return `apas_layout_${CLI_CLIENT_ID}_active_tab`;
-}
-
-function pane(overrides: Partial<PaneConfig> & Pick<PaneConfig, "pane_id">): PaneConfig {
-  return {
-    pane_id: overrides.pane_id,
-    provider: overrides.provider ?? "claude",
-    mode: overrides.mode ?? "interactive",
-    session_id: overrides.session_id ?? `${SESSION_ID}-pane-${overrides.pane_id}`,
-    is_paused: overrides.is_paused ?? false,
-    label: overrides.label ?? `Pane ${overrides.pane_id}`,
-    stop_requested: overrides.stop_requested,
-    role: overrides.role,
-    managed: overrides.managed,
-  };
-}
-
-function seedTabbedView({
-  activePaneId = ACTIVE_PANE_ID,
-  panes = [pane({ pane_id: ACTIVE_PANE_ID, label: "Worker" })],
-  stopBot = vi.fn(),
-}: {
-  activePaneId?: number;
-  panes?: PaneConfig[];
-  stopBot?: StoreState["stopBot"];
-} = {}) {
-  localStorage.setItem(activeTabKey(), String(activePaneId));
-
-  act(() => {
-    useStore.setState({
-      connected: true,
-      isAttached: true,
-      isDualPane: true,
-      sessionId: SESSION_ID,
-      cliClientId: CLI_CLIENT_ID,
-      messages: [],
-      paneConfigs: panes,
-      paneMessages: Object.fromEntries(panes.map((item) => [paneKey(item.pane_id), []])),
-      paneHasMore: {},
-      paneStatuses: {},
-      paneModes: {},
-      pausedPanes: [],
-      loadingMorePane: null,
-      hasMoreMessages: false,
-      isLoadingMore: false,
-      teamRecords: [],
-      projectPolicies: {
-        [SESSION_ID]: {
-          teamAvailable: true,
-          allowedLaunchProfiles: ["terminal:claude:official:default"],
-          version: 1,
-          projectSuspended: false,
-          noncompliantPaneIds: [],
-        },
-      },
-      loadPaneMessagesIfNeeded: vi.fn(),
-      loadMoreMessages: vi.fn(),
-      stopBot,
-    });
-  });
-
-  return { stopBot };
-}
-
-describe("TabbedView bot stop controls", () => {
-  beforeEach(() => {
-    Element.prototype.scrollIntoView = vi.fn();
-  });
-
-  afterEach(() => {
-    vi.restoreAllMocks();
-    localStorage.clear();
-    act(() => {
-      useStore.setState(initialStore, true);
-    });
-  });
-
-  it("renders graceful Stop Bot controls for a running bot pane", async () => {
-    const { stopBot } = seedTabbedView({
-      panes: [
-        pane({
-          pane_id: ACTIVE_PANE_ID,
-          label: "Worker",
-          mode: "deadloop",
-          stop_requested: false,
-        }),
-      ],
-    });
-
-    render(<TabbedView />);
-
-    const stopButton = await screen.findByRole("button", { name: "Stop Bot" });
-    expect(stopButton.getAttribute("title")).toBe(
-      "Stop after current work finishes (click again to force stop)",
-    );
-    expect(
-      screen.getByText(
-        "Bot is running autonomously. Click Stop Bot to switch to interactive mode after current work finishes.",
-      ),
-    ).toBeTruthy();
-
-    fireEvent.click(stopButton);
-
-    expect(stopBot).toHaveBeenCalledWith(ACTIVE_PANE_ID);
-  });
-
-  it("renders Force Stop controls when a stop is already requested", async () => {
-    const { stopBot } = seedTabbedView({
-      panes: [
-        pane({
-          pane_id: ACTIVE_PANE_ID,
-          label: "Worker",
-          mode: "deadloop",
-          stop_requested: true,
-        }),
-      ],
-    });
-
-    render(<TabbedView />);
-
-    const forceStopButton = await screen.findByRole("button", { name: "Force Stop" });
-    expect(forceStopButton.getAttribute("title")).toContain("Force stop immediately");
-    expect(screen.getByText(/Stop requested .* Click Force Stop to kill immediately\./)).toBeTruthy();
-
-    fireEvent.click(forceStopButton);
-
-    expect(stopBot).toHaveBeenCalledWith(ACTIVE_PANE_ID);
-  });
-
-  it("does not render stop controls for interactive panes or Overview", async () => {
-    seedTabbedView({
-      panes: [
-        pane({ pane_id: ACTIVE_PANE_ID, label: "Interactive worker", mode: "interactive" }),
-        pane({ pane_id: 77, label: "Bot worker", mode: "deadloop" }),
-      ],
-    });
-
-    render(<TabbedView />);
-
-    await screen.findByRole("button", { name: "Bot" });
-    expect(screen.queryByRole("button", { name: "Stop Bot" })).toBeNull();
-    expect(screen.queryByRole("button", { name: "Force Stop" })).toBeNull();
-
-    fireEvent.click(screen.getByText("Overview"));
-
-    await waitFor(() => {
-      expect(screen.queryByRole("button", { name: "Stop Bot" })).toBeNull();
-      expect(screen.queryByRole("button", { name: "Force Stop" })).toBeNull();
-    });
-  });
+it.each([false, true])("retains legacy history read-only with stop_requested=%s and no Stop Bot or force-stop send", async (stopRequested) => {
+  const send = vi.fn();
+  const sendMessageToPane = vi.fn(() => ({ success: true }));
+  localStorage.setItem("apas_layout_cli-history_active_tab", "42");
+  act(() => useStore.setState({
+    connected: true, isAttached: true, isDualPane: true, sessionId: "history", cliClientId: "cli-history",
+    ws: { readyState: WebSocket.OPEN, send } as unknown as WebSocket,
+    paneConfigs: [{ pane_id: 42, provider: "claude", mode: "deadloop", session_id: "pane-history", is_paused: false, label: "Earlier bot", stop_requested: stopRequested, prompt: "Keep original source" }],
+    paneListReceived: true, paneMessages: { "42": [{ id: "old-output", role: "assistant", content: "Retained execution evidence", timestamp: new Date(), outputType: { type: "text" } }] }, paneStatuses: {}, paneModes: {}, pausedPanes: [], messages: [],
+    loadPaneMessagesIfNeeded: vi.fn(), loadMoreMessages: vi.fn(), sendMessageToPane, projectPolicies: {},
+  }));
+  render(<TabbedView />);
+  expect(await screen.findByText(/Legacy bot history is read-only/)).toBeTruthy();
+  expect(screen.getByText("Retained execution evidence")).toBeTruthy();
+  expect(screen.queryByRole("button", { name: /^(Stop Bot|Force Stop|Bot)$/ })).toBeNull();
+  send.mockClear();
+  fireEvent.click(screen.getByRole("button", { name: "Project overview" }));
+  fireEvent.click(screen.getByRole("button", { name: "Back to interactive agents" }));
+  expect(send).not.toHaveBeenCalled();
+  expect(sendMessageToPane).not.toHaveBeenCalled();
+  expect(useStore.getState().paneConfigs[0].prompt).toBe("Keep original source");
+  expect(useStore.getState().sessionId).toBe("history");
 });

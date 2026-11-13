@@ -95,7 +95,7 @@ impl Database {
             > 0)
     }
     pub async fn clear_stopped_job_fences(&self) -> Result<()> {
-        sqlx::query("DELETE FROM autonomous_job_project_fences WHERE project_id IN (SELECT id FROM projects WHERE lifecycle_status='active') AND NOT EXISTS (SELECT 1 FROM autonomous_jobs j WHERE j.project_id=autonomous_job_project_fences.project_id AND j.state NOT IN ('review_ready','cancelled','failed'))").execute(&self.pool).await?;
+        sqlx::query("DELETE FROM autonomous_job_project_fences WHERE project_id IN (SELECT id FROM projects WHERE lifecycle_status='active') AND NOT EXISTS (SELECT 1 FROM autonomous_jobs j WHERE j.project_id=autonomous_job_project_fences.project_id AND j.state NOT IN ('review_ready','cancelled','failed','completed'))").execute(&self.pool).await?;
         Ok(())
     }
     pub async fn job(&self, id: Uuid) -> Result<Option<StoredJob>> {
@@ -124,6 +124,7 @@ impl Database {
             "SELECT document FROM autonomous_jobs WHERE project_id=",
         );
         query.push_bind(project);
+        query.push(" AND json_extract(document,'$.detail.task.worker') IS NULL");
         if let Some(cursor) = cursor {
             if let Some((created_at, id)) = cursor.rsplit_once('|') {
                 query
@@ -134,7 +135,9 @@ impl Database {
                     .push(")");
             } else {
                 // Preserve the global list's lexical behavior for opaque cursors.
-                query.push(" AND (created_at || '|' || id)<").push_bind(cursor);
+                query
+                    .push(" AND (created_at || '|' || id)<")
+                    .push_bind(cursor);
             }
         }
         if let Some(status) = status {
@@ -152,28 +155,6 @@ impl Database {
             .into_iter()
             .map(|r| serde_json::from_str(r.get::<&str, _>("document")).map_err(Into::into))
             .collect()
-    }
-    pub async fn job_preview(&self, actor: Uuid, id: Uuid) -> Result<Option<JobPreview>> {
-        let row =
-            sqlx::query("SELECT document FROM autonomous_job_previews WHERE id=? AND actor=?")
-                .bind(id.to_string())
-                .bind(actor.to_string())
-                .fetch_optional(&self.pool)
-                .await?;
-        row.map(|r| serde_json::from_str(r.get::<&str, _>("document")).map_err(Into::into))
-            .transpose()
-    }
-    pub async fn store_job_preview(&self, actor: Uuid, preview: &JobPreview) -> Result<()> {
-        sqlx::query(
-            "INSERT INTO autonomous_job_previews(id,actor,project_id,document) VALUES(?,?,?,?)",
-        )
-        .bind(preview.id.to_string())
-        .bind(actor.to_string())
-        .bind(&preview.project_id)
-        .bind(serde_json::to_string(preview)?)
-        .execute(&self.pool)
-        .await?;
-        Ok(())
     }
     pub async fn job_receipt(
         &self,
@@ -300,7 +281,7 @@ impl Database {
     pub async fn retain_job_content(&self) -> Result<()> {
         let cutoff = (Utc::now() - chrono::Duration::days(30)).to_rfc3339();
         let mut tx = self.job_transaction().await?;
-        sqlx::query("DELETE FROM autonomous_job_events WHERE job_id IN (SELECT id FROM autonomous_jobs WHERE state IN ('review_ready','cancelled','failed') AND json_extract(document,'$.detail.runs[#-1].ended_at')<?)").bind(&cutoff).execute(&mut *tx).await?;
+        sqlx::query("DELETE FROM autonomous_job_events WHERE job_id IN (SELECT id FROM autonomous_jobs WHERE state IN ('review_ready','cancelled','failed','completed') AND json_extract(document,'$.detail.runs[#-1].ended_at')<?)").bind(&cutoff).execute(&mut *tx).await?;
         sqlx::query("UPDATE autonomous_job_artifacts SET content=X'' WHERE json_extract(manifest,'$.expires_at') IS NOT NULL AND json_extract(manifest,'$.expires_at')<?").bind(Utc::now().to_rfc3339()).execute(&mut *tx).await?;
         sqlx::query(
             "DELETE FROM autonomous_job_previews WHERE json_extract(document,'$.expires_at')<?",

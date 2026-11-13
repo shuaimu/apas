@@ -19,6 +19,7 @@ import { publishTerminalMessage } from "@/terminal/events";
 import { startNotificationAndLinkRuntime, stopNotificationAndLinkRuntime } from "@/notifications";
 import { acceptJobsBootstrap, setJobEnvironment, startJobsRuntime, stopJobsRuntime, purgeJobAccess } from "@/jobs/runtime";
 import { queryClient } from "@/query/client";
+import { bindWorkerSocket, handleWorkerMessage } from "@/workers/runtime";
 
 let supervisor: ConnectionSupervisor | null = null;
 let cleanup: (() => void) | null = null;
@@ -45,6 +46,7 @@ export function startConnectionRuntime(): ConnectionSupervisor {
       startNotificationAndLinkRuntime();
     },
     onMessage: (message) => {
+      if (handleWorkerMessage(message)) return;
       if (handlePaneWorkSummaryMessage(message)) return;
       if (handleSessionInstancesMessage(message)) return;
       if (message.type === "session_attached") {
@@ -74,6 +76,7 @@ export function startConnectionRuntime(): ConnectionSupervisor {
     },
     onSynchronized: () => {
       reconcileVisiblePaneWorkSummaries((message) => supervisor?.send(message) ?? false);
+      bindWorkerSocket(useMobileStore.getState().negotiatedCapabilities.includes("autonomous_workers_v1") ? (message) => supervisor?.send(message) ?? false : null);
     },
     isAuthenticationLoss: (error) => error instanceof ApiError && [401, 403].includes(error.status),
     onAuthenticationLost: () => {

@@ -21,6 +21,10 @@ pub struct JobService {
     pub readiness: DashMap<Uuid, JobWorkerReadiness>,
     preparations: DashMap<Uuid, (Uuid, Uuid, String, Uuid, oneshot::Sender<JobWorkerReport>)>,
     pub subscriptions: DashMap<(Uuid, Uuid), String>,
+    pub worker_subscriptions: DashMap<(Uuid, Uuid), String>,
+    pub worker_subscription_cursors: DashMap<(Uuid, Uuid), u64>,
+    pub worker_socket_lock: tokio::sync::Mutex<()>,
+    pub worker_claims: DashMap<Uuid, ()>,
     pub connection_auth: DashMap<Uuid, (Uuid, Option<String>, usize)>,
     pub cleanup_scheduled: DashMap<String, ()>,
     daemon_gates: DashMap<Uuid, std::sync::Arc<tokio::sync::Mutex<()>>>,
@@ -47,9 +51,11 @@ impl Drop for PendingPreparation<'_> {
 fn digest(value: &impl Serialize) -> Result<String> {
     Ok(format!("{:x}", Sha256::digest(serde_json::to_vec(value)?)))
 }
-fn fresh(readiness: &JobWorkerReadiness) -> bool {
-    readiness.protocol_version == JOB_PROTOCOL_VERSION
-        && chrono::DateTime::parse_from_rfc3339(&readiness.expires_at).is_ok_and(|d| d > Utc::now())
+pub(crate) fn fresh(readiness: &JobWorkerReadiness) -> bool {
+    matches!(
+        readiness.protocol_version,
+        JOB_PROTOCOL_VERSION | WORKER_EXECUTION_PROTOCOL_VERSION
+    ) && chrono::DateTime::parse_from_rfc3339(&readiness.expires_at).is_ok_and(|d| d > Utc::now())
         && chrono::DateTime::parse_from_rfc3339(&readiness.checked_at).is_ok_and(|d| {
             d <= Utc::now() && d > Utc::now() - Duration::seconds(JOB_READINESS_SECONDS as i64)
         })
@@ -180,7 +186,7 @@ pub async fn targets(state: &AppState, actor: Uuid, project: &str) -> Result<Job
         unavailable_reasons,
     })
 }
-async fn prepare(
+pub(crate) async fn prepare(
     state: &AppState,
     actor: Uuid,
     project: &str,
@@ -231,298 +237,12 @@ async fn prepare(
     response.ok_or_else(|| anyhow::anyhow!("prepare_unavailable"))
 }
 pub async fn preview(
-    state: &AppState,
-    actor: Uuid,
-    project: &str,
-    request: JobPreviewRequest,
+    _state: &AppState,
+    _actor: Uuid,
+    _project: &str,
+    _request: JobPreviewRequest,
 ) -> Result<JobPreview> {
-    ensure!(
-        !request.instruction.trim().is_empty()
-            && request.instruction.len() <= 64 * 1024
-            && request.acceptance_criteria.len() <= 64
-            && request.acceptance_criteria.iter().all(|s| s.len() <= 8192),
-        "invalid_task"
-    );
-    ensure!(
-        !request.base_ref.is_empty() && request.base_ref.len() <= 512,
-        "invalid_base"
-    );
-    let target = targets(state, actor, project)
-        .await?
-        .targets
-        .into_iter()
-        .find(|t| t.machine_id == request.machine_id && t.available)
-        .ok_or_else(|| anyhow::anyhow!("target_unavailable"))?;
-    let prepared = prepare(
-        state,
-        actor,
-        project,
-        &target,
-        &request.base_ref,
-        &request.worker_profile,
-    )
-    .await?;
-    let JobWorkerReport::Prepared {
-        repository,
-        base_sha,
-        base_ref,
-        profile,
-        ..
-    } = prepared
-    else {
-        anyhow::bail!("prepare_rejected")
-    };
-    ensure!(
-        base_ref == request.base_ref
-            && profile.key == request.worker_profile
-            && profile.ready
-            && !repository.is_empty()
-            && base_sha.len() == 40
-            && base_sha.bytes().all(|b| b.is_ascii_hexdigit()),
-        "prepared_inputs_invalid"
-    );
-    ensure!(
-        target.policy.policy.worker_profiles.contains(&profile.key)
-            && target
-                .policy
-                .policy
-                .model_profiles
-                .contains(&request.model_profile)
-            && target
-                .policy
-                .policy
-                .verification_profiles
-                .contains(&request.verification_profile),
-        "profile_denied"
-    );
-    ensure!(
-        profile
-            .model_profiles
-            .iter()
-            .any(|p| p.key == request.model_profile),
-        "model_unavailable"
-    );
-    let verifier = profile
-        .verification_profiles
-        .iter()
-        .find(|p| p.key == request.verification_profile)
-        .ok_or_else(|| anyhow::anyhow!("verification_unavailable"))?;
-    ensure!(
-        request.limits.fits_within(&target.policy.policy.limits)
-            && request.limits.fits_within(&profile.limits),
-        "limits_denied"
-    );
-    let task = JobTaskSpec {
-        instruction: request.instruction,
-        acceptance_criteria: request.acceptance_criteria,
-        source_url: request.source_url,
-        repository,
-        base_ref,
-        base_sha,
-        worker_profile: profile.key,
-        worker_profile_digest: profile.digest,
-        verification_profile: verifier.key.clone(),
-        verification_profile_digest: verifier.digest.clone(),
-        model_profile: request.model_profile,
-    };
-    let mut preview = JobPreview {
-        id: Uuid::new_v4(),
-        project_id: project.into(),
-        fingerprint: String::new(),
-        expires_at: (Utc::now() + Duration::minutes(5)).to_rfc3339(),
-        task,
-        machine_id: target.machine_id,
-        cluster_owner_user_id: target.cluster_owner_user_id,
-        hostname: target.hostname,
-        limits: request.limits,
-        policy_digest: target.policy.digest,
-    };
-    preview.fingerprint = digest(&preview)?;
-    state.db.store_job_preview(actor, &preview).await?;
-    Ok(preview)
-}
-async fn admit_inner(
-    state: &AppState,
-    actor: Uuid,
-    project: &str,
-    request: JobAdmissionRequest,
-) -> Result<JobMutationReceipt> {
-    let fingerprint = digest(&("admit", project, &request))?;
-    {
-        let mut tx = state.db.job_transaction().await?;
-        if let Some(receipt) =
-            store::receipt(&mut tx, actor, request.request_id, &fingerprint).await?
-        {
-            tx.commit().await?;
-            receipt_access(state, actor, &receipt).await?;
-            return Ok(receipt);
-        }
-    }
-    let preview = state
-        .db
-        .job_preview(actor, request.preview_id)
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("preview_not_found"))?;
-    ensure!(
-        preview.project_id == project
-            && preview.fingerprint == request.fingerprint
-            && preview.expires_at > Utc::now().to_rfc3339(),
-        "preview_changed"
-    );
-    let current = preview_for_confirmation(state, actor, &preview).await?;
-    ensure!(current, "preview_changed");
-    let policy = effective_job_policy(&state.db, project).await?;
-    let mut tx = state.db.job_transaction().await?;
-    if let Some(receipt) = store::receipt(&mut tx, actor, request.request_id, &fingerprint).await? {
-        tx.commit().await?;
-        return Ok(receipt);
-    }
-    ensure!(
-        effective_job_policy(&state.db, project).await?.digest == preview.policy_digest,
-        "preview_changed"
-    );
-    ensure!(
-        authorize_job_action(
-            state,
-            actor,
-            project,
-            preview.cluster_owner_user_id,
-            preview.machine_id,
-            actor,
-            JobAction::Admit
-        )
-        .await?,
-        "job_access_denied"
-    );
-    let fenced: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM autonomous_job_project_fences WHERE project_id=?")
-            .bind(project)
-            .fetch_one(&mut *tx)
-            .await?;
-    ensure!(fenced == 0, "project_stop_pending");
-    let queued: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM autonomous_jobs WHERE project_id=? AND state IN ('queued','blocked')",
-    )
-    .bind(project)
-    .fetch_one(&mut *tx)
-    .await?;
-    ensure!(
-        queued < policy.policy.max_queued_project as i64,
-        "queue_capacity"
-    );
-    let id = Uuid::new_v4();
-    let run_id = Uuid::new_v4();
-    let now = Utc::now().to_rfc3339();
-    let zero_usage = JobUsage {
-        spend_micro_usd: Some(0),
-        ..Default::default()
-    };
-    let run = JobRun {
-        id: run_id,
-        job_id: id,
-        attempt: 1,
-        epoch: 1,
-        state: JobState::Queued,
-        usage: zero_usage.clone(),
-        started_at: None,
-        ended_at: None,
-        worker_version: None,
-        candidate_sha: None,
-        stop_evidence: None,
-        reason: None,
-    };
-    let summary = JobSummary {
-        id,
-        project_id: project.into(),
-        project_name: project.into(),
-        title: preview.task.instruction.chars().take(100).collect(),
-        state: JobState::Queued,
-        state_version: 1,
-        current_run_id: run_id,
-        cluster_owner_user_id: preview.cluster_owner_user_id,
-        machine_id: preview.machine_id,
-        hostname: preview.hostname,
-        created_at: now.clone(),
-        updated_at: now,
-        usage: zero_usage,
-        limits: preview.limits,
-        attention_count: 0,
-        reason: None,
-        allowed_actions: Default::default(),
-    };
-    let mut job = StoredJob {
-        detail: JobDetail {
-            job: summary,
-            task: preview.task,
-            runs: vec![run],
-            questions: vec![],
-            high_watermark: 0,
-            policy_digest: preview.policy_digest,
-            publication: None,
-        },
-        initiator: actor,
-        review: None,
-        dispatched: false,
-        source_seq: 0,
-        lease_expires_at: None,
-        last_renewed_at: None,
-    };
-    store::save(&mut tx, &job).await?;
-    let event = store::append(
-        &mut tx,
-        &mut job,
-        JobEventKind::Admitted,
-        "Job admitted",
-        None,
-        None,
-    )
-    .await?;
-    let receipt = JobMutationReceipt {
-        request_id: request.request_id,
-        operation: JobMutationKind::Admit,
-        job_id: Some(id),
-        run_id: Some(run_id),
-        status: JobReceiptStatus::Accepted,
-        error_code: None,
-        message: None,
-    };
-    store::save_receipt(&mut tx, actor, project, &fingerprint, &receipt).await?;
-    tx.commit().await?;
-    fanout(state, project, &event).await;
-    Ok(receipt)
-}
-async fn preview_for_confirmation(
-    state: &AppState,
-    actor: Uuid,
-    preview: &JobPreview,
-) -> Result<bool> {
-    let target = targets(state, actor, &preview.project_id)
-        .await?
-        .targets
-        .into_iter()
-        .find(|t| {
-            t.machine_id == preview.machine_id
-                && t.cluster_owner_user_id == preview.cluster_owner_user_id
-                && t.available
-        });
-    let Some(target) = target else {
-        return Ok(false);
-    };
-    if target.policy.digest != preview.policy_digest {
-        return Ok(false);
-    }
-    let report = prepare(
-        state,
-        actor,
-        &preview.project_id,
-        &target,
-        &preview.task.base_ref,
-        &preview.task.worker_profile,
-    )
-    .await?;
-    Ok(
-        matches!(report,JobWorkerReport::Prepared{repository,base_sha,profile,..} if repository==preview.task.repository && base_sha==preview.task.base_sha && profile.digest==preview.task.worker_profile_digest && profile.ready && profile.verification_profiles.iter().any(|v|v.key==preview.task.verification_profile && v.digest==preview.task.verification_profile_digest)),
-    )
+    anyhow::bail!("upgrade_required")
 }
 async fn receipt_access(state: &AppState, actor: Uuid, receipt: &JobMutationReceipt) -> Result<()> {
     if let Some(id) = receipt.job_id {
@@ -559,12 +279,6 @@ pub async fn receipt(state: &AppState, actor: Uuid, request: Uuid) -> Result<Job
 }
 async fn actions(state: &AppState, actor: Uuid, job: &StoredJob) -> Result<JobAllowedActions> {
     let phase = job.detail.job.state;
-    let stopped = job.detail.runs.last().is_some_and(|r| {
-        r.stop_evidence
-            .as_ref()
-            .is_some_and(|e| e.descendants_stopped)
-            || r.started_at.is_none()
-    });
     let fenced = state
         .db
         .job_project_fenced(&job.detail.job.project_id)
@@ -581,14 +295,7 @@ async fn actions(state: &AppState, actor: Uuid, job: &StoredJob) -> Result<JobAl
             && authorized(state, actor, job, JobAction::Cancel)
                 .await
                 .unwrap_or(false),
-        retry: !fenced
-            && matches!(phase, JobState::Failed | JobState::Cancelled)
-            && job.detail.publication.is_none()
-            && stopped
-            && remaining(job).is_ok()
-            && authorized(state, actor, job, JobAction::Retry)
-                .await
-                .unwrap_or(false),
+        retry: false,
         retry_publication: !fenced
             && matches!(phase, JobState::Blocked | JobState::RecoveryRequired)
             && valid_review(job)
@@ -627,6 +334,9 @@ pub async fn list_jobs(
     let mut rows = state.db.all_jobs().await?;
     rows.reverse();
     for job in rows {
+        if job.detail.task.worker.is_some() {
+            continue;
+        }
         let key = format!("{}|{}", job.detail.job.created_at, job.detail.job.id);
         if cursor.is_some_and(|c| key.as_str() >= c) {
             continue;
@@ -683,9 +393,8 @@ pub async fn list_project_jobs(
     );
     let rows = state.db.project_jobs(project, cursor, status).await?;
     let next_cursor = if rows.len() == 50 {
-        rows.last().map(|job| {
-            format!("{}|{}", job.detail.job.created_at, job.detail.job.id)
-        })
+        rows.last()
+            .map(|job| format!("{}|{}", job.detail.job.created_at, job.detail.job.id))
     } else {
         None
     };
@@ -700,25 +409,6 @@ pub async fn list_project_jobs(
         });
     }
     Ok(ProjectJobListResponse { jobs, next_cursor })
-}
-fn remaining(job: &StoredJob) -> Result<JobLimits> {
-    let mut limits = job.detail.job.limits.clone();
-    let usage = &job.detail.job.usage;
-    ensure!(
-        job.detail.runs.len() < limits.attempts as usize,
-        "attempts_exhausted"
-    );
-    limits.elapsed_seconds = limits.elapsed_seconds.saturating_sub(usage.elapsed_seconds);
-    limits.spend_micro_usd = limits.spend_micro_usd.saturating_sub(
-        usage
-            .spend_micro_usd
-            .ok_or_else(|| anyhow::anyhow!("usage_unknown"))?,
-    );
-    ensure!(
-        limits.elapsed_seconds > 0 && limits.spend_micro_usd > 0,
-        "budget_exhausted"
-    );
-    Ok(limits)
 }
 fn valid_review(job: &StoredJob) -> bool {
     job.review
@@ -739,7 +429,7 @@ fn valid_review(job: &StoredJob) -> bool {
                     == Some(&v.candidate_sha)
         })
 }
-async fn cancel_locked(
+pub(crate) async fn cancel_locked(
     tx: &mut store::JobTx<'_>,
     job: &mut StoredJob,
     reason: &str,
@@ -847,66 +537,10 @@ async fn mutate_inner(
             runtime_authorized(state, &job).await?,
             "runtime_allowance_denied"
         );
-        if kind == JobMutationKind::Retry {
-            let policy = effective_job_policy(&state.db, project).await?;
-            ensure!(
-                job.detail.runs.len() < policy.policy.limits.attempts as usize,
-                "attempts_exhausted"
-            );
-        }
     }
     let event = match kind {
         JobMutationKind::Cancel => cancel_locked(&mut tx, &mut job, "user_cancelled").await?,
-        JobMutationKind::Retry => {
-            ensure!(
-                matches!(job.detail.job.state, JobState::Failed | JobState::Cancelled)
-                    && job.detail.publication.is_none(),
-                "retry_not_allowed"
-            );
-            ensure!(
-                !job.dispatched
-                    || job
-                        .current()
-                        .stop_evidence
-                        .as_ref()
-                        .is_some_and(|e| e.descendants_stopped),
-                "stop_unconfirmed"
-            );
-            remaining(&job)?;
-            let run_id = Uuid::new_v4();
-            let attempt = job.detail.runs.len() as u32 + 1;
-            let epoch = job.current().epoch + 1;
-            job.detail.runs.push(JobRun {
-                id: run_id,
-                job_id: id,
-                attempt,
-                epoch,
-                state: JobState::Queued,
-                usage: JobUsage::default(),
-                started_at: None,
-                ended_at: None,
-                worker_version: None,
-                candidate_sha: None,
-                stop_evidence: None,
-                reason: None,
-            });
-            job.detail.job.current_run_id = run_id;
-            job.dispatched = false;
-            job.source_seq = 0;
-            job.review = None;
-            job.transition(JobState::Queued, None);
-            Some(
-                store::append(
-                    &mut tx,
-                    &mut job,
-                    JobEventKind::PhaseChanged,
-                    "Explicit coding retry queued",
-                    None,
-                    None,
-                )
-                .await?,
-            )
-        }
+        JobMutationKind::Retry => anyhow::bail!("upgrade_required"),
         JobMutationKind::RetryPublication => {
             ensure!(
                 matches!(
@@ -957,9 +591,13 @@ async fn mutate_inner(
         message: None,
     };
     store::save_receipt(&mut tx, actor, project, &fp, &r).await?;
+    crate::workers::reconcile_job(&mut tx, &job).await?;
     tx.commit().await?;
     if let Some(event) = event {
         fanout(state, project, &event).await
+    }
+    if let Some(context) = &job.detail.task.worker {
+        crate::workers::socket::fanout(state, context.worker_id).await;
     }
     Ok(r)
 }
@@ -1050,8 +688,12 @@ async fn answer_inner(
         message: None,
     };
     store::save_receipt(&mut tx, actor, project, &fp, &r).await?;
+    crate::workers::reconcile_job(&mut tx, &job).await?;
     tx.commit().await?;
     fanout(state, project, &event).await;
+    if let Some(context) = &job.detail.task.worker {
+        crate::workers::socket::fanout(state, context.worker_id).await;
+    }
     Ok(r)
 }
 fn validate_answers(q: &JobQuestion, answers: &[JobQuestionAnswer]) -> Result<()> {
@@ -1132,6 +774,7 @@ fn report_identity(report: &JobWorkerReport) -> Option<&JobRunIdentity> {
         | JobWorkerReport::Question { identity, .. }
         | JobWorkerReport::AnswerConfirmed { identity, .. }
         | JobWorkerReport::Settled { identity, .. }
+        | JobWorkerReport::WorkerResult { identity, .. }
         | JobWorkerReport::Stopped { identity, .. }
         | JobWorkerReport::ArtifactChunk { identity, .. }
         | JobWorkerReport::Verified { identity, .. }
@@ -1147,6 +790,7 @@ fn report_source(report: &JobWorkerReport) -> Option<u64> {
         | JobWorkerReport::Question { source_seq, .. }
         | JobWorkerReport::AnswerConfirmed { source_seq, .. }
         | JobWorkerReport::Settled { source_seq, .. }
+        | JobWorkerReport::WorkerResult { source_seq, .. }
         | JobWorkerReport::Stopped { source_seq, .. } => Some(*source_seq),
         _ => None,
     }
@@ -1271,9 +915,30 @@ pub async fn report(state: &AppState, machine: Uuid, report: JobWorkerReport) ->
     let mut tx = state.db.job_transaction().await?;
     let mut job = store::load(&mut tx, identity.job_id).await?;
     ensure!(job.identity() == identity, "stale_epoch");
+    if matches!(&report, JobWorkerReport::WorkerResult { .. }) {
+        ensure!(
+            job.detail.task.worker.is_some()
+                && state
+                    .sessions
+                    .daemon_supports_capability(&machine, OMP_PERSISTENT_WORKER_CAPABILITY,),
+            "worker_result_protocol_required"
+        );
+    }
     let source = report_source(&report);
     if let Some(seq) = source {
         if seq <= job.source_seq {
+            if let JobWorkerReport::WorkerResult { result, .. } = &report {
+                let retained: Option<String> = sqlx::query_scalar(
+                    "SELECT document FROM autonomous_worker_results WHERE run_id=?",
+                )
+                .bind(identity.run_id.to_string())
+                .fetch_optional(&mut *tx)
+                .await?;
+                ensure!(
+                    retained.as_deref() == Some(serde_json::to_string(result)?.as_str()),
+                    "worker_result_conflict"
+                );
+            }
             return Ok(());
         }
         ensure!(seq == job.source_seq + 1, "source_sequence_gap");
@@ -1466,6 +1131,7 @@ pub async fn report(state: &AppState, machine: Uuid, report: JobWorkerReport) ->
             sqlx::query("UPDATE autonomous_job_mutations SET document=json_set(document,'$.status','completed') WHERE (actor,request_id) IN (SELECT actor,request_id FROM autonomous_job_answer_intents WHERE question_id=?)").bind(question.id.to_string()).execute(&mut *tx).await?;
             job.detail.job.attention_count = job.detail.job.attention_count.saturating_sub(1);
             if !cancelled
+                && !job.detail.job.state.is_terminal()
                 && !job.detail.questions.iter().any(|q| {
                     q.run_id == identity.run_id
                         && q.state != JobQuestionState::Confirmed
@@ -1478,7 +1144,35 @@ pub async fn report(state: &AppState, machine: Uuid, report: JobWorkerReport) ->
             kind = JobEventKind::AnswerConfirmed;
             summary = "Provider confirmed answer".into();
         }
+        JobWorkerReport::WorkerResult {
+            result,
+            evidence,
+            usage,
+            ..
+        } => {
+            ensure!(
+                evidence.descendants_stopped
+                    && !evidence.boot_id.is_empty()
+                    && !evidence.container_id.is_empty(),
+                "stop_unconfirmed"
+            );
+            merge_usage(&mut job, usage)?;
+            job.current().stop_evidence = Some(evidence);
+            crate::workers::accept_result(&mut tx, &mut job, &result).await?;
+            kind = if job.detail.job.state == JobState::Failed {
+                JobEventKind::Failed
+            } else {
+                JobEventKind::PhaseChanged
+            };
+            summary = "Bounded worker result and trusted execution evidence retained".into();
+        }
         JobWorkerReport::Settled { usage, .. } => {
+            if job.detail.task.worker.is_some() {
+                ensure!(
+                    crate::workers::candidate_ready(&mut tx, &job).await?,
+                    "worker_candidate_result_required"
+                );
+            }
             merge_usage(&mut job, usage)?;
             ensure!(
                 job.current()
@@ -1521,6 +1215,19 @@ pub async fn report(state: &AppState, machine: Uuid, report: JobWorkerReport) ->
             merge_usage(&mut job, usage)?;
             job.current().stop_evidence = Some(evidence);
             job.current().ended_at = Some(Utc::now().to_rfc3339());
+            for question in job
+                .detail
+                .questions
+                .iter_mut()
+                .filter(|q| q.run_id == identity.run_id)
+            {
+                if question.state != JobQuestionState::Confirmed
+                    && question.state != JobQuestionState::Cancelled
+                {
+                    question.state = JobQuestionState::Cancelled;
+                    question.version += 1;
+                }
+            }
             if !job.detail.job.state.is_terminal() {
                 job.transition(
                     if cancelled {
@@ -1558,7 +1265,11 @@ pub async fn report(state: &AppState, machine: Uuid, report: JobWorkerReport) ->
             ..
         } => {
             persist_artifact(&mut tx, &job, artifact, offset, &data_base64, final_chunk).await?;
+            let worker_event = crate::workers::reconcile_job(&mut tx, &job).await?;
             tx.commit().await?;
+            if let Some(event) = worker_event {
+                crate::workers::socket::fanout(state, event.worker_id).await;
+            }
             return Ok(());
         }
         JobWorkerReport::Verified {
@@ -1675,8 +1386,9 @@ pub async fn report(state: &AppState, machine: Uuid, report: JobWorkerReport) ->
                     old.repository == publication.repository
                         && old.number == publication.number
                         && old.branch == publication.branch
-                        && old.head_sha == publication.head_sha
-                        && old.base_sha == publication.base_sha
+                        && (job.detail.task.worker.is_some()
+                            || (old.head_sha == publication.head_sha
+                                && old.base_sha == publication.base_sha))
                         && publication.url.starts_with("https://"),
                     "publication_conflict"
                 );
@@ -1689,6 +1401,7 @@ pub async fn report(state: &AppState, machine: Uuid, report: JobWorkerReport) ->
                 }
                 summary = "External pull request disposition refreshed".into();
             } else {
+                crate::workers::publication_unknown(&mut tx, &job).await?;
                 summary = "External pull request could not be located; retained evidence unchanged"
                     .into();
             }
@@ -1748,8 +1461,12 @@ pub async fn report(state: &AppState, machine: Uuid, report: JobWorkerReport) ->
     }
     let project = job.detail.job.project_id.clone();
     let event = store::append(&mut tx, &mut job, kind, &summary, event_detail, source).await?;
+    crate::workers::reconcile_job(&mut tx, &job).await?;
     tx.commit().await?;
     fanout(state, &project, &event).await;
+    if let Some(context) = &job.detail.task.worker {
+        crate::workers::socket::fanout(state, context.worker_id).await;
+    }
     Ok(())
 }
 async fn persist_artifact(
@@ -1874,9 +1591,7 @@ async fn reconcile_inventory(
     let mut tx = state.db.job_transaction().await?;
     let mut job = store::load(&mut tx, inventory.identity.job_id).await?;
     ensure!(job.identity() == inventory.identity, "stale_inventory");
-    if job.detail.job.state.is_terminal() {
-        return Ok(());
-    }
+    let terminal = job.detail.job.state.is_terminal();
     merge_usage(&mut job, inventory.usage.clone())?;
     if let Some(evidence) = inventory
         .stop_evidence
@@ -1884,7 +1599,7 @@ async fn reconcile_inventory(
         .filter(|e| e.descendants_stopped && !e.boot_id.is_empty() && !e.container_id.is_empty())
     {
         job.current().stop_evidence = Some(evidence.clone());
-        if matches!(inventory.state, JobState::Cancelled | JobState::Failed) {
+        if !terminal && matches!(inventory.state, JobState::Cancelled | JobState::Failed) {
             job.current().ended_at = Some(evidence.stopped_at.clone());
             job.transition(
                 if job.detail.job.state == JobState::Cancelling {
@@ -1895,7 +1610,10 @@ async fn reconcile_inventory(
                 Some(evidence.reason.clone()),
             );
         }
-    } else if !inventory.prompt_confirmed && job.detail.job.state != JobState::Cancelling {
+    } else if !terminal
+        && !inventory.prompt_confirmed
+        && job.detail.job.state != JobState::Cancelling
+    {
         job.transition(
             JobState::RecoveryRequired,
             Some("prompt_admission_uncertain".into()),
@@ -1919,15 +1637,20 @@ async fn reconcile_inventory(
         None,
     )
     .await?;
+    let worker_event = crate::workers::reconcile_job(&mut tx, &job).await?;
     tx.commit().await?;
     fanout(state, &project, &event).await;
+    if let Some(event) = worker_event {
+        crate::workers::socket::fanout(state, event.worker_id).await;
+    }
     Ok(())
 }
 
 pub async fn cancel_project_jobs(state: &AppState, project: &str, reason: &str) -> Result<()> {
     let mut tx = state.db.job_transaction().await?;
     sqlx::query("INSERT INTO autonomous_job_project_fences(project_id,reason) VALUES(?,?) ON CONFLICT(project_id) DO UPDATE SET reason=excluded.reason").bind(project).bind(reason).execute(&mut *tx).await?;
-    let rows=sqlx::query("SELECT document FROM autonomous_jobs WHERE project_id=? AND state NOT IN ('review_ready','cancelled','failed')").bind(project).fetch_all(&mut *tx).await?;
+    crate::workers::fence_project(&mut tx, project, reason).await?;
+    let rows=sqlx::query("SELECT document FROM autonomous_jobs WHERE project_id=? AND state NOT IN ('review_ready','cancelled','failed','completed')").bind(project).fetch_all(&mut *tx).await?;
     let mut events = Vec::new();
     for row in rows {
         let mut job: StoredJob = serde_json::from_str(row.get("document"))?;
@@ -2008,6 +1731,9 @@ pub async fn project_jobs_stopped(state: &AppState, project: &str) -> Result<boo
     Ok(complete)
 }
 async fn runtime_authorized(state: &AppState, job: &StoredJob) -> Result<bool> {
+    if job.detail.task.worker.is_some() && !crate::workers::runtime_allowed(state, job).await? {
+        return Ok(false);
+    }
     if !authorized(state, job.initiator, job, JobAction::Admit)
         .await
         .unwrap_or(false)
@@ -2058,6 +1784,7 @@ impl StoredJob {
     }
 }
 pub async fn reconcile_authority(state: &AppState) -> Result<()> {
+    crate::workers::reconcile_authority(state).await?;
     for old in state.db.all_jobs().await? {
         if old.detail.job.state.is_terminal() || old.detail.job.state == JobState::Cancelling {
             continue;
@@ -2072,6 +1799,7 @@ pub async fn reconcile_authority(state: &AppState) -> Result<()> {
             }
         }
     }
+    crate::workers::socket::reconcile_subscriptions(state).await?;
     reconcile_subscriptions(state).await
 }
 pub async fn reconcile_subscriptions(state: &AppState) -> Result<()> {
@@ -2152,6 +1880,12 @@ fn ready_for_job(state: &AppState, job: &StoredJob) -> bool {
             .get(&job.detail.job.machine_id)
             .is_some_and(|r| {
                 fresh(&r)
+                    && (job.detail.task.worker.is_none()
+                        || (r.protocol_version == WORKER_EXECUTION_PROTOCOL_VERSION
+                            && state.sessions.daemon_supports_capability(
+                                &job.detail.job.machine_id,
+                                OMP_PERSISTENT_WORKER_CAPABILITY,
+                            )))
                     && r.cluster_owner_user_id == job.detail.job.cluster_owner_user_id
                     && r.profiles.iter().any(|p| {
                         p.ready
@@ -2187,6 +1921,7 @@ fn run_limits(job: &StoredJob, policy: &JobPolicy) -> JobLimits {
 async fn dispatch_tick(state: &AppState) -> Result<()> {
     reconcile_authority(state).await?;
     state.db.clear_stopped_job_fences().await?;
+    crate::workers::tick(state).await?;
     for (project, event) in state.db.pending_job_notifications().await? {
         if let Err(error) = deliver_notification(state, &project, &event).await {
             tracing::warn!(%error,"Durable job notification deferred");
@@ -2200,7 +1935,10 @@ async fn dispatch_tick(state: &AppState) -> Result<()> {
             continue;
         }
         let policy = effective_job_policy(&state.db, &old.detail.job.project_id).await?;
-        if !old.dispatched && matches!(old.detail.job.state, JobState::Queued | JobState::Blocked) {
+        if old.detail.task.worker.is_none()
+            && !old.dispatched
+            && matches!(old.detail.job.state, JobState::Queued | JobState::Blocked)
+        {
             let ready = ready_for_job(state, &old);
             let mut tx = state.db.job_transaction().await?;
             let mut job = store::load(&mut tx, old.detail.job.id).await?;
@@ -2218,7 +1956,7 @@ async fn dispatch_tick(state: &AppState) -> Result<()> {
             if fenced > 0 {
                 continue;
             }
-            let counts=sqlx::query("SELECT COALESCE(SUM(project_id=?),0) AS project_count,COALESCE(SUM(owner=? AND machine=?),0) AS machine_count,COALESCE(SUM(owner=?),0) AS cluster_count FROM autonomous_jobs WHERE json_extract(document,'$.dispatched')=1 AND state NOT IN ('review_ready','cancelled','failed')")
+            let counts=sqlx::query("SELECT COALESCE(SUM(project_id=?),0) AS project_count,COALESCE(SUM(owner=? AND machine=?),0) AS machine_count,COALESCE(SUM(owner=?),0) AS cluster_count FROM autonomous_jobs WHERE json_extract(document,'$.dispatched')=1 AND state NOT IN ('review_ready','cancelled','failed','completed')")
                 .bind(&job.detail.job.project_id).bind(job.detail.job.cluster_owner_user_id.to_string()).bind(job.detail.job.machine_id.to_string()).bind(job.detail.job.cluster_owner_user_id.to_string()).fetch_one(&mut *tx).await?;
             let earlier:i64=sqlx::query_scalar("SELECT COUNT(*) FROM autonomous_jobs WHERE owner=? AND machine=? AND json_extract(document,'$.dispatched')=0 AND state IN ('queued','blocked') AND (created_at<? OR (created_at=? AND id<?))")
                 .bind(job.detail.job.cluster_owner_user_id.to_string()).bind(job.detail.job.machine_id.to_string()).bind(&job.detail.job.created_at).bind(&job.detail.job.created_at).bind(job.detail.job.id.to_string()).fetch_one(&mut *tx).await?;
@@ -2549,13 +2287,26 @@ pub async fn subscribe(state: &AppState, connection: Uuid, project: String, job:
             return;
         }
     };
+    if snapshot.task.worker.is_some()
+        && !state
+            .sessions
+            .web_supports_capability(&connection, AUTONOMOUS_WORKERS_CAPABILITY)
+    {
+        reject_subscription(state, connection, &project, job, "upgrade_required", false).await;
+        return;
+    }
     state
         .jobs
         .subscriptions
         .insert((connection, job), project.clone());
     state
         .sessions
-        .send_to_web(&connection, ServerToWeb::JobSnapshot { detail: snapshot })
+        .send_to_web(
+            &connection,
+            ServerToWeb::JobSnapshot {
+                detail: Box::new(snapshot),
+            },
+        )
         .await;
     match state.db.job_events(job, after).await {
         Ok(replay) if !replay.resync_required => {
@@ -2662,6 +2413,9 @@ async fn fanout(state: &AppState, project: &str, event: &JobEvent) {
         .collect();
     if let Ok(Some(job)) = state.db.job(event.job_id).await {
         for connection in inbox {
+            if job.detail.task.worker.is_some() {
+                continue;
+            }
             if !state
                 .sessions
                 .web_supports_capability(&connection, AUTONOMOUS_JOBS_CAPABILITY)
@@ -2694,7 +2448,7 @@ async fn fanout(state: &AppState, project: &str, event: &JobEvent) {
     }
 }
 
-async fn connection_actor(state: &AppState, connection: Uuid) -> Option<Uuid> {
+pub(crate) async fn connection_actor(state: &AppState, connection: Uuid) -> Option<Uuid> {
     let binding = state
         .jobs
         .connection_auth
@@ -2742,7 +2496,12 @@ pub async fn web_outbound_allowed(
     let Some(actor) = connection_actor(state, connection).await else {
         return false;
     };
-    detail_by_id(state, actor, job).await.is_ok()
+    detail_by_id(state, actor, job).await.is_ok_and(|detail| {
+        detail.task.worker.is_none()
+            || state
+                .sessions
+                .web_supports_capability(&connection, AUTONOMOUS_WORKERS_CAPABILITY)
+    })
 }
 
 async fn existing_request(
@@ -2832,7 +2591,7 @@ pub async fn admit(
     if let Some(receipt) = existing_request(state, actor, id, &fp).await? {
         return Ok(receipt);
     }
-    let result = admit_inner(state, actor, project, request).await;
+    let result = Err(anyhow::anyhow!("upgrade_required"));
     mutation_result(
         state,
         actor,
@@ -2858,7 +2617,11 @@ pub async fn mutate(
     if let Some(receipt) = existing_request(state, actor, id, &fp).await? {
         return Ok(receipt);
     }
-    let result = mutate_inner(state, actor, project, job, kind, request).await;
+    let result = if kind == JobMutationKind::Retry {
+        Err(anyhow::anyhow!("upgrade_required"))
+    } else {
+        mutate_inner(state, actor, project, job, kind, request).await
+    };
     mutation_result(state, actor, project, id, kind, Some(job), &fp, result).await
 }
 pub async fn answer(
@@ -2978,6 +2741,10 @@ async fn confirm_purge(
         .execute(&mut *tx)
         .await?;
     store::acknowledge(&mut tx, command).await?;
+    let worker_event = crate::workers::reconcile_job(&mut tx, &job).await?;
     tx.commit().await?;
+    if let Some(event) = worker_event {
+        crate::workers::socket::fanout(state, event.worker_id).await;
+    }
     Ok(())
 }

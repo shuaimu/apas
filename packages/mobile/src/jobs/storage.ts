@@ -45,9 +45,13 @@ export function writeJobRecord(scope: JobScope, key: string, value: unknown): Pr
 }
 
 export async function readJobRecord<T>(scope: JobScope, key: string): Promise<T | null> {
+  const epoch = generation;
   await queue;
+  requireStorageAuthority(scope);
   const db = await openCache();
   const row = await db.getFirstAsync<{ payload: string }>("SELECT payload FROM job_records WHERE account_id=? AND project_id=? AND job_id=? AND record_key=?", scope.account, scope.project, scope.job, key);
+  if (epoch !== generation) throw new Error("Job cache authority changed");
+  requireStorageAuthority(scope);
   return row ? JSON.parse(row.payload) as T : null;
 }
 
@@ -83,7 +87,12 @@ export function purgeJobStorage(account?: string, project?: string): Promise<voi
   else storageAccount = null;
   return serial(async () => {
     const db = await openCache();
-    if (account && project) await db.runAsync("DELETE FROM job_records WHERE account_id=? AND project_id=?", account, project);
+    if (account && project) {
+      await db.runAsync("DELETE FROM job_records WHERE account_id=? AND project_id=?", account, project);
+      // Global worker pages contain protected labels from multiple projects.
+      // Drop all such pages on a discovered revocation, not just the visible inbox.
+      await db.runAsync("DELETE FROM job_records WHERE account_id=? AND project_id='' AND job_id LIKE 'worker:%'", account);
+    }
     else if (account) await db.runAsync("DELETE FROM job_records WHERE account_id=?", account);
     else await db.runAsync("DELETE FROM job_records");
   });

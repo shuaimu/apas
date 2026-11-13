@@ -5,6 +5,7 @@ use shared::jobs::{
     JobPolicy, JobPolicyManagement, JobPolicyOverride, JobPreview, JobPreviewRequest, JobReview,
     JobTargetsResponse, MobileJobsBootstrap, ProjectJobListResponse,
 };
+use shared::workers::*;
 use shared::{
     CodeEvent, MobileAuthResponse, MobileBootstrapResponse, MobileDeviceSession,
     MobileLoginRequest, MobileLogoutRequest, MobileNotificationPreferences, MobilePushTokenRequest,
@@ -30,6 +31,7 @@ struct MobileProtocolContract {
     push_token_request: MobilePushTokenRequest,
     notification_preferences: MobileNotificationPreferences,
     jobs: JobProtocolContract,
+    workers: WorkerProtocolContract,
 }
 
 #[derive(JsonSchema)]
@@ -56,6 +58,25 @@ struct JobProtocolContract {
     bootstrap: MobileJobsBootstrap,
 }
 
+#[derive(JsonSchema)]
+#[allow(dead_code)]
+struct WorkerProtocolContract {
+    preview_request: WorkerPreviewRequest,
+    preview: WorkerPreview,
+    approval_request: WorkerApprovalRequest,
+    mutation_request: WorkerMutationRequest,
+    item_request: WorkerItemRequest,
+    targets: WorkerTargetsResponse,
+    list: WorkerListResponse,
+    detail: WorkerDetail,
+    items: WorkerItemsResponse,
+    runs: WorkerRunsResponse,
+    events: WorkerEventsResponse,
+    receipt: WorkerMutationReceipt,
+    bootstrap: MobileWorkersBootstrap,
+    execution_result: WorkerResult,
+}
+
 fn write_schema<T: JsonSchema + ?Sized>(output: &Path, name: &str) -> anyhow::Result<()> {
     let schema = schema_for!(T);
     let json = serde_json::to_string_pretty(&schema)?;
@@ -76,6 +97,7 @@ fn main() -> anyhow::Result<()> {
     write_schema::<ServerToWeb>(&output, "server-to-web.schema.json")?;
     write_schema::<CodeEvent>(&output, "code-event.schema.json")?;
     write_schema::<JobProtocolContract>(&output, "jobs.schema.json")?;
+    write_schema::<WorkerProtocolContract>(&output, "workers.schema.json")?;
     println!("exported mobile schemas to {}", output.display());
     Ok(())
 }

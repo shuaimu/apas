@@ -23,7 +23,7 @@ import {
   X,
 } from "lucide-react";
 import { AskUserQuestionCard } from "@/components/tools/AskUserQuestionCard";
-import { ProjectJobsWorkspace } from "@/components/jobs/ProjectJobsWorkspace";
+import { ProjectWorkersWorkspace } from "@/components/workers/ProjectWorkersWorkspace";
 import { readSelectedPane, writeSelectedPane } from "@/lib/mobileSelectedPane";
 import { isOmpQuestionInput, ompQuestionKey, parseOmpQuestionResult } from "@/lib/ompQuestions";
 import {
@@ -784,11 +784,15 @@ export function MobileSessionActivity({ connected, onBack, onReconnect }: Mobile
   const retainedTerminal = mountedTerminal?.sessionId === sessionId
     && paneConfigs.some((pane) => pane.pane_id === mountedTerminal.paneId && pane.kind === "terminal")
     ? mountedTerminal : null;
-  const terminalIsOpen = terminalPaneId !== null && retainedTerminal?.paneId === terminalPaneId;
+  const terminalIsOpen = terminalPaneId !== null
+    && selectedPaneId === terminalPaneId
+    && retainedTerminal?.paneId === terminalPaneId;
   // The retained terminal's own pane, which need not be the selected one.
   // Its screen still reads, but keys and sizes would only be refused.
   const retainedRefusal = retainedTerminal
-    ? tabHosts.tabs.get(retainedTerminal.paneId)?.refusal
+    ? paneConfigs.find((pane) => pane.pane_id === retainedTerminal.paneId)?.mode === "deadloop"
+      ? "Legacy bot history is read-only."
+      : tabHosts.tabs.get(retainedTerminal.paneId)?.refusal
     : undefined;
   // The machines the Open sheet's request starts; empty means only the one it
   // names, which is all an older server ever starts.
@@ -797,7 +801,12 @@ export function MobileSessionActivity({ connected, onBack, onReconnect }: Mobile
     : [];
 
   return (
-    <ProjectJobsWorkspace key={`${accountId}:${projectId ?? sessionId}`} project={projectContext} paneSelectionRequested={false}>
+    <ProjectWorkersWorkspace key={`${accountId}:${projectId ?? sessionId}`} project={projectContext} paneSelectionRequested={false}
+      renderOverviewPanels={(selectInteractive) => <section aria-label="Interactive project" className="job-card">
+        <h2>Interactive project</h2>
+        {paneConfigs.length ? paneConfigs.map((pane) => <button key={pane.pane_id} type="button" onClick={() => { selectInteractive(); selectPane(pane.pane_id); }}>{paneLabel(pane)}</button>) : <p>No interactive panes. Add an interactive agent separately; workers do not create panes.</p>}
+      </section>}
+    >
     {(workspace) => (
     <section aria-label="Mobile session activity" className="flex h-full min-h-0 w-full flex-col overflow-hidden bg-[#f7f7fa] text-[#18181b] dark:bg-[#111115] dark:text-[#f7f7fa]">
       {!connected && (
@@ -810,7 +819,7 @@ export function MobileSessionActivity({ connected, onBack, onReconnect }: Mobile
           top row; the project's identity is read once and takes the small line
           beneath. Account left entirely — it navigates away from the session,
           and the home screen has it. */}
-      <div hidden={terminalIsOpen && !workspace.active} className={terminalIsOpen && !workspace.active ? "hidden" : "shrink-0 border-b border-[#dedee7] px-4 pt-3 pb-2.5 dark:border-[#383842]"}>
+      <div className="shrink-0 border-b border-[#dedee7] px-4 pt-3 pb-2.5 dark:border-[#383842]">
         <div className="flex items-center gap-2" onClickCapture={persistActivityScroll}>
           <button type="button" aria-label="Back to coding sessions" onClick={onBack} className="-ml-2 flex h-11 w-11 shrink-0 items-center justify-center rounded-lg text-[#686873] hover:bg-[#efeff5] dark:text-[#aaaab6] dark:hover:bg-[#25252d]"><ArrowLeft className="h-5 w-5" /></button>
           <div className="no-scrollbar flex min-w-0 flex-1 items-center gap-2 overflow-x-auto">
@@ -957,7 +966,7 @@ export function MobileSessionActivity({ connected, onBack, onReconnect }: Mobile
             {selectedPlanReviews.map((plan) => {
               // Answering optimistically drops the review, while the server
               // refuses it for a machine that is not running the project.
-              const planRefusal = tabHosts.tabs.get(plan.paneId)?.refusal;
+              const planRefusal = selectedPane?.mode === "deadloop" ? "Legacy bot history is read-only." : tabHosts.tabs.get(plan.paneId)?.refusal;
               return (
                 <div key={plan.toolUseId} className="rounded-2xl border border-amber-400 bg-white p-3.5 dark:border-amber-700 dark:bg-[#1b1b21]">
                   <span className="rounded-full bg-amber-100 px-2.5 py-1 text-[0.68rem] font-extrabold uppercase text-amber-800 dark:bg-amber-950/60 dark:text-amber-200">plan review</span>
@@ -983,7 +992,7 @@ export function MobileSessionActivity({ connected, onBack, onReconnect }: Mobile
 
         {visibleActivity.length > 0 ? (
           <div className="space-y-2.5">
-            {visibleActivity.map((item) => <MobileEventCard key={item.key} item={item} answeredQuestions={answeredQuestions} onApprove={approve} onReject={reject} disabledReason={tabHosts.tabs.get(item.paneId)?.refusal} />)}
+            {visibleActivity.map((item) => <MobileEventCard key={item.key} item={item} answeredQuestions={answeredQuestions} onApprove={approve} onReject={reject} disabledReason={paneConfigs.find((pane) => pane.pane_id === item.paneId)?.mode === "deadloop" ? "Legacy bot history is read-only." : tabHosts.tabs.get(item.paneId)?.refusal} />)}
           </div>
         ) : (
           <div className="flex min-h-60 flex-col items-center justify-center px-5 text-center">
@@ -1064,8 +1073,13 @@ export function MobileSessionActivity({ connected, onBack, onReconnect }: Mobile
         {!connected && canCompose && <p className="mb-1.5 text-[11px] text-amber-700 dark:text-amber-300">You can keep drafting while offline. Reconnect to send.</p>}
         {connected && !sessionIsRunning && canCompose && <p className="mb-1.5 text-[11px] text-amber-700 dark:text-amber-300">You can draft a message, but this project must be running before it can be sent.</p>}
         {connected && sessionIsRunning && canCompose && selectedRefusal && <p className="mb-1.5 text-[11px] text-amber-700 dark:text-amber-300">You can draft a message, but it cannot be sent: {selectedRefusal}</p>}
+        {selectedIsBot && selectedPaneId !== null && <details className="mb-2 text-sm">
+          <summary className="min-h-11 cursor-pointer">Earlier bot instructions</summary>
+          <p>Original provider: {selectedPane?.provider}. This retained history is read-only. New autonomous workers are created and approved independently.</p>
+          <p className="whitespace-pre-wrap break-words">{selectedPane?.prompt || "No saved bot prompt is available."}</p>
+        </details>}
         <div className="flex items-end gap-2">
-          <textarea value={followUp} onChange={(event) => setFollowUp(event.target.value)} rows={2} placeholder={selectedIsBot ? "Stop the bot before steering it" : selectedIsTerminal ? "Message this terminal conversation" : "Steer this session and pane"} disabled={!canCompose} className="min-h-[2.75rem] flex-1 resize-none rounded-xl border border-[#dedee7] bg-white px-3 py-2 text-sm outline-none focus:border-[#6d5efc] disabled:opacity-50 dark:border-[#383842] dark:bg-[#1b1b21]" />
+          <textarea value={followUp} onChange={(event) => setFollowUp(event.target.value)} rows={2} placeholder={selectedIsBot ? "Legacy bot history is read-only" : selectedIsTerminal ? "Message this terminal conversation" : "Steer this session and pane"} disabled={!canCompose} className="min-h-[2.75rem] flex-1 resize-none rounded-xl border border-[#dedee7] bg-white px-3 py-2 text-sm outline-none focus:border-[#6d5efc] disabled:opacity-50 dark:border-[#383842] dark:bg-[#1b1b21]" />
           <button type="button" aria-label={selectedIsTerminal ? "Send conversation message" : "Send follow-up"} disabled={!canSend || !followUp.trim()} onClick={sendFollowUp} className="flex h-11 w-11 shrink-0 items-center justify-center rounded-xl bg-[#6d5efc] text-white disabled:opacity-40"><Send className="h-5 w-5" /></button>
         </div>
       </div>
@@ -1074,10 +1088,10 @@ export function MobileSessionActivity({ connected, onBack, onReconnect }: Mobile
       {newPaneOpen && (
         <div className="fixed inset-0 z-[95] flex items-end bg-black/45" onClick={() => setNewPaneOpen(false)}>
           <div role="dialog" aria-modal="true" aria-label="Add agent" onClick={(event) => event.stopPropagation()} className="max-h-[82dvh] w-full overflow-y-auto rounded-t-[1.4rem] border-t border-[#dedee7] bg-[#f7f7fa] p-4 pb-[max(1rem,env(safe-area-inset-bottom))] shadow-2xl dark:border-[#383842] dark:bg-[#111115]">
-            <div className="flex items-center justify-between"><div><h2 className="text-xl font-extrabold">{interactiveCreation ? "Interactive agent" : "Add agent"}</h2><p className="mt-1 text-sm text-[#686873] dark:text-[#aaaab6]">{interactiveCreation ? "Choose a profile allowed by this project's cluster policy." : "Choose interactive or bounded autonomous work."}</p></div><button type="button" aria-label="Close add agent" onClick={() => setNewPaneOpen(false)} className="flex h-11 w-11 shrink-0 items-center justify-center rounded-lg hover:bg-[#efeff5] dark:hover:bg-[#25252d]"><X className="h-5 w-5" /></button></div>
+            <div className="flex items-center justify-between"><div><h2 className="text-xl font-extrabold">{interactiveCreation ? "Interactive agent" : "Add agent"}</h2><p className="mt-1 text-sm text-[#686873] dark:text-[#aaaab6]">{interactiveCreation ? "Choose a profile allowed by this project's cluster policy." : "Choose interactive work or an autonomous responsibility."}</p></div><button type="button" aria-label="Close add agent" onClick={() => setNewPaneOpen(false)} className="flex h-11 w-11 shrink-0 items-center justify-center rounded-lg hover:bg-[#efeff5] dark:hover:bg-[#25252d]"><X className="h-5 w-5" /></button></div>
             {!interactiveCreation ? <div className="mt-4 space-y-2">
               <button type="button" onClick={() => setInteractiveCreation(true)} className="min-h-11 w-full rounded-2xl border border-[#dedee7] bg-white p-3.5 text-left dark:border-[#383842] dark:bg-[#1b1b21]"><span className="block font-bold">Interactive agent</span><span className="mt-1 block text-sm">Work directly with a provider in a terminal.</span></button>
-              <button type="button" disabled={!workspace.addAutonomous} onClick={() => { persistActivityScroll(); setNewPaneOpen(false); workspace.addAutonomous?.(); }} className="min-h-11 w-full rounded-2xl border border-[#dedee7] bg-white p-3.5 text-left disabled:opacity-50 dark:border-[#383842] dark:bg-[#1b1b21]"><span className="block font-bold">Autonomous agent</span><span className="mt-1 block text-sm">{workspace.unavailableReason || "Review a bounded task, worker readiness and limits."}</span></button>
+              <button type="button" disabled={!workspace.addAutonomous} onClick={() => { persistActivityScroll(); setNewPaneOpen(false); workspace.addAutonomous?.(); }} className="min-h-11 w-full rounded-2xl border border-[#dedee7] bg-white p-3.5 text-left disabled:opacity-50 dark:border-[#383842] dark:bg-[#1b1b21]"><span className="block font-bold">Autonomous worker</span><span className="mt-1 block text-sm">{workspace.unavailableReason || "Review a responsibility, standing checklist and recurring allowance."}</span></button>
             </div> : <>
             <button type="button" onClick={() => setInteractiveCreation(false)} className="mt-2 min-h-11 text-sm font-bold text-[#6d5efc]">Back to agent types</button>
             {/* Where the agent runs, when there is a real choice: the same
@@ -1178,7 +1192,7 @@ export function MobileSessionActivity({ connected, onBack, onReconnect }: Mobile
               >
                 <Pencil className="h-5 w-5 shrink-0 text-[#686873] dark:text-[#aaaab6]" /> Rename conversation
               </button>
-              <button type="button" aria-label="Reboot this pane" disabled={!selectedPane || Boolean(selectedRefusal)} title={selectedRefusal} onClick={() => { setMoreOpen(false); setRebootTarget(selectedPane ?? null); }} className="flex w-full items-center gap-3 rounded-2xl border border-[#dedee7] bg-white p-3.5 text-left font-bold disabled:opacity-40 dark:border-[#383842] dark:bg-[#1b1b21]"><RotateCcw className="h-5 w-5 shrink-0 text-[#686873] dark:text-[#aaaab6]" /> Reboot this pane</button>
+              {!selectedIsBot && <button type="button" aria-label="Reboot this pane" disabled={!selectedPane || Boolean(selectedRefusal)} title={selectedRefusal} onClick={() => { setMoreOpen(false); setRebootTarget(selectedPane ?? null); }} className="flex w-full items-center gap-3 rounded-2xl border border-[#dedee7] bg-white p-3.5 text-left font-bold disabled:opacity-40 dark:border-[#383842] dark:bg-[#1b1b21]"><RotateCcw className="h-5 w-5 shrink-0 text-[#686873] dark:text-[#aaaab6]" /> Reboot this pane</button>}
               <button type="button" aria-label="Close this pane" disabled={!selectedPane || Boolean(selectedRefusal)} title={selectedRefusal} onClick={() => { setMoreOpen(false); setCloseTarget(selectedPane ?? null); }} className="flex w-full items-center gap-3 rounded-2xl border border-red-200 bg-white p-3.5 text-left font-bold text-red-700 disabled:opacity-40 dark:border-red-900 dark:bg-[#1b1b21] dark:text-red-300"><Trash2 className="h-5 w-5 shrink-0" /> Close this pane</button>
               {/* Different scope from the four above, and the only place it can
                   live: project management is per-project, so there is no
@@ -1354,6 +1368,6 @@ export function MobileSessionActivity({ connected, onBack, onReconnect }: Mobile
       )}
     </section>
     )}
-    </ProjectJobsWorkspace>
+    </ProjectWorkersWorkspace>
   );
 }

@@ -17,7 +17,7 @@ export function JobAlias({ kind }: { kind: "list" | "new" | "detail" | "question
   if (!hydrated) return <Screen><ActivityIndicator /></Screen>;
   if (!signedIn) return <Redirect href="/login" />;
   if (kind === "list") return <Redirect href={{ pathname: "/(code)/jobs", params: { attention: params.attention } }} />;
-  if (kind === "new") return <Redirect href={{ pathname: "/(code)/jobs/new", params: { project: params.project } }} />;
+  if (kind === "new") return <Redirect href={{ pathname: "/(code)/workers/new", params: { project: params.project } }} />;
   if (!params.jobId) return <Redirect href="/(code)/jobs" />;
   const target = { jobId: params.jobId, project: params.project, run: params.run };
   if (kind === "question") return <Redirect href={{ pathname: "/(code)/jobs/[jobId]/questions/[questionId]", params: { ...target, questionId: params.questionId ?? "" } }} />;

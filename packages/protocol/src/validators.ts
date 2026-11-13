@@ -4,6 +4,7 @@ import codeEventSchema from "../schema/code-event.schema.json" with { type: "jso
 import serverToWebSchema from "../schema/server-to-web.schema.json" with { type: "json" };
 import webToServerSchema from "../schema/web-to-server.schema.json" with { type: "json" };
 import jobSchema from "../schema/jobs.schema.json" with { type: "json" };
+import workerSchema from "../schema/workers.schema.json" with { type: "json" };
 
 const ajv = new Ajv2020({ allErrors: true, strict: false });
 ajv.addFormat("uuid", /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i);
@@ -12,14 +13,17 @@ ajv.addFormat("uint", { type: "number", validate: (value) => Number.isSafeIntege
 ajv.addFormat("uint16", { type: "number", validate: (value) => Number.isInteger(value) && value >= 0 && value <= 65_535 });
 ajv.addFormat("uint32", { type: "number", validate: (value) => Number.isInteger(value) && value >= 0 && value <= 4_294_967_295 });
 ajv.addFormat("uint64", { type: "number", validate: (value) => Number.isSafeInteger(value) && value >= 0 });
+ajv.addFormat("int32", { type: "number", validate: (value) => Number.isInteger(value) && value >= -2_147_483_648 && value <= 2_147_483_647 });
 ajv.addFormat("int64", { type: "number", validate: Number.isSafeInteger });
 ajv.addFormat("double", { type: "number", validate: Number.isFinite });
 const validateWebToServer = ajv.compile(webToServerSchema) as ValidateFunction;
 const validateServerToWeb = ajv.compile(serverToWebSchema) as ValidateFunction;
 const validateCodeEventValue = ajv.compile(codeEventSchema) as ValidateFunction;
 const jobValidators = new Map<JobContractKind, ValidateFunction>();
+const workerValidators = new Map<WorkerContractKind, ValidateFunction>();
 
 export type JobContractKind = keyof typeof jobSchema.properties;
+export type WorkerContractKind = keyof typeof workerSchema.properties;
 
 export interface ValidationResult {
   valid: boolean;
@@ -53,6 +57,20 @@ export function validateJobContract(kind: JobContractKind, value: unknown): Vali
       ...jobSchema.properties[kind],
     }) as ValidateFunction;
     jobValidators.set(kind, validator);
+  }
+  return result(validator, value);
+}
+
+/** Worker REST responses must retain their exact identity and state vocabulary. */
+export function validateWorkerContract(kind: WorkerContractKind, value: unknown): ValidationResult {
+  let validator = workerValidators.get(kind);
+  if (!validator) {
+    validator = ajv.compile({
+      $schema: workerSchema.$schema,
+      $defs: workerSchema.$defs,
+      ...workerSchema.properties[kind],
+    }) as ValidateFunction;
+    workerValidators.set(kind, validator);
   }
   return result(validator, value);
 }

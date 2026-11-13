@@ -37,6 +37,7 @@ import {
   type SessionInstance,
 } from "./projectInstances";
 import { noRuntimeAccessReason } from "./tabHosts";
+import { receiveWorkerMessage } from "./workers";
 
 // UUID generator with fallback for environments without crypto.randomUUID
 function generateId(): string {
@@ -1013,8 +1014,6 @@ interface AppState {
   addMessageToPane: (message: Message, pane: PaneType | number) => void;
   startAutoRefresh: () => void;
   stopAutoRefresh: () => void;
-  pauseDeadloop: () => void;
-  resumeDeadloop: () => void;
   pausePane: (paneId: number) => void;
   resumePane: (paneId: number) => void;
   rebootPane: (paneId: number) => void;
@@ -1064,13 +1063,6 @@ interface AppState {
   ) => void;
   interruptPane: (paneId: number) => void;
   reorderPanes: (paneIds: number[]) => void;
-  startBot: (
-    paneId: number,
-    prompt?: string,
-    minIterationIntervalMinutes?: number,
-    effort?: string,
-  ) => void;
-  stopBot: (paneId: number) => void;
   /** Reboot the CLI of one of the project's instances; absent = the
    *  primary's. A daemon runs every project on its machine, so this restarts
    *  them all there. */
@@ -1554,6 +1546,9 @@ function newTabRefusal(
   spec: AddPaneSpec,
   machineId: string | undefined,
 ): string | null {
+  if (spec.mode !== "interactive") {
+    return "Legacy bot creation is retired. Review an autonomous worker mandate instead.";
+  }
   const kind = spec.kind ?? "agent";
   const managed = spec.managed ?? false;
   if (machineId) {
@@ -2035,6 +2030,7 @@ export const useStore = create<AppState>((set, get) => ({
           "pane_work_summary_v1",
           "cli_lifecycle_v1",
           "autonomous_jobs_v1",
+          "autonomous_workers_v1",
           PROJECT_INSTANCES_CAPABILITY,
         ],
         client_kind: "web",
@@ -2047,6 +2043,14 @@ export const useStore = create<AppState>((set, get) => ({
       lastIncomingAt = Date.now();
       try {
         const data = JSON.parse(event.data);
+        if (typeof data.type === "string" && data.type.startsWith("worker_")) {
+          // Old-account and replaced sockets must never deliver protected worker hints.
+          const state = get();
+          if (generation === wsGeneration && state.ws === ws && state.token === token) {
+            receiveWorkerMessage(data);
+          }
+          return;
+        }
         handleServerMessage(data, set, get);
       } catch (e) {
         console.error("Failed to parse message:", e);
@@ -3123,6 +3127,9 @@ export const useStore = create<AppState>((set, get) => ({
         error: "This pane uses a retired provider and is read-only.",
       };
     }
+    if (paneConfig?.mode === "deadloop" || pane === "deadloop") {
+      return { success: false, error: "Earlier bot conversations are read-only. Create an explicitly approved worker instead." };
+    }
 
     // One shared id for the optimistic placeholder + the pending-send
     // queue entry — lets the `user_input` ack handler strip the
@@ -3281,37 +3288,10 @@ export const useStore = create<AppState>((set, get) => ({
     }
   },
 
-  pauseDeadloop: () => {
-    const { ws, sessionId } = get();
-    if (ws && ws.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify({ type: "pause_deadloop", session_id: get().sessionId }));
-      // Also send new pane-specific pause
-      ws.send(JSON.stringify({ type: "pause_pane", session_id: sessionId, pane_id: PANE_ID_DEADLOOP }));
-    }
-  },
-
-  resumeDeadloop: () => {
-    const { ws, sessionId, paneConfigs, showToast } = get();
-    const pane = paneConfigs.find((candidate) => candidate.pane_id === PANE_ID_DEADLOOP);
-    if (pane && isRetiredProviderModel(pane.provider, pane.model)) {
-      showToast("This pane uses a retired provider and cannot be resumed", "error");
-      return;
-    }
-    if (ws && ws.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify({ type: "resume_deadloop", session_id: get().sessionId }));
-      // Also send new pane-specific resume
-      ws.send(JSON.stringify({ type: "resume_pane", session_id: sessionId, pane_id: PANE_ID_DEADLOOP }));
-    }
-  },
-
   pausePane: (paneId: number) => {
     const { ws, sessionId } = get();
     if (ws && ws.readyState === WebSocket.OPEN) {
       ws.send(JSON.stringify({ type: "pause_pane", session_id: sessionId, pane_id: paneId }));
-      // Also send legacy message for backward compat
-      if (paneId === PANE_ID_DEADLOOP) {
-        ws.send(JSON.stringify({ type: "pause_deadloop", session_id: get().sessionId }));
-      }
     }
   },
 
@@ -3323,6 +3303,10 @@ export const useStore = create<AppState>((set, get) => ({
       showToast("This pane uses a retired provider and cannot be resumed", "error");
       return;
     }
+    if (pane?.mode === "deadloop") {
+      showToast("Legacy bots cannot be resumed. Create and approve a new autonomous worker independently.", "error");
+      return;
+    }
     // No allowlist check: it decides what may be created, and this pane exists.
     // Team availability still applies — it is the switch that stops a running
     // team, not a catalogue of profiles.
@@ -3332,9 +3316,6 @@ export const useStore = create<AppState>((set, get) => ({
     }
     if (ws && ws.readyState === WebSocket.OPEN) {
       ws.send(JSON.stringify({ type: "resume_pane", session_id: sessionId, pane_id: paneId }));
-      if (paneId === PANE_ID_DEADLOOP) {
-        ws.send(JSON.stringify({ type: "resume_deadloop", session_id: get().sessionId }));
-      }
     }
   },
 
@@ -3344,6 +3325,10 @@ export const useStore = create<AppState>((set, get) => ({
     const policy = sessionId ? projectPolicies[sessionId] : undefined;
     if (pane && isRetiredProviderModel(pane.provider, pane.model)) {
       showToast("This pane uses a retired provider and cannot be rebooted", "error");
+      return;
+    }
+    if (pane?.mode === "deadloop") {
+      showToast("Legacy bots cannot be restored. Create and approve a new autonomous worker independently.", "error");
       return;
     }
     // Existing pane: team availability only, never the allowlist.
@@ -3784,46 +3769,6 @@ export const useStore = create<AppState>((set, get) => ({
     const { ws } = get();
     if (ws && ws.readyState === WebSocket.OPEN) {
       ws.send(JSON.stringify({ type: "reorder_panes", session_id: get().sessionId, pane_ids: paneIds }));
-    }
-  },
-
-  startBot: (
-    paneId: number,
-    prompt?: string,
-    minIterationIntervalMinutes?: number,
-    effort?: string,
-  ) => {
-    const { ws, sessionId, paneConfigs, projectPolicies, showToast } = get();
-    const pane = paneConfigs.find((candidate) => candidate.pane_id === paneId);
-    const policy = sessionId ? projectPolicies[sessionId] : undefined;
-    if (pane && isRetiredProviderModel(pane.provider, pane.model)) {
-      showToast("This pane uses a retired provider and cannot be started", "error");
-      return;
-    }
-    // Existing pane: team availability only, never the allowlist.
-    if (!sessionId || !pane || (pane.managed && !policy?.teamAvailable)) {
-      showToast("Start refused by the current cluster policy", "error");
-      return;
-    }
-    if (ws && ws.readyState === WebSocket.OPEN) {
-      const trimmedEffort = typeof effort === "string" ? effort.trim() : "";
-      ws.send(JSON.stringify({
-        type: "start_bot",
-        session_id: get().sessionId,
-        pane_id: paneId,
-        ...(prompt ? { prompt } : {}),
-        ...(typeof minIterationIntervalMinutes === "number" && Number.isFinite(minIterationIntervalMinutes)
-          ? { min_iteration_interval_minutes: Math.max(0, Math.floor(minIterationIntervalMinutes)) }
-          : {}),
-        ...(trimmedEffort ? { effort: trimmedEffort } : {}),
-      }));
-    }
-  },
-
-  stopBot: (paneId: number) => {
-    const { ws } = get();
-    if (ws && ws.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify({ type: "stop_bot", session_id: get().sessionId, pane_id: paneId }));
     }
   },
 

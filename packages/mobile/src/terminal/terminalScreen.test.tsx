@@ -206,6 +206,19 @@ describe("native terminal containment and input", () => {
     expect(mockSend).toHaveBeenLastCalledWith(expect.objectContaining({ type: "terminal_input", pane_id: 3 }));
   });
 
+  it("retains old bot terminal output but never sends input or resize to a deadloop pane", () => {
+    useMobileStore.setState({ panesBySession: { [sessionId]: [{ ...zoo006Pane, mode: "deadloop" }] } });
+    const view = render(<TerminalScreen />);
+    makeRunning();
+    mockSend.mockClear();
+    bridge({ type: "input", data: "continue the old loop\\r" });
+    bridge({ type: "resize", cols: 100, rows: 30 });
+    act(() => jest.advanceTimersByTime(200));
+    expect(mockSend).not.toHaveBeenCalled();
+    expect(view.getByText("Earlier bot terminal history is read-only. Create and approve a fresh worker separately.")).toBeTruthy();
+    expect(view.getByRole("button", { name: "Esc" })).toBeDisabled();
+  });
+
   it("says when the tab's machine is not running the project", () => {
     useMobileStore.setState({
       negotiatedCapabilities: ["project_instances_v1"],

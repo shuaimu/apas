@@ -2,6 +2,13 @@
 
 Define the externally observable contract for unattended OMP workers whose isolation, execution ownership, questions and limits are controlled by APAS rather than inferred from terminal text or model promises.
 
+Worker-originated execution additionally follows `autonomous-worker-execution`:
+protocol v2 and the exact bootstrap digest must qualify read-only inspection and
+bounded result-document handling as well as implementation. Legacy v1 readiness
+is sufficient only to drain already admitted finite work, never to start a
+persistent worker. The containment and complete-stop requirements below remain
+unchanged.
+
 ## ADDED Requirements
 
 ### Requirement: Worker availability proves the required runtime behavior

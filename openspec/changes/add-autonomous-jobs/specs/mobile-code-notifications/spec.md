@@ -1,7 +1,7 @@
 ## ADDED Requirements
 
 ### Requirement: Autonomous job attention uses privacy-safe notification events
-The system SHALL integrate job questions, failures/recovery needs, review-ready results and completion/cancellation with the existing device notification preferences and durable delivery mechanism. Push payloads SHALL contain only generic text and opaque job/run/question/review routing identities, never task titles, instructions, code, paths, answers, credentials or raw worker output. Repeated delivery of the same event SHALL not create distinct logical notifications. Recipient access and device validity SHALL be checked before dispatch.
+The system SHALL integrate actionable worker questions, failures/recovery and draft review with existing notification preferences and durable delivery. Routine successful inspection/wakeup completion SHALL NOT produce completion spam. Payloads SHALL contain only generic text and opaque worker/run/question/review identities, never titles, instructions, code, paths, answers, credentials or raw output. Repeated delivery SHALL not create distinct logical notifications. Recipient access and device validity SHALL be checked before dispatch. Existing finite-job notification links SHALL retain authorized read-only destinations.
 
 #### Scenario: A job needs a human answer
 - **WHEN** an authorized recipient has question notifications enabled and a pending job question is persisted
@@ -14,7 +14,7 @@ The system SHALL integrate job questions, failures/recovery needs, review-ready 
 - **AND** previously issued links still require current authorization before opening details
 
 ### Requirement: Notification links resolve exact durable job context
-Job notification links SHALL resolve the exact job and optional run/question/review context through authenticated lookup, independently of live session bootstrap. Link handling SHALL support fresh login, app cold start and foreground resume without performing a job mutation. Stale or inaccessible destinations SHALL show a safe current outcome and authorized Jobs or Attention navigation rather than another user's data or an arbitrary active session.
+Notification links SHALL resolve the exact worker and optional run/question/review through authenticated lookup independently of live session bootstrap; worker-only failures with no execution SHALL open worker detail without inventing a run. Retained finite-job links SHALL resolve their original evidence. Cold start, fresh login and foreground resume SHALL navigate without performing mutations. Inaccessible destinations SHALL show a safe outcome and authorized Workers/Attention navigation rather than another user's data or an arbitrary active session.
 
 #### Scenario: User opens a review notification after worker exit
 - **WHEN** an authorized user taps the notification from a cold native app or supported HTTPS link

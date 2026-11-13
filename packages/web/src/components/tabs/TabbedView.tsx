@@ -9,7 +9,7 @@ import { UserMessage } from "../chat/UserMessage";
 import { AssistantMessage } from "../chat/AssistantMessage";
 import { ToolGroupCard, groupMessagesForRender, isToolLikeMessage } from "../chat/ToolGroupCard";
 import { TabBar } from "./TabBar";
-import { ProjectJobsWorkspace } from "../jobs/ProjectJobsWorkspace";
+import { ProjectWorkersWorkspace } from "../workers/ProjectWorkersWorkspace";
 import { WorkerTaskBar } from "./WorkerTaskBar";
 import { UsageLimitsDisplay } from "../UsageLimits";
 import { CodeBlock } from "../code/CodeBlock";
@@ -141,40 +141,8 @@ const TerminalPane = dynamic(
 
 // Sentinel pane_id for the single-pane fallback (no pane system)
 const PANE_ID_MAIN = 0;
-const DEFAULT_BOT_MIN_INTERVAL_MINUTES = 15;
 const PANE_REBOOT_CONFIRM_MESSAGE =
   "Reboot this pane's agent? The running process is killed and respawned on the SAME session (so the agent resumes with its prior conversation context).";
-export const CLASSIC_TODO_BOT_LOOP_PROMPT = `Work on tasks defined in TODO.md. Do the following steps. Don't ask me for advice, just pick the best option you think that is honest, complete, and not corner-cutting:
-
-1. Do a git pull to check if there are any remote updates. Pick the top high-priority undone task, choose its first leaf task. If there are no undone TODO items left, sleep a minute and exit.
-2. Analyze the task, check if this can be done with not too many LOC (i.e., smaller than 500 lines code give or take). If not, try to analyze this task and break it down into several smaller tasks, expanding it in the TODO.md. The breakdown can be nested and hierarchical. Try to make each leaf task small enough (<500 lines LOC). You can document your analysis in the doc folder for future reference.
-3. Try to execute the first leaf task. Make a plan for the task before execute. You can document key findings in either the TODO.md (a few sentences in the TODO item, or doc it in the docs folder for longer details and discussions.
-4. Make sure to add comprehensive test for the task executed. Run the whole test suites to make sure no regression happens. If tests fail, fix them using the best, honest, complete approach, run test suites again to verify fixes work. Repeat this step until no tests fail.
-5. Prepare for git commit, remove all temporary files, especially not to commit any binary files. For plan files, remove the implementation plan and keep the design rational and user manual and put it in the docs folder.
-6. Git commit the changes. First do git pull --rebase, and fix conflicts if any. Then do git push.`;
-
-type BotPromptPaneConfig = Pick<
-  PaneConfig,
-  "prompt" | "managed" | "role" | "goal" | "backstory"
->;
-
-export function defaultBotPromptForPane(
-  _config: BotPromptPaneConfig | undefined,
-): string {
-  // Every pane gets the same starting loop now. The managed-team variant is
-  // gone with team mode; a pane's role, goal and backstory still reach the
-  // agent through its own system prompt.
-  return CLASSIC_TODO_BOT_LOOP_PROMPT;
-}
-
-export function botPromptForPane(
-  config: BotPromptPaneConfig | undefined,
-): string {
-  const savedPrompt = config?.prompt;
-  if (savedPrompt && savedPrompt.trim().length > 0) return savedPrompt;
-  return defaultBotPromptForPane(config);
-}
-
 // Store scroll positions per session+pane combination
 interface ScrollState {
   scrollTop: number;
@@ -357,43 +325,6 @@ const PROVIDER_LABEL: Record<ProviderOption, string> = Object.fromEntries(
   PROVIDER_OPTIONS.map((o) => [o.value, o.label]),
 ) as Record<ProviderOption, string>;
 
-function normalizeClaudeEffortOption(raw?: string | null): string {
-  if (typeof raw !== "string") return "default";
-  const normalized = raw.trim().toLowerCase();
-  if (
-    normalized === "default" ||
-    normalized === "low" ||
-    normalized === "medium" ||
-    normalized === "high" ||
-    normalized === "max" ||
-    normalized === "xhigh" ||
-    normalized === "ultracode"
-  ) {
-    return normalized;
-  }
-  if (normalized === "x-high") return "xhigh";
-  return "default";
-}
-
-function normalizeCodexEffortOption(raw?: string | null): string {
-  if (typeof raw !== "string") return "default";
-  const normalized = raw.trim().toLowerCase();
-  if (
-    normalized === "default" ||
-    normalized === "low" ||
-    normalized === "medium" ||
-    normalized === "high" ||
-    normalized === "xhigh" ||
-    normalized === "max" ||
-    normalized === "ultra"
-  ) {
-    return normalized;
-  }
-  if (normalized === "x-high") return "xhigh";
-  if (normalized === "ultracode") return "ultra"; // claude→codex bridge
-  if (normalized === "minimal") return "low";
-  return "default";
-}
 
 // Synthesize PaneConfig entries from observed pane_id keys when no PaneList was received
 function synthesizeConfigs(
@@ -481,14 +412,10 @@ export function TabbedView({
   const connected = useStore((s) => s.connected);
   const addPane = useStore((s) => s.addPane);
   const removePane = useStore((s) => s.removePane);
-  const pausePane = useStore((s) => s.pausePane);
-  const resumePane = useStore((s) => s.resumePane);
   const updatePaneLabel = useStore((s) => s.updatePaneLabel);
   const updatePaneModel = useStore((s) => s.updatePaneModel);
   const interruptPane = useStore((s) => s.interruptPane);
   const reorderPanes = useStore((s) => s.reorderPanes);
-  const startBot = useStore((s) => s.startBot);
-  const stopBot = useStore((s) => s.stopBot);
   const startMachineProjectCli = useStore((s) => s.startMachineProjectCli);
   const stopMachineProjectCli = useStore((s) => s.stopMachineProjectCli);
   const rebootCli = useStore((s) => s.rebootCli);
@@ -528,14 +455,6 @@ export function TabbedView({
   // tab pays a one-time mount cost, and the pane stays mounted after so
   // subsequent switches are still instant. Reset on session change.
   const [mountedPanes, setMountedPanes] = useState<Set<number>>(() => new Set());
-  const [startBotModalOpen, setStartBotModalOpen] = useState(false);
-  const [viewBotPromptModalOpen, setViewBotPromptModalOpen] = useState(false);
-  const [startBotPaneId, setStartBotPaneId] = useState<number | null>(null);
-  const [botPromptDraft, setBotPromptDraft] = useState("");
-  const [botMinIntervalDraft, setBotMinIntervalDraft] = useState(String(DEFAULT_BOT_MIN_INTERVAL_MINUTES));
-  // Holds a Claude or Codex effort value depending on the active pane's
-  // provider, so it's typed as the widened string rather than either union.
-  const [botEffortDraft, setBotEffortDraft] = useState<string>("default");
   const [inputDrafts, setInputDrafts] = useState<Record<string, string>>({});
   const [addTabError, setAddTabError] = useState<string | null>(null);
   const addTabErrorTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -1008,7 +927,6 @@ export function TabbedView({
   const activeIsLoading = activeTabId === PANE_ID_MAIN ? isLoadingMore : loadingMorePane === activeTabId;
   const activeStatus = activeTabId != null ? paneStatuses[paneKey(activeTabId)] || null : null;
   const activeIsAwaitingAnswer = paneIsAwaitingAnswerStatus(activeStatus);
-  const activeIsPaused = activeTabId != null ? pausedPanes.includes(activeTabId) : false;
   const activeIsBot = activeConfig?.mode === "deadloop";
   // Terminal panes take keystrokes directly in xterm.js. Showing the chat
   // composer under one would be worse than redundant: its text goes down
@@ -1025,7 +943,6 @@ export function TabbedView({
     },
     [activeTabId, setTerminalViewModeForPane],
   );
-  const activeStopRequested = activeConfig?.stop_requested === true;
   const activeProvider = activeConfig?.provider;
   const activeIsUnsupported = isRetiredProviderModel(
     activeProvider,
@@ -1045,25 +962,9 @@ export function TabbedView({
     : activeIsDeepseek
       ? "deepseek"
       : activeProvider;
-  // Starting a bot preserves a saved Claude/Codex effort even though effort
-  // is no longer editable from the web toolbar.
-  const isCodexEffort = activeUsageProvider === "codex";
-  const activeSupportsBotEffort =
-    activeUsageProvider === "claude" || isCodexEffort;
-  const activeBotEffortOption: string = isCodexEffort
-    ? normalizeCodexEffortOption(activeConfig?.effort)
-    : normalizeClaudeEffortOption(activeConfig?.effort);
-  const activeBotPrompt = botPromptForPane(activeConfig);
-  const activeBotMinIntervalMinutes = typeof activeConfig?.min_iteration_interval_minutes === "number"
-    ? activeConfig.min_iteration_interval_minutes
-    : DEFAULT_BOT_MIN_INTERVAL_MINUTES;
   const diffModalPaneConfig = diffModalPaneId !== null
     ? effectiveTabs.find((t) => t.pane_id === diffModalPaneId)
     : undefined;
-  const startBotTargetConfig = useMemo(
-    () => effectiveTabs.find((t) => t.pane_id === startBotPaneId),
-    [effectiveTabs, startBotPaneId],
-  );
 
   // Use a targeted selector to avoid re-renders when unrelated usage limits change
   const currentUsageLimits = useStore(
@@ -1082,10 +983,6 @@ export function TabbedView({
     if (activeUsageProvider === "deepseek") return "DeepSeek Usage";
     return "Claude Usage";
   }, [activeUsageProvider]);
-
-  useEffect(() => {
-    setBotEffortDraft(activeBotEffortOption);
-  }, [activeBotEffortOption, activeTabId]);
 
   const canBootCurrentProject = !isAttached && bootTarget != null && !bootTarget.isRunning;
 
@@ -1126,7 +1023,7 @@ export function TabbedView({
       if (activeIsBot) {
         return {
           success: false,
-          error: "This pane is in bot mode. Click Stop Bot to switch to interactive mode.",
+          error: "Legacy bot history is read-only. Create an autonomous worker with fresh approval.",
         };
       }
       if (activeTabId === PANE_ID_MAIN) {
@@ -1150,61 +1047,6 @@ export function TabbedView({
     },
     [activeIsBot, activeIsUnsupported, activeRefusal, activeTabId, effectiveTabs, sendMessageToPane],
   );
-
-  const handleStartBot = useCallback(() => {
-    if (activeTabId == null || activeIsUnsupported) return;
-    setStartBotPaneId(activeTabId);
-    const savedMinInterval = typeof activeConfig?.min_iteration_interval_minutes === "number"
-      ? activeConfig.min_iteration_interval_minutes
-      : DEFAULT_BOT_MIN_INTERVAL_MINUTES;
-    setBotPromptDraft(botPromptForPane(activeConfig));
-    setBotMinIntervalDraft(String(savedMinInterval));
-    setBotEffortDraft(activeBotEffortOption);
-    setStartBotModalOpen(true);
-  }, [activeBotEffortOption, activeConfig?.min_iteration_interval_minutes, activeConfig?.prompt, activeIsUnsupported, activeTabId]);
-
-  const handleStopBot = useCallback(() => {
-    if (activeTabId == null) return;
-    stopBot(activeTabId);
-  }, [activeTabId, stopBot]);
-
-  const handleCancelStartBot = useCallback(() => {
-    setStartBotModalOpen(false);
-    setStartBotPaneId(null);
-  }, []);
-
-  const handleOpenBotPrompt = useCallback(() => {
-    if (!activeIsBot) return;
-    setViewBotPromptModalOpen(true);
-  }, [activeIsBot]);
-
-  const handleCloseBotPrompt = useCallback(() => {
-    setViewBotPromptModalOpen(false);
-  }, []);
-
-  const handleConfirmStartBot = useCallback(() => {
-    if (startBotPaneId == null) return;
-    const trimmed = botPromptDraft.trim();
-    const minutesInput = botMinIntervalDraft.trim();
-    const parsedMinutes = minutesInput === "" ? NaN : Number(minutesInput);
-    const minIntervalMinutes = Number.isFinite(parsedMinutes)
-      ? Math.max(0, Math.floor(parsedMinutes))
-      : DEFAULT_BOT_MIN_INTERVAL_MINUTES;
-    startBot(
-      startBotPaneId,
-      trimmed.length > 0 ? botPromptDraft : defaultBotPromptForPane(startBotTargetConfig),
-      minIntervalMinutes,
-      activeSupportsBotEffort ? botEffortDraft : undefined,
-    );
-    setStartBotModalOpen(false);
-    setStartBotPaneId(null);
-  }, [activeSupportsBotEffort, botEffortDraft, botMinIntervalDraft, botPromptDraft, startBot, startBotPaneId, startBotTargetConfig]);
-
-  useEffect(() => {
-    if (!activeIsBot && viewBotPromptModalOpen) {
-      setViewBotPromptModalOpen(false);
-    }
-  }, [activeIsBot, viewBotPromptModalOpen]);
 
   // No selected project/session — keep this distinct from a selected project
   // whose authoritative pane list is empty. The latter continues into the
@@ -1258,7 +1100,7 @@ export function TabbedView({
   const paneControlsDisabled = Boolean(activeRefusal);
 
   return (
-    <ProjectJobsWorkspace
+    <ProjectWorkersWorkspace
       key={`${accountId}:${projectId ?? sessionId}`}
       project={projectContext}
       paneSelectionRequested={pendingPaneSelection?.sessionId === sessionId}
@@ -1271,8 +1113,6 @@ export function TabbedView({
             requestPaneDiff(paneId);
           }}
           onOpenRole={setRoleModalPaneId}
-          onPausePane={(paneId) => { if (paneControlAllowed(paneId)) pausePane(paneId); }}
-          onResumePane={(paneId) => { if (paneControlAllowed(paneId)) resumePane(paneId); }}
           onRemovePane={handleCloseTab}
         />
       )}
@@ -1337,7 +1177,12 @@ export function TabbedView({
       {/* Toolbar controls wrap on narrow phones instead of overflowing past
           the right edge of the pane frame. */}
       <div className="flex flex-wrap items-center gap-2 px-3 py-1.5 border-b border-gray-200 dark:border-gray-700 bg-gray-50 dark:bg-gray-800/30 flex-shrink-0">
-        {/* Start/Stop Bot */}
+        {/* Interactive pane controls; legacy bot history cannot start work. */}
+        {activeIsBot && activeTabId != null && <details className="w-full text-sm">
+          <summary className="min-h-11 cursor-pointer">Earlier bot instructions</summary>
+          <p>Original provider: {activeConfig?.provider}. This retained history is read-only. New autonomous workers are created and approved independently.</p>
+          <p className="whitespace-pre-wrap break-words">{activeConfig?.prompt || "No saved bot prompt is available."}</p>
+        </details>}
         {activeIsUnsupported ? (
           <div
             className="rounded border border-red-300 bg-red-50 px-2.5 py-1 text-xs font-medium text-red-700 dark:border-red-800 dark:bg-red-950/40 dark:text-red-300"
@@ -1345,52 +1190,8 @@ export function TabbedView({
           >
             Unsupported provider — history is read-only
           </div>
-        ) : isAttached && activeTabId != null && activeTabId !== PANE_ID_MAIN && (
-          activeIsBot ? (
+        ) : isAttached && activeTabId != null && activeTabId !== PANE_ID_MAIN && !activeIsBot && (
             <>
-              {activeStopRequested ? (
-                <button
-                  onClick={handleStopBot}
-                  disabled={paneControlsDisabled}
-                  className="flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium rounded transition-colors bg-amber-600 hover:bg-amber-700 text-white disabled:cursor-not-allowed disabled:opacity-50"
-                  title={activeRefusal ?? "Force stop immediately — kill the current process"}
-                >
-                  <svg className="w-3 h-3" fill="none" stroke="currentColor" strokeWidth="2.5" viewBox="0 0 24 24"><path d="M6 18L18 6M6 6l12 12" /></svg>
-                  Force Stop
-                </button>
-              ) : (
-                <button
-                  onClick={handleStopBot}
-                  disabled={paneControlsDisabled}
-                  className="flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium rounded transition-colors bg-red-500 hover:bg-red-600 text-white disabled:cursor-not-allowed disabled:opacity-50"
-                  title={activeRefusal ?? "Stop after current work finishes (click again to force stop)"}
-                >
-                  <svg className="w-3 h-3" fill="currentColor" viewBox="0 0 24 24"><path d="M6 6h12v12H6z" /></svg>
-                  Stop Bot
-                </button>
-              )}
-              <button
-                onClick={handleOpenBotPrompt}
-                className="flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium rounded transition-colors bg-indigo-500 hover:bg-indigo-600 text-white"
-                title="View this tab's current bot prompt"
-              >
-                <svg className="w-3 h-3" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24"><path d="M15 12h.01M12 12h.01M9 12h.01M4 6h16v12H4z" /></svg>
-                View Prompt
-              </button>
-            </>
-          ) : (
-            <>
-              {!activeIsTerminal && (
-                <button
-                  onClick={handleStartBot}
-                  disabled={paneControlsDisabled}
-                  className="flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium rounded transition-colors bg-green-500 hover:bg-green-600 text-white disabled:cursor-not-allowed disabled:opacity-50"
-                  title={activeRefusal ?? "Start autonomous bot execution in this tab"}
-                >
-                  <svg className="w-3 h-3" fill="currentColor" viewBox="0 0 24 24"><path d="M8 5v14l11-7z" /></svg>
-                  Bot
-                </button>
-              )}
               {!activeIsTerminal && activeTabId != null && activeProvider && (
                 <select
                   value={activeProvider as ProviderOption}
@@ -1471,7 +1272,6 @@ export function TabbedView({
                 </button>
               )}
             </>
-          )
         )}
 
         {activeIsTerminal && !activeIsUnsupported && (
@@ -1509,7 +1309,7 @@ export function TabbedView({
             Summary
           </button>
         )}
-        {!activeIsUnsupported && shouldShowPaneRebootButton(activeTabId) && (
+        {!activeIsBot && !activeIsUnsupported && shouldShowPaneRebootButton(activeTabId) && (
           <button
             onClick={() => {
               requestConfirmedPaneReboot(
@@ -1654,7 +1454,7 @@ export function TabbedView({
                   onLoadMore={() => loadMoreMessages(tab.pane_id)}
                   isLoading={loadingMorePane === tab.pane_id}
                   hasMore={paneHasMore[paneKey(tab.pane_id)] || false}
-                  disabledReason={tabHosts.tabs.get(tab.pane_id)?.refusal}
+                  disabledReason={tab.mode === "deadloop" ? "Legacy bot history is read-only." : tabHosts.tabs.get(tab.pane_id)?.refusal}
                 />
               ) : (
                 <>
@@ -1668,7 +1468,7 @@ export function TabbedView({
                     hasMore={paneHasMore[paneKey(tab.pane_id)] || false}
                     isActive={isActive}
                     role={tab.role}
-                    disabledReason={tabHosts.tabs.get(tab.pane_id)?.refusal}
+                    disabledReason={tab.mode === "deadloop" ? "Legacy bot history is read-only." : tabHosts.tabs.get(tab.pane_id)?.refusal}
                   />
                 </>
               )}
@@ -1693,11 +1493,7 @@ export function TabbedView({
         <div className="p-3 border-t border-gray-200 dark:border-gray-700 flex-shrink-0">
           {activeIsBot ? (
             <div className="text-center text-sm text-gray-400 dark:text-gray-500 py-2">
-              {activeStopRequested
-                ? "Stop requested — waiting for current work to finish. Click Force Stop to kill immediately."
-                : activeIsPaused
-                  ? "Bot is paused from previous state. Click Stop Bot to switch to interactive mode."
-                  : "Bot is running autonomously. Click Stop Bot to switch to interactive mode after current work finishes."}
+              Legacy bot history is read-only. Use Autonomous worker to review a new responsibility and recurring allowance.
             </div>
           ) : (
             <InteractiveInput
@@ -1722,25 +1518,6 @@ export function TabbedView({
         )}
       </div>
       </div>
-
-      <StartBotPromptModal
-        open={startBotModalOpen}
-        prompt={botPromptDraft}
-        minIntervalMinutes={botMinIntervalDraft}
-        tabLabel={startBotTargetConfig?.label || (startBotPaneId != null ? `Tab ${startBotPaneId}` : "Tab")}
-        onPromptChange={setBotPromptDraft}
-        onMinIntervalChange={setBotMinIntervalDraft}
-        onCancel={handleCancelStartBot}
-        onConfirm={handleConfirmStartBot}
-      />
-
-      <ViewBotPromptModal
-        open={viewBotPromptModalOpen}
-        prompt={activeBotPrompt}
-        minIntervalMinutes={activeBotMinIntervalMinutes}
-        tabLabel={activeConfig?.label || (activeTabId != null ? `Tab ${activeTabId}` : "Tab")}
-        onClose={handleCloseBotPrompt}
-      />
 
       <WorktreeCleanupModal
         open={cleanupDialog !== null}
@@ -1800,7 +1577,7 @@ export function TabbedView({
               // A held tool on a machine that is not running the project (or
               // that this viewer may not use) can only be refused; the
               // optimistic answer would also drop the review from view.
-              const reviewRefusal = tabHosts.tabs.get(item.paneId)?.refusal;
+              const reviewRefusal = effectiveTabs.find((pane) => pane.pane_id === item.paneId)?.mode === "deadloop" ? "Legacy bot history is read-only." : tabHosts.tabs.get(item.paneId)?.refusal;
               return (
               <div
                 key={item.toolUseId}
@@ -1852,7 +1629,7 @@ export function TabbedView({
       )}
     </div>
     )}
-    </ProjectJobsWorkspace>
+    </ProjectWorkersWorkspace>
   );
 }
 
@@ -2224,157 +2001,6 @@ function WorktreeCleanupModal({ open, worktreePath, onCancel, onConfirm }: Workt
             className="rounded border border-zinc-600 bg-zinc-800 px-3 py-1.5 text-sm hover:bg-zinc-700"
           >
             Cancel
-          </button>
-        </div>
-      </div>
-    </div>
-  );
-}
-
-interface ViewBotPromptModalProps {
-  open: boolean;
-  prompt: string;
-  minIntervalMinutes: number;
-  tabLabel: string;
-  onClose: () => void;
-}
-
-function ViewBotPromptModal({
-  open,
-  prompt,
-  minIntervalMinutes,
-  tabLabel,
-  onClose,
-}: ViewBotPromptModalProps) {
-  if (!open) return null;
-
-  return (
-    <div
-      className="fixed inset-0 z-[100] bg-black/50 flex items-center justify-center p-4"
-      onClick={onClose}
-    >
-      <div
-        className="w-full max-w-2xl bg-white dark:bg-gray-900 rounded-xl shadow-xl border border-gray-200 dark:border-gray-700"
-        onClick={(e) => e.stopPropagation()}
-      >
-        <div className="px-4 py-3 border-b border-gray-200 dark:border-gray-700">
-          <h3 className="text-sm font-semibold text-gray-900 dark:text-gray-100">
-            Bot Prompt for {tabLabel}
-          </h3>
-          <p className="text-xs mt-1 text-gray-500 dark:text-gray-400">
-            This is the active prompt currently used by this bot tab.
-          </p>
-        </div>
-        <div className="p-4 space-y-4">
-          <div>
-            <label className="block text-xs font-medium text-gray-700 dark:text-gray-300 mb-1">
-              Minimum Interval Between Iterations (minutes)
-            </label>
-            <input
-              type="text"
-              value={String(minIntervalMinutes)}
-              readOnly
-              className="w-full rounded-lg border border-gray-300 dark:border-gray-600 bg-gray-100 dark:bg-gray-800 px-3 py-2 text-sm"
-            />
-          </div>
-          <textarea
-            value={prompt}
-            readOnly
-            rows={10}
-            className="w-full rounded-lg border border-gray-300 dark:border-gray-600 bg-gray-100 dark:bg-gray-800 px-3 py-2 text-sm"
-          />
-        </div>
-        <div className="px-4 py-3 border-t border-gray-200 dark:border-gray-700 flex items-center justify-end">
-          <button
-            onClick={onClose}
-            className="px-3 py-1.5 text-xs font-medium rounded bg-indigo-500 hover:bg-indigo-600 text-white"
-          >
-            Close
-          </button>
-        </div>
-      </div>
-    </div>
-  );
-}
-
-interface StartBotPromptModalProps {
-  open: boolean;
-  prompt: string;
-  minIntervalMinutes: string;
-  tabLabel: string;
-  onPromptChange: (value: string) => void;
-  onMinIntervalChange: (value: string) => void;
-  onCancel: () => void;
-  onConfirm: () => void;
-}
-
-function StartBotPromptModal({
-  open,
-  prompt,
-  minIntervalMinutes,
-  tabLabel,
-  onPromptChange,
-  onMinIntervalChange,
-  onCancel,
-  onConfirm,
-}: StartBotPromptModalProps) {
-  if (!open) return null;
-
-  return (
-    <div
-      className="fixed inset-0 z-[100] bg-black/50 flex items-center justify-center p-4"
-      onClick={onCancel}
-    >
-      <div
-        className="w-full max-w-2xl bg-white dark:bg-gray-900 rounded-xl shadow-xl border border-gray-200 dark:border-gray-700"
-        onClick={(e) => e.stopPropagation()}
-      >
-        <div className="px-4 py-3 border-b border-gray-200 dark:border-gray-700">
-          <h3 className="text-sm font-semibold text-gray-900 dark:text-gray-100">
-            Start Bot on {tabLabel}
-          </h3>
-          <p className="text-xs mt-1 text-gray-500 dark:text-gray-400">
-            Edit the loop prompt for this tab. Classic/manual side-chat tabs default to the TODO.md loop; managed team panes default to their role metadata. This prompt is saved per tab in `.apas`.
-          </p>
-        </div>
-        <div className="p-4 space-y-4">
-          <div>
-            <label className="block text-xs font-medium text-gray-700 dark:text-gray-300 mb-1">
-              Minimum Interval Between Iterations (minutes)
-            </label>
-            <input
-              type="number"
-              min={0}
-              step={1}
-              value={minIntervalMinutes}
-              onChange={(e) => onMinIntervalChange(e.target.value)}
-              className="w-full rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-800 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
-              placeholder={String(DEFAULT_BOT_MIN_INTERVAL_MINUTES)}
-            />
-            <p className="text-[11px] mt-1 text-gray-500 dark:text-gray-400">
-              Default is 15. Next iteration starts no sooner than this interval since the previous iteration started.
-            </p>
-          </div>
-          <textarea
-            value={prompt}
-            onChange={(e) => onPromptChange(e.target.value)}
-            rows={10}
-            className="w-full rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-800 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
-            placeholder="Enter bot loop prompt..."
-          />
-        </div>
-        <div className="px-4 py-3 border-t border-gray-200 dark:border-gray-700 flex items-center justify-end gap-2">
-          <button
-            onClick={onCancel}
-            className="px-3 py-1.5 text-xs font-medium rounded bg-gray-200 hover:bg-gray-300 dark:bg-gray-700 dark:hover:bg-gray-600 text-gray-800 dark:text-gray-100"
-          >
-            Cancel
-          </button>
-          <button
-            onClick={onConfirm}
-            className="px-3 py-1.5 text-xs font-medium rounded bg-green-500 hover:bg-green-600 text-white"
-          >
-            Start Bot
           </button>
         </div>
       </div>

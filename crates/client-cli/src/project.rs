@@ -208,27 +208,6 @@ impl ProjectMetadata {
         }
     }
 
-    /// Get or create the deadloop Claude session ID (legacy compat)
-    pub fn get_or_create_deadloop_session_id(&mut self) -> Uuid {
-        self.migrate_legacy();
-        // Find the first deadloop pane
-        if let Some(pane) = self
-            .panes
-            .iter()
-            .find(|p| p.pane_id == shared::PANE_ID_DEADLOOP)
-        {
-            return pane.session_id;
-        }
-        // Fallback to legacy field
-        if let Some(id) = self.deadloop_claude_session_id {
-            id
-        } else {
-            let id = Uuid::new_v4();
-            self.deadloop_claude_session_id = Some(id);
-            id
-        }
-    }
-
     /// Get or create the interactive Claude session ID (legacy compat)
     pub fn get_or_create_interactive_session_id(&mut self) -> Uuid {
         self.migrate_legacy();

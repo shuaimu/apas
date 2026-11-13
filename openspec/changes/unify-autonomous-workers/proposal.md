@@ -1,0 +1,33 @@
+## Why
+
+APAS currently exposes two incomplete versions of unattended work: a bot that repeats a prompt and an autonomous job that ends after one approved task. The requested product is a persistent worker with an ongoing job description, a standing checklist, and authority to discover and prioritize concrete work within that responsibility.
+
+## What Changes
+
+- Introduce project-owned autonomous workers with stable identity, an account-approved versioned mandate, a human-controlled standing checklist, a worker-maintained backlog, durable checkpoints, and explicit running, idle, waiting, paused, blocked, and recovery states.
+- Approve the continuing responsibility and its execution envelope once. The worker may discover, add, refine, and prioritize work inside that mandate without asking the person to launch each task. It cannot expand its mandate, permissions, budget, repository, or execution target.
+- Separate persistent worker lifetime from bounded OMP execution. APAS persists scheduling and continuation; OMP provides the model/tool/delegation loop within each run. No-work inspection is a successful idle outcome, not an excuse to fabricate changes or continuously call the model.
+- Reuse the job engine's fenced execution, structured questions, isolated verification, draft-only publication, receipts, and evidence. Add worker-wide allowances across runs, a finite recurring budget, work-item identity, and an explicit no-change inspection result. Completing a task or delivering a PR does not complete the worker.
+- **BREAKING:** replace new bot and standalone one-shot-job creation with one Autonomous worker flow on desktop, mobile browser, and native mobile. Keep ordinary interactive panes and provider behavior unchanged. Show worker descriptions, current work, backlog/checklist, status, next check, budgets, and results in project Overview and cross-project Workers/Attention.
+- **BREAKING:** remove legacy bot drivers and creation commands after draining old unattended execution. Preserve bot prompts/provider/cadence/history read-only, with no bot-to-worker conversion. Users create and approve fresh workers separately. Never turn a finite prior approval into perpetual spending, silently switch a provider, or reinterpret a live terminal as a qualified OMP worker.
+
+## Capabilities
+
+### New Capabilities
+
+- `autonomous-workers`: standing mandates, autonomous backlog ownership, durable scheduling/checkpoints, lifecycle controls, authority, receipts, finite-job conversion, and read-only legacy bot history.
+- `autonomous-worker-execution`: bounded inspection and implementation runs, structured state updates, cumulative accounting, OMP readiness, recovery, and review-aware continuation.
+- `autonomous-worker-surfaces`: shared browser/native worker creation, oversight, questions, results, offline continuity, notifications, and history navigation.
+
+### Modified Capabilities
+
+- `project-policy-governance`: independently enable recurring workers, constrain recurring allowances and cadence, and enforce worker authority at every automatic dispatch.
+- `web-project-workspace`: expose one worker inventory and typed worker navigation alongside, but independent of, interactive panes.
+
+## Impact
+
+Affects shared Rust/protocol contracts; server job storage, scheduling, policy, routes, lifecycle cleanup and notifications; CLI job hosts, OMP bootstrap and legacy bot paths; browser/native job screens, caches and navigation; and existing operational guidance. Worker APIs remain under `/projects/`; UI routes remain outside nginx's API prefixes.
+
+This is a successor to `add-autonomous-jobs`, not a claim that its seven remaining operational gates are complete. Its implementation/history remain intact; this change supersedes its task-only product/admission boundary for worker-originated execution while preserving its containment and delivery guarantees. Reconcile that explicit dependency before either change's final spec synchronization/archive. The parallel `run-project-tabs-across-machines` proposal does not grant worker failover or change worker identity.
+
+This proposal neither implements nor deploys the feature, enables recurring spend, restarts providers, nor introduces managed teams, automatic merge, arbitrary external issue integrations, or additional worker providers beyond the qualified OMP execution backend.

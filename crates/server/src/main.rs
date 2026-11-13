@@ -13,6 +13,7 @@ mod session;
 mod state;
 mod storage;
 mod work_summary;
+mod workers;
 
 use state::AppState;
 

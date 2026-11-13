@@ -20,8 +20,14 @@ export default function AuthenticatedLayout() {
     }}>
       <Stack.Screen name="(tabs)" options={{ headerShown: false }} />
       <Stack.Screen name="new" options={{ title: "New task", presentation: "modal" }} />
-      <Stack.Screen name="jobs/index" options={{ title: "Jobs & Attention" }} />
-      <Stack.Screen name="jobs/new" options={{ title: "New autonomous job" }} />
+      <Stack.Screen name="workers/index" options={{ title: "Workers & Attention" }} />
+      <Stack.Screen name="workers/new" options={{ title: "Approve recurring worker" }} />
+      <Stack.Screen name="workers/[workerId]/index" options={{ title: "Worker responsibility" }} />
+      <Stack.Screen name="workers/[workerId]/runs/[runId]/index" options={{ title: "Exact execution" }} />
+      <Stack.Screen name="workers/[workerId]/runs/[runId]/questions/[questionId]" options={{ title: "Execution question" }} />
+      <Stack.Screen name="workers/[workerId]/runs/[runId]/review" options={{ title: "Historical review" }} />
+      <Stack.Screen name="jobs/index" options={{ title: "Earlier job results" }} />
+      <Stack.Screen name="jobs/new" options={{ title: "Unapproved worker draft" }} />
       <Stack.Screen name="jobs/[jobId]/index" options={{ title: "Job detail" }} />
       <Stack.Screen name="jobs/[jobId]/questions/[questionId]" options={{ title: "Job questions" }} />
       <Stack.Screen name="jobs/[jobId]/review" options={{ title: "Job review" }} />

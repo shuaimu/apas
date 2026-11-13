@@ -723,10 +723,9 @@ describe('useStore', () => {
 
       useStore.getState().resumePane(42);
       useStore.getState().rebootPane(42);
-      useStore.getState().startBot(42);
 
       expect(showToast).not.toHaveBeenCalled();
-      expect(send).toHaveBeenCalledTimes(3);
+      expect(send).toHaveBeenCalledTimes(2);
 
       // Creating that same combination is still refused.
       expect(useStore.getState().addPane('claude', 'interactive'))
@@ -1427,10 +1426,9 @@ describe('retired provider web guards', () => {
     useStore.getState().resumePane(91);
     useStore.getState().rebootPane(91);
     useStore.getState().updatePaneModel(91, null, 'codex');
-    useStore.getState().startBot(91);
 
     expect(send).not.toHaveBeenCalled();
-    expect(showToast).toHaveBeenCalledTimes(4);
+    expect(showToast).toHaveBeenCalledTimes(3);
   });
 });
 

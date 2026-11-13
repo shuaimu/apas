@@ -49,15 +49,15 @@ export function JobList({ attention }: { attention: boolean }) {
     return () => { remove(); clearInterval(timer); };
   }, [refresh, online]);
   return <>
-    <h1 tabIndex={-1}>{attention ? "Attention" : "Autonomous jobs"}</h1>
-    <p>{attention ? "Decisions, recovery and review that need your attention." : "Bounded coding work, independent verification and draft pull requests — separate from interactive sessions."}</p>
-    <div className="job-actions"><Link href="/code/jobs/new" className="job-button">New job</Link><button disabled={loading || !online} onClick={() => void refresh()}>Refresh jobs</button></div>
+    <h1 tabIndex={-1}>Earlier results</h1>
+    <p>Retained standalone job evidence and original request identities are read-only. These results have not become recurring workers.</p>
+    <div className="job-actions"><Link href="/code/workers/new" className="job-button">New autonomous worker</Link><button disabled={loading || !online} onClick={() => void refresh()}>Refresh earlier results</button></div>
     {!fresh && <p className="job-notice" role="status">{online ? "Checking current access and durable job state…" : "Offline or reconnecting. Cached jobs are stale and read-only."}</p>}
     <JobError message={error} />
-    {requests.length > 0 && <section className="job-card"><h2>Interrupted request recovery</h2><p>These saved identities are resolved before another submission. No request is replayed automatically.</p>{requests.map((request) => <div key={request.id}><p>Request <code>{request.id}</code> · {request.receipt?.status ?? "unconfirmed"}</p>{request.receipt?.job_id ? <Link className="job-button" href={jobHref(request.scope[1], request.receipt.job_id)}>Open original job</Link> : <Link className="job-button" href={request.scope[2] ? jobHref(request.scope[1], request.scope[2]) : `/code/jobs/new?project=${encodeURIComponent(request.scope[1])}`}>Resolve saved request</Link>}</div>)}</section>}
+    {requests.length > 0 && <section className="job-card"><h2>Earlier request receipts</h2><p>Original request identities remain inspectable. No retired submission is replayed.</p>{requests.map((request) => <div key={request.id}><p>Request <code>{request.id}</code> · {request.receipt?.status ?? "unconfirmed"}</p>{request.receipt?.job_id ? <Link className="job-button" href={jobHref(request.scope[1], request.receipt.job_id)}>Open original result</Link> : <p>The original receipt has not identified a retained result. Refresh to resolve the same request; creating a worker requires a separate approval.</p>}</div>)}</section>}
     <section aria-label={attention ? "Jobs needing attention" : "Job list"}>
       {page?.jobs.map((job) => <article className="job-card" key={job.id}><h2><Link href={jobHref(job.project_id, job.id)}>{job.title}</Link></h2><p>{job.project_name} · {job.hostname}</p><p><strong>{job.state.replaceAll("_", " ")}</strong>{job.attention_count ? ` · ${job.attention_count} attention items` : ""}</p>{job.reason && <p>{job.reason}</p>}<Usage usage={job.usage} limits={job.limits} /><p>Updated <time dateTime={job.updated_at}>{new Date(job.updated_at).toLocaleString()}</time></p><Link className="job-button" href={jobHref(job.project_id, job.id)}>Open job details</Link></article>)}
-      {page && !page.jobs.length && <p className="job-notice">{attention ? "No jobs currently need your attention." : "No authorized jobs on this page. Create a job when an operator has enabled a qualified target."}</p>}
+      {page && !page.jobs.length && <p className="job-notice">No authorized earlier results on this page.</p>}
     </section>
     <div className="job-actions"><button disabled={loading || !history.length} onClick={() => { setPage(undefined); setCursor(history[history.length - 1]); setHistory((items) => items.slice(0, -1)); }}>Previous jobs page</button><button disabled={loading || !online || !page?.next_cursor} onClick={() => { setHistory((items) => [...items, cursor]); setCursor(page!.next_cursor!); setPage(undefined); }}>Next jobs page</button></div>
   </>;

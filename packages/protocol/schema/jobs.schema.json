@@ -780,6 +780,16 @@
         "publish_enabled": {
           "type": "boolean"
         },
+        "recurring": {
+          "$ref": "#/$defs/RecurringWorkerPolicy",
+          "default": {
+            "enabled": false,
+            "max_elapsed_seconds_24h": 7200,
+            "max_runs_24h": 24,
+            "max_spend_micro_usd_24h": 20000000,
+            "min_interval_seconds": 900
+          }
+        },
         "verification_profiles": {
           "type": "array",
           "items": {
@@ -929,6 +939,16 @@
           "type": [
             "boolean",
             "null"
+          ]
+        },
+        "recurring": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RecurringWorkerPolicy"
+            },
+            {
+              "type": "null"
+            }
           ]
         },
         "verification_profiles": {
@@ -1441,20 +1461,29 @@
       ]
     },
     "JobState": {
-      "type": "string",
-      "enum": [
-        "queued",
-        "preparing",
-        "running",
-        "needs_input",
-        "verifying",
-        "publishing",
-        "review_ready",
-        "blocked",
-        "recovery_required",
-        "cancelling",
-        "cancelled",
-        "failed"
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "queued",
+            "preparing",
+            "running",
+            "needs_input",
+            "verifying",
+            "publishing",
+            "review_ready",
+            "blocked",
+            "recovery_required",
+            "cancelling",
+            "cancelled",
+            "failed"
+          ]
+        },
+        {
+          "description": "Successful read-only worker inspection; never evidence of code delivery.",
+          "type": "string",
+          "const": "completed"
+        }
       ]
     },
     "JobStopEvidence": {
@@ -1680,6 +1709,16 @@
         },
         "verification_profile_digest": {
           "type": "string"
+        },
+        "worker": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/WorkerExecutionContext"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "worker_profile": {
           "type": "string"
@@ -1990,6 +2029,413 @@
         "attention_count",
         "allowed_actions",
         "description"
+      ]
+    },
+    "RecurringWorkerPolicy": {
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "max_elapsed_seconds_24h": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "max_runs_24h": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "max_spend_micro_usd_24h": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "min_interval_seconds": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "enabled",
+        "max_elapsed_seconds_24h",
+        "max_spend_micro_usd_24h",
+        "max_runs_24h",
+        "min_interval_seconds"
+      ]
+    },
+    "WorkerChecklistObservation": {
+      "type": "object",
+      "properties": {
+        "index": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "observation": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "index",
+        "observation"
+      ]
+    },
+    "WorkerCheckpoint": {
+      "type": "object",
+      "properties": {
+        "backlog_revision": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "base_sha": {
+          "type": "string"
+        },
+        "checklist": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/WorkerChecklistObservation"
+          }
+        },
+        "id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "mandate_revision": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "recorded_at": {
+          "type": "string"
+        },
+        "run_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "summary": {
+          "type": "string"
+        },
+        "worker_id": {
+          "type": "string",
+          "format": "uuid"
+        }
+      },
+      "required": [
+        "id",
+        "worker_id",
+        "run_id",
+        "mandate_revision",
+        "backlog_revision",
+        "base_sha",
+        "summary",
+        "checklist",
+        "recorded_at"
+      ]
+    },
+    "WorkerExecutionContext": {
+      "type": "object",
+      "properties": {
+        "backlog_revision": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "checkpoint": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/WorkerCheckpoint"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "items": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/WorkerItem"
+          }
+        },
+        "mandate": {
+          "$ref": "#/$defs/WorkerMandateSpec"
+        },
+        "mandate_revision": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "purpose": {
+          "$ref": "#/$defs/WorkerRunPurpose"
+        },
+        "reservation_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "schedule_generation": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "selected_item_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "uuid"
+        },
+        "worker_id": {
+          "type": "string",
+          "format": "uuid"
+        }
+      },
+      "required": [
+        "worker_id",
+        "mandate_revision",
+        "backlog_revision",
+        "schedule_generation",
+        "reservation_id",
+        "purpose",
+        "mandate",
+        "items"
+      ]
+    },
+    "WorkerItem": {
+      "type": "object",
+      "properties": {
+        "attempts": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "created_at": {
+          "type": "string"
+        },
+        "id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "item": {
+          "$ref": "#/$defs/WorkerItemDraft"
+        },
+        "job_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "uuid"
+        },
+        "origin": {
+          "$ref": "#/$defs/WorkerItemOrigin"
+        },
+        "outcome": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "revision": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "run_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "uuid"
+        },
+        "state": {
+          "$ref": "#/$defs/WorkerItemState"
+        },
+        "updated_at": {
+          "type": "string"
+        },
+        "worker_id": {
+          "type": "string",
+          "format": "uuid"
+        }
+      },
+      "required": [
+        "id",
+        "worker_id",
+        "revision",
+        "item",
+        "origin",
+        "state",
+        "attempts",
+        "created_at",
+        "updated_at"
+      ]
+    },
+    "WorkerItemDraft": {
+      "type": "object",
+      "properties": {
+        "acceptance_criteria": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "dependencies": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "format": "uuid"
+          }
+        },
+        "evidence": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "instruction": {
+          "type": "string"
+        },
+        "priority": {
+          "type": "integer",
+          "format": "int32"
+        },
+        "scope_rationale": {
+          "type": "string"
+        },
+        "title": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "title",
+        "instruction",
+        "acceptance_criteria",
+        "scope_rationale",
+        "evidence",
+        "priority",
+        "dependencies"
+      ]
+    },
+    "WorkerItemOrigin": {
+      "type": "string",
+      "enum": [
+        "human",
+        "inspection",
+        "implementation"
+      ]
+    },
+    "WorkerItemState": {
+      "type": "string",
+      "enum": [
+        "ready",
+        "selected",
+        "running",
+        "awaiting_review",
+        "done",
+        "blocked",
+        "dismissed"
+      ]
+    },
+    "WorkerLimits": {
+      "type": "object",
+      "properties": {
+        "attempts_per_item": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "elapsed_seconds_24h": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "per_run": {
+          "$ref": "#/$defs/JobLimits"
+        },
+        "runs_24h": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "spend_micro_usd_24h": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "per_run",
+        "elapsed_seconds_24h",
+        "spend_micro_usd_24h",
+        "runs_24h",
+        "attempts_per_item"
+      ]
+    },
+    "WorkerMandateSpec": {
+      "type": "object",
+      "properties": {
+        "base_ref": {
+          "type": "string"
+        },
+        "checklist": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "description": {
+          "type": "string"
+        },
+        "interval_seconds": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "limits": {
+          "$ref": "#/$defs/WorkerLimits"
+        },
+        "machine_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "model_profile": {
+          "type": "string"
+        },
+        "title": {
+          "type": "string"
+        },
+        "verification_profile": {
+          "type": "string"
+        },
+        "worker_profile": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "title",
+        "description",
+        "checklist",
+        "machine_id",
+        "worker_profile",
+        "verification_profile",
+        "model_profile",
+        "base_ref",
+        "interval_seconds",
+        "limits"
+      ]
+    },
+    "WorkerRunPurpose": {
+      "type": "string",
+      "enum": [
+        "inspection",
+        "implementation"
       ]
     }
   }

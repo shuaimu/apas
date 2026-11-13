@@ -1,13 +1,12 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { randomUUID } from "expo-crypto";
 import { useFocusEffect } from "expo-router";
 import type { JobAdmissionRequest, JobAnswerRequest, JobMutationReceipt, JobMutationRequest } from "@apas/protocol";
-import { ApiError } from "@/api/client";
 import { jobsApi } from "./api";
-import { jobControlsReady, purgeJobAccess, selectJob, synchronizeJob, unselectJob, useJobs } from "./runtime";
+import { jobControlsReady, selectJob, unselectJob, useJobs } from "./runtime";
 import { readJobRecord, writeJobRecord } from "./storage";
 import type { JobScope } from "./storage";
 
+import { authorityCurrent, workerAuthority } from "@/workers/runtime";
 export function useJob(job: string, project?: string) {
   const account = useJobs((state) => state.account);
   const entry = useJobs((state) => state.entries[job]);
@@ -48,8 +47,10 @@ export function useJobDraft<T>(scope: JobScope | null, key: string, initial: T) 
     }).catch((cause) => { if (live) setError(`Draft could not be restored: ${String(cause)}`); });
     return () => { live = false; };
   }, [serialized, key]);
-  const save = (next: T) => {
-    if (!scope || !loaded || useJobs.getState().account !== scope.account) return;
+  const save = useCallback((next: T) => {
+    if (!serialized || !loaded || current.current !== scopeKey) return;
+    const scope = JSON.parse(serialized) as JobScope;
+    if (useJobs.getState().account !== scope.account) return;
     setValue(next); setSaving(true); setError(null);
     const owner = scopeKey;
     const version = ++saveVersion.current;
@@ -57,10 +58,11 @@ export function useJobDraft<T>(scope: JobScope | null, key: string, initial: T) 
     void pending.current.then(() => { if (current.current === owner && saveVersion.current === version) setSaving(false); }).catch((cause) => {
       if (current.current === owner && saveVersion.current === version) { setSaving(false); setError(`Draft was not saved: ${String(cause)}`); }
     });
-  };
+  }, [serialized, loaded, scopeKey, key]);
   const flush = async () => {
-    if (!scope || !loaded || useJobs.getState().account !== scope.account) throw new Error("Protected draft storage is not ready");
+    if (!scope || !loaded || current.current !== scopeKey || useJobs.getState().account !== scope.account) throw new Error("Protected draft storage is not ready");
     await pending.current;
+    if (current.current !== scopeKey || useJobs.getState().account !== scope.account) throw new Error("Protected draft authority changed");
     await writeJobRecord(scope, key, value);
   };
   return { value, save, loaded, saving, error, flush };
@@ -72,101 +74,33 @@ type SavedMutation =
   | { kind: "cancel" | "retry" | "retry-publication"; body: JobMutationRequest };
 interface MutationRecord { mutation: SavedMutation; receipt: JobMutationReceipt | null }
 
-export function useJobMutation(scope: JobScope | null, key: string) {
-  const [record, setRecord] = useState<MutationRecord | null>(null);
-  const [loaded, setLoaded] = useState(false);
-  const [busy, setBusy] = useState(false);
-  const [message, setMessage] = useState<string | null>(null);
-  const sending = useRef(false);
-  const [canRetry, setCanRetry] = useState(false);
-  const canRead = useJobs((state) => state.online && state.foreground && state.authorized);
-  const latestRecord = useRef(record);
-  useEffect(() => { latestRecord.current = record; }, [record]);
-  const savedRequestId = record?.mutation.body.request_id;
+export function useJobReceipt(scope: JobScope | null, key: string) {
+  const [stored, setStored] = useState<{ owner: string; record: MutationRecord | null; message: string | null } | null>(null);
   const serialized = scope ? JSON.stringify(scope) : "";
-  const scopeKey = JSON.stringify([serialized, key]);
-  const [renderedScope, setRenderedScope] = useState(scopeKey);
-  const [wasReadable, setWasReadable] = useState(canRead);
-  if (renderedScope !== scopeKey) {
-    setRenderedScope(scopeKey); setLoaded(false); setRecord(null); setBusy(false); setMessage(null); setCanRetry(false);
-  }
-  if (wasReadable !== canRead) { setWasReadable(canRead); setCanRetry(false); }
-  const identity = useRef(scopeKey);
-  useEffect(() => {
-    identity.current = scopeKey;
-    return () => { identity.current = ""; };
-  }, [scopeKey]);
-  const resolve = useCallback(async (saved: MutationRecord, owner: JobScope) => {
-    const ownerKey = JSON.stringify([JSON.stringify(owner), key]);
-    try {
-      const receipt = await jobsApi.receipt(saved.mutation.body.request_id);
-      if (identity.current !== ownerKey || useJobs.getState().account !== owner.account) return;
-      const confirmed = { ...saved, receipt };
-      await writeJobRecord(owner, key, confirmed);
-      if (identity.current !== ownerKey || useJobs.getState().account !== owner.account) return;
-      setRecord(confirmed); setCanRetry(false);
-      setMessage(receipt.message ?? `Request ${receipt.status}. Answers require separate provider confirmation.`);
-    } catch (error) {
-      if (identity.current !== ownerKey || useJobs.getState().account !== owner.account) return;
-      setCanRetry(error instanceof ApiError && error.status === 404);
-      setMessage(error instanceof ApiError && error.status === 404
-        ? "No receipt found. The result is unconfirmed. Only an explicit retry with this same request identity is permitted."
-        : `Receipt is unconfirmed; no request was replayed. ${String(error)}`);
-    }
-  }, [key]);
+  const owner = JSON.stringify([serialized, key]);
+  const record = stored?.owner === owner ? stored.record : null;
+  const message = stored?.owner === owner ? stored.message : null;
+  const canRead = useJobs((state) => state.online && state.foreground && state.authorized);
+  const currentScope = useRef("");
   useEffect(() => {
     let live = true;
-    if (!serialized) return;
-    const owner = JSON.parse(serialized) as JobScope;
-    void readJobRecord<MutationRecord>(owner, key).then((saved) => {
-      if (!live) return;
-      setRecord(saved); setLoaded(true);
-    }).catch((error) => { if (live) setMessage(`Request identity could not be restored: ${String(error)}`); });
-    return () => { live = false; };
-  }, [serialized, key, resolve]);
-  useEffect(() => {
-    const saved = latestRecord.current;
-    if (canRead && serialized && saved) void resolve(saved, JSON.parse(serialized) as JobScope);
-  }, [canRead, serialized, savedRequestId, resolve]);
-  const send = async (mutation: SavedMutation) => {
-    if (!scope || !loaded || sending.current) throw new Error("Request storage is not ready");
-    const state = useJobs.getState();
-    if (state.account !== scope.account || !state.authorized || !state.online || !state.foreground || !state.mutations || (scope.job && !jobControlsReady(scope.job))) throw new Error("Synchronize this job before changing it");
-    setBusy(true); setMessage(null); setCanRetry(false);
-    sending.current = true;
-    const ownerKey = scopeKey;
+    currentScope.current = owner;
+    if (serialized) void readJobRecord<MutationRecord>(JSON.parse(serialized) as JobScope, key)
+      .then((record) => { if (live) setStored({ owner, record, message: null }); })
+      .catch((error) => { if (live) setStored({ owner, record: null, message: String(error) }); });
+    return () => { live = false; currentScope.current = ""; };
+  }, [serialized, key, owner]);
+  const resolve = async () => {
+    if (!scope || !record || !canRead) return;
+    const stamp = workerAuthority();
     try {
-      const saved = { mutation, receipt: null };
-      await writeJobRecord(scope, key, saved);
-      if (identity.current !== ownerKey || useJobs.getState().account !== scope.account) return;
-      setRecord(saved);
-      const receipt = mutation.kind === "admit" ? await jobsApi.admit(scope.project, mutation.body)
-        : mutation.kind === "answer" ? await jobsApi.answer(scope.project, scope.job, mutation.question, mutation.body)
-        : await jobsApi.mutate(scope.project, scope.job, mutation.kind, mutation.body);
-      if (identity.current !== ownerKey || useJobs.getState().account !== scope.account) return;
-      const confirmed = { mutation, receipt };
+      const receipt = await jobsApi.receipt(record.mutation.body.request_id);
+      if (!authorityCurrent(stamp) || currentScope.current !== owner || useJobs.getState().account !== scope.account) return;
+      const confirmed = { ...record, receipt };
       await writeJobRecord(scope, key, confirmed);
-      if (identity.current !== ownerKey || useJobs.getState().account !== scope.account) return;
-      setRecord(confirmed); setMessage(receipt.message ?? `Request ${receipt.status}`);
-      if (scope.job) await synchronizeJob(scope.job, scope.project);
-    } catch (error) {
-      if (error instanceof ApiError && [401, 403].includes(error.status)) await purgeJobAccess(error.status === 401 ? undefined : scope.project);
-      if (identity.current === ownerKey && useJobs.getState().account === scope.account) setMessage(`Unconfirmed request; resolve its receipt before retrying. ${String(error)}`);
-    } finally { sending.current = false; if (identity.current === ownerKey) setBusy(false); }
+      if (!authorityCurrent(stamp) || currentScope.current !== owner) return;
+      setStored({ owner, record: confirmed, message: `Earlier request ${receipt.status}. Retired operations cannot be replayed.` });
+    } catch (error) { if (authorityCurrent(stamp) && currentScope.current === owner) setStored({ owner, record, message: `Receipt remains unconfirmed; no request was resent. ${String(error)}` }); }
   };
-  return {
-    record, loaded, busy, message, canRetry,
-    submit: async (mutation: SavedMutation) => { if (record) throw new Error("Resolve the saved request first"); await send(mutation); },
-    retry: async () => {
-      if (!canRetry) throw new Error("Resolve the original receipt before explicitly retrying");
-      if (record) await send(record.mutation);
-    },
-    resolve: async () => { if (record && scope) await resolve(record, scope); },
-    clear: async () => {
-      if (!scope || !record?.receipt || record.receipt.status === "pending") return;
-      await writeJobRecord(scope, key, null);
-      if (identity.current === scopeKey && useJobs.getState().account === scope.account) { setRecord(null); setMessage(null); setCanRetry(false); }
-    },
-    requestId: randomUUID,
-  };
+  return { record, message, resolve };
 }

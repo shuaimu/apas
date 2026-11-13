@@ -6,6 +6,7 @@ import {
   validateCodeEvent,
   validateServerMessage,
   validateJobContract,
+  validateWorkerContract,
 } from "../src/validators.js";
 
 const fixturesDirectory = fileURLToPath(new URL("../fixtures", import.meta.url));
@@ -47,6 +48,65 @@ describe("Rust protocol golden fixtures", () => {
       request_id: "7c6d2400-7b4b-455d-b732-7f066dab7a24",
       expected_version: Number.MAX_SAFE_INTEGER + 1,
     }).valid).toBe(false);
+  });
+
+  it("rejects unsafe worker versions and accidental mutation fields", () => {
+    const request = {
+      request_id: "7c6d2400-7b4b-455d-b732-7f066dab7a24",
+      expected_version: 12,
+    };
+    expect(validateWorkerContract("mutation_request", request).valid).toBe(true);
+    expect(validateWorkerContract("mutation_request", {
+      ...request, expected_version: Number.MAX_SAFE_INTEGER + 1,
+    }).valid).toBe(false);
+    expect(validateWorkerContract("mutation_request", {
+      ...request, approve_recurring: true,
+    }).valid).toBe(false);
+  });
+
+  it("requires an execution reservation and refuses model delivery assertions", () => {
+    const result = {
+      version: 1,
+      worker_id: "7c6d2400-7b4b-455d-b732-7f066dab7a24",
+      reservation_id: "7c6d2400-7b4b-455d-b732-7f066dab7a25",
+      mandate_revision: 1, backlog_revision: 0, schedule_generation: 1,
+      purpose: "inspection", disposition: "no_work", summary: "No eligible maintenance work.",
+      checklist: [], upserts: [], selected_item_id: null,
+    };
+    expect(validateWorkerContract("execution_result", result).valid).toBe(true);
+    const { reservation_id: _reservation, ...unbound } = result;
+    expect(validateWorkerContract("execution_result", unbound).valid).toBe(false);
+    expect(validateWorkerContract("execution_result", {
+      ...result, pull_request_merged: true,
+    }).valid).toBe(false);
+    expect(validateWorkerContract("execution_result", {
+      ...result, disposition: "published",
+    }).valid).toBe(false);
+  });
+
+  it("enforces signed priority boundaries on backlog edits", () => {
+    const request = {
+      request_id: "7c6d2400-7b4b-455d-b732-7f066dab7a24",
+      expected_version: 1,
+      item_id: "7c6d2400-7b4b-455d-b732-7f066dab7a25",
+      expected_item_revision: null,
+      item: {
+        title: "Fix the documented boundary", instruction: "Correct the checked range.",
+        acceptance_criteria: ["Boundary inputs produce the documented result."],
+        scope_rationale: "Within the approved correctness mandate.",
+        evidence: [], priority: 0, dependencies: [],
+      },
+    };
+    for (const priority of [-2_147_483_648, 2_147_483_647]) {
+      expect(validateWorkerContract("item_request", {
+        ...request, item: { ...request.item, priority },
+      }).valid).toBe(true);
+    }
+    for (const priority of [-2_147_483_649, 2_147_483_648, 1.5]) {
+      expect(validateWorkerContract("item_request", {
+        ...request, item: { ...request.item, priority },
+      }).valid).toBe(false);
+    }
   });
 
   it("rejects an unknown job receipt state instead of implying acceptance", () => {

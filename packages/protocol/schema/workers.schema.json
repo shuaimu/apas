@@ -1,0 +1,2520 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "WorkerProtocolContract",
+  "type": "object",
+  "properties": {
+    "approval_request": {
+      "$ref": "#/$defs/WorkerApprovalRequest"
+    },
+    "bootstrap": {
+      "$ref": "#/$defs/MobileWorkersBootstrap"
+    },
+    "detail": {
+      "$ref": "#/$defs/WorkerDetail"
+    },
+    "events": {
+      "$ref": "#/$defs/WorkerEventsResponse"
+    },
+    "execution_result": {
+      "$ref": "#/$defs/WorkerResult"
+    },
+    "item_request": {
+      "$ref": "#/$defs/WorkerItemRequest"
+    },
+    "items": {
+      "$ref": "#/$defs/WorkerItemsResponse"
+    },
+    "list": {
+      "$ref": "#/$defs/WorkerListResponse"
+    },
+    "mutation_request": {
+      "$ref": "#/$defs/WorkerMutationRequest"
+    },
+    "preview": {
+      "$ref": "#/$defs/WorkerPreview"
+    },
+    "preview_request": {
+      "$ref": "#/$defs/WorkerPreviewRequest"
+    },
+    "receipt": {
+      "$ref": "#/$defs/WorkerMutationReceipt"
+    },
+    "runs": {
+      "$ref": "#/$defs/WorkerRunsResponse"
+    },
+    "targets": {
+      "$ref": "#/$defs/WorkerTargetsResponse"
+    }
+  },
+  "required": [
+    "preview_request",
+    "preview",
+    "approval_request",
+    "mutation_request",
+    "item_request",
+    "targets",
+    "list",
+    "detail",
+    "items",
+    "runs",
+    "events",
+    "receipt",
+    "bootstrap",
+    "execution_result"
+  ],
+  "$defs": {
+    "EffectiveJobPolicy": {
+      "type": "object",
+      "properties": {
+        "digest": {
+          "type": "string"
+        },
+        "policy": {
+          "$ref": "#/$defs/JobPolicy"
+        },
+        "requested": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/JobPolicyOverride"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "sources": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/JobPolicySource"
+          }
+        }
+      },
+      "required": [
+        "policy",
+        "digest",
+        "sources"
+      ]
+    },
+    "JobAllowedActions": {
+      "type": "object",
+      "properties": {
+        "admit": {
+          "type": "boolean"
+        },
+        "answer": {
+          "type": "boolean"
+        },
+        "cancel": {
+          "type": "boolean"
+        },
+        "manage_policy": {
+          "type": "boolean"
+        },
+        "retry": {
+          "type": "boolean"
+        },
+        "retry_publication": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "admit",
+        "answer",
+        "cancel",
+        "retry",
+        "retry_publication",
+        "manage_policy"
+      ]
+    },
+    "JobDetail": {
+      "type": "object",
+      "properties": {
+        "high_watermark": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "job": {
+          "$ref": "#/$defs/JobSummary"
+        },
+        "policy_digest": {
+          "type": "string"
+        },
+        "publication": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/JobPublication"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "questions": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/JobQuestion"
+          }
+        },
+        "runs": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/JobRun"
+          }
+        },
+        "task": {
+          "$ref": "#/$defs/JobTaskSpec"
+        }
+      },
+      "required": [
+        "job",
+        "task",
+        "runs",
+        "questions",
+        "high_watermark",
+        "policy_digest"
+      ]
+    },
+    "JobLimits": {
+      "type": "object",
+      "properties": {
+        "attempts": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "cpu_millis": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "elapsed_seconds": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "memory_bytes": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "model_concurrency": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "model_output_tokens": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "output_bytes": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "pids": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "spend_micro_usd": {
+          "description": "Reported-spend threshold, not a promise about the provider's final invoice.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "workspace_bytes": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "elapsed_seconds",
+        "spend_micro_usd",
+        "attempts",
+        "cpu_millis",
+        "memory_bytes",
+        "workspace_bytes",
+        "output_bytes",
+        "pids",
+        "model_concurrency",
+        "model_output_tokens"
+      ]
+    },
+    "JobModelApi": {
+      "type": "string",
+      "enum": [
+        "openai_responses",
+        "anthropic_messages"
+      ]
+    },
+    "JobModelProfile": {
+      "type": "object",
+      "properties": {
+        "api": {
+          "$ref": "#/$defs/JobModelApi"
+        },
+        "key": {
+          "type": "string"
+        },
+        "label": {
+          "type": "string"
+        },
+        "model": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "key",
+        "label",
+        "model",
+        "api"
+      ]
+    },
+    "JobPolicy": {
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "limits": {
+          "$ref": "#/$defs/JobLimits"
+        },
+        "max_active_cluster": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "max_active_machine": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "max_active_project": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "max_queued_project": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "model_profiles": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "publish_enabled": {
+          "type": "boolean"
+        },
+        "recurring": {
+          "$ref": "#/$defs/RecurringWorkerPolicy",
+          "default": {
+            "enabled": false,
+            "max_elapsed_seconds_24h": 7200,
+            "max_runs_24h": 24,
+            "max_spend_micro_usd_24h": 20000000,
+            "min_interval_seconds": 900
+          }
+        },
+        "verification_profiles": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "worker_profiles": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "enabled",
+        "worker_profiles",
+        "model_profiles",
+        "verification_profiles",
+        "publish_enabled",
+        "limits",
+        "max_active_project",
+        "max_active_machine",
+        "max_active_cluster",
+        "max_queued_project"
+      ]
+    },
+    "JobPolicyOverride": {
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "limits": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/JobLimits"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "max_active_cluster": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        },
+        "max_active_machine": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        },
+        "max_active_project": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        },
+        "max_queued_project": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        },
+        "model_profiles": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "string"
+          }
+        },
+        "publish_enabled": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "recurring": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RecurringWorkerPolicy"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "verification_profiles": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "string"
+          }
+        },
+        "worker_profiles": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "JobPolicySource": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "revision": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "scope": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "scope",
+        "id",
+        "revision"
+      ]
+    },
+    "JobPublication": {
+      "type": "object",
+      "properties": {
+        "base_sha": {
+          "type": "string"
+        },
+        "branch": {
+          "type": "string"
+        },
+        "draft": {
+          "type": "boolean"
+        },
+        "head_sha": {
+          "type": "string"
+        },
+        "number": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "observed_at": {
+          "type": "string"
+        },
+        "repository": {
+          "type": "string"
+        },
+        "state": {
+          "type": "string"
+        },
+        "url": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "repository",
+        "number",
+        "url",
+        "branch",
+        "base_sha",
+        "head_sha",
+        "draft",
+        "state",
+        "observed_at"
+      ]
+    },
+    "JobQuestion": {
+      "type": "object",
+      "properties": {
+        "answers": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "$ref": "#/$defs/JobQuestionAnswer"
+          }
+        },
+        "confirmed_at": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "created_at": {
+          "type": "string"
+        },
+        "dialog_id": {
+          "type": "string"
+        },
+        "epoch": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "questions": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/JobQuestionItem"
+          }
+        },
+        "run_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "state": {
+          "$ref": "#/$defs/JobQuestionState"
+        },
+        "tool_call_id": {
+          "type": "string"
+        },
+        "version": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "id",
+        "run_id",
+        "epoch",
+        "version",
+        "dialog_id",
+        "tool_call_id",
+        "state",
+        "questions",
+        "created_at"
+      ]
+    },
+    "JobQuestionAnswer": {
+      "type": "object",
+      "properties": {
+        "custom_input": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "id": {
+          "type": "string"
+        },
+        "selected_option_ids": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "selected_option_ids"
+      ]
+    },
+    "JobQuestionItem": {
+      "type": "object",
+      "properties": {
+        "header": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "id": {
+          "type": "string"
+        },
+        "multi": {
+          "type": "boolean"
+        },
+        "options": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/JobQuestionOption"
+          }
+        },
+        "question": {
+          "type": "string"
+        },
+        "recommended": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "id",
+        "question",
+        "options",
+        "multi"
+      ]
+    },
+    "JobQuestionOption": {
+      "type": "object",
+      "properties": {
+        "description": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "id": {
+          "type": "string"
+        },
+        "label": {
+          "type": "string"
+        },
+        "preview": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "id",
+        "label"
+      ]
+    },
+    "JobQuestionState": {
+      "type": "string",
+      "enum": [
+        "pending",
+        "answer_accepted",
+        "answer_delivered",
+        "confirmed",
+        "uncertain",
+        "cancelled"
+      ]
+    },
+    "JobReceiptStatus": {
+      "type": "string",
+      "enum": [
+        "pending",
+        "accepted",
+        "completed",
+        "rejected"
+      ]
+    },
+    "JobRun": {
+      "type": "object",
+      "properties": {
+        "attempt": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "candidate_sha": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "ended_at": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "epoch": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "job_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "reason": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "started_at": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "state": {
+          "$ref": "#/$defs/JobState"
+        },
+        "stop_evidence": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/JobStopEvidence"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "usage": {
+          "$ref": "#/$defs/JobUsage"
+        },
+        "worker_version": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "id",
+        "job_id",
+        "attempt",
+        "epoch",
+        "state",
+        "usage"
+      ]
+    },
+    "JobState": {
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "queued",
+            "preparing",
+            "running",
+            "needs_input",
+            "verifying",
+            "publishing",
+            "review_ready",
+            "blocked",
+            "recovery_required",
+            "cancelling",
+            "cancelled",
+            "failed"
+          ]
+        },
+        {
+          "description": "Successful read-only worker inspection; never evidence of code delivery.",
+          "type": "string",
+          "const": "completed"
+        }
+      ]
+    },
+    "JobStopEvidence": {
+      "type": "object",
+      "properties": {
+        "boot_id": {
+          "type": "string"
+        },
+        "container_id": {
+          "type": "string"
+        },
+        "descendants_stopped": {
+          "type": "boolean"
+        },
+        "reason": {
+          "type": "string"
+        },
+        "stopped_at": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "boot_id",
+        "container_id",
+        "stopped_at",
+        "reason",
+        "descendants_stopped"
+      ]
+    },
+    "JobSummary": {
+      "type": "object",
+      "properties": {
+        "allowed_actions": {
+          "$ref": "#/$defs/JobAllowedActions"
+        },
+        "attention_count": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "cluster_owner_user_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "created_at": {
+          "type": "string"
+        },
+        "current_run_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "hostname": {
+          "type": "string"
+        },
+        "id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "limits": {
+          "$ref": "#/$defs/JobLimits"
+        },
+        "machine_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "project_id": {
+          "type": "string"
+        },
+        "project_name": {
+          "type": "string"
+        },
+        "reason": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "state": {
+          "$ref": "#/$defs/JobState"
+        },
+        "state_version": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "title": {
+          "type": "string"
+        },
+        "updated_at": {
+          "type": "string"
+        },
+        "usage": {
+          "$ref": "#/$defs/JobUsage"
+        }
+      },
+      "required": [
+        "id",
+        "project_id",
+        "project_name",
+        "title",
+        "state",
+        "state_version",
+        "current_run_id",
+        "cluster_owner_user_id",
+        "machine_id",
+        "hostname",
+        "created_at",
+        "updated_at",
+        "usage",
+        "limits",
+        "attention_count",
+        "allowed_actions"
+      ]
+    },
+    "JobTarget": {
+      "type": "object",
+      "properties": {
+        "allowed_actions": {
+          "$ref": "#/$defs/JobAllowedActions"
+        },
+        "available": {
+          "type": "boolean"
+        },
+        "cluster_owner_user_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "hostname": {
+          "type": "string"
+        },
+        "machine_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "policy": {
+          "$ref": "#/$defs/EffectiveJobPolicy"
+        },
+        "profiles": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/JobWorkerProfile"
+          }
+        },
+        "project_id": {
+          "type": "string"
+        },
+        "unavailable_reasons": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "required": [
+        "project_id",
+        "machine_id",
+        "cluster_owner_user_id",
+        "hostname",
+        "profiles",
+        "available",
+        "unavailable_reasons",
+        "policy",
+        "allowed_actions"
+      ]
+    },
+    "JobTaskSpec": {
+      "type": "object",
+      "properties": {
+        "acceptance_criteria": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "base_ref": {
+          "type": "string"
+        },
+        "base_sha": {
+          "type": "string"
+        },
+        "instruction": {
+          "type": "string"
+        },
+        "model_profile": {
+          "type": "string"
+        },
+        "repository": {
+          "type": "string"
+        },
+        "source_url": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "verification_profile": {
+          "type": "string"
+        },
+        "verification_profile_digest": {
+          "type": "string"
+        },
+        "worker": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/WorkerExecutionContext"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "worker_profile": {
+          "type": "string"
+        },
+        "worker_profile_digest": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "instruction",
+        "acceptance_criteria",
+        "repository",
+        "base_ref",
+        "base_sha",
+        "worker_profile",
+        "worker_profile_digest",
+        "verification_profile",
+        "verification_profile_digest",
+        "model_profile"
+      ]
+    },
+    "JobUsage": {
+      "type": "object",
+      "properties": {
+        "elapsed_seconds": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "estimated": {
+          "type": "boolean"
+        },
+        "input_tokens": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "output_tokens": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "spend_micro_usd": {
+          "description": "None is unknown, not zero.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "elapsed_seconds",
+        "input_tokens",
+        "output_tokens",
+        "estimated"
+      ]
+    },
+    "JobVerificationProfile": {
+      "type": "object",
+      "properties": {
+        "digest": {
+          "type": "string"
+        },
+        "image": {
+          "type": "string"
+        },
+        "key": {
+          "type": "string"
+        },
+        "label": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "key",
+        "label",
+        "digest",
+        "image"
+      ]
+    },
+    "JobWorkerProfile": {
+      "type": "object",
+      "properties": {
+        "digest": {
+          "type": "string"
+        },
+        "image": {
+          "type": "string"
+        },
+        "key": {
+          "type": "string"
+        },
+        "label": {
+          "type": "string"
+        },
+        "limits": {
+          "$ref": "#/$defs/JobLimits"
+        },
+        "model_profiles": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/JobModelProfile"
+          }
+        },
+        "omp_version": {
+          "type": "string"
+        },
+        "ready": {
+          "type": "boolean"
+        },
+        "unavailable_reasons": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "verification_profiles": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/JobVerificationProfile"
+          }
+        }
+      },
+      "required": [
+        "key",
+        "label",
+        "digest",
+        "image",
+        "omp_version",
+        "model_profiles",
+        "verification_profiles",
+        "limits",
+        "ready",
+        "unavailable_reasons"
+      ]
+    },
+    "MobileWorkersBootstrap": {
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "next_cursor": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "workers": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/WorkerSummary"
+          }
+        }
+      },
+      "required": [
+        "enabled",
+        "workers"
+      ]
+    },
+    "RecurringWorkerPolicy": {
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "max_elapsed_seconds_24h": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "max_runs_24h": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "max_spend_micro_usd_24h": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "min_interval_seconds": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "enabled",
+        "max_elapsed_seconds_24h",
+        "max_spend_micro_usd_24h",
+        "max_runs_24h",
+        "min_interval_seconds"
+      ]
+    },
+    "WorkerAllowedActions": {
+      "type": "object",
+      "properties": {
+        "answer": {
+          "type": "boolean"
+        },
+        "edit_backlog": {
+          "type": "boolean"
+        },
+        "edit_mandate": {
+          "type": "boolean"
+        },
+        "pause": {
+          "type": "boolean"
+        },
+        "resume": {
+          "type": "boolean"
+        },
+        "retry": {
+          "type": "boolean"
+        },
+        "retry_publication": {
+          "type": "boolean"
+        },
+        "stop": {
+          "type": "boolean"
+        },
+        "wake": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "edit_mandate",
+        "edit_backlog",
+        "pause",
+        "stop",
+        "resume",
+        "wake",
+        "retry",
+        "answer",
+        "retry_publication"
+      ]
+    },
+    "WorkerApprovalRequest": {
+      "type": "object",
+      "properties": {
+        "fingerprint": {
+          "type": "string"
+        },
+        "preview_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "request_id": {
+          "type": "string",
+          "format": "uuid"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "request_id",
+        "preview_id",
+        "fingerprint"
+      ]
+    },
+    "WorkerBudget": {
+      "type": "object",
+      "properties": {
+        "accounting_uncertain": {
+          "type": "boolean"
+        },
+        "eligible_at": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "reserved_elapsed_seconds": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "reserved_runs": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "reserved_spend_micro_usd": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "runs": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "usage": {
+          "$ref": "#/$defs/JobUsage"
+        },
+        "window_started_at": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "usage",
+        "runs",
+        "reserved_elapsed_seconds",
+        "reserved_spend_micro_usd",
+        "reserved_runs",
+        "accounting_uncertain",
+        "window_started_at"
+      ]
+    },
+    "WorkerChecklistObservation": {
+      "type": "object",
+      "properties": {
+        "index": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "observation": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "index",
+        "observation"
+      ]
+    },
+    "WorkerCheckpoint": {
+      "type": "object",
+      "properties": {
+        "backlog_revision": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "base_sha": {
+          "type": "string"
+        },
+        "checklist": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/WorkerChecklistObservation"
+          }
+        },
+        "id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "mandate_revision": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "recorded_at": {
+          "type": "string"
+        },
+        "run_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "summary": {
+          "type": "string"
+        },
+        "worker_id": {
+          "type": "string",
+          "format": "uuid"
+        }
+      },
+      "required": [
+        "id",
+        "worker_id",
+        "run_id",
+        "mandate_revision",
+        "backlog_revision",
+        "base_sha",
+        "summary",
+        "checklist",
+        "recorded_at"
+      ]
+    },
+    "WorkerConversionSource": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "job_id": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "kind": {
+              "type": "string",
+              "const": "job"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "job_id"
+          ]
+        }
+      ]
+    },
+    "WorkerDesiredState": {
+      "type": "string",
+      "enum": [
+        "active",
+        "paused"
+      ]
+    },
+    "WorkerDetail": {
+      "type": "object",
+      "properties": {
+        "allowed_actions": {
+          "$ref": "#/$defs/WorkerAllowedActions"
+        },
+        "budget": {
+          "$ref": "#/$defs/WorkerBudget"
+        },
+        "checkpoint": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/WorkerCheckpoint"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "current_job": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/JobDetail"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "mandate": {
+          "$ref": "#/$defs/WorkerMandate"
+        },
+        "worker": {
+          "$ref": "#/$defs/WorkerSummary"
+        }
+      },
+      "required": [
+        "worker",
+        "mandate",
+        "budget",
+        "allowed_actions"
+      ]
+    },
+    "WorkerEvent": {
+      "type": "object",
+      "properties": {
+        "created_at": {
+          "type": "string"
+        },
+        "job_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "uuid"
+        },
+        "kind": {
+          "$ref": "#/$defs/WorkerEventKind"
+        },
+        "project_id": {
+          "type": "string"
+        },
+        "question_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "uuid"
+        },
+        "run_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "uuid"
+        },
+        "seq": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "state_version": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "summary": {
+          "type": "string"
+        },
+        "worker_id": {
+          "type": "string",
+          "format": "uuid"
+        }
+      },
+      "required": [
+        "worker_id",
+        "project_id",
+        "seq",
+        "state_version",
+        "kind",
+        "summary",
+        "created_at"
+      ]
+    },
+    "WorkerEventKind": {
+      "type": "string",
+      "enum": [
+        "approved",
+        "mandate_changed",
+        "state_changed",
+        "backlog_changed",
+        "checkpoint",
+        "run_changed",
+        "question",
+        "review",
+        "budget"
+      ]
+    },
+    "WorkerEventsResponse": {
+      "type": "object",
+      "properties": {
+        "events": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/WorkerEvent"
+          }
+        },
+        "has_more": {
+          "type": "boolean"
+        },
+        "high_watermark": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "resync_required": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "events",
+        "high_watermark",
+        "has_more",
+        "resync_required"
+      ]
+    },
+    "WorkerExecutionContext": {
+      "type": "object",
+      "properties": {
+        "backlog_revision": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "checkpoint": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/WorkerCheckpoint"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "items": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/WorkerItem"
+          }
+        },
+        "mandate": {
+          "$ref": "#/$defs/WorkerMandateSpec"
+        },
+        "mandate_revision": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "purpose": {
+          "$ref": "#/$defs/WorkerRunPurpose"
+        },
+        "reservation_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "schedule_generation": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "selected_item_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "uuid"
+        },
+        "worker_id": {
+          "type": "string",
+          "format": "uuid"
+        }
+      },
+      "required": [
+        "worker_id",
+        "mandate_revision",
+        "backlog_revision",
+        "schedule_generation",
+        "reservation_id",
+        "purpose",
+        "mandate",
+        "items"
+      ]
+    },
+    "WorkerItem": {
+      "type": "object",
+      "properties": {
+        "attempts": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "created_at": {
+          "type": "string"
+        },
+        "id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "item": {
+          "$ref": "#/$defs/WorkerItemDraft"
+        },
+        "job_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "uuid"
+        },
+        "origin": {
+          "$ref": "#/$defs/WorkerItemOrigin"
+        },
+        "outcome": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "revision": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "run_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "uuid"
+        },
+        "state": {
+          "$ref": "#/$defs/WorkerItemState"
+        },
+        "updated_at": {
+          "type": "string"
+        },
+        "worker_id": {
+          "type": "string",
+          "format": "uuid"
+        }
+      },
+      "required": [
+        "id",
+        "worker_id",
+        "revision",
+        "item",
+        "origin",
+        "state",
+        "attempts",
+        "created_at",
+        "updated_at"
+      ]
+    },
+    "WorkerItemDraft": {
+      "type": "object",
+      "properties": {
+        "acceptance_criteria": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "dependencies": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "format": "uuid"
+          }
+        },
+        "evidence": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "instruction": {
+          "type": "string"
+        },
+        "priority": {
+          "type": "integer",
+          "format": "int32"
+        },
+        "scope_rationale": {
+          "type": "string"
+        },
+        "title": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "title",
+        "instruction",
+        "acceptance_criteria",
+        "scope_rationale",
+        "evidence",
+        "priority",
+        "dependencies"
+      ]
+    },
+    "WorkerItemOrigin": {
+      "type": "string",
+      "enum": [
+        "human",
+        "inspection",
+        "implementation"
+      ]
+    },
+    "WorkerItemProposal": {
+      "type": "object",
+      "properties": {
+        "expected_revision": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "item": {
+          "$ref": "#/$defs/WorkerItemDraft"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "item"
+      ]
+    },
+    "WorkerItemRequest": {
+      "type": "object",
+      "properties": {
+        "expected_item_revision": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "expected_version": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "item": {
+          "$ref": "#/$defs/WorkerItemDraft"
+        },
+        "item_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "request_id": {
+          "type": "string",
+          "format": "uuid"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "request_id",
+        "expected_version",
+        "item_id",
+        "item"
+      ]
+    },
+    "WorkerItemState": {
+      "type": "string",
+      "enum": [
+        "ready",
+        "selected",
+        "running",
+        "awaiting_review",
+        "done",
+        "blocked",
+        "dismissed"
+      ]
+    },
+    "WorkerItemsResponse": {
+      "type": "object",
+      "properties": {
+        "backlog_revision": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "items": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/WorkerItem"
+          }
+        },
+        "next_cursor": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "items",
+        "backlog_revision"
+      ]
+    },
+    "WorkerLimits": {
+      "type": "object",
+      "properties": {
+        "attempts_per_item": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "elapsed_seconds_24h": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "per_run": {
+          "$ref": "#/$defs/JobLimits"
+        },
+        "runs_24h": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "spend_micro_usd_24h": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "per_run",
+        "elapsed_seconds_24h",
+        "spend_micro_usd_24h",
+        "runs_24h",
+        "attempts_per_item"
+      ]
+    },
+    "WorkerListResponse": {
+      "type": "object",
+      "properties": {
+        "next_cursor": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "workers": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/WorkerSummary"
+          }
+        }
+      },
+      "required": [
+        "workers"
+      ]
+    },
+    "WorkerMandate": {
+      "type": "object",
+      "properties": {
+        "approved_at": {
+          "type": "string"
+        },
+        "approved_by": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "policy_digest": {
+          "type": "string"
+        },
+        "repository": {
+          "type": "string"
+        },
+        "revision": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "spec": {
+          "$ref": "#/$defs/WorkerMandateSpec"
+        },
+        "verification_profile_digest": {
+          "type": "string"
+        },
+        "worker_profile_digest": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "revision",
+        "spec",
+        "repository",
+        "worker_profile_digest",
+        "verification_profile_digest",
+        "policy_digest",
+        "approved_by",
+        "approved_at"
+      ]
+    },
+    "WorkerMandateSpec": {
+      "type": "object",
+      "properties": {
+        "base_ref": {
+          "type": "string"
+        },
+        "checklist": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "description": {
+          "type": "string"
+        },
+        "interval_seconds": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "limits": {
+          "$ref": "#/$defs/WorkerLimits"
+        },
+        "machine_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "model_profile": {
+          "type": "string"
+        },
+        "title": {
+          "type": "string"
+        },
+        "verification_profile": {
+          "type": "string"
+        },
+        "worker_profile": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "title",
+        "description",
+        "checklist",
+        "machine_id",
+        "worker_profile",
+        "verification_profile",
+        "model_profile",
+        "base_ref",
+        "interval_seconds",
+        "limits"
+      ]
+    },
+    "WorkerMutationKind": {
+      "type": "string",
+      "enum": [
+        "approve",
+        "edit_mandate",
+        "pause",
+        "stop",
+        "resume",
+        "wake",
+        "upsert_item",
+        "dismiss_item",
+        "retry_item",
+        "answer",
+        "retry_publication"
+      ]
+    },
+    "WorkerMutationReceipt": {
+      "type": "object",
+      "properties": {
+        "error_code": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "operation": {
+          "$ref": "#/$defs/WorkerMutationKind"
+        },
+        "project_id": {
+          "type": "string"
+        },
+        "request_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "state_version": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "status": {
+          "$ref": "#/$defs/JobReceiptStatus"
+        },
+        "worker_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "uuid"
+        }
+      },
+      "required": [
+        "request_id",
+        "operation",
+        "status",
+        "project_id"
+      ]
+    },
+    "WorkerMutationRequest": {
+      "type": "object",
+      "properties": {
+        "expected_version": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "request_id": {
+          "type": "string",
+          "format": "uuid"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "request_id",
+        "expected_version"
+      ]
+    },
+    "WorkerPreview": {
+      "type": "object",
+      "properties": {
+        "base_sha": {
+          "type": "string"
+        },
+        "cluster_owner_user_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "expected_version": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "expires_at": {
+          "type": "string"
+        },
+        "fingerprint": {
+          "type": "string"
+        },
+        "hostname": {
+          "type": "string"
+        },
+        "id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "mandate": {
+          "$ref": "#/$defs/WorkerMandate"
+        },
+        "policy": {
+          "$ref": "#/$defs/EffectiveJobPolicy"
+        },
+        "project_id": {
+          "type": "string"
+        },
+        "source": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/WorkerConversionSource"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "worker_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "uuid"
+        }
+      },
+      "required": [
+        "id",
+        "project_id",
+        "fingerprint",
+        "expires_at",
+        "mandate",
+        "cluster_owner_user_id",
+        "hostname",
+        "base_sha",
+        "policy"
+      ]
+    },
+    "WorkerPreviewRequest": {
+      "type": "object",
+      "properties": {
+        "expected_version": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "default": null,
+          "minimum": 0
+        },
+        "source": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/WorkerConversionSource"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "spec": {
+          "$ref": "#/$defs/WorkerMandateSpec"
+        },
+        "worker_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "uuid",
+          "default": null
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "spec"
+      ]
+    },
+    "WorkerResult": {
+      "type": "object",
+      "properties": {
+        "backlog_revision": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "checklist": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/WorkerChecklistObservation"
+          }
+        },
+        "disposition": {
+          "$ref": "#/$defs/WorkerResultDisposition"
+        },
+        "mandate_revision": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "purpose": {
+          "$ref": "#/$defs/WorkerRunPurpose"
+        },
+        "reservation_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "schedule_generation": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "selected_item_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "uuid"
+        },
+        "summary": {
+          "type": "string"
+        },
+        "upserts": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/WorkerItemProposal"
+          }
+        },
+        "version": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "worker_id": {
+          "type": "string",
+          "format": "uuid"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "version",
+        "worker_id",
+        "mandate_revision",
+        "backlog_revision",
+        "schedule_generation",
+        "reservation_id",
+        "purpose",
+        "disposition",
+        "summary",
+        "checklist",
+        "upserts"
+      ]
+    },
+    "WorkerResultDisposition": {
+      "type": "string",
+      "enum": [
+        "select_work",
+        "no_work",
+        "candidate_ready",
+        "blocked",
+        "no_change"
+      ]
+    },
+    "WorkerRunPurpose": {
+      "type": "string",
+      "enum": [
+        "inspection",
+        "implementation"
+      ]
+    },
+    "WorkerRunSummary": {
+      "type": "object",
+      "properties": {
+        "item_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "uuid"
+        },
+        "job_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "mandate_revision": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "purpose": {
+          "$ref": "#/$defs/WorkerRunPurpose"
+        },
+        "run": {
+          "$ref": "#/$defs/JobRun"
+        },
+        "worker_id": {
+          "type": "string",
+          "format": "uuid"
+        }
+      },
+      "required": [
+        "worker_id",
+        "job_id",
+        "purpose",
+        "mandate_revision",
+        "run"
+      ]
+    },
+    "WorkerRunsResponse": {
+      "type": "object",
+      "properties": {
+        "next_cursor": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "runs": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/WorkerRunSummary"
+          }
+        }
+      },
+      "required": [
+        "runs"
+      ]
+    },
+    "WorkerState": {
+      "type": "string",
+      "enum": [
+        "queued",
+        "preparing",
+        "inspecting",
+        "working",
+        "needs_input",
+        "verifying",
+        "publishing",
+        "idle",
+        "waiting_review",
+        "waiting_budget",
+        "pausing",
+        "paused",
+        "stopping",
+        "blocked",
+        "recovery_required"
+      ]
+    },
+    "WorkerSummary": {
+      "type": "object",
+      "properties": {
+        "active_job_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "uuid"
+        },
+        "active_run_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "uuid"
+        },
+        "attention": {
+          "type": "boolean"
+        },
+        "attention_question_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "uuid"
+        },
+        "attention_run_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "uuid"
+        },
+        "backlog_revision": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "cluster_owner_user_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "created_at": {
+          "type": "string"
+        },
+        "current_item_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "uuid"
+        },
+        "description": {
+          "type": "string"
+        },
+        "desired_state": {
+          "$ref": "#/$defs/WorkerDesiredState"
+        },
+        "high_watermark": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "hostname": {
+          "type": "string"
+        },
+        "id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "machine_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "mandate_revision": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "next_check_at": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "project_id": {
+          "type": "string"
+        },
+        "reason": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "state": {
+          "$ref": "#/$defs/WorkerState"
+        },
+        "state_version": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "title": {
+          "type": "string"
+        },
+        "updated_at": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "project_id",
+        "title",
+        "description",
+        "state",
+        "desired_state",
+        "mandate_revision",
+        "backlog_revision",
+        "state_version",
+        "high_watermark",
+        "machine_id",
+        "cluster_owner_user_id",
+        "hostname",
+        "attention",
+        "created_at",
+        "updated_at"
+      ]
+    },
+    "WorkerTargetsResponse": {
+      "type": "object",
+      "properties": {
+        "project_id": {
+          "type": "string"
+        },
+        "targets": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/JobTarget"
+          }
+        },
+        "unavailable_reasons": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "required": [
+        "project_id",
+        "targets",
+        "unavailable_reasons"
+      ]
+    }
+  }
+}

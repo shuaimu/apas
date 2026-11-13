@@ -15,16 +15,16 @@ const originalFetch = global.fetch;
 beforeEach(() => { global.fetch = fetchMock; fetchMock.mockReset(); jest.mocked(validAccessToken).mockClear(); });
 afterAll(() => { global.fetch = originalFetch; });
 
-test("a lost admission reply never causes automatic mutation replay", async () => {
-  fetchMock.mockRejectedValueOnce(new Error("connection lost after commit"));
-  await expect(jobsApi.admit("project", { request_id: "original", preview_id: "preview", fingerprint: "digest" })).rejects.toBeInstanceOf(Error);
-  expect(fetchMock).toHaveBeenCalledTimes(1);
+test("earlier job review preserves its requested run and uses read-only HTTP", async () => {
+  fetchMock.mockResolvedValueOnce({ ok: true, json: async () => ({}) });
+  await jobsApi.review("project", "job", null, "historical-run");
+  expect(fetchMock).toHaveBeenCalledWith("https://apas.example/projects/project/jobs/job/review?limit=40&run_id=historical-run", expect.objectContaining({ method: "GET" }));
 });
 
-test("even an authentication failure does not automatically replay a mutation", async () => {
-  fetchMock.mockResolvedValueOnce({ ok: false, status: 401, json: async () => ({ error: "expired" }) });
-  await expect(jobsApi.mutate("project", "job", "cancel", { request_id: "original", expected_version: 2 })).rejects.toMatchObject({ status: 401 });
+test("earlier admission receipts remain resolvable without replaying retired mutations", async () => {
+  fetchMock.mockResolvedValueOnce({ ok: true, json: async () => ({ request_id: "original", status: "accepted" }) });
+  await expect(jobsApi.receipt("original")).resolves.toMatchObject({ request_id: "original" });
   expect(fetchMock).toHaveBeenCalledTimes(1);
-  expect(validAccessToken).not.toHaveBeenCalledWith(true);
+  expect(fetchMock.mock.calls[0][1].method).toBe("GET");
 });
 

@@ -6,13 +6,13 @@ import { EmptyState, OfflineBanner, Screen, SectionTitle, StatusBadge } from "@/
 import { useTheme } from "@/design/tokens";
 import { useMobileStore } from "@/state/store";
 import { JobAction } from "@/jobs/ui";
-import { useJobs } from "@/jobs/runtime";
+import { useWorkers } from "@/workers/runtime";
 
 export default function AttentionScreen() {
   const theme = useTheme();
   const sessions = useMobileStore((state) => state.sessions);
   const eventsBySession = useMobileStore((state) => state.eventsBySession);
-  const jobs = useJobs((state) => state.inbox.jobs);
+  const workers = useWorkers((state) => state.inbox.workers);
   const attentionEvents = Object.values(eventsBySession).flatMap(deriveAttention);
   const open = (event: CodeEvent) => router.push({
     pathname: "/(code)/session/[sessionId]",
@@ -25,7 +25,7 @@ export default function AttentionScreen() {
         <Pressable accessibilityRole="button" onPress={() => router.back()} style={styles.backButton}><Text style={{ color: theme.accent, fontWeight: "700" }}>‹ Coding sessions</Text></Pressable>
         <SectionTitle>Needs attention</SectionTitle>
         <Text style={{ color: theme.textMuted }}>Server-authoritative pending decisions and selected failures</Text>
-        <JobAction onPress={() => router.push({ pathname: "/(code)/jobs", params: { attention: "1" } })}>Job Attention ({jobs.reduce((count, job) => count + job.attention_count, 0)} in current inbox)</JobAction>
+        <JobAction onPress={() => router.push({ pathname: "/(code)/workers", params: { attention: "1" } })}>Worker Attention ({workers.filter((worker) => worker.attention).length} in loaded inbox; not a total)</JobAction>
       </View>
       <FlatList
         data={attentionEvents}

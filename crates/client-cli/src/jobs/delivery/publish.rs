@@ -693,6 +693,7 @@ mod tests {
                 epoch: 1,
             },
             task: JobTaskSpec {
+                worker: None,
                 instruction: "task".into(),
                 acceptance_criteria: vec![],
                 source_url: None,

@@ -14,7 +14,7 @@ function pane(overrides: Partial<PaneConfig> & Pick<PaneConfig, "pane_id" | "lab
   return {
     pane_id: overrides.pane_id,
     provider: overrides.provider ?? "claude",
-    mode: overrides.mode ?? "deadloop",
+    mode: overrides.mode ?? "interactive",
     session_id: `pane-${overrides.pane_id}`,
     is_paused: false,
     label: overrides.label,
@@ -49,8 +49,6 @@ function renderPaneGrid(onRemovePane = vi.fn(), onOpenPane = vi.fn()) {
       onOpenPane={onOpenPane}
       onOpenDiff={vi.fn()}
       onOpenRole={vi.fn()}
-      onPausePane={vi.fn()}
-      onResumePane={vi.fn()}
       onRemovePane={onRemovePane}
     />,
   );
@@ -106,6 +104,21 @@ describe("PaneGrid empty states", () => {
     renderPaneGrid();
     expect(within(card("Needs answer")).getByLabelText("pending answer")).toBeTruthy();
     expect(within(card("Needs answer")).queryByLabelText("thinking")).toBeNull();
+  });
+
+  it("keeps legacy roles and history without bot or team execution controls", () => {
+    seedPaneGrid([
+      pane({ pane_id: 23, label: "Earlier coordinator", role: "tech lead", managed: true, mode: "deadloop" }),
+    ]);
+    const { onOpenPane, onRemovePane } = renderPaneGrid();
+    expect(screen.queryByText("Pause")).toBeNull();
+    expect(screen.queryByText("Resume")).toBeNull();
+    expect(screen.queryByTitle(/Click to flip/)).toBeNull();
+    expect(screen.queryByText("+ Add to team")).toBeNull();
+    fireEvent.click(card("Earlier coordinator"));
+    expect(onOpenPane).toHaveBeenCalledWith(23);
+    fireEvent.click(within(card("Earlier coordinator")).getByText("Remove"));
+    expect(onRemovePane).toHaveBeenCalledWith(23);
   });
 });
 

@@ -19,6 +19,7 @@ import { instancesForSession, tabUnavailableReason } from "@/state/projectInstan
 import { mutationsAllowed, PROJECT_INSTANCES_CAPABILITY, useMobileStore } from "@/state/store";
 import { subscribeTerminalMessages } from "@/terminal/events";
 import { encodeTerminalInput } from "@/terminal/input";
+import { paneIsRetiredBot } from "@/state/paneStatus";
 
 const LINK_HOSTS = new Set(["github.com", "gitlab.com", "docs.rs", "docs.expo.dev"]);
 
@@ -45,6 +46,7 @@ export default function TerminalScreen() {
   // an error frame shows nothing here.
   const unavailableReason = useMemo(() => {
     const pane = (livePanes ?? session?.panes)?.find((candidate) => candidate.pane_id === paneId);
+    if (paneIsRetiredBot(pane)) return "Earlier bot terminal history is read-only. Create and approve a fresh worker separately.";
     return tabUnavailableReason(pane, instancesForSession(session, liveInstances), instancesSupported && Boolean(session?.is_active));
   }, [instancesSupported, liveInstances, livePanes, paneId, session]);
   // The size the terminal last asked for, and whether it was held back while

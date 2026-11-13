@@ -1,21 +1,21 @@
 ## Purpose
 
-Define APAS-owned, explicitly approved coding jobs with durable identity, bounded execution, current authorization and honest recovery semantics independent of interactive panes or a connected client.
+Define the internal bounded job engine and retained finite-job evidence, with immutable identity, current authorization and honest recovery semantics independent of interactive panes or a connected client. After persistent-worker cutover, the `autonomous-workers` capability owns public approval, recurrence and controls; this capability does not expose a second standalone creation or retry product.
 
 ## ADDED Requirements
 
 ### Requirement: Admission binds one immutable task and finite allowance
-The system SHALL admit one job only after an explicit confirmation of its instruction, acceptance criteria, project, canonical repository, base commit, exact execution target, worker and verification profiles, and finite cumulative limits. Admission SHALL return a durable job/run receipt. Local drafts SHALL NOT start work. Changing approved task content or increasing its allowance SHALL require a new explicitly approved job, not mutation of a running job.
+Every admitted job SHALL bind immutable purpose, instruction, acceptance criteria, project, canonical repository, exact base commit, execution target, worker and verification profiles, and finite cumulative limits before dispatch. After worker cutover, only an atomic worker execution claim under a currently approved standing mandate and recurring allowance SHALL create a new job. Its immutable context SHALL pin worker, mandate/backlog/item revisions, execution purpose and reservation identity. Historical finite approvals SHALL remain unchanged and SHALL NOT grant recurrence. Local drafts SHALL NOT start work; retired standalone admission and retry requests SHALL receive an upgrade-required refusal.
 
-#### Scenario: User confirms a reviewed task
-- **WHEN** an authorized user confirms a currently valid admission preview
-- **THEN** the system records the exact approved input, policy digest and target before scheduling execution
-- **AND** returns the stable job and initial run identities without creating an interactive pane
+#### Scenario: An approved worker selects eligible work
+- **WHEN** the coordinator atomically claims an inspection or eligible implementation under current authority and remaining allowance
+- **THEN** it records the exact bounded input, policy digest, target, reservation and job/run identities before dispatch
+- **AND** it creates no interactive pane and requests no redundant per-item approval inside the approved mandate
 
-#### Scenario: Reviewed inputs are stale
-- **WHEN** the base commit, task fingerprint, target eligibility, profile or policy differs from the reviewed preview
-- **THEN** admission is rejected as changed
-- **AND** the client retains the draft for a fresh explicit confirmation rather than silently approving new inputs
+#### Scenario: A selected input is stale
+- **WHEN** the selected item's revision, inspection context, approved profile or effective policy no longer permits that claim
+- **THEN** the old selection cannot dispatch
+- **AND** the worker requires fresh inspection or reviewed mandate approval according to the changed boundary
 
 ### Requirement: Job access does not widen project or compute grants
 Job content SHALL require an active account and current project-content authority. Admission and explicit retry SHALL additionally require the project owner or selected hosting operator, exact-machine launch authority, active project lifecycle and effective job policy. Answering a question SHALL require current runtime authority and the job initiator, project owner or selected hosting operator. Cancellation SHALL permit those same actors through a stop-specific authority check even while a project is suspended or deleting. System-administration credentials SHALL remain separate from ordinary job credentials; authorized administration stop operations SHALL still stop jobs.
@@ -66,7 +66,7 @@ The system SHALL reserve capacity and record dispatch intent durably before cont
 - **THEN** the report cannot advance the current run or authorize publication
 
 ### Requirement: Job lifecycle distinguishes evidence and uncertainty
-Jobs SHALL expose queued, preparing, running, needs-input, verifying, publishing, review-ready, blocked, recovery-required, cancelling, cancelled and failed states with explicit reasons and allowed actions. Review-ready SHALL mean verified draft delivery, never merged code. A worker yield, process exit, socket loss or absence of progress SHALL NOT establish successful completion. Retry SHALL create a new run only after the previous run is positively stopped, with current admission checks and the remaining cumulative allowance; no automatic model retry is permitted.
+Jobs SHALL expose queued, preparing, running, needs-input, verifying, publishing, review-ready, completed, blocked, recovery-required, cancelling, cancelled and failed states with explicit reasons and allowed actions. Review-ready SHALL mean verified draft delivery, never merged code. Completed SHALL be a validated successful inspection with positive stop evidence and SHALL NOT imply verification or publication. A worker yield, process exit, socket loss or absence of progress SHALL NOT establish successful completion. Worker-item retry SHALL be explicit, require positive prior stop and current authority, and retain item/rolling allowances; it SHALL NOT reopen standalone job retry or automatically repair terminal failures.
 
 #### Scenario: Work reaches review
 - **WHEN** the immutable candidate passes independent verification and its draft PR is reconciled
@@ -78,10 +78,10 @@ Jobs SHALL expose queued, preparing, running, needs-input, verifying, publishing
 - **THEN** the job becomes recovery-required with retained evidence
 - **AND** neither automatic rerun nor a replacement owner is allowed while old execution may still exist
 
-#### Scenario: User explicitly retries a stopped failure
-- **WHEN** current authority and policy permit retry and the old attempt is confirmed stopped
-- **THEN** a new run receives a new identity and consumes the job's remaining approved time, cost and attempt allowance
-- **AND** connection recovery alone never creates that run
+#### Scenario: User explicitly retries a stopped worker item
+- **WHEN** current worker authority and policy permit retry and the old execution is confirmed stopped
+- **THEN** the next immutable execution receives new job/run identities and consumes the same item's remaining allowance and attempts
+- **AND** connection recovery alone never creates that execution
 
 ### Requirement: Cancellation and lifecycle cleanup require stop evidence
 Cancellation SHALL durably fence further dispatch, answer delivery and new publication before requesting runtime termination. Cancelling SHALL remain visible until all worker, delegated, verifier and publisher activity is reconciled. Project stop, suspension and deletion SHALL cover durable job inventory even when no interactive project process or machine connection is present. Deletion SHALL retain cleanup records until termination and artifact cleanup are positively established.

@@ -108,6 +108,7 @@ describe("ConnectionSupervisor", () => {
     sockets[0].open();
     await Promise.resolve();
     expect(JSON.parse(sockets[0].sent[0]).capabilities).toContain("project_instances_v1");
+    expect(JSON.parse(sockets[0].sent[0]).capabilities).toContain("autonomous_workers_v1");
     sockets[0].receive({
       type: "authenticated",
       user_id: emptyBootstrap.user_id,
@@ -127,6 +128,28 @@ describe("ConnectionSupervisor", () => {
     sockets[0].receive({ type: "session_instances_v2", session_id: emptyBootstrap.user_id });
     expect(sockets[0].closed).toBe(true);
     expect(onMessage).toHaveBeenCalledTimes(frames.length);
+  });
+
+  it("carries negotiated worker read subscriptions without acknowledged mutation replay", async () => {
+    const socket = new FakeSocket();
+    const onMessage = jest.fn();
+    const mutations = jest.fn();
+    const supervisor = new ConnectionSupervisor({
+      createSocket: () => socket, accessToken: async () => "access",
+      bootstrap: async () => emptyBootstrap, persistBootstrap: async () => undefined,
+      setPhase: jest.fn(), setMutationsAllowed: mutations, applyBootstrap: jest.fn(), onMessage,
+    });
+    supervisor.start(); socket.open();
+    await Promise.resolve();
+    socket.receive({ type: "authenticated", user_id: emptyBootstrap.user_id, mutations_allowed: false, negotiated_capabilities: ["autonomous_workers_v1"] });
+    await Promise.resolve(); await Promise.resolve();
+    const subscription = { type: "subscribe_worker" as const, project_id: "project", worker_id: emptyBootstrap.user_id, after_seq: 7 };
+    expect(supervisor.send(subscription)).toBe(true);
+    socket.receive({ type: "worker_inbox_changed" });
+    expect(onMessage).toHaveBeenCalledWith({ type: "worker_inbox_changed" });
+    expect(mutations).toHaveBeenLastCalledWith(false);
+    expect(socket.sent.map((value) => JSON.parse(value)).filter((value) => value.type === "subscribe_worker")).toEqual([subscription]);
+    supervisor.stop();
   });
 
   it("makes the socket unusable immediately in the background", () => {

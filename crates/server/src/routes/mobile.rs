@@ -193,7 +193,9 @@ fn mobile_launch_capability_error(
         return Some("The project CLI must be updated and reconnected before launching a Pi task");
     }
     if provider == shared::Provider::Omp && !supports_omp_terminal {
-        return Some("The project CLI must be updated and reconnected before launching an OMP task");
+        return Some(
+            "The project CLI must be updated and reconnected before launching an OMP task",
+        );
     }
     None
 }
@@ -363,10 +365,11 @@ async fn task_launch_instance(
             .db
             .get_effective_project_policy(&request.project_id)
             .await?;
-        let wait =
-            state
-                .sessions
-                .wait_for_instance_start(session_id, machine_id, Some(&request.project_id));
+        let wait = state.sessions.wait_for_instance_start(
+            session_id,
+            machine_id,
+            Some(&request.project_id),
+        );
         (wait, Some(policy))
     };
     // A request dropped from here on, because its client went away, must not
@@ -661,7 +664,11 @@ pub async fn launch_task(
             manual_mode: false,
             managed: false,
             machine_id: tag,
-            hostname: tag.and(instance.as_ref().and_then(|instance| instance.hostname.clone())),
+            hostname: tag.and(
+                instance
+                    .as_ref()
+                    .and_then(|instance| instance.hostname.clone()),
+            ),
         };
         state.sessions.reserve_pane_id(&session_id, pane_id, tag);
         let add = ServerToCli::AddPane {
@@ -760,6 +767,9 @@ pub async fn bootstrap(
     let jobs = crate::jobs::list_jobs(&state, user_id, None, None)
         .await
         .map_err(|_| AppError::Internal("Unable to load autonomous jobs".to_string()))?;
+    let workers = crate::workers::list(&state, user_id, None, None, None)
+        .await
+        .map_err(|_| AppError::Internal("Unable to load autonomous workers".to_string()))?;
     Ok(Json(MobileBootstrapResponse {
         user_id,
         user_email: user.email,
@@ -776,6 +786,11 @@ pub async fn bootstrap(
             jobs: jobs.jobs,
             next_cursor: jobs.next_cursor,
             unavailable_reasons: Vec::new(),
+        },
+        autonomous_workers: shared::MobileWorkersBootstrap {
+            enabled: true,
+            workers: workers.workers,
+            next_cursor: workers.next_cursor,
         },
     }))
 }
@@ -864,19 +879,23 @@ mod tests {
 
     #[test]
     fn mobile_opencode_launch_requires_its_provider_capability() {
-        let error = mobile_launch_capability_error(shared::Provider::Opencode, true, false, true, true)
-            .expect("older CLI must be rejected");
+        let error =
+            mobile_launch_capability_error(shared::Provider::Opencode, true, false, true, true)
+                .expect("older CLI must be rejected");
         assert!(error.contains("OpenCode"));
         assert!(error.contains("updated and reconnected"));
 
         assert!(
-            mobile_launch_capability_error(shared::Provider::Opencode, true, true, true, true).is_none()
+            mobile_launch_capability_error(shared::Provider::Opencode, true, true, true, true)
+                .is_none()
         );
         assert!(
-            mobile_launch_capability_error(shared::Provider::Claude, true, false, false, true).is_none()
+            mobile_launch_capability_error(shared::Provider::Claude, true, false, false, true)
+                .is_none()
         );
         assert!(
-            mobile_launch_capability_error(shared::Provider::Codex, true, false, false, true).is_none()
+            mobile_launch_capability_error(shared::Provider::Codex, true, false, false, true)
+                .is_none()
         );
     }
 
@@ -887,11 +906,18 @@ mod tests {
         assert!(error.contains("Pi"));
         assert!(error.contains("updated and reconnected"));
 
-        assert!(mobile_launch_capability_error(shared::Provider::Pi, true, false, true, true).is_none());
-        // An OpenCode-capable CLI that predates Pi must still accept OpenCode.
         assert!(
-            mobile_launch_capability_error(shared::Provider::Opencode, true, true, false, true).is_none()
+            mobile_launch_capability_error(shared::Provider::Pi, true, false, true, true).is_none()
         );
+        // An OpenCode-capable CLI that predates Pi must still accept OpenCode.
+        assert!(mobile_launch_capability_error(
+            shared::Provider::Opencode,
+            true,
+            true,
+            false,
+            true
+        )
+        .is_none());
     }
 
     /// A native build that never receives the instance-set frame still learns
@@ -1395,7 +1421,10 @@ mod tests {
             );
             self.state.sessions.set_daemon_capabilities(
                 machine_id,
-                capabilities.iter().map(|capability| capability.to_string()).collect(),
+                capabilities
+                    .iter()
+                    .map(|capability| capability.to_string())
+                    .collect(),
             );
             rx
         }
@@ -1450,10 +1479,15 @@ mod tests {
     ) -> (Uuid, AddedPanes) {
         let cli_id = Uuid::new_v4();
         let (tx, mut rx) = tokio::sync::mpsc::channel(16);
-        state.sessions.register_cli(cli_id, Uuid::new_v4(), tx, None);
+        state
+            .sessions
+            .register_cli(cli_id, Uuid::new_v4(), tx, None);
         state.sessions.set_cli_capabilities(
             cli_id,
-            capabilities.iter().map(|capability| capability.to_string()).collect(),
+            capabilities
+                .iter()
+                .map(|capability| capability.to_string())
+                .collect(),
         );
         assert!(matches!(
             state.sessions.attach_cli_instance(
@@ -1512,7 +1546,10 @@ mod tests {
         assert_eq!(response.session_id, p.session);
         let added = on_zoo_005.lock().unwrap().clone();
         assert_eq!(added.len(), 1);
-        assert_eq!(added[0].0.machine_id, None, "an older CLI's panes stay untagged");
+        assert_eq!(
+            added[0].0.machine_id, None,
+            "an older CLI's panes stay untagged"
+        );
         assert_eq!(
             added[0].1.as_deref(),
             Some("Make the flaky upload test deterministic")
@@ -1565,7 +1602,11 @@ mod tests {
         assert_eq!(response.pane_id, Some(native_task_pane_id(request_id)));
         let replayed = p.submit(p.launch(m6, request_id)).await.unwrap();
         assert_eq!(replayed.pane_id, response.pane_id);
-        assert_eq!(on_zoo_006.lock().unwrap().len(), 1, "a retry creates nothing");
+        assert_eq!(
+            on_zoo_006.lock().unwrap().len(),
+            1,
+            "a retry creates nothing"
+        );
     }
 
     /// A machine whose daemon cannot run an instance beside the others fails
@@ -1580,7 +1621,10 @@ mod tests {
         let request_id = Uuid::new_v4();
 
         let refusal = conflict(p.submit(p.launch(m6, request_id)).await);
-        assert!(refusal.ends_with("Reboot zoo-006 to update it."), "{refusal}");
+        assert!(
+            refusal.ends_with("Reboot zoo-006 to update it."),
+            "{refusal}"
+        );
         assert_eq!(conflict(p.submit(p.launch(m6, request_id)).await), refusal);
         assert!(on_zoo_005.lock().unwrap().is_empty());
         assert!(zoo_006.try_recv().is_err());
@@ -1602,7 +1646,10 @@ mod tests {
         let mut zoo_006 = p.daemon(m6, HOST_B, CAPABLE_DAEMON);
         let request_id = Uuid::new_v4();
 
-        assert_eq!(conflict(p.submit(p.launch(m6, request_id)).await), STILL_STARTING);
+        assert_eq!(
+            conflict(p.submit(p.launch(m6, request_id)).await),
+            STILL_STARTING
+        );
         assert!(matches!(
             zoo_006.try_recv(),
             Ok(ServerToDaemon::StartProjectCli {

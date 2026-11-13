@@ -30,8 +30,6 @@ interface PaneGridProps {
   onOpenPane: (paneId: number) => void;
   onOpenDiff: (paneId: number) => void;
   onOpenRole: (paneId: number) => void;
-  onPausePane: (paneId: number) => void;
-  onResumePane: (paneId: number) => void;
   onRemovePane: (paneId: number) => void;
 }
 
@@ -52,8 +50,6 @@ export function PaneGrid({
   onOpenPane,
   onOpenDiff,
   onOpenRole,
-  onPausePane,
-  onResumePane,
   onRemovePane,
 }: PaneGridProps) {
   const paneConfigs = useStore((s) => s.paneConfigs);
@@ -97,8 +93,6 @@ export function PaneGrid({
             onOpen={() => onOpenPane(pane.pane_id)}
             onOpenDiff={() => onOpenDiff(pane.pane_id)}
             onOpenRole={() => onOpenRole(pane.pane_id)}
-            onPause={() => onPausePane(pane.pane_id)}
-            onResume={() => onResumePane(pane.pane_id)}
             onRemove={() => onRemovePane(pane.pane_id)}
           />
         );
@@ -117,11 +111,7 @@ interface PaneCardProps {
   onOpen: () => void;
   onOpenDiff: () => void;
   onOpenRole: () => void;
-  onPause: () => void;
-  onResume: () => void;
   onRemove: () => void;
-  /** Present only on unmanaged cards — one-way promote to the team. */
-  onPromote?: () => void;
 }
 
 function PaneCard({
@@ -134,13 +124,10 @@ function PaneCard({
   onOpen,
   onOpenDiff,
   onOpenRole,
-  onPause,
-  onResume,
   onRemove,
-  onPromote,
 }: PaneCardProps) {
-  const isBot = pane.mode === "deadloop";
   const isTerminal = pane.kind === "terminal";
+  const readOnlyHistory = pane.mode === "deadloop";
   const mappedAgentValue = providerModelValue(pane.provider, pane.model);
   // Fable remains an official-Claude model on this combined backend control;
   // this change only adds the two explicit DeepSeek variants.
@@ -151,25 +138,19 @@ function PaneCard({
     || currentAgentValue === "unsupported";
   const isAwaitingAnswer = paneIsAwaitingAnswerStatus(status) && !isPaused;
   const isThinking = !!status && !isPaused && !isAwaitingAnswer;
-  const modeIndicator = isUnsupported
+  const modeIndicator = readOnlyHistory
+    ? { icon: "", label: "earlier bot history" }
+    : isUnsupported
     ? { icon: "!", label: "unsupported provider" }
     : isAwaitingAnswer
     ? { icon: "?", label: "pending answer" }
-    : isBot
-    ? isPaused
-      ? { icon: "⏸", label: "paused" }
-      : { icon: "⏵", label: "running" }
     : isThinking
       ? { icon: "●", label: "thinking" }
       : { icon: "•", label: "idle" };
-  const modeColor = isUnsupported
+  const modeColor = readOnlyHistory ? "text-gray-400" : isUnsupported
     ? "text-red-500"
     : isAwaitingAnswer
     ? "text-amber-500"
-    : isBot
-    ? isPaused
-      ? "text-amber-500"
-      : "text-emerald-500"
     : isThinking
       ? "text-blue-500 animate-pulse"
       : "text-gray-400";
@@ -205,19 +186,7 @@ function PaneCard({
             {pane.role}
           </span>
         )}
-        {/* v3.2: autonomous/manual toggle. Hidden for the legacy default
-            panes and for Manager/Tech-Lead panes (those have their own
-            semantics — Manager is always user-facing, Tech Lead is the
-            orchestrator itself, not a delegation target). */}
-        {!isUnsupported && !isTerminal && pane.pane_id !== PANE_ID_INTERACTIVE &&
-          pane.pane_id !== PANE_ID_DEADLOOP &&
-          !isManagerOrTechLead(pane.role) && (
-            <WorkerModeToggle
-              paneId={pane.pane_id}
-              manualMode={pane.manual_mode === true}
-            />
-          )}
-        {isUnsupported ? (
+        {readOnlyHistory ? <span className="ml-auto text-xs">Earlier bot · Read-only</span> : isUnsupported ? (
           <span className="ml-auto rounded bg-red-100 px-2 py-0.5 text-[10px] font-medium text-red-700 dark:bg-red-900/40 dark:text-red-300">
             Unsupported provider
           </span>
@@ -317,7 +286,7 @@ function PaneCard({
               Diff
             </span>
           )}
-          {!isUnsupported && !isTerminal && (
+          {!readOnlyHistory && !isUnsupported && !isTerminal && (
             <span
               className="rounded border border-purple-400 dark:border-purple-700 bg-purple-50 dark:bg-purple-900/30 px-1.5 py-0.5 text-purple-700 dark:text-purple-300 hover:bg-purple-100 dark:hover:bg-purple-900/50"
               role="button"
@@ -330,52 +299,7 @@ function PaneCard({
               Role
             </span>
           )}
-          {!isUnsupported && isBot && (
-            isPaused ? (
-              <span
-                className="rounded border border-emerald-400 dark:border-emerald-700 bg-emerald-50 dark:bg-emerald-900/30 px-1.5 py-0.5 text-emerald-700 dark:text-emerald-300 hover:bg-emerald-100 dark:hover:bg-emerald-900/50"
-                role="button"
-                onClick={(e) => {
-                  e.stopPropagation();
-                  onResume();
-                }}
-                title="Resume this deadloop"
-              >
-                Resume
-              </span>
-            ) : (
-              <span
-                className="rounded border border-amber-400 dark:border-amber-700 bg-amber-50 dark:bg-amber-900/30 px-1.5 py-0.5 text-amber-700 dark:text-amber-300 hover:bg-amber-100 dark:hover:bg-amber-900/50"
-                role="button"
-                onClick={(e) => {
-                  e.stopPropagation();
-                  onPause();
-                }}
-                title="Pause this deadloop"
-              >
-                Pause
-              </span>
-            )
-          )}
-          {!isUnsupported && onPromote && (
-            <span
-              className="rounded border border-blue-500 bg-blue-600 px-1.5 py-0.5 text-white hover:bg-blue-500"
-              role="button"
-              onClick={(e) => {
-                e.stopPropagation();
-                onPromote();
-              }}
-              title="Promote to a team member — Tech Lead may delegate work to it. One-way; you can't demote back."
-            >
-              + Add to team
-            </span>
-          )}
-          {(isUnsupported || (
-            pane.pane_id !== PANE_ID_INTERACTIVE &&
-            pane.pane_id !== PANE_ID_DEADLOOP &&
-            !(pane.managed && isManagerOrTechLead(pane.role))
-          )) && pane.pane_id !== PANE_ID_INTERACTIVE &&
-            pane.pane_id !== PANE_ID_DEADLOOP && (
+          {pane.pane_id !== PANE_ID_INTERACTIVE && pane.pane_id !== PANE_ID_DEADLOOP && (
               <span
                 className="rounded border border-red-400 dark:border-red-700 bg-red-50 dark:bg-red-900/30 px-1.5 py-0.5 text-red-700 dark:text-red-300 hover:bg-red-100 dark:hover:bg-red-900/50"
                 role="button"
@@ -396,83 +320,9 @@ function PaneCard({
               default
             </span>
           )}
-          {isManagerRole(pane.role) &&
-            pane.pane_id !== PANE_ID_INTERACTIVE &&
-            pane.pane_id !== PANE_ID_DEADLOOP && (
-              <span
-                className="rounded bg-violet-100 dark:bg-violet-900/40 px-1.5 py-0.5 text-[10px] text-violet-700 dark:text-violet-300"
-                title="Manager pane — user-facing role; controlled from the Overview panel"
-              >
-                manager
-              </span>
-            )}
-          {isTechLeadRole(pane.role) &&
-            pane.pane_id !== PANE_ID_INTERACTIVE &&
-            pane.pane_id !== PANE_ID_DEADLOOP && (
-              <span
-                className="rounded bg-indigo-100 dark:bg-indigo-900/40 px-1.5 py-0.5 text-[10px] text-indigo-700 dark:text-indigo-300"
-                title="Tech Lead pane — autonomous orchestrator; controlled from the Overview panel"
-              >
-                tech lead
-              </span>
-            )}
         </span>
       </div>
     </button>
-  );
-}
-
-// v3 role detection — Manager and Tech Lead panes are managed from the
-// Overview's Team panel (Pause/Resume/Edit goal), so PaneGrid hides the
-// Remove button on them to avoid accidental destruction.
-function isManagerRole(role: string | undefined): boolean {
-  if (!role) return false;
-  const lower = role.toLowerCase();
-  return lower.includes("manager") && !lower.includes("tech lead");
-}
-
-function isTechLeadRole(role: string | undefined): boolean {
-  if (!role) return false;
-  return role.toLowerCase().includes("tech lead");
-}
-
-function isManagerOrTechLead(role: string | undefined): boolean {
-  return isManagerRole(role) || isTechLeadRole(role);
-}
-
-// v3.2: per-worker autonomous/manual toggle. Autonomous = Tech Lead may
-// delegate to this pane via .apas-team.jsonl. Manual = pane reserved for
-// direct user conversation; Tech Lead skips it.
-function WorkerModeToggle({
-  paneId,
-  manualMode,
-}: {
-  paneId: number;
-  manualMode: boolean;
-}) {
-  const updatePaneManualMode = useStore((s) => s.updatePaneManualMode);
-  const onClick = (e: React.MouseEvent) => {
-    e.stopPropagation();
-    updatePaneManualMode(paneId, !manualMode);
-  };
-  return manualMode ? (
-    <span
-      role="button"
-      onClick={onClick}
-      className="cursor-pointer rounded border border-rose-300 bg-rose-50 px-1.5 py-0.5 text-[10px] font-medium text-rose-700 hover:bg-rose-100 dark:border-rose-800 dark:bg-rose-900/30 dark:text-rose-300 dark:hover:bg-rose-900/50"
-      title="Manual mode: only the user chats with this worker; Tech Lead won't delegate. Click to flip to autonomous."
-    >
-      👤 manual
-    </span>
-  ) : (
-    <span
-      role="button"
-      onClick={onClick}
-      className="cursor-pointer rounded border border-sky-300 bg-sky-50 px-1.5 py-0.5 text-[10px] font-medium text-sky-700 hover:bg-sky-100 dark:border-sky-800 dark:bg-sky-900/30 dark:text-sky-300 dark:hover:bg-sky-900/50"
-      title="Autonomous mode: Tech Lead may delegate work to this pane. Click to flip to manual."
-    >
-      🤖 auto
-    </span>
   );
 }
 

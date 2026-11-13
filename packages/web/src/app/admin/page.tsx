@@ -390,7 +390,7 @@ export default function SystemAdminPage() {
                 onSave={(policy) => mutate("/admin/policy/default", { method: "PATCH", body: JSON.stringify(policy) })}
               />
             )}
-            <AutonomousJobPolicyEditor title="Deployment autonomous job policy" endpoint="/admin/job-policy" deployment request={api} />
+            <AutonomousJobPolicyEditor title="Deployment autonomous worker policy" endpoint="/admin/job-policy" deployment request={api} />
           </section>
         )}
 
@@ -501,7 +501,7 @@ export default function SystemAdminPage() {
                 />
                 <AutonomousJobPolicyEditor
                   key={selectedProject.project.id}
-                  title="Project autonomous job policy"
+                  title="Project autonomous worker policy"
                   endpoint={`/admin/projects/${encodeURIComponent(selectedProject.project.id)}/job-policy`}
                   request={api}
                 />

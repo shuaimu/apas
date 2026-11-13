@@ -12,6 +12,10 @@ import { useMobileStore } from "@/state/store";
 import { jobsApi } from "@/jobs/api";
 import { acceptJobsBootstrap, purgeJobAccess, useJobs } from "@/jobs/runtime";
 import { consumeJobLink, parseJobLink, retainJobLink } from "@/jobs/links";
+import { parseWorkerLink } from "@/workers/links";
+import { workersApi } from "@/workers/api";
+import { exactWorkerRun } from "@/workers/continuity";
+import { authorityCurrent, handleWorkerError, workerAuthority } from "@/workers/runtime";
 
 let cleanup: (() => void) | null = null;
 
@@ -26,15 +30,43 @@ Notifications.setNotificationHandler({
 
 export async function handleAuthorizedLink(rawUrl: string): Promise<boolean> {
   const destination = parseJobLink(rawUrl);
+  const workerDestination = parseWorkerLink(rawUrl);
   let current;
   try { current = await bootstrap(); }
   catch (error) {
-    if (destination) retainJobLink(rawUrl);
+    if (destination || workerDestination) retainJobLink(rawUrl);
     throw error;
   }
   useMobileStore.getState().applyBootstrap(current);
   await replaceSessionSummaries(current.sessions);
   await acceptJobsBootstrap(current);
+  if (workerDestination) {
+    const stamp = workerAuthority();
+    let project: string | undefined;
+    try {
+      const detail = await workersApi.resolve(workerDestination.worker);
+      project = detail.worker.project_id;
+      if (detail.worker.id !== workerDestination.worker) throw new Error("Worker destination mismatch");
+      if (workerDestination.run) {
+        const execution = exactWorkerRun(await workersApi.run(project, workerDestination.worker, workerDestination.run), workerDestination.worker, workerDestination.run);
+        if (workerDestination.question && !execution.questions.some((question) => question.id === workerDestination.question && question.run_id === workerDestination.run)) throw new Error("Requested historical question is unavailable");
+        if (workerDestination.review) {
+          const review = await workersApi.review(project, workerDestination.worker, workerDestination.run);
+          if (review.run_id !== workerDestination.run) throw new Error("Requested historical review is unavailable");
+        }
+      }
+      if (!authorityCurrent(stamp)) return false;
+      const params = { workerId: workerDestination.worker, project };
+      if (workerDestination.question && workerDestination.run) router.push({ pathname: "/(code)/workers/[workerId]/runs/[runId]/questions/[questionId]", params: { ...params, runId: workerDestination.run, questionId: workerDestination.question } });
+      else if (workerDestination.review && workerDestination.run) router.push({ pathname: "/(code)/workers/[workerId]/runs/[runId]/review", params: { ...params, runId: workerDestination.run } });
+      else if (workerDestination.run) router.push({ pathname: "/(code)/workers/[workerId]/runs/[runId]", params: { ...params, runId: workerDestination.run } });
+      else router.push({ pathname: "/(code)/workers/[workerId]", params });
+      return true;
+    } catch (error) {
+      if (authorityCurrent(stamp)) await handleWorkerError(error, project);
+      return false;
+    }
+  }
   if (destination) {
     try {
       const detail = await jobsApi.resolve(destination.job);

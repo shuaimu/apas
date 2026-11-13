@@ -698,6 +698,7 @@ mod tests {
                 epoch: 1,
             },
             task: JobTaskSpec {
+                worker: None,
                 instruction: "change files".into(),
                 acceptance_criteria: vec![],
                 source_url: None,

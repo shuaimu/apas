@@ -3,6 +3,7 @@ pub mod config;
 pub mod delivery;
 pub mod gateway;
 pub mod host;
+mod result;
 pub mod rpc;
 pub mod sandbox;
 
@@ -300,6 +301,7 @@ fn source_for(project_id: &str) -> Result<PathBuf> {
         .map(|p| PathBuf::from(p.path))
         .context("project has no host-local registered source repository")
 }
+
 async fn dispatch(
     config: &config::AutonomousJobConfig,
     machine: Uuid,

@@ -917,9 +917,8 @@ impl Document {
         }
         self.panes = merged;
 
-        // Restore ORs `is_paused` into the legacy deadloop pane, so it follows
-        // that pane's pause. Only that pane's owner moves it, and it clears
-        // when no such pane is left anywhere.
+        // Preserve the historical project-level pause mirror without allowing
+        // one machine to rewrite another machine's pane history.
         let is_deadloop = |pane: &&StoredPane| pane.config.pane_id == shared::PANE_ID_DEADLOOP;
         if let Some(own) = self
             .panes
@@ -954,8 +953,7 @@ impl Document {
     }
 
     /// Write the file if the operation changed it, and return it as the typed
-    /// view. An unchanged file is not rewritten: the project's file watcher
-    /// wakes deadloop panes on every change to `.apas`.
+    /// view. Unchanged saves preserve the file and its modification time.
     fn commit(self) -> Result<ProjectMetadata> {
         let rendered = self.render()?;
         if rendered != self.root {
@@ -1555,8 +1553,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_write_that_changes_nothing_leaves_the_file_alone() {
-        // The project's file watcher wakes deadloop panes whenever `.apas`
-        // changes, so an idle save must not touch it.
+        // An idle save must not rewrite shared metadata or move its mtime.
         use std::os::unix::fs::MetadataExt;
         let _config = isolated_config_dir();
         let me = Uuid::new_v4();

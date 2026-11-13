@@ -31,17 +31,58 @@ use crate::tui::{PaneOutput, TuiCommand, TuiEvent};
 
 type ProjectPolicyState = Arc<Mutex<Option<shared::EffectiveProjectPolicy>>>;
 
-/// Classic/manual single-agent fallback. Managed team panes should be created
-/// from role templates / canonical role prompts instead of this TODO.md loop.
-const DEFAULT_PROMPT: &str = r#"Work on tasks defined in TODO.md. Do the following steps. Don't ask me for advice, just pick the best option you think that is honest, complete, and not corner-cutting:
+const LEGACY_BOT_RETIRED: &str = "[upgrade_required: Legacy bots are retired. This pane is read-only history and cannot be restarted or converted. Create and approve a fresh Autonomous worker independently; historical bot records grant no recurring authority and make no stop or continuity claim.]";
 
-1. Do a git pull to check if there are any remote updates. Pick the top high-priority undone task, choose its first leaf task. If there are no undone TODO items left, sleep a minute and exit.
-2. Analyze the task, check if this can be done with not too many LOC (i.e., smaller than 500 lines code give or take). If not, try to analyze this task and break it down into several smaller tasks, expanding it in the TODO.md. The breakdown can be nested and hierarchical. Try to make each leaf task small enough (<500 lines LOC). You can document your analysis in the doc folder for future reference.
-3. Try to execute the first leaf task. Make a plan for the task before execute. You can document key findings in either the TODO.md (a few sentences in the TODO item, or doc it in the docs folder for longer details and discussions.
-4. Make sure to add comprehensive test for the task executed. Run the whole test suites to make sure no regression happens. If tests fail, fix them using the best, honest, complete approach, run test suites again to verify fixes work. Repeat this step until no tests fail.
-5. Prepare for git commit, remove all temporary files, especially not to commit any binary files. For plan files, remove the implementation plan and keep the design rational and user manual and put it in the docs folder.
-6. Git commit the changes. First do git pull --rebase, and fix conflicts if any. Then do git push."#;
-const DEFAULT_MIN_ITERATION_INTERVAL_MINUTES: u64 = 15;
+fn legacy_bot_rejection_output(pane_id: u32) -> PaneOutput {
+    PaneOutput {
+        pane_id,
+        text: LEGACY_BOT_RETIRED.to_string(),
+    }
+}
+
+fn report_legacy_bot_rejection(
+    output_tx: &mpsc::Sender<PaneOutput>,
+    server_tx: &tokio_mpsc::Sender<CliToServer>,
+    session_id: Uuid,
+    pane_id: u32,
+) {
+    let _ = output_tx.send(legacy_bot_rejection_output(pane_id));
+    let _ = server_tx.try_send(CliToServer::Output {
+        session_id,
+        data: LEGACY_BOT_RETIRED.to_string(),
+        output_type: shared::OutputType::Error,
+        pane_type: None,
+        pane_id: Some(pane_id),
+    });
+}
+
+/// The only legacy bot mutations accepted by this runtime are narrow drain
+/// requests. In particular, changing provider cannot convert historical state.
+fn retired_bot_request_target(message: &ServerToCli, pane_metas: &PaneMetas) -> Option<u32> {
+    let pane_id = match message {
+        ServerToCli::StartBot { pane_id, .. } => return Some(*pane_id),
+        ServerToCli::AddPane { pane_config, .. }
+            if pane_config.mode == shared::PaneMode::Deadloop =>
+        {
+            return Some(pane_config.pane_id);
+        }
+        ServerToCli::Input { pane_id, .. } => pane_id.unwrap_or(shared::PANE_ID_INTERACTIVE),
+        ServerToCli::AddPane { pane_config, .. } => pane_config.pane_id,
+        ServerToCli::TerminalInput { pane_id, .. }
+        | ServerToCli::RebootPane { pane_id, .. }
+        | ServerToCli::RemovePane { pane_id, .. }
+        | ServerToCli::UpdatePaneModel { pane_id, .. }
+        | ServerToCli::UpdatePaneEffort { pane_id, .. } => *pane_id,
+        _ => return None,
+    };
+    match pane_metas.lock() {
+        Ok(metas) => metas
+            .get(&pane_id)
+            .filter(|meta| meta.mode == shared::PaneMode::Deadloop)
+            .map(|_| pane_id),
+        Err(_) => Some(pane_id),
+    }
+}
 
 /// Pane input: (text, from_tui). from_tui=true means input came from TUI keyboard,
 /// from_tui=false means it came from web (server already echoed it to web clients).
@@ -1242,42 +1283,13 @@ fn trim_to_option(raw: Option<String>) -> Option<String> {
     })
 }
 
-/// Send SIGTERM (then SIGKILL after a grace period) to the entire process
-/// group led by `pgid`. Used to reap a deadloop-pane's agent plus any
-/// background children it left behind once the agent has emitted its
-/// `result` event — without this the deadloop's next iteration never
-/// starts because the agent process lingers indefinitely.
-#[cfg(unix)]
-fn kill_process_group(pgid: u32) {
-    if pgid == 0 {
-        return;
-    }
-    unsafe {
-        libc::kill(-(pgid as i32), libc::SIGTERM);
-    }
-    let pgid_for_fallback = pgid;
-    std::thread::spawn(move || {
-        std::thread::sleep(Duration::from_millis(500));
-        unsafe {
-            libc::kill(-(pgid_for_fallback as i32), libc::SIGKILL);
-        }
-    });
-}
-
-#[cfg(not(unix))]
-fn kill_process_group(_pgid: u32) {}
-
-/// How long a pane's agent gets to handle SIGTERM before the group is
-/// SIGKILLed. Matches the deadloop's existing escalation window.
+/// How long a pane's agent gets to handle SIGTERM before group SIGKILL.
 const PANE_KILL_GRACE: Duration = Duration::from_millis(500);
 
 /// Put a pane's agent in its own process group at exec.
 ///
-/// Every pane spawn does this, for two reasons. The deadloop group-kills the
-/// agent the moment it emits its result event — one that lingers past result
-/// wedges the next iteration. And closing a pane (or quitting APAS)
-/// group-kills to reach the agent's *own* children: bash commands, subagents,
-/// and this pane's `apas mcp-server`, none of which are children of ours.
+/// Closing a pane (or quitting APAS) group-kills to reach the agent's own
+/// children: bash commands, subagents and this pane's `apas mcp-server`.
 ///
 /// Turn semantics are unchanged for interactive panes: nothing group-kills
 /// them mid-turn, so background work a user launches still outlives the turn.
@@ -1982,11 +1994,9 @@ struct PaneMeta {
     /// handler can recover claude's request_id and original questions when
     /// the user's answers arrive from the web UI.
     pending_questions: Arc<Mutex<HashMap<String, PendingAskQuestion>>>,
-    /// Live mirror of `effort`. The streaming worker's spawn loop reads
-    /// this every iteration so a respawn (process crash, /loop iteration,
-    /// etc.) picks up the latest effort the user selected — without it,
-    /// the worker would keep using whatever effort was captured at first
-    /// launch. The primary update path is `apply_flag_settings`
+    /// Live mirror of `effort`, read on provider respawn so crashes do not
+    /// revert the latest effort selected by the user.
+    /// The primary update path is `apply_flag_settings`
     /// control_request to the live claude (see UpdatePaneEffort handler);
     /// this Arc is the safety net for fresh process spawns.
     effort_arc: Arc<Mutex<Option<String>>>,
@@ -2032,67 +2042,13 @@ struct PaneMeta {
     kind: shared::PaneKind,
 }
 
-#[derive(Clone, Debug)]
-struct StartBotPreservedFields {
-    worktree_path: Option<String>,
-    role: Option<String>,
-    goal: Option<String>,
-    backstory: Option<String>,
-    plan_review_mode: shared::PlanReviewMode,
-    manual_mode: bool,
-    managed: bool,
-}
-
-impl Default for StartBotPreservedFields {
-    fn default() -> Self {
-        Self {
-            worktree_path: None,
-            role: None,
-            goal: None,
-            backstory: None,
-            plan_review_mode: shared::PlanReviewMode::default(),
-            manual_mode: false,
-            managed: false,
-        }
-    }
-}
-
-fn start_bot_preserved_fields(meta: Option<&PaneMeta>) -> StartBotPreservedFields {
-    match meta {
-        Some(meta) => StartBotPreservedFields {
-            worktree_path: meta.worktree_path.clone(),
-            role: meta.role.clone(),
-            goal: meta.goal.clone(),
-            backstory: meta.backstory.clone(),
-            plan_review_mode: meta.plan_review_mode,
-            manual_mode: meta.manual_mode,
-            managed: meta.managed,
-        },
-        None => StartBotPreservedFields::default(),
-    }
-}
-
 fn restored_pane_mode_and_pause(
     pane: &shared::PaneConfig,
-    legacy_deadloop_paused: bool,
+    _legacy_deadloop_paused: bool,
 ) -> (shared::PaneMode, bool) {
-    let mode = if pane.mode == shared::PaneMode::Deadloop && pane.stop_requested {
-        shared::PaneMode::Interactive
-    } else {
-        pane.mode.clone()
-    };
-
-    let is_paused = if mode == shared::PaneMode::Deadloop {
-        if pane.pane_id == shared::PANE_ID_DEADLOOP {
-            pane.is_paused || legacy_deadloop_paused
-        } else {
-            pane.is_paused
-        }
-    } else {
-        false
-    };
-
-    (mode, is_paused)
+    // Preserve the source mode as read-only history. Neither a pause flag nor
+    // a requested stop permits restart or establishes complete-stop evidence.
+    (pane.mode.clone(), pane.mode == shared::PaneMode::Deadloop)
 }
 
 /// One pane as a starting runtime restores it.
@@ -2754,7 +2710,15 @@ pub async fn run_project(
     machine_id: Uuid,
     instances: bool,
 ) -> Result<ProjectOutcome> {
-    run_inner(server_url, token, working_dir, shutdown, machine_id, instances).await
+    run_inner(
+        server_url,
+        token,
+        working_dir,
+        shutdown,
+        machine_id,
+        instances,
+    )
+    .await
 }
 
 async fn run_inner(
@@ -2813,8 +2777,6 @@ async fn run_inner(
         Err(error) => tracing::warn!(%error, "could not reconcile persistent pane-host registry"),
     }
 
-    let default_prompt = DEFAULT_PROMPT.to_string();
-
     let working_dir_str = working_dir.to_string_lossy().to_string();
     let server_url = server_url.to_string();
     let token = token.to_string();
@@ -2830,14 +2792,6 @@ async fn run_inner(
     // Shutdown flag
     // Supplied by the caller so a project can be stopped from outside; a
     // standalone run passes a fresh one and nothing ever sets it.
-
-    // One file watcher per project, shared across all panes. Drives
-    // event-based deadloop wake-ups so panes only consume tokens when
-    // team-todo.md / .apas-team.jsonl / project_goal.md / .apas actually
-    // change, instead of every `min_iteration_interval`.
-    let file_watcher: Arc<crate::file_watcher::ProjectFileWatcher> = Arc::new(
-        crate::file_watcher::ProjectFileWatcher::new(std::path::Path::new(&working_dir_str)),
-    );
 
     // Per-pane pause flags (for deadloop panes)
     let pane_pauses: PanePauses = Arc::new(Mutex::new(HashMap::new()));
@@ -2878,18 +2832,6 @@ async fn run_inner(
     let (command_tx, command_rx) = mpsc::channel::<TuiCommand>();
 
     // Startup payloads for initial pane sessions.
-    let mut deadloop_startups: Vec<(
-        u32,
-        Uuid,
-        Provider,
-        String,
-        Option<String>,
-        Option<String>,
-        u64,
-        Arc<AtomicBool>,
-        Arc<AtomicBool>,
-        Arc<Mutex<Option<std::process::Child>>>,
-    )> = Vec::new();
     let mut interactive_startups: Vec<(
         u32,
         Uuid,
@@ -2904,7 +2846,6 @@ async fn run_inner(
         Vec::new();
     {
         let mut pauses = pane_pauses.lock().unwrap();
-        let mut stop_requests = pane_stop_requests.lock().unwrap();
         let mut metas = pane_metas.lock().unwrap();
         let mut channels = input_channels.lock().unwrap();
         let mut sessions = pane_sessions.lock().unwrap();
@@ -2919,7 +2860,7 @@ async fn run_inner(
             tab_model,
             tab_effort,
             min_interval_minutes,
-            is_paused,
+            _is_paused,
             tab_worktree,
             tab_role,
             tab_goal,
@@ -2960,10 +2901,12 @@ async fn run_inner(
             );
             sessions.insert(*pane_id, *pane_session_id);
 
+            if *mode == shared::PaneMode::Deadloop {
+                pauses.insert(*pane_id, Arc::new(AtomicBool::new(true)));
+                let _ = output_tx.send(legacy_bot_rejection_output(*pane_id));
+                continue;
+            }
             if shared::is_retired_launch(*provider, tab_model.as_deref()) {
-                if *mode == shared::PaneMode::Deadloop {
-                    pauses.insert(*pane_id, Arc::new(AtomicBool::new(true)));
-                }
                 let _ = output_tx.send(PaneOutput {
                     text: "[Unsupported provider — this historical pane remains stopped]"
                         .to_string(),
@@ -2972,10 +2915,7 @@ async fn run_inner(
                 continue;
             }
 
-            // Terminal panes host a real TUI on a pty. They register no
-            // input channel and start no deadloop — the pty is driven
-            // entirely by `Terminal*` messages — so branch before the
-            // agent-worker startup bookkeeping below.
+            // Terminal panes use pty I/O rather than agent input channels.
             if tab_kind.is_terminal() {
                 terminal_startups.push((
                     *pane_id,
@@ -2987,42 +2927,17 @@ async fn run_inner(
                 continue;
             }
 
-            if *mode == shared::PaneMode::Deadloop {
-                let pause_flag = Arc::new(AtomicBool::new(*is_paused));
-                let stop_flag = Arc::new(AtomicBool::new(false));
-                pauses.insert(*pane_id, pause_flag.clone());
-                stop_requests.insert(*pane_id, stop_flag.clone());
-                let dl_prompt = tab_prompt
-                    .clone()
-                    .filter(|p| !p.trim().is_empty())
-                    .unwrap_or_else(|| default_prompt.clone());
-                let resolved_min_interval_minutes =
-                    min_interval_minutes.unwrap_or(DEFAULT_MIN_ITERATION_INTERVAL_MINUTES);
-                deadloop_startups.push((
-                    *pane_id,
-                    *pane_session_id,
-                    *provider,
-                    dl_prompt,
-                    tab_model.clone(),
-                    tab_effort.clone(),
-                    resolved_min_interval_minutes,
-                    pause_flag,
-                    stop_flag,
-                    child_proc,
-                ));
-            } else {
-                let (input_tx, input_rx) = mpsc::channel::<PaneInput>();
-                channels.insert(*pane_id, input_tx);
-                interactive_startups.push((
-                    *pane_id,
-                    *pane_session_id,
-                    *provider,
-                    tab_model.clone(),
-                    tab_effort.clone(),
-                    input_rx,
-                    child_proc,
-                ));
-            }
+            let (input_tx, input_rx) = mpsc::channel::<PaneInput>();
+            channels.insert(*pane_id, input_tx);
+            interactive_startups.push((
+                *pane_id,
+                *pane_session_id,
+                *provider,
+                tab_model.clone(),
+                tab_effort.clone(),
+                input_rx,
+                child_proc,
+            ));
         }
     }
 
@@ -3166,13 +3081,9 @@ async fn run_inner(
     };
 
     // Send initial messages for restored panes.
-    for (pane_id, _, label, mode, _, _, _, _, _, is_paused, _, _, _, _, _, _, _, _) in
-        &tabs_to_restore
-    {
-        let init_text = if *pane_id == shared::PANE_ID_DEADLOOP
-            && *mode == shared::PaneMode::Deadloop
-        {
-            "[Deadloop pane initializing...]".to_string()
+    for (pane_id, _, label, mode, _, _, _, _, _, _, _, _, _, _, _, _, _, _) in &tabs_to_restore {
+        let init_text = if *mode == shared::PaneMode::Deadloop {
+            LEGACY_BOT_RETIRED.to_string()
         } else if *pane_id == shared::PANE_ID_INTERACTIVE && *mode == shared::PaneMode::Interactive
         {
             "[Interactive pane initializing...]".to_string()
@@ -3183,18 +3094,6 @@ async fn run_inner(
             text: init_text,
             pane_id: *pane_id,
         });
-
-        if *mode == shared::PaneMode::Deadloop && *is_paused {
-            let paused_text = if *pane_id == shared::PANE_ID_DEADLOOP {
-                "[Deadloop starting in paused state (from previous session)]".to_string()
-            } else {
-                "[Bot starting in paused state (from previous session)]".to_string()
-            };
-            let _ = output_tx.send(PaneOutput {
-                text: paused_text,
-                pane_id: *pane_id,
-            });
-        }
     }
 
     // Spawn centralized input router — routes TUI input to correct pane via input_channels.
@@ -3202,120 +3101,6 @@ async fn run_inner(
 
     // Spawn pane session threads for restored panes.
     let mut pane_threads = Vec::new();
-
-    for (
-        pane_id,
-        pane_session_id,
-        provider,
-        dl_prompt,
-        model,
-        effort,
-        min_interval_minutes,
-        pause_flag,
-        stop_flag,
-        child_process,
-    ) in deadloop_startups
-    {
-        let output_tx = output_tx.clone();
-        let server_tx = server_tx.clone();
-        let shutdown = shutdown.clone();
-        let event_tx = event_tx.clone();
-        let working_dir = working_dir_str.clone();
-        let input_channels_for_dl = input_channels.clone();
-        let sid = session_id;
-        let binary_path = resolve_pane_binary_path(
-            provider,
-            model.as_deref(),
-            &claude_path,
-            &codex_path,
-            &opencode_path,
-            &pi_path,
-            &omp_path,
-            &cursor_agent_path,
-        );
-        let (
-            interrupt_slot,
-            control_resp_slot,
-            pending_qs,
-            effort_arc,
-            worktree_path,
-            system_prompt,
-            pr_mode_arc,
-            pr_pending,
-        ) = pane_metas
-            .lock()
-            .unwrap()
-            .get(&pane_id)
-            .map(|m| {
-                (
-                    m.streaming_interrupt_tx.clone(),
-                    m.control_response_tx.clone(),
-                    m.pending_questions.clone(),
-                    m.effort_arc.clone(),
-                    m.worktree_path.clone(),
-                    crate::pane_identity::compose_system_prompt(
-                        m.role.as_deref(),
-                        m.goal.as_deref(),
-                        m.backstory.as_deref(),
-                    ),
-                    m.plan_review_mode_arc.clone(),
-                    m.pending_plan_reviews.clone(),
-                )
-            })
-            .unwrap_or_else(|| {
-                (
-                    Arc::new(Mutex::new(None)),
-                    Arc::new(Mutex::new(None)),
-                    Arc::new(Mutex::new(HashMap::new())),
-                    Arc::new(Mutex::new(None)),
-                    None,
-                    None,
-                    Arc::new(Mutex::new(shared::PlanReviewMode::default())),
-                    Arc::new(Mutex::new(HashMap::new())),
-                )
-            });
-        let file_watcher_for_dl = file_watcher.clone();
-        pane_threads.push(thread::spawn(move || {
-            run_deadloop_session(
-                &binary_path,
-                &working_dir,
-                worktree_path,
-                system_prompt,
-                pr_mode_arc,
-                pr_pending,
-                sid,
-                pane_session_id,
-                pane_id,
-                &dl_prompt,
-                model.clone(),
-                effort.clone(),
-                min_interval_minutes,
-                &provider,
-                output_tx,
-                server_tx,
-                shutdown,
-                pause_flag,
-                stop_flag,
-                child_process,
-                event_tx,
-                interrupt_slot,
-                control_resp_slot,
-                pending_qs,
-                effort_arc,
-                input_channels_for_dl,
-                // Claude reuses its on-disk session jsonl across boots,
-                // so try_resume_first=true correctly continues prior chats.
-                // Codex/Cursor/etc. keep their session state server-side
-                // (codex thread, cursor chatId) and we don't always know
-                // whether the saved id is still valid; passing false means
-                // every reboot starts a fresh thread. Trade-off: no
-                // cross-boot continuity for those backends, but we never
-                // fail with "no rollout found" on a stale id either.
-                boot_restore_try_resume_first(&provider, model.as_deref()),
-                file_watcher_for_dl,
-            )
-        }));
-    }
 
     for (pane_id, pane_session_id, provider, model, effort, input_rx, child_proc) in
         interactive_startups
@@ -3424,8 +3209,6 @@ async fn run_inner(
         let pane_metas_event = pane_metas.clone();
         let terminal_panes_event = terminal_panes.clone();
         let event_tx_event = event_tx.clone();
-        let default_prompt_for_events = default_prompt.clone();
-        let file_watcher_for_events = file_watcher.clone();
         let project_policy_for_events = project_policy.clone();
         let store_for_events = store.clone();
         thread::spawn(move || {
@@ -3450,8 +3233,6 @@ async fn run_inner(
                 pane_stop_requests_event,
                 pane_metas_event,
                 terminal_panes_event,
-                &default_prompt_for_events,
-                file_watcher_for_events,
                 project_policy_for_events,
                 store_for_events,
             )
@@ -3534,9 +3315,7 @@ async fn run_inner(
     // call the tool when told directly, but do not reliably act on MCP
     // `initialize` instructions, so an ordinary task recorded nothing.
     //
-    // Polling rather than the file watcher: the watcher is mtime-gated for
-    // deadloop wake-ups and reports only *that* something changed, while this
-    // needs to know *how much* was appended so it can resume from a cursor.
+    // Poll from a transcript cursor so appended records are not replayed.
     {
         let server_tx_for_turns = server_tx.clone();
         let terminal_questions_for_turns = terminal_questions.clone();
@@ -4494,16 +4273,6 @@ fn save_pane_configs(
                         meta.effort.clone(),
                         meta.min_iteration_interval_minutes,
                     )
-                } else if pane_id == shared::PANE_ID_DEADLOOP {
-                    (
-                        shared::PaneMode::Deadloop,
-                        Provider::Claude,
-                        default_pane_label(pane_id, None),
-                        None,
-                        None,
-                        None,
-                        Some(DEFAULT_MIN_ITERATION_INTERVAL_MINUTES),
-                    )
                 } else {
                     (
                         shared::PaneMode::Interactive,
@@ -4587,26 +4356,6 @@ fn save_pane_configs(
     }
 }
 
-/// Keep the legacy project-level `is_paused` in step with pane 1's pause, as
-/// the web's legacy deadloop controls always have; a restore ORs it into pane
-/// 1. Only the runtime that runs pane 1 writes it: on any other machine's
-/// instance it would pause, on its next start, a pane this runtime does not
-/// own.
-fn persist_legacy_deadloop_pause(store: &ProjectStore, pane_metas: &PaneMetas, paused: bool) {
-    let runs_deadloop_pane = pane_metas
-        .lock()
-        .is_ok_and(|metas| metas.contains_key(&shared::PANE_ID_DEADLOOP));
-    if !runs_deadloop_pane {
-        tracing::warn!(
-            "not recording a legacy deadloop pause for pane 1, which this runtime does not run"
-        );
-        return;
-    }
-    if let Err(error) = store.update_settings(|metadata| metadata.is_paused = paused) {
-        tracing::warn!(%error, "could not record the legacy deadloop pause in .apas");
-    }
-}
-
 /// Every pane id a tab created here must avoid: this runtime's panes, and
 /// every pane `.apas` records for any machine (see [`local_pane_id`]).
 fn local_pane_ids_in_use(store: &ProjectStore, pane_metas: &PaneMetas) -> HashSet<u32> {
@@ -4654,8 +4403,6 @@ fn handle_tui_events(
     pane_stop_requests: PaneStopRequests,
     pane_metas: PaneMetas,
     terminal_panes: TerminalPanes,
-    default_prompt: &str,
-    file_watcher: Arc<crate::file_watcher::ProjectFileWatcher>,
     project_policy: ProjectPolicyState,
     store: ProjectStore,
 ) {
@@ -4808,6 +4555,16 @@ fn handle_tui_events(
                 try_resume_first,
                 kind,
             }) => {
+                if mode == shared::PaneMode::Deadloop
+                    || pane_metas.lock().ok().is_some_and(|metas| {
+                        metas
+                            .get(&pane_id)
+                            .is_some_and(|meta| meta.mode == shared::PaneMode::Deadloop)
+                    })
+                {
+                    report_legacy_bot_rejection(&output_tx, &server_tx, session_id, pane_id);
+                    continue;
+                }
                 if shared::is_retired_launch(provider, model.as_deref()) {
                     tracing::warn!(pane_id, "AddPane refused for retired provider");
                     let _ = output_tx.send(PaneOutput {
@@ -4914,10 +4671,7 @@ fn handle_tui_events(
                 });
 
                 // Terminal tab: allocate a pty running the provider's real
-                // TUI and stop here. None of the agent machinery below
-                // applies — no input channel, no deadloop, no system
-                // prompt — so an early return keeps those paths honest
-                // rather than threading `kind` through all of them.
+                // Terminal panes have no headless agent input or system prompt.
                 if kind.is_terminal() {
                     if let Err(err) = spawn_terminal_pane(
                         &terminal_panes,
@@ -4954,112 +4708,7 @@ fn handle_tui_events(
                     continue;
                 }
 
-                if mode == shared::PaneMode::Deadloop {
-                    // Deadloop's input_tx lives inside the streaming worker
-                    // and isn't registered in input_channels, so we can't
-                    // replay a queued input here. Log + drop so we know it
-                    // happened.
-                    if initial_input.is_some() {
-                        tracing::warn!(
-                            pane_id,
-                            "Dropping buffered input on recreated deadloop pane (no external input channel)",
-                        );
-                    }
-                    // Deadloop tab: spawn deadloop session with its own pause flag
-                    let pause_flag = Arc::new(AtomicBool::new(false));
-                    let stop_flag = Arc::new(AtomicBool::new(false));
-                    {
-                        let mut pauses = pane_pauses.lock().unwrap();
-                        pauses.insert(pane_id, pause_flag.clone());
-                    }
-                    {
-                        let mut stop_requests = pane_stop_requests.lock().unwrap();
-                        stop_requests.insert(pane_id, stop_flag.clone());
-                    }
-                    let dl_prompt = prompt.unwrap_or_else(|| default_prompt.to_string());
-                    let resolved_min_interval_minutes = min_iteration_interval_minutes
-                        .unwrap_or(DEFAULT_MIN_ITERATION_INTERVAL_MINUTES);
-                    let output_tx = output_tx.clone();
-                    let server_tx = server_tx.clone();
-                    let shutdown = shutdown.clone();
-                    let event_tx = event_tx.clone();
-                    let working_dir = working_dir.to_string();
-                    let input_channels_for_dl = input_channels.clone();
-                    let (
-                        interrupt_slot,
-                        control_resp_slot,
-                        pending_qs,
-                        effort_arc,
-                        worktree_path,
-                        system_prompt,
-                        pr_mode_arc,
-                        pr_pending,
-                    ) = pane_metas
-                        .lock()
-                        .unwrap()
-                        .get(&pane_id)
-                        .map(|m| {
-                            (
-                                m.streaming_interrupt_tx.clone(),
-                                m.control_response_tx.clone(),
-                                m.pending_questions.clone(),
-                                m.effort_arc.clone(),
-                                m.worktree_path.clone(),
-                                crate::pane_identity::compose_system_prompt(
-                                    m.role.as_deref(),
-                                    m.goal.as_deref(),
-                                    m.backstory.as_deref(),
-                                ),
-                                m.plan_review_mode_arc.clone(),
-                                m.pending_plan_reviews.clone(),
-                            )
-                        })
-                        .unwrap_or_else(|| {
-                            (
-                                Arc::new(Mutex::new(None)),
-                                Arc::new(Mutex::new(None)),
-                                Arc::new(Mutex::new(HashMap::new())),
-                                Arc::new(Mutex::new(None)),
-                                None,
-                                None,
-                                Arc::new(Mutex::new(shared::PlanReviewMode::default())),
-                                Arc::new(Mutex::new(HashMap::new())),
-                            )
-                        });
-                    let file_watcher_for_dl = file_watcher.clone();
-                    thread::spawn(move || {
-                        run_deadloop_session(
-                            &binary_path,
-                            &working_dir,
-                            worktree_path,
-                            system_prompt,
-                            pr_mode_arc,
-                            pr_pending,
-                            session_id,
-                            claude_session_id,
-                            pane_id,
-                            &dl_prompt,
-                            model.clone(),
-                            normalized_effort.clone(),
-                            resolved_min_interval_minutes,
-                            &provider,
-                            output_tx,
-                            server_tx,
-                            shutdown,
-                            pause_flag,
-                            stop_flag,
-                            child_proc,
-                            event_tx,
-                            interrupt_slot,
-                            control_resp_slot,
-                            pending_qs,
-                            effort_arc,
-                            input_channels_for_dl,
-                            try_resume_first,
-                            file_watcher_for_dl,
-                        )
-                    });
-                } else {
+                {
                     // Interactive tab: spawn interactive session
                     let (input_tx, input_rx) = mpsc::channel::<PaneInput>();
                     {
@@ -5165,6 +4814,14 @@ fn handle_tui_events(
                 pane_id,
                 cleanup_action,
             }) => {
+                if pane_metas.lock().ok().is_some_and(|metas| {
+                    metas
+                        .get(&pane_id)
+                        .is_some_and(|meta| meta.mode == shared::PaneMode::Deadloop)
+                }) {
+                    report_legacy_bot_rejection(&output_tx, &server_tx, session_id, pane_id);
+                    continue;
+                }
                 pending_omp_reboots.remove(&pane_id);
                 // Remove input channel (causes interactive session thread to exit)
                 {
@@ -5172,9 +4829,7 @@ fn handle_tui_events(
                     channels.remove(&pane_id);
                 }
 
-                // For deadloop panes, signal shutdown by setting pause and removing pause flag
-                // (the deadloop thread checks shutdown flag which will eventually stop it,
-                // but we also kill the child process for immediate effect)
+                // Remove retained historical control flags when closing a pane.
                 {
                     let mut pauses = pane_pauses.lock().unwrap();
                     pauses.remove(&pane_id);
@@ -5249,775 +4904,25 @@ fn handle_tui_events(
                     &pane_stop_requests,
                 );
             }
-            Ok(TuiEvent::StartBot {
-                pane_id,
-                prompt,
-                min_iteration_interval_minutes,
-                effort,
-            }) => {
-                // Preserve provider/model and any existing per-pane prompt across mode switches.
-                let (
-                    provider,
-                    existing_label,
-                    existing_prompt,
-                    existing_model,
-                    existing_effort,
-                    existing_min_interval_minutes,
-                    existing_kind,
-                    preserved_fields,
-                ) = {
-                    let metas = pane_metas.lock().unwrap();
-                    match metas.get(&pane_id) {
-                        Some(meta) => (
-                            meta.provider,
-                            meta.label.clone(),
-                            meta.prompt.clone(),
-                            meta.model.clone(),
-                            meta.effort.clone(),
-                            meta.min_iteration_interval_minutes,
-                            meta.kind,
-                            start_bot_preserved_fields(Some(meta)),
-                        ),
-                        None => (
-                            Provider::Claude,
-                            default_pane_label(pane_id, None),
-                            None,
-                            None,
-                            None,
-                            None,
-                            shared::PaneKind::Agent,
-                            start_bot_preserved_fields(None),
-                        ),
-                    }
-                };
-                let resolved_prompt = prompt.filter(|p| !p.trim().is_empty()).or(existing_prompt);
-                let resolved_effort = if let Some(requested_effort) = effort.as_deref() {
-                    normalize_effort_level(Some(requested_effort))
-                } else {
-                    normalize_effort_level(existing_effort.as_deref())
-                };
-                let resolved_min_interval_minutes = min_iteration_interval_minutes
-                    .or(existing_min_interval_minutes)
-                    .unwrap_or(DEFAULT_MIN_ITERATION_INTERVAL_MINUTES);
-
-                if shared::is_retired_launch(provider, existing_model.as_deref()) {
-                    tracing::warn!(pane_id, "StartBot refused for retired provider");
-                    let _ = output_tx.send(PaneOutput {
-                        text: "[Start refused — unsupported provider has been retired]".to_string(),
-                        pane_id,
-                    });
-                    continue;
-                }
-
-                // The allowlist is not consulted for a pane that already
-                // exists — it decides what may be created. Team availability
-                // still is: it is the switch that stops a running team, and
-                // honouring it here is what stops a disabled team coming back
-                // one pane at a time.
-                if !existing_pane_relaunch_allowed() {
-                    let denied = shared::launch_profile_key(
-                        existing_kind,
-                        provider,
-                        existing_model.as_deref(),
-                    );
-                    tracing::warn!(pane_id, %denied, "StartBot refused by cluster policy");
-                    let _ = output_tx.send(PaneOutput {
-                        text: format!(
-                            "[Start refused — launch profile {} is unavailable under the current cluster policy]",
-                            denied
-                        ),
-                        pane_id,
-                    });
-                    continue;
-                }
-
-                // Kill any old child process and wait for it to fully exit
-                // so the Claude session ID is released before we --resume.
-                // This covers both the Deadloop→StartBot and the
-                // Stop→FinalizeStopBot→StartBot paths (where mode is
-                // already Interactive but the old process may still linger).
-                {
-                    let metas = pane_metas.lock().unwrap();
-                    if let Some(meta) = metas.get(&pane_id) {
-                        if meta.mode == shared::PaneMode::Deadloop {
-                            // Signal old deadloop thread to exit
-                            if let Some(old_flag) = pane_stop_requests.lock().unwrap().get(&pane_id)
-                            {
-                                old_flag.store(true, Ordering::SeqCst);
-                            }
-                        }
-                        // Kill and wait regardless of mode
-                        if let Ok(mut guard) = meta.child_process.lock() {
-                            if let Some(child) = guard.take() {
-                                let mut child = child;
-                                let _ = child.kill();
-                                let _ = child.wait();
-                            }
-                        }
-                    }
-                }
-
-                // Convert interactive pane to deadloop:
-                // 1. Remove input channel (kills interactive session thread)
-                {
-                    let mut channels = input_channels.lock().unwrap();
-                    channels.remove(&pane_id);
-                }
-
-                // 2. Create pause flag and child process for the deadloop
-                let pause_flag = Arc::new(AtomicBool::new(false));
-                let stop_flag = Arc::new(AtomicBool::new(false));
-                let child_proc: Arc<Mutex<Option<std::process::Child>>> =
-                    Arc::new(Mutex::new(None));
-                {
-                    let mut pauses = pane_pauses.lock().unwrap();
-                    pauses.insert(pane_id, pause_flag.clone());
-                }
-                {
-                    let mut stop_requests = pane_stop_requests.lock().unwrap();
-                    stop_requests.insert(pane_id, stop_flag.clone());
-                }
-                {
-                    let mut metas = pane_metas.lock().unwrap();
-                    metas.insert(
-                        pane_id,
-                        PaneMeta {
-                            kind: shared::PaneKind::Agent,
-                            mode: shared::PaneMode::Deadloop,
-                            provider,
-                            label: existing_label,
-                            prompt: resolved_prompt.clone(),
-                            model: existing_model.clone(),
-                            effort: resolved_effort.clone(),
-                            min_iteration_interval_minutes: Some(resolved_min_interval_minutes),
-                            child_process: child_proc.clone(),
-                            streaming_interrupt_tx: Arc::new(Mutex::new(None)),
-                            control_response_tx: Arc::new(Mutex::new(None)),
-                            pending_questions: Arc::new(Mutex::new(HashMap::new())),
-                            effort_arc: Arc::new(Mutex::new(resolved_effort.clone())),
-                            worktree_path: preserved_fields.worktree_path,
-                            role: preserved_fields.role,
-                            goal: preserved_fields.goal,
-                            backstory: preserved_fields.backstory,
-                            plan_review_mode: preserved_fields.plan_review_mode,
-                            plan_review_mode_arc: Arc::new(Mutex::new(
-                                preserved_fields.plan_review_mode,
-                            )),
-                            pending_plan_reviews: Arc::new(Mutex::new(HashMap::new())),
-                            manual_mode: preserved_fields.manual_mode,
-                            managed: preserved_fields.managed,
-                        },
-                    );
-                }
-
-                // 3. Notify TUI to update tab mode
-                let _ = command_tx.send(TuiCommand::SetMode {
-                    pane_id,
-                    mode: shared::PaneMode::Deadloop,
-                });
-
-                let _ = output_tx.send(PaneOutput {
-                    text: "[Bot started on this pane]".to_string(),
-                    pane_id,
-                });
-
-                // 4. Reuse claude session id for --resume history continuity
-                let claude_session_id = {
-                    let ps = pane_sessions.lock().unwrap();
-                    ps.get(&pane_id).copied().unwrap_or_else(Uuid::new_v4)
-                };
-
-                // 5. Spawn deadloop session
-                let dl_prompt = resolved_prompt.unwrap_or_else(|| default_prompt.to_string());
-                let binary_path = resolve_pane_binary_path(
-                    provider,
-                    existing_model.as_deref(),
-                    claude_path,
-                    codex_path,
-                    opencode_path,
-                    pi_path,
-                    omp_path,
-                    cursor_agent_path,
-                );
-                {
-                    let output_tx = output_tx.clone();
-                    let server_tx = server_tx.clone();
-                    let shutdown = shutdown.clone();
-                    let event_tx = event_tx.clone();
-                    let working_dir = working_dir.to_string();
-                    let input_channels_for_dl = input_channels.clone();
-                    let (
-                        interrupt_slot,
-                        control_resp_slot,
-                        pending_qs,
-                        effort_arc,
-                        worktree_path,
-                        system_prompt,
-                        pr_mode_arc,
-                        pr_pending,
-                    ) = pane_metas
-                        .lock()
-                        .unwrap()
-                        .get(&pane_id)
-                        .map(|m| {
-                            (
-                                m.streaming_interrupt_tx.clone(),
-                                m.control_response_tx.clone(),
-                                m.pending_questions.clone(),
-                                m.effort_arc.clone(),
-                                m.worktree_path.clone(),
-                                crate::pane_identity::compose_system_prompt(
-                                    m.role.as_deref(),
-                                    m.goal.as_deref(),
-                                    m.backstory.as_deref(),
-                                ),
-                                m.plan_review_mode_arc.clone(),
-                                m.pending_plan_reviews.clone(),
-                            )
-                        })
-                        .unwrap_or_else(|| {
-                            (
-                                Arc::new(Mutex::new(None)),
-                                Arc::new(Mutex::new(None)),
-                                Arc::new(Mutex::new(HashMap::new())),
-                                Arc::new(Mutex::new(None)),
-                                None,
-                                None,
-                                Arc::new(Mutex::new(shared::PlanReviewMode::default())),
-                                Arc::new(Mutex::new(HashMap::new())),
-                            )
-                        });
-                    let file_watcher_for_dl = file_watcher.clone();
-                    thread::spawn(move || {
-                        run_deadloop_session(
-                            &binary_path,
-                            &working_dir,
-                            worktree_path,
-                            system_prompt,
-                            pr_mode_arc,
-                            pr_pending,
-                            session_id,
-                            claude_session_id,
-                            pane_id,
-                            &dl_prompt,
-                            existing_model.clone(),
-                            resolved_effort.clone(),
-                            resolved_min_interval_minutes,
-                            &provider,
-                            output_tx,
-                            server_tx,
-                            shutdown,
-                            pause_flag,
-                            stop_flag,
-                            child_proc,
-                            event_tx,
-                            interrupt_slot,
-                            control_resp_slot,
-                            pending_qs,
-                            effort_arc,
-                            input_channels_for_dl,
-                            true,
-                            file_watcher_for_dl,
-                        )
-                    });
-                }
-
-                // 6. Send updated pane list
-                let _ = server_tx.blocking_send(CliToServer::PaneList {
-                    session_id,
-                    panes: build_pane_list(
-                        &store.owner,
-                        &pane_metas,
-                        &input_channels,
-                        session_id,
-                        &pane_sessions,
-                        &pane_pauses,
-                        &pane_stop_requests,
-                    ),
-                });
-
-                save_pane_configs(
-                    &store,
-                    &pane_sessions,
-                    &pane_metas,
-                    &pane_pauses,
-                    &pane_stop_requests,
-                );
-            }
             Ok(TuiEvent::StopBot { pane_id }) => {
-                let pane_mode = {
-                    let metas = pane_metas.lock().unwrap();
-                    let Some(meta) = metas.get(&pane_id) else {
-                        continue;
-                    };
-                    meta.mode.clone()
-                };
-
-                // For interactive panes: prefer the soft control_request
-                // (preserves the long-lived streaming claude — same path as
-                // InterruptPane), fall back to kill if the streaming
-                // interrupt channel is absent (non-streaming providers) or
-                // the worker is dead.
-                if pane_mode == shared::PaneMode::Interactive {
-                    let (soft_interrupt, _child_present): (Option<mpsc::Sender<()>>, bool) = {
-                        let metas = pane_metas.lock().unwrap();
-                        match metas.get(&pane_id) {
-                            Some(m) => {
-                                let soft = m
-                                    .streaming_interrupt_tx
-                                    .lock()
-                                    .ok()
-                                    .and_then(|g| g.as_ref().cloned());
-                                let present = m
-                                    .child_process
-                                    .lock()
-                                    .ok()
-                                    .map(|g| g.is_some())
-                                    .unwrap_or(false);
-                                (soft, present)
-                            }
-                            None => (None, false),
-                        }
-                    };
-                    let mut soft_sent = false;
-                    if let Some(tx) = soft_interrupt {
-                        if tx.send(()).is_ok() {
-                            soft_sent = true;
-                            tracing::info!(
-                                pane_id,
-                                "StopBot(Interactive): signaled streaming worker for soft interrupt",
-                            );
-                        }
-                    }
-                    if !soft_sent {
-                        let metas = pane_metas.lock().unwrap();
-                        if let Some(meta) = metas.get(&pane_id) {
-                            if let Ok(mut guard) = meta.child_process.lock() {
-                                if let Some(ref mut child) = *guard {
-                                    let _ = child.kill();
-                                }
-                            }
-                        }
-                    }
-                    let msg = if soft_sent {
-                        "[Interrupted current turn — process still alive.]"
-                    } else {
-                        "[Process killed]"
-                    };
-                    let _ = output_tx.send(PaneOutput {
-                        text: msg.to_string(),
-                        pane_id,
-                    });
-                    let _ = server_tx.blocking_send(CliToServer::StreamMessage {
-                        session_id,
-                        message: shared::ClaudeStreamMessage::Result {
-                            subtype: "text".to_string(),
-                            result: msg.to_string(),
-                            is_error: false,
-                            total_cost_usd: 0.0,
-                            duration_ms: 0,
-                            session_id: session_id.to_string(),
-                            extra: serde_json::Value::Null,
-                        },
-                        pane_type: None,
-                        pane_id: Some(pane_id),
-                    });
-                    continue;
-                }
-
-                // Check if stop is already requested (two-stage stop)
-                let already_requested = {
-                    let stop_requests = pane_stop_requests.lock().unwrap();
-                    stop_requests
+                // Never reinterpret an old bot-stop request as permission to
+                // interrupt an unrelated interactive pane.
+                let child = pane_metas.lock().ok().and_then(|metas| {
+                    metas
                         .get(&pane_id)
-                        .map(|f| f.load(Ordering::SeqCst))
-                        .unwrap_or(false)
-                };
-
-                if !already_requested {
-                    // === Stage 1: Graceful stop ===
-                    // Set the stop_requested flag; deadloop will stop after current iteration
-                    {
-                        let stop_requests = pane_stop_requests.lock().unwrap();
-                        if let Some(flag) = stop_requests.get(&pane_id) {
-                            flag.store(true, Ordering::SeqCst);
-                        }
-                    }
-
-                    let _ = output_tx.send(PaneOutput {
-                        text: "[Stop requested — will stop after current work finishes...]"
-                            .to_string(),
-                        pane_id,
-                    });
-
-                    // Notify web clients
-                    let _ = server_tx.blocking_send(CliToServer::StreamMessage {
-                        session_id,
-                        message: shared::ClaudeStreamMessage::Result {
-                            subtype: "text".to_string(),
-                            result: "[Stop requested — will stop after current work finishes...]"
-                                .to_string(),
-                            is_error: false,
-                            total_cost_usd: 0.0,
-                            duration_ms: 0,
-                            session_id: session_id.to_string(),
-                            extra: serde_json::Value::Null,
-                        },
-                        pane_type: None,
-                        pane_id: Some(pane_id),
-                    });
-
-                    // Send updated PaneList so web sees stop_requested=true
-                    let _ = server_tx.blocking_send(CliToServer::PaneList {
-                        session_id,
-                        panes: build_pane_list(
-                            &store.owner,
-                            &pane_metas,
-                            &input_channels,
-                            session_id,
-                            &pane_sessions,
-                            &pane_pauses,
-                            &pane_stop_requests,
-                        ),
-                    });
-
-                    // Persist stop_requested immediately so a crash/restart before
-                    // FinalizeStopBot does not resurrect bot mode.
-                    save_pane_configs(
-                        &store,
-                        &pane_sessions,
-                        &pane_metas,
-                        &pane_pauses,
-                        &pane_stop_requests,
-                    );
-                } else {
-                    // === Stage 2: Force stop ===
-                    // Soft path first: send control_request("interrupt") to
-                    // the streaming worker. The current turn aborts, claude
-                    // emits Result, the deadloop driver sees stop_requested
-                    // is already true, and the loop unwinds — without losing
-                    // the long-lived claude process. SIGKILL fallback if the
-                    // streaming channel is absent (non-streaming provider)
-                    // or send fails (worker dead). The 3-second escalation
-                    // ensures a wedged turn that ignores control_request
-                    // still gets killed.
-                    let (soft_interrupt, child_pid): (Option<mpsc::Sender<()>>, Option<u32>) = {
-                        let metas = pane_metas.lock().unwrap();
-                        match metas.get(&pane_id) {
-                            Some(m) => {
-                                let soft = m
-                                    .streaming_interrupt_tx
-                                    .lock()
-                                    .ok()
-                                    .and_then(|g| g.as_ref().cloned());
-                                let pid = m
-                                    .child_process
-                                    .lock()
-                                    .ok()
-                                    .and_then(|g| g.as_ref().map(|c| c.id()));
-                                (soft, pid)
-                            }
-                            None => (None, None),
-                        }
-                    };
-                    let mut soft_sent = false;
-                    if let Some(tx) = soft_interrupt {
-                        if tx.send(()).is_ok() {
-                            soft_sent = true;
-                            tracing::info!(
-                                pane_id,
-                                "StopBot(Force,Deadloop): signaled streaming worker for soft interrupt",
-                            );
-                            // Escalate to SIGKILL after 3s if the process is
-                            // still alive — covers the case where the turn
-                            // is genuinely wedged below the stream-json layer
-                            // (e.g. claude itself isn't reading stdin).
-                            if let Some(pid) = child_pid {
-                                let pane_for_log = pane_id;
-                                std::thread::spawn(move || {
-                                    std::thread::sleep(Duration::from_secs(3));
-                                    let alive =
-                                        std::path::Path::new(&format!("/proc/{}", pid)).exists();
-                                    if alive {
-                                        tracing::warn!(
-                                            pane_id = pane_for_log,
-                                            pid,
-                                            "StopBot(Force): soft interrupt didn't take in 3s, escalating to SIGKILL",
-                                        );
-                                        let _ = std::process::Command::new("kill")
-                                            .arg("-KILL")
-                                            .arg(pid.to_string())
-                                            .status();
-                                    }
-                                });
-                            }
-                        }
-                    }
-                    if !soft_sent {
-                        let metas = pane_metas.lock().unwrap();
-                        if let Some(meta) = metas.get(&pane_id) {
-                            if let Ok(mut guard) = meta.child_process.lock() {
-                                if let Some(child) = guard.take() {
-                                    let mut child = child;
-                                    let _ = child.kill();
-                                    let _ = child.wait();
-                                }
-                            }
-                        }
-                    }
-
-                    // Reuse FinalizeStopBot logic — pass current stop_flag so
-                    // the handler can verify it belongs to THIS deadloop.
-                    let current_stop_flag = {
-                        let stops = pane_stop_requests.lock().unwrap();
-                        stops.get(&pane_id).cloned()
-                    };
-                    if let Some(sf) = current_stop_flag {
-                        let _ = event_tx.send(TuiEvent::FinalizeStopBot {
-                            pane_id,
-                            stop_flag: sf,
-                        });
-                    }
-                }
-            }
-            Ok(TuiEvent::FinalizeStopBot { pane_id, stop_flag }) => {
-                // Finalize stop: switch from deadloop to interactive mode.
-                // Called after deadloop finishes gracefully OR after force-kill.
-                //
-                // IMPORTANT: Verify that the stop_flag belongs to the CURRENT
-                // deadloop for this pane. A stale FinalizeStopBot from an old
-                // deadloop thread (that was still cleaning up when a new
-                // StartBot spawned a replacement) must be ignored. Otherwise
-                // it would kill the new deadloop and orphan its thread.
-                {
-                    let stops = pane_stop_requests.lock().unwrap();
-                    if let Some(current) = stops.get(&pane_id) {
-                        if !Arc::ptr_eq(&stop_flag, current) {
-                            // This FinalizeStopBot is from an old deadloop — ignore it.
-                            continue;
-                        }
-                    }
-                    // If there's no entry, the flags were already cleaned up
-                    // (e.g. pane was removed). Still safe to proceed.
-                }
-
-                let (
-                    provider,
-                    saved_label,
-                    saved_prompt,
-                    saved_model,
-                    saved_effort,
-                    saved_min_interval_minutes,
-                ) = {
-                    let metas = pane_metas.lock().unwrap();
-                    let Some(meta) = metas.get(&pane_id) else {
-                        continue;
-                    };
-                    if meta.mode != shared::PaneMode::Deadloop {
-                        continue;
-                    }
-                    (
-                        meta.provider,
-                        meta.label.clone(),
-                        meta.prompt.clone(),
-                        meta.model.clone(),
-                        meta.effort.clone(),
-                        meta.min_iteration_interval_minutes,
-                    )
-                };
-
-                // Remove deadloop control flags.
-                {
-                    let mut pauses = pane_pauses.lock().unwrap();
-                    pauses.remove(&pane_id);
-                }
-                {
-                    let mut stop_requests = pane_stop_requests.lock().unwrap();
-                    stop_requests.remove(&pane_id);
-                }
-
-                // Create input channel for interactive mode.
-                let (input_tx, input_rx) = mpsc::channel::<PaneInput>();
-                {
-                    let mut channels = input_channels.lock().unwrap();
-                    channels.insert(pane_id, input_tx);
-                }
-
-                // Update pane meta to interactive.
-                let child_proc: Arc<Mutex<Option<std::process::Child>>> =
-                    Arc::new(Mutex::new(None));
-                {
-                    let mut metas = pane_metas.lock().unwrap();
-                    metas.insert(
-                        pane_id,
-                        PaneMeta {
-                            kind: shared::PaneKind::Agent,
-                            mode: shared::PaneMode::Interactive,
-                            provider,
-                            label: saved_label,
-                            prompt: saved_prompt,
-                            model: saved_model.clone(),
-                            effort: saved_effort.clone(),
-                            min_iteration_interval_minutes: saved_min_interval_minutes,
-                            child_process: child_proc.clone(),
-                            streaming_interrupt_tx: Arc::new(Mutex::new(None)),
-                            control_response_tx: Arc::new(Mutex::new(None)),
-                            pending_questions: Arc::new(Mutex::new(HashMap::new())),
-                            effort_arc: Arc::new(Mutex::new(saved_effort.clone())),
-                            worktree_path: None,
-                            role: None,
-                            goal: None,
-                            backstory: None,
-                            plan_review_mode: shared::PlanReviewMode::default(),
-                            plan_review_mode_arc: Arc::new(Mutex::new(
-                                shared::PlanReviewMode::default(),
-                            )),
-                            pending_plan_reviews: Arc::new(Mutex::new(HashMap::new())),
-                            manual_mode: false,
-                            managed: false,
-                        },
-                    );
-                }
-
-                // Notify TUI to update tab mode.
-                let _ = command_tx.send(TuiCommand::SetMode {
-                    pane_id,
-                    mode: shared::PaneMode::Interactive,
+                        .filter(|meta| meta.mode == shared::PaneMode::Deadloop)
+                        .map(|meta| meta.child_process.clone())
                 });
-
-                let _ = output_tx.send(PaneOutput {
-                    text: "[Bot stopped — switched to interactive mode]".to_string(),
-                    pane_id,
-                });
-
-                // Notify web clients
-                let _ = server_tx.blocking_send(CliToServer::StreamMessage {
-                    session_id,
-                    message: shared::ClaudeStreamMessage::Result {
-                        subtype: "text".to_string(),
-                        result: "[Bot stopped — switched to interactive mode]".to_string(),
-                        is_error: false,
-                        total_cost_usd: 0.0,
-                        duration_ms: 0,
-                        session_id: session_id.to_string(),
-                        extra: serde_json::Value::Null,
-                    },
-                    pane_type: None,
-                    pane_id: Some(pane_id),
-                });
-
-                // Get session id for this pane.
-                let claude_session_id = {
-                    let ps = pane_sessions.lock().unwrap();
-                    ps.get(&pane_id).copied().unwrap_or_else(Uuid::new_v4)
-                };
-
-                // Spawn interactive session.
-                let binary_path = resolve_pane_binary_path(
-                    provider,
-                    saved_model.as_deref(),
-                    claude_path,
-                    codex_path,
-                    opencode_path,
-                    pi_path,
-                    omp_path,
-                    cursor_agent_path,
-                );
-                {
-                    let output_tx = output_tx.clone();
-                    let server_tx = server_tx.clone();
-                    let shutdown = shutdown.clone();
-                    let working_dir = working_dir.to_string();
-                    let (
-                        interrupt_slot,
-                        control_resp_slot,
-                        pending_qs,
-                        effort_arc,
-                        worktree_path,
-                        system_prompt,
-                        pr_mode_arc,
-                        pr_pending,
-                    ) = pane_metas
-                        .lock()
-                        .unwrap()
-                        .get(&pane_id)
-                        .map(|m| {
-                            (
-                                m.streaming_interrupt_tx.clone(),
-                                m.control_response_tx.clone(),
-                                m.pending_questions.clone(),
-                                m.effort_arc.clone(),
-                                m.worktree_path.clone(),
-                                crate::pane_identity::compose_system_prompt(
-                                    m.role.as_deref(),
-                                    m.goal.as_deref(),
-                                    m.backstory.as_deref(),
-                                ),
-                                m.plan_review_mode_arc.clone(),
-                                m.pending_plan_reviews.clone(),
-                            )
-                        })
-                        .unwrap_or_else(|| {
-                            (
-                                Arc::new(Mutex::new(None)),
-                                Arc::new(Mutex::new(None)),
-                                Arc::new(Mutex::new(HashMap::new())),
-                                Arc::new(Mutex::new(None)),
-                                None,
-                                None,
-                                Arc::new(Mutex::new(shared::PlanReviewMode::default())),
-                                Arc::new(Mutex::new(HashMap::new())),
-                            )
-                        });
-                    thread::spawn(move || {
-                        run_pane_session(
-                            &binary_path,
-                            &working_dir,
-                            worktree_path,
-                            system_prompt,
-                            pr_mode_arc,
-                            pr_pending,
-                            session_id,
-                            claude_session_id,
-                            pane_id,
-                            &provider,
-                            saved_model.clone(),
-                            saved_effort.clone(),
-                            input_rx,
-                            output_tx,
-                            server_tx,
-                            shutdown,
-                            child_proc,
-                            interrupt_slot,
-                            control_resp_slot,
-                            pending_qs,
-                            effort_arc,
-                            true,
-                        )
-                    });
+                if let Some(child) = child {
+                    if let Ok(mut slot) = child.lock() {
+                        if let Some(mut child) = slot.take() {
+                            kill_pane_child_group(&mut child);
+                        }
+                    }
                 }
-
-                // Publish updated pane list and persist config.
-                let _ = server_tx.blocking_send(CliToServer::PaneList {
-                    session_id,
-                    panes: build_pane_list(
-                        &store.owner,
-                        &pane_metas,
-                        &input_channels,
-                        session_id,
-                        &pane_sessions,
-                        &pane_pauses,
-                        &pane_stop_requests,
-                    ),
-                });
-
-                save_pane_configs(
-                    &store,
-                    &pane_sessions,
-                    &pane_metas,
-                    &pane_pauses,
-                    &pane_stop_requests,
-                );
+                // Killing a known child is only a drain attempt, not proof
+                // that an older runtime or escaped descendants are stopped.
+                report_legacy_bot_rejection(&output_tx, &server_tx, session_id, pane_id);
             }
             Err(mpsc::RecvTimeoutError::Timeout) => continue,
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
@@ -6352,54 +5257,6 @@ fn build_agent_args(
             (base, resume)
         }
     }
-}
-
-fn build_deadloop_agent_args(
-    provider: &Provider,
-    session_id: &Uuid,
-    prompt: &str,
-    model: Option<&str>,
-    effort: Option<&str>,
-    first_message: bool,
-    try_resume_first: bool,
-) -> (Vec<String>, bool) {
-    build_agent_args(
-        provider,
-        session_id,
-        prompt,
-        model,
-        effort,
-        first_message,
-        try_resume_first,
-    )
-}
-
-fn is_codex_stale_session_error(line: &str) -> bool {
-    let lower = line.to_lowercase();
-    lower.contains("no rollout found") || lower.contains("thread/resume failed")
-}
-
-fn should_recover_deadloop_stale_session(
-    stale_session_detected: bool,
-    first_message: bool,
-    using_resume: bool,
-    exit_was_error: bool,
-    had_error: bool,
-) -> bool {
-    stale_session_detected || (first_message && using_resume && exit_was_error && !had_error)
-}
-
-fn reset_deadloop_codex_stale_session(
-    first_message: &mut bool,
-    try_resume_first: &mut bool,
-    claude_session_id: &mut Uuid,
-    fresh_session_id: Uuid,
-) -> Uuid {
-    let old = *claude_session_id;
-    *claude_session_id = fresh_session_id;
-    *try_resume_first = false;
-    *first_message = true;
-    old
 }
 
 /// Intercept claude's `control_request` envelopes on stdout. Returns
@@ -6770,22 +5627,132 @@ fn parse_agent_output(
 #[cfg(test)]
 #[allow(deprecated)]
 mod tests {
+    #[test]
+    fn retired_start_request_is_rejected_even_without_a_pane() {
+        let request: shared::ServerToCli = serde_json::from_value(serde_json::json!({
+            "type": "start_bot",
+            "session_id": Uuid::new_v4(),
+            "pane_id": 42,
+            "prompt": "Original Claude instructions",
+            "min_iteration_interval_minutes": 15,
+            "effort": null
+        }))
+        .unwrap();
+        let metas = Arc::new(Mutex::new(HashMap::new()));
+        assert_eq!(
+            super::retired_bot_request_target(&request, &metas),
+            Some(42)
+        );
+        assert!(metas.lock().unwrap().is_empty());
+        let (output_tx, output_rx) = mpsc::channel();
+        let (server_tx, mut server_rx) = tokio_mpsc::channel(1);
+        let session_id = Uuid::new_v4();
+        super::report_legacy_bot_rejection(&output_tx, &server_tx, session_id, 42);
+        assert!(output_rx.recv().unwrap().text.contains("upgrade_required"));
+        match server_rx.try_recv().unwrap() {
+            CliToServer::Output {
+                session_id: returned,
+                pane_id,
+                data,
+                output_type,
+                ..
+            } => {
+                assert_eq!(returned, session_id);
+                assert_eq!(pane_id, Some(42));
+                assert!(matches!(output_type, shared::OutputType::Error));
+                assert!(data.contains("fresh Autonomous worker independently"));
+                assert!(data.contains("no stop or continuity claim"));
+            }
+            message => panic!("expected explicit rejection, got {message:?}"),
+        }
+    }
+
+    #[test]
+    fn historical_bot_cannot_reboot_change_provider_or_accept_input() {
+        let mut meta = test_pane_meta(Provider::Codex, false, None, Arc::new(Mutex::new(None)));
+        let session_id = Uuid::new_v4();
+        let requests = [
+            shared::ServerToCli::RebootPane {
+                session_id,
+                pane_id: 42,
+            },
+            shared::ServerToCli::RemovePane {
+                session_id,
+                pane_id: 42,
+                cleanup_action: None,
+            },
+            shared::ServerToCli::UpdatePaneModel {
+                session_id,
+                pane_id: 42,
+                provider: Some(Provider::Omp),
+                model: None,
+            },
+            shared::ServerToCli::Input {
+                session_id,
+                pane_id: Some(42),
+                data: "continue".into(),
+            },
+        ];
+        let metas = Arc::new(Mutex::new(HashMap::from([(42, meta.clone())])));
+        for request in &requests {
+            assert_eq!(super::retired_bot_request_target(request, &metas), Some(42));
+        }
+        meta.mode = shared::PaneMode::Interactive;
+        metas.lock().unwrap().insert(42, meta);
+        for request in &requests {
+            assert_eq!(super::retired_bot_request_target(request, &metas), None);
+        }
+    }
+
+    #[test]
+    fn retired_deadloop_admission_is_rejected_before_creation() {
+        let panes = Arc::new(Mutex::new(HashMap::new()));
+        let pane_config = test_pane_config(42, shared::PaneMode::Deadloop, false, false);
+        let request = shared::ServerToCli::AddPane {
+            session_id: Uuid::new_v4(),
+            pane_config,
+            isolated_worktree: true,
+            initial_input: Some("must not execute".into()),
+        };
+        assert_eq!(
+            super::retired_bot_request_target(&request, &panes),
+            Some(42)
+        );
+        assert!(panes.lock().is_ok_and(|panes| panes.is_empty()));
+    }
+
+    #[test]
+    fn restored_bot_preserves_original_provider_prompt_and_history() {
+        let mut pane = test_pane_config(42, shared::PaneMode::Deadloop, false, true);
+        pane.provider = Provider::Codex;
+        pane.prompt = Some("Keep the original instruction".into());
+        pane.min_iteration_interval_minutes = Some(27);
+        pane.worktree_path = Some("/existing/worktree".into());
+        let original = serde_json::to_value(&pane).unwrap();
+        let tabs = super::restored_tabs(std::slice::from_ref(&pane), false);
+        assert_eq!(tabs[0].1, pane.session_id);
+        assert_eq!(tabs[0].3, shared::PaneMode::Deadloop);
+        assert_eq!(tabs[0].4, Provider::Codex);
+        assert_eq!(tabs[0].5, pane.prompt);
+        assert_eq!(tabs[0].8, Some(27));
+        assert!(tabs[0].9);
+        assert_eq!(tabs[0].10, pane.worktree_path);
+        assert_eq!(serde_json::to_value(&pane).unwrap(), original);
+    }
+
     use super::{
         active_usage_providers, announce_and_persist_panes, append_codex_sqlite_home_env,
         auto_cancel_pending_questions_for_new_input, boot_restore_try_resume_first,
-        build_agent_args, build_agent_switch_respawn_event, build_deadloop_agent_args,
-        build_pane_env_overrides_from_keys, build_pane_list, build_pane_reboot_events,
-        build_user_envelope_line, canonicalize_requested_model, codex_sqlite_home_path,
-        convert_opencode_to_claude, deadloop_wait_plan, ensure_private_codex_sqlite_home,
-        evaluate_deadloop_watchdog, is_codex_stale_session_error, is_idempotent_add_pane_retry,
-        live_provider_binary, manual_create_pr_worktree_path, model_switch_can_use_fast_path,
-        normalize_codex_effort, normalize_effort_level, reconcile_terminal_questions_for_pane,
-        remember_verified_codex_session, reset_deadloop_codex_stale_session,
-        resolve_pane_binary_path, resolve_terminal_binary, restored_pane_mode_and_pause,
-        retired_launch_rejection_output, route_web_input_to_pane, run_deadloop_session_inner,
-        save_pane_configs, should_recover_deadloop_stale_session, start_bot_preserved_fields,
-        stop_retired_panes, terminal_state_reports, truncate_str_at_char_boundary,
-        update_project_operations, DeadloopWatchdogDecision, DeadloopWatchdogState, InputChannels,
+        build_agent_args, build_agent_switch_respawn_event, build_pane_env_overrides_from_keys,
+        build_pane_list, build_pane_reboot_events, build_user_envelope_line,
+        canonicalize_requested_model, codex_sqlite_home_path, convert_opencode_to_claude,
+        ensure_private_codex_sqlite_home, is_idempotent_add_pane_retry, live_provider_binary,
+        manual_create_pr_worktree_path, model_switch_can_use_fast_path, normalize_codex_effort,
+        normalize_effort_level, reconcile_terminal_questions_for_pane,
+        remember_verified_codex_session, resolve_pane_binary_path, resolve_terminal_binary,
+        restored_pane_mode_and_pause, retired_launch_rejection_output, route_web_input_to_pane,
+        save_pane_configs, stop_retired_panes, terminal_state_reports,
+        truncate_str_at_char_boundary, update_project_operations, InputChannels,
         PaneInputRouteResult, PaneMeta, PaneMetas, PanePauses, PaneStopRequests,
         PendingAskQuestion, ProjectStore, ASK_USER_QUESTION_AUTO_CANCEL_STATUS,
         CODEX_SQLITE_HOME_ENV, DEEPSEEK_DEFAULT_MODEL,
@@ -6794,7 +5761,7 @@ mod tests {
     use crate::project::{get_or_create_project, save_project, ProjectMetadata};
     use crate::project_instances::{read_project_metadata, PaneOwner};
     use crate::terminal_pane::TerminalPanes;
-    use crate::tui::{PaneOutput, TuiEvent};
+    use crate::tui::TuiEvent;
     use base64::Engine as _;
     use shared::{ClaudeContentBlock, ClaudeStreamMessage, CliToServer, Provider};
     use std::collections::{HashMap, HashSet};
@@ -6802,7 +5769,7 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{mpsc, Arc, Mutex};
     use std::thread;
-    use std::time::{Duration, Instant, SystemTime};
+    use std::time::{Duration, Instant};
     use tokio::sync::mpsc as tokio_mpsc;
     use uuid::Uuid;
 
@@ -7083,22 +6050,6 @@ mod tests {
         assert!(super::existing_pane_relaunch_allowed());
     }
 
-    #[test]
-    fn deadloop_wait_cursor_is_sampled_at_wait_entry() {
-        let last_started_at = Instant::now();
-        let self_write_at = last_started_at + Duration::from_millis(20);
-        let wait_entry_at = last_started_at + Duration::from_millis(50);
-        let min_interval = Duration::from_secs(10);
-
-        let plan = deadloop_wait_plan(last_started_at, min_interval, wait_entry_at)
-            .expect("min interval still has time remaining");
-
-        assert_eq!(plan.cursor, wait_entry_at);
-        assert!(plan.cursor > self_write_at);
-        assert_ne!(plan.cursor, last_started_at);
-        assert_eq!(plan.remaining, min_interval - Duration::from_millis(50));
-    }
-
     fn extract_ts_string_const<'a>(source: &'a str, name: &str) -> Option<&'a str> {
         let prefix = format!("export const {name} = ");
         source.lines().find_map(|line| {
@@ -7126,111 +6077,6 @@ mod tests {
         assert_eq!(shared::DEEPSEEK_FLASH_MODEL, web_flash);
         assert_eq!(shared::DEEPSEEK_LEGACY_FLASH_MODEL, web_legacy_flash);
         assert_eq!(shared::DEEPSEEK_RETIRED_PRO_MODEL, web_retired_pro);
-    }
-
-    #[test]
-    fn deadloop_watchdog_mtime_updates_reset_activity_clock() {
-        let start = Instant::now();
-        let idle_threshold = Duration::from_secs(30 * 60);
-        let previous_activity = start
-            .checked_sub(idle_threshold + Duration::from_secs(60))
-            .expect("start should support test subtraction");
-        let mut state = DeadloopWatchdogState::new(start);
-        state.last_activity = previous_activity;
-        let mtime = SystemTime::UNIX_EPOCH + Duration::from_secs(123);
-
-        let decision =
-            evaluate_deadloop_watchdog(&mut state, start, idle_threshold, Some(mtime), true, true);
-
-        assert_eq!(decision, DeadloopWatchdogDecision::Noop);
-        assert_eq!(state.last_mtime, Some(mtime));
-        assert_eq!(state.last_activity, start);
-        assert_eq!(state.last_nudge, None);
-
-        let before_threshold = start + idle_threshold - Duration::from_secs(1);
-        let decision = evaluate_deadloop_watchdog(
-            &mut state,
-            before_threshold,
-            idle_threshold,
-            Some(mtime),
-            true,
-            true,
-        );
-
-        assert_eq!(decision, DeadloopWatchdogDecision::Noop);
-        assert_eq!(state.last_nudge, None);
-    }
-
-    #[test]
-    fn deadloop_watchdog_stale_activity_nudges_once_until_cooldown_expires() {
-        let start = Instant::now();
-        let idle_threshold = Duration::from_secs(30 * 60);
-        let mut state = DeadloopWatchdogState::new(start);
-
-        let first_nudge_at = start + idle_threshold;
-        let decision = evaluate_deadloop_watchdog(
-            &mut state,
-            first_nudge_at,
-            idle_threshold,
-            None,
-            true,
-            true,
-        );
-
-        assert_eq!(
-            decision,
-            DeadloopWatchdogDecision::Nudge { idle_minutes: 30 }
-        );
-        assert_eq!(state.last_nudge, Some(first_nudge_at));
-
-        let inside_cooldown = first_nudge_at + idle_threshold - Duration::from_secs(1);
-        let decision = evaluate_deadloop_watchdog(
-            &mut state,
-            inside_cooldown,
-            idle_threshold,
-            None,
-            true,
-            true,
-        );
-
-        assert_eq!(decision, DeadloopWatchdogDecision::Noop);
-        assert_eq!(state.last_nudge, Some(first_nudge_at));
-
-        let cooldown_expired = first_nudge_at + idle_threshold;
-        let decision = evaluate_deadloop_watchdog(
-            &mut state,
-            cooldown_expired,
-            idle_threshold,
-            None,
-            true,
-            true,
-        );
-
-        assert_eq!(
-            decision,
-            DeadloopWatchdogDecision::Nudge { idle_minutes: 60 }
-        );
-        assert_eq!(state.last_nudge, Some(cooldown_expired));
-    }
-
-    #[test]
-    fn deadloop_watchdog_skips_inactive_supervisor_or_missing_jsonl_path() {
-        let start = Instant::now();
-        let idle_threshold = Duration::from_secs(30 * 60);
-        let mut state = DeadloopWatchdogState::new(start);
-        let stale_at = start + idle_threshold;
-
-        let decision =
-            evaluate_deadloop_watchdog(&mut state, stale_at, idle_threshold, None, true, false);
-
-        assert_eq!(decision, DeadloopWatchdogDecision::Noop);
-        assert_eq!(state.last_nudge, None);
-
-        let decision =
-            evaluate_deadloop_watchdog(&mut state, stale_at, idle_threshold, None, false, true);
-
-        assert_eq!(decision, DeadloopWatchdogDecision::Noop);
-        assert_eq!(state.last_nudge, None);
     }
 
     fn test_pane_meta(
@@ -7697,96 +6543,6 @@ mod tests {
         assert_eq!(normalize_codex_effort(Some("default")), None);
         assert_eq!(normalize_codex_effort(Some("  ")), None);
         assert_eq!(normalize_codex_effort(None), None);
-    }
-
-    #[test]
-    fn codex_stale_session_recovery_resets_first_resumed_message_for_fresh_retry() {
-        let old_session_id = Uuid::parse_str("00000000-0000-4000-8000-000000000001").unwrap();
-        let fresh_session_id = Uuid::parse_str("00000000-0000-4000-8000-000000000002").unwrap();
-        let mut session_id = old_session_id;
-        let mut first_message = true;
-        let mut try_resume_first = true;
-
-        assert!(should_recover_deadloop_stale_session(
-            false,
-            first_message,
-            true,
-            true,
-            false,
-        ));
-
-        let old = reset_deadloop_codex_stale_session(
-            &mut first_message,
-            &mut try_resume_first,
-            &mut session_id,
-            fresh_session_id,
-        );
-
-        assert_eq!(old, old_session_id);
-        assert_eq!(session_id, fresh_session_id);
-        assert!(first_message);
-        assert!(!try_resume_first);
-
-        let (args, using_resume) = build_deadloop_agent_args(
-            &Provider::Codex,
-            &session_id,
-            FULL_PROMPT,
-            None,
-            None,
-            first_message,
-            try_resume_first,
-        );
-
-        assert!(!using_resume);
-        assert_eq!(args.get(0).map(String::as_str), Some("exec"));
-        assert!(!args.iter().any(|arg| arg == "resume"));
-        assert_eq!(args.last().map(String::as_str), Some(FULL_PROMPT));
-        assert!(!args.iter().any(|arg| arg == &old_session_id.to_string()));
-        assert!(!args.iter().any(|arg| arg == &fresh_session_id.to_string()));
-    }
-
-    #[test]
-    fn codex_stale_session_recovery_ignores_mid_loop_ordinary_failure() {
-        let session_id = Uuid::parse_str("00000000-0000-4000-8000-000000000003").unwrap();
-        let first_message = false;
-        let try_resume_first = true;
-
-        assert!(!should_recover_deadloop_stale_session(
-            false,
-            first_message,
-            true,
-            true,
-            true,
-        ));
-
-        let (args, using_resume) = build_deadloop_agent_args(
-            &Provider::Codex,
-            &session_id,
-            FULL_PROMPT,
-            None,
-            None,
-            first_message,
-            try_resume_first,
-        );
-
-        assert!(using_resume);
-        assert_eq!(args.get(0).map(String::as_str), Some("exec"));
-        assert_eq!(args.get(1).map(String::as_str), Some("resume"));
-        assert!(args.iter().any(|arg| arg == &session_id.to_string()));
-        assert_eq!(args.last().map(String::as_str), Some(FULL_PROMPT));
-    }
-
-    #[test]
-    fn codex_stale_session_error_detects_resume_failures() {
-        assert!(is_codex_stale_session_error(
-            "ERROR no rollout found for thread id abc123"
-        ));
-        assert!(is_codex_stale_session_error(
-            "thread/resume failed: remote thread disappeared"
-        ));
-        assert!(!is_codex_stale_session_error(
-            "model returned a normal tool execution error"
-        ));
     }
 
     #[test]
@@ -8629,74 +7385,6 @@ mod tests {
     }
 
     #[test]
-    fn deadloop_initial_resume_flag_controls_codex_first_spawn_args() {
-        let session_id = Uuid::from_u128(3);
-
-        let (fresh_args, fresh_using_resume) = build_deadloop_agent_args(
-            &Provider::Codex,
-            &session_id,
-            FULL_PROMPT,
-            None,
-            None,
-            true,
-            false,
-        );
-        assert!(!fresh_using_resume);
-        assert_eq!(fresh_args.get(0).map(String::as_str), Some("exec"));
-        assert_ne!(fresh_args.get(1).map(String::as_str), Some("resume"));
-        assert!(!fresh_args.iter().any(|arg| arg == &session_id.to_string()));
-
-        let (resume_args, resume_using_resume) = build_deadloop_agent_args(
-            &Provider::Codex,
-            &session_id,
-            FULL_PROMPT,
-            None,
-            None,
-            true,
-            true,
-        );
-        assert!(resume_using_resume);
-        assert_eq!(resume_args.get(0).map(String::as_str), Some("exec"));
-        assert_eq!(resume_args.get(1).map(String::as_str), Some("resume"));
-        assert!(resume_args.iter().any(|arg| arg == &session_id.to_string()));
-    }
-
-    #[test]
-    fn start_bot_preserves_managed_role_metadata() {
-        let effort_arc = Arc::new(Mutex::new(Some("max".to_string())));
-        let meta = test_pane_meta(Provider::Claude, true, Some("max"), effort_arc);
-
-        let preserved = start_bot_preserved_fields(Some(&meta));
-
-        assert!(preserved.managed);
-        assert!(preserved.manual_mode);
-        assert_eq!(
-            preserved.worktree_path.as_deref(),
-            Some("/tmp/apas-side-dev")
-        );
-        assert_eq!(preserved.role.as_deref(), Some("developer"));
-        assert_eq!(preserved.goal.as_deref(), Some("Ship the side quest"));
-        assert_eq!(
-            preserved.backstory.as_deref(),
-            Some("A manually added helper pane"),
-        );
-        assert_eq!(
-            preserved.plan_review_mode,
-            shared::PlanReviewMode::RiskyOnly
-        );
-    }
-
-    #[test]
-    fn start_bot_defaults_untracked_panes_to_unmanaged() {
-        let preserved = start_bot_preserved_fields(None);
-
-        assert!(!preserved.managed);
-        assert!(!preserved.manual_mode);
-        assert!(preserved.role.is_none());
-        assert_eq!(preserved.plan_review_mode, shared::PlanReviewMode::Never);
-    }
-
-    #[test]
     fn save_pane_configs_persists_pause_flags_and_legacy_deadloop_pause() {
         // The project lock lives in `config_dir()/locks`; without this the
         // lock lands in whatever config dir another test points at.
@@ -8955,7 +7643,7 @@ mod tests {
         let unpaused_worker = test_pane_config(42, shared::PaneMode::Deadloop, false, false);
         assert_eq!(
             restored_pane_mode_and_pause(&unpaused_worker, true),
-            (shared::PaneMode::Deadloop, false)
+            (shared::PaneMode::Deadloop, true)
         );
 
         let stopped_deadloop = test_pane_config(
@@ -8966,7 +7654,7 @@ mod tests {
         );
         assert_eq!(
             restored_pane_mode_and_pause(&stopped_deadloop, true),
-            (shared::PaneMode::Interactive, false)
+            (shared::PaneMode::Deadloop, true)
         );
 
         let interactive = test_pane_config(2, shared::PaneMode::Interactive, true, false);
@@ -8974,74 +7662,6 @@ mod tests {
             restored_pane_mode_and_pause(&interactive, true),
             (shared::PaneMode::Interactive, false)
         );
-    }
-
-    #[test]
-    fn paused_deadloop_session_waits_without_spawning_child() {
-        let dir = tempfile::tempdir().expect("temp project dir");
-        let working_dir = dir.path().to_string_lossy().to_string();
-        let (output_tx, output_rx) = mpsc::channel::<PaneOutput>();
-        let (event_tx, _event_rx) = mpsc::channel::<TuiEvent>();
-        let (server_tx, _server_rx) = tokio_mpsc::channel::<CliToServer>(8);
-        let shutdown = Arc::new(AtomicBool::new(false));
-        let pause = Arc::new(AtomicBool::new(true));
-        let stop_requested = Arc::new(AtomicBool::new(false));
-        let child_process = Arc::new(Mutex::new(None));
-        let child_for_assert = child_process.clone();
-        let input_channels: InputChannels = Arc::new(Mutex::new(HashMap::new()));
-        let watcher = Arc::new(crate::file_watcher::ProjectFileWatcher::new(dir.path()));
-        let shutdown_for_thread = shutdown.clone();
-
-        let handle = thread::spawn(move || {
-            let provider = Provider::Codex;
-            run_deadloop_session_inner(
-                "apas-test-binary-that-must-not-run",
-                &working_dir,
-                None,
-                None,
-                Arc::new(Mutex::new(shared::PlanReviewMode::default())),
-                Arc::new(Mutex::new(HashMap::new())),
-                Uuid::new_v4(),
-                Uuid::new_v4(),
-                shared::PANE_ID_DEADLOOP,
-                "test prompt",
-                None,
-                None,
-                0,
-                &provider,
-                output_tx,
-                server_tx,
-                shutdown_for_thread,
-                pause,
-                stop_requested,
-                child_process,
-                event_tx,
-                Arc::new(Mutex::new(None)),
-                Arc::new(Mutex::new(None)),
-                Arc::new(Mutex::new(HashMap::new())),
-                Arc::new(Mutex::new(None)),
-                input_channels,
-                true,
-                watcher,
-            );
-        });
-
-        let mut saw_paused = false;
-        for _ in 0..10 {
-            if let Ok(output) = output_rx.recv_timeout(Duration::from_millis(100)) {
-                assert!(!output.text.contains("Failed to spawn"));
-                assert!(!output.text.contains("Error spawning"));
-                saw_paused |= output.text.contains("paused - waiting for resume");
-                if saw_paused {
-                    break;
-                }
-            }
-        }
-
-        assert!(saw_paused, "paused loop should report that it is waiting");
-        assert!(child_for_assert.lock().unwrap().is_none());
-        shutdown.store(true, Ordering::SeqCst);
-        handle.join().expect("paused worker should exit cleanly");
     }
 
     #[test]
@@ -11048,7 +9668,11 @@ mod tests {
             match super::session_start_message(metadata.id, &alone, "/work", None, None, Vec::new())
             {
                 CliToServer::SessionStart { machine_id, .. } => {
-                    assert_eq!(machine_id, Some(zoo6), "still reported as the machine it is")
+                    assert_eq!(
+                        machine_id,
+                        Some(zoo6),
+                        "still reported as the machine it is"
+                    )
                 }
                 other => panic!("expected a session start, got {other:?}"),
             }
@@ -11182,8 +9806,7 @@ mod tests {
 
             // zoo-005 runs on alone, closing its tab and opening another.
             let running = super::open_runtime(dir.path(), &machine(zoo5, "zoo-005")).unwrap();
-            let running_ids: Vec<u32> =
-                running.tabs.iter().map(|(pane_id, ..)| *pane_id).collect();
+            let running_ids: Vec<u32> = running.tabs.iter().map(|(pane_id, ..)| *pane_id).collect();
             assert_eq!(running_ids, vec![3]);
             let store = existing_project_store(dir.path(), machine(zoo5, "zoo-005"));
             store
@@ -11417,849 +10040,6 @@ mod tests {
         assert_eq!(ids_of(&disk.panes), vec![5]);
         assert_eq!(disk.panes[0].hostname.as_deref(), Some("zoo-005"));
     }
-
-    #[test]
-    fn only_the_runtime_that_runs_pane_one_records_the_legacy_deadloop_pause() {
-        let _config = crate::config::test_config::isolated_config_dir();
-        let (zoo5, zoo6) = (Uuid::new_v4(), Uuid::new_v4());
-        let dir = tempfile::tempdir().unwrap();
-        write_project(
-            dir.path(),
-            vec![recorded_pane(
-                shared::PANE_ID_DEADLOOP,
-                shared::PaneKind::Agent,
-                Some((zoo6, "zoo-006")),
-            )],
-        );
-        let deadloop_pane = || -> PaneMetas {
-            Arc::new(Mutex::new(HashMap::from([(
-                shared::PANE_ID_DEADLOOP,
-                test_pane_meta(Provider::Claude, false, None, Arc::new(Mutex::new(None))),
-            )])))
-        };
-
-        // zoo-005 runs no pane 1; the flag would pause zoo-006's on restart.
-        let elsewhere = existing_project_store(dir.path(), machine(zoo5, "zoo-005"));
-        let no_panes: PaneMetas = Arc::new(Mutex::new(HashMap::new()));
-        super::persist_legacy_deadloop_pause(&elsewhere, &no_panes, true);
-        assert!(!on_disk(dir.path()).is_paused);
-
-        let owner = existing_project_store(dir.path(), machine(zoo6, "zoo-006"));
-        super::persist_legacy_deadloop_pause(&owner, &deadloop_pane(), true);
-        assert!(on_disk(dir.path()).is_paused);
-        super::persist_legacy_deadloop_pause(&owner, &deadloop_pane(), false);
-        assert!(!on_disk(dir.path()).is_paused);
-    }
-}
-
-/// Run the deadloop (autonomous) session on any pane
-#[allow(clippy::too_many_arguments)]
-fn run_deadloop_session(
-    binary_path: &str,
-    working_dir: &str,
-    worktree_path: Option<String>,
-    system_prompt: Option<String>,
-    plan_review_mode_arc: Arc<Mutex<shared::PlanReviewMode>>,
-    pending_plan_reviews: Arc<Mutex<HashMap<String, PendingPlanReview>>>,
-    session_id: Uuid,
-    claude_session_id: Uuid,
-    pane_id: u32,
-    prompt: &str,
-    model: Option<String>,
-    effort: Option<String>,
-    min_iteration_interval_minutes: u64,
-    provider: &Provider,
-    output_tx: mpsc::Sender<PaneOutput>,
-    server_tx: tokio_mpsc::Sender<CliToServer>,
-    shutdown: Arc<AtomicBool>,
-    pause: Arc<AtomicBool>,
-    stop_requested: Arc<AtomicBool>,
-    child_process: Arc<Mutex<Option<std::process::Child>>>,
-    event_tx: mpsc::Sender<TuiEvent>,
-    interrupt_tx_slot: Arc<Mutex<Option<mpsc::Sender<()>>>>,
-    control_response_tx_slot: Arc<Mutex<Option<mpsc::Sender<String>>>>,
-    pending_questions: Arc<Mutex<HashMap<String, PendingAskQuestion>>>,
-    effort_arc: Arc<Mutex<Option<String>>>,
-    input_channels: InputChannels,
-    // Initial value for the legacy path's `try_resume_first`. Mirror
-    // of the same param on run_pane_session — false when the worker
-    // is being spawned with a freshly-minted session id (e.g.
-    // provider switch via UpdatePaneModel), so codex's `exec resume`
-    // doesn't fail with "no rollout found".
-    initial_try_resume: bool,
-    // Project-shared file watcher; used to wake the deadloop early
-    // when team-todo.md / .apas-team.jsonl / project_goal.md / .apas
-    // change, so iterations only fire on real signal instead of
-    // burning tokens on a min-interval timer.
-    file_watcher: Arc<crate::file_watcher::ProjectFileWatcher>,
-) {
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        run_deadloop_session_inner(
-            binary_path,
-            working_dir,
-            worktree_path,
-            system_prompt,
-            plan_review_mode_arc,
-            pending_plan_reviews,
-            session_id,
-            claude_session_id,
-            pane_id,
-            prompt,
-            model,
-            effort,
-            min_iteration_interval_minutes,
-            provider,
-            output_tx.clone(),
-            server_tx,
-            shutdown,
-            pause,
-            stop_requested,
-            child_process,
-            event_tx,
-            interrupt_tx_slot,
-            control_response_tx_slot,
-            pending_questions,
-            effort_arc,
-            input_channels,
-            initial_try_resume,
-            file_watcher,
-        )
-    }));
-
-    if let Err(e) = result {
-        let msg = if let Some(s) = e.downcast_ref::<&str>() {
-            s.to_string()
-        } else if let Some(s) = e.downcast_ref::<String>() {
-            s.clone()
-        } else {
-            "Unknown panic".to_string()
-        };
-        let _ = output_tx.send(PaneOutput {
-            text: format!("[DEADLOOP CRASHED: {}]", msg),
-            pane_id,
-        });
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct DeadloopWaitPlan {
-    remaining: Duration,
-    cursor: Instant,
-}
-
-fn deadloop_wait_plan(
-    last_iteration_started_at: Instant,
-    min_iteration_interval: Duration,
-    wait_entry_at: Instant,
-) -> Option<DeadloopWaitPlan> {
-    let elapsed_since_last_start = wait_entry_at
-        .checked_duration_since(last_iteration_started_at)
-        .unwrap_or(Duration::ZERO);
-    let remaining = min_iteration_interval
-        .checked_sub(elapsed_since_last_start)
-        .unwrap_or(Duration::ZERO);
-    if remaining.is_zero() {
-        None
-    } else {
-        Some(DeadloopWaitPlan {
-            remaining,
-            cursor: wait_entry_at,
-        })
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn run_deadloop_session_inner(
-    binary_path: &str,
-    working_dir: &str,
-    worktree_path: Option<String>,
-    system_prompt: Option<String>,
-    plan_review_mode_arc: Arc<Mutex<shared::PlanReviewMode>>,
-    pending_plan_reviews: Arc<Mutex<HashMap<String, PendingPlanReview>>>,
-    session_id: Uuid,
-    claude_session_id: Uuid,
-    pane_id: u32,
-    prompt: &str,
-    model: Option<String>,
-    effort: Option<String>,
-    min_iteration_interval_minutes: u64,
-    provider: &Provider,
-    output_tx: mpsc::Sender<PaneOutput>,
-    server_tx: tokio_mpsc::Sender<CliToServer>,
-    shutdown: Arc<AtomicBool>,
-    pause: Arc<AtomicBool>,
-    stop_requested: Arc<AtomicBool>,
-    child_process: Arc<Mutex<Option<std::process::Child>>>,
-    event_tx: mpsc::Sender<TuiEvent>,
-    interrupt_tx_slot: Arc<Mutex<Option<mpsc::Sender<()>>>>,
-    control_response_tx_slot: Arc<Mutex<Option<mpsc::Sender<String>>>>,
-    pending_questions: Arc<Mutex<HashMap<String, PendingAskQuestion>>>,
-    effort_arc: Arc<Mutex<Option<String>>>,
-    input_channels: InputChannels,
-    // Same semantics as on run_pane_session — false skips the very
-    // first `--resume`/`exec resume` so codex / cursor don't fail
-    // against a freshly-minted session id from a provider switch.
-    initial_try_resume: bool,
-    file_watcher: Arc<crate::file_watcher::ProjectFileWatcher>,
-) {
-    // Provider::Claude → long-lived stream-json process driven from
-    // run_deadloop_session_streaming. Other providers fall through to the
-    // legacy per-iteration --print spawn below.
-    if matches!(provider, Provider::Claude) {
-        // Claude streaming derives try_resume_first from on-disk
-        // session_jsonl existence; ignore the flag here.
-        let _ = initial_try_resume;
-        return run_deadloop_session_streaming(
-            binary_path,
-            working_dir,
-            worktree_path,
-            system_prompt,
-            plan_review_mode_arc,
-            pending_plan_reviews,
-            session_id,
-            claude_session_id,
-            pane_id,
-            prompt,
-            model,
-            effort,
-            min_iteration_interval_minutes,
-            provider,
-            output_tx,
-            server_tx,
-            shutdown,
-            pause,
-            stop_requested,
-            child_process,
-            event_tx,
-            interrupt_tx_slot,
-            control_response_tx_slot,
-            pending_questions,
-            effort_arc,
-            input_channels,
-            file_watcher,
-        );
-    }
-    let effective_dir: String = worktree_path.as_deref().unwrap_or(working_dir).to_string();
-    let _ = system_prompt; // codex/cursor/etc. ignored for now — see role.rs note.
-    let _ = plan_review_mode_arc; // non-claude legacy path doesn't gate
-    let _ = pending_plan_reviews;
-    let _ = input_channels; // non-streaming provider paths do not register
-    let _ = interrupt_tx_slot; // unused for legacy path
-    let _ = control_response_tx_slot; // unused for legacy path
-    let _ = pending_questions; // unused for legacy path
-    let _ = effort_arc; // unused for legacy path
-
-    // For Codex, we need to capture the real thread_id from the first invocation
-    // and use it for subsequent `codex exec resume` calls.
-    let mut claude_session_id = claude_session_id;
-
-    let _ = output_tx.send(PaneOutput {
-        text: format!(
-            "[Deadloop session: {}]",
-            &claude_session_id.to_string()[..8]
-        ),
-        pane_id,
-    });
-
-    let mut iteration = 0;
-    let mut first_message = true;
-    let mut try_resume_first = initial_try_resume;
-    let mut was_paused = false;
-    // Set by the stderr reader thread when codex reports it can't
-    // resume the session id apas handed it ("no rollout found for
-    // thread id …"). The main loop checks this after the iteration
-    // and, if set, mints a fresh thread id, saves it to .apas, and
-    // retries without --resume — the recovery the existing
-    // `first_message && using_resume` path only triggers on the very
-    // first iteration, so a server-side rollout expiry mid-run was
-    // wedging the deadloop until manual .apas surgery.
-    let stale_session_detected = Arc::new(AtomicBool::new(false));
-    let min_iteration_interval =
-        Duration::from_secs(min_iteration_interval_minutes.saturating_mul(60));
-    let mut last_iteration_started_at: Option<Instant> = None;
-    // Suppress duplicate env-config errors so a misconfigured backend doesn't
-    // spam the pane every iteration; cleared once env build succeeds.
-    let mut last_env_err: Option<String> = None;
-
-    while !shutdown.load(Ordering::SeqCst) {
-        if stop_requested.load(Ordering::SeqCst) {
-            // Graceful stop: current iteration finished, finalize the mode switch
-            let _ = event_tx.send(TuiEvent::FinalizeStopBot {
-                pane_id,
-                stop_flag: stop_requested.clone(),
-            });
-            return;
-        }
-
-        if pause.load(Ordering::SeqCst) {
-            if !was_paused {
-                was_paused = true;
-                let _ = output_tx.send(PaneOutput {
-                    text: "[Deadloop paused - waiting for resume...]".to_string(),
-                    pane_id,
-                });
-            }
-            thread::sleep(Duration::from_millis(500));
-            continue;
-        } else if was_paused {
-            was_paused = false;
-            let _ = output_tx.send(PaneOutput {
-                text: "[Deadloop resumed]".to_string(),
-                pane_id,
-            });
-        }
-
-        if let Some(last_started_at) = last_iteration_started_at {
-            // Event-driven wait: block until any watched project file
-            // changes after the wait-entry cursor OR the min-interval
-            // timer fires — whichever first. Replaces the pure-sleep
-            // loop that paid tokens on every cycle even when nothing
-            // had moved.
-            if let Some(wait_plan) =
-                deadloop_wait_plan(last_started_at, min_iteration_interval, Instant::now())
-            {
-                let _ = output_tx.send(PaneOutput {
-                    text: format!(
-                        "[Waiting for file change or {}s timeout (min interval: {}m)]",
-                        wait_plan.remaining.as_secs(),
-                        min_iteration_interval_minutes
-                    ),
-                    pane_id,
-                });
-                // Cursor must be NOW (entry to the wait), not
-                // last_started_at — otherwise the agent's own writes
-                // during the iteration just past
-                // (team-todo.md / .apas-team.jsonl mutations are this
-                // pane's job) count as "change after cursor" and wake
-                // the loop the instant it goes to sleep. That bug
-                // collapses the 15-minute min interval to ~0s and was
-                // the symptom of "the Tech Lead loops constantly".
-                let reason = file_watcher.wait_until(
-                    Some(wait_plan.cursor),
-                    wait_plan.remaining,
-                    &shutdown,
-                    &pause,
-                    &stop_requested,
-                );
-                match reason {
-                    crate::file_watcher::WakeReason::FileChanged { path, .. } => {
-                        let label = path
-                            .as_ref()
-                            .and_then(|p| p.file_name())
-                            .and_then(|n| n.to_str())
-                            .unwrap_or("(file)")
-                            .to_string();
-                        let _ = output_tx.send(PaneOutput {
-                            text: format!("[Wake: {} changed]", label),
-                            pane_id,
-                        });
-                    }
-                    crate::file_watcher::WakeReason::Shutdown => return,
-                    crate::file_watcher::WakeReason::Timeout => {
-                        // Either real timeout (proceed) or pause/stop
-                        // flipped (the loop top will handle it).
-                    }
-                }
-                if shutdown.load(Ordering::SeqCst) {
-                    return;
-                }
-                if stop_requested.load(Ordering::SeqCst) {
-                    let _ = event_tx.send(TuiEvent::FinalizeStopBot {
-                        pane_id,
-                        stop_flag: stop_requested.clone(),
-                    });
-                    return;
-                }
-                if pause.load(Ordering::SeqCst) {
-                    continue;
-                }
-            }
-        }
-
-        last_iteration_started_at = Some(Instant::now());
-        iteration += 1;
-        let _ = output_tx.send(PaneOutput {
-            text: format!("=== Iteration {} ===", iteration),
-            pane_id,
-        });
-
-        // Always use the original user-defined prompt so the agent retains
-        // the full task context across resume iterations.
-        let iteration_prompt = prompt;
-
-        let _ = server_tx.try_send(CliToServer::UserInput {
-            session_id,
-            text: format!("[Iteration {}]\n{}", iteration, iteration_prompt),
-            pane_type: Some(PaneType::Deadloop),
-            pane_id: Some(pane_id),
-        });
-
-        let _ = server_tx.try_send(CliToServer::PaneStatus {
-            session_id,
-            pane_type: PaneType::Deadloop,
-            pane_id: Some(pane_id),
-            status: Some("Thinking...".to_string()),
-        });
-
-        let (args, using_resume) = build_deadloop_agent_args(
-            provider,
-            &claude_session_id,
-            iteration_prompt,
-            model.as_deref(),
-            effort.as_deref(),
-            first_message,
-            try_resume_first,
-        );
-        if first_message && !try_resume_first {
-            first_message = false;
-        }
-
-        // Reap whatever child this pane spawned on the prior iteration
-        // BEFORE starting a new one. Codex `exec resume` does not exit on
-        // its own when apas decides the turn is done (apas reads the
-        // result marker on stdout, but codex may still be running a slow
-        // tool call). Without this reap the previous codex keeps running
-        // in the background, billing tokens against the user's quota,
-        // while we start another one on top — runaway codex usage was
-        // exactly this leak. SIGKILL the entire process group (deadloop
-        // spawns set pgid via pre_exec, so -pgid catches the agent's
-        // own children too), then wait() to fully release the zombie.
-        if let Ok(mut guard) = child_process.lock() {
-            if let Some(mut prior) = guard.take() {
-                let prior_pid = prior.id();
-                #[cfg(unix)]
-                unsafe {
-                    libc::kill(-(prior_pid as i32), libc::SIGKILL);
-                }
-                #[cfg(not(unix))]
-                {
-                    let _ = prior.kill();
-                }
-                let _ = prior.wait();
-                tracing::info!(
-                    pane_id,
-                    prior_pid,
-                    "Reaped prior deadloop agent child before starting new iteration",
-                );
-            }
-        }
-        // Defensive sweep for processes that escaped reap entirely
-        // (e.g., prior apas crash that lost its child_process handle).
-        // Matches by session id in argv; only catches current-session
-        // ids — codex's rotating thread_id can hide older orphans.
-        kill_processes_using_session(&claude_session_id.to_string());
-
-        let pane_env = match build_pane_env_overrides(provider, model.as_deref()) {
-            Ok(env) => {
-                last_env_err = None;
-                env
-            }
-            Err(err) => {
-                if last_env_err.as_deref() != Some(err.as_str()) {
-                    last_env_err = Some(err.clone());
-                    let err_msg = format!("[{}]", err);
-                    let _ = output_tx.send(PaneOutput {
-                        text: err_msg.clone(),
-                        pane_id,
-                    });
-                    let _ = server_tx.try_send(CliToServer::StreamMessage {
-                        session_id,
-                        message: shared::ClaudeStreamMessage::Result {
-                            subtype: "text".to_string(),
-                            result: err_msg,
-                            is_error: true,
-                            total_cost_usd: 0.0,
-                            duration_ms: 0,
-                            session_id: session_id.to_string(),
-                            extra: serde_json::Value::Null,
-                        },
-                        pane_type: Some(PaneType::Deadloop),
-                        pane_id: Some(pane_id),
-                    });
-                }
-                thread::sleep(Duration::from_secs(2));
-                continue;
-            }
-        };
-
-        let mut command = Command::new(binary_path);
-        command
-            .args(&args)
-            .current_dir(&effective_dir)
-            // Clear CLAUDECODE so Claude CLI doesn't refuse to start (nesting detection)
-            .env_remove("CLAUDECODE")
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        for (key, value) in &pane_env {
-            command.env(key, value);
-        }
-        spawn_in_own_process_group(&mut command);
-
-        match command.spawn() {
-            Ok(mut child) => {
-                let child_pid = child.id();
-                let stdout = match child.stdout.take() {
-                    Some(s) => s,
-                    None => {
-                        let _ = output_tx.send(PaneOutput {
-                            text: "[Error: Failed to capture stdout]".to_string(),
-                            pane_id,
-                        });
-                        thread::sleep(Duration::from_secs(5));
-                        continue;
-                    }
-                };
-                let stderr = child.stderr.take();
-
-                if let Ok(mut guard) = child_process.lock() {
-                    *guard = Some(child);
-                }
-
-                let (stdout_tx, stdout_rx) = mpsc::channel::<Option<String>>();
-                let stdout_thread = thread::spawn(move || {
-                    let reader = BufReader::new(stdout);
-                    for line in reader.lines() {
-                        match line {
-                            Ok(l) => {
-                                if stdout_tx.send(Some(l)).is_err() {
-                                    break;
-                                }
-                            }
-                            Err(_) => break,
-                        }
-                    }
-                    let _ = stdout_tx.send(None);
-                });
-
-                let output_tx_stderr = output_tx.clone();
-                let server_tx_stderr = server_tx.clone();
-                let stale_flag_for_stderr = stale_session_detected.clone();
-                let stderr_thread = stderr.map(|stderr| {
-                    thread::spawn(move || {
-                        let reader = BufReader::new(stderr);
-                        for line in reader.lines() {
-                            if let Ok(line) = line {
-                                if !line.trim().is_empty() {
-                                    // Detect codex's "the session id you
-                                    // gave me doesn't exist" signal so the
-                                    // main loop can mint a fresh id and
-                                    // retry instead of crashing forever.
-                                    // Covers both the older "no rollout
-                                    // found" phrasing and the JSON-RPC
-                                    // "thread/resume failed" prefix.
-                                    if is_codex_stale_session_error(&line) {
-                                        stale_flag_for_stderr.store(true, Ordering::SeqCst);
-                                    }
-                                    let _ = output_tx_stderr.send(PaneOutput {
-                                        text: format!("[stderr] {}", line),
-                                        pane_id,
-                                    });
-                                    let _ = server_tx_stderr.try_send(CliToServer::Output {
-                                        session_id,
-                                        data: format!("[stderr] {}", line),
-                                        output_type: shared::OutputType::Error,
-                                        pane_type: Some(PaneType::Deadloop),
-                                        pane_id: Some(pane_id),
-                                    });
-                                }
-                            }
-                        }
-                    })
-                });
-
-                let mut had_error = false;
-                let mut process_exited = false;
-                let mut exit_was_error = false;
-                let mut timeouts_after_exit = 0;
-                const MAX_TIMEOUTS_AFTER_EXIT: u32 = 10;
-                let check_interval = Duration::from_millis(500);
-
-                loop {
-                    if shutdown.load(Ordering::SeqCst) {
-                        break;
-                    }
-
-                    // Stop/pause requested mid-turn: kill this iteration's
-                    // agent now so a long-running (non-Claude) turn halts
-                    // immediately instead of running to completion. The loop
-                    // top re-checks both flags — pause blocks, stop finalizes.
-                    // Without this, "Stop team" / pause only took effect
-                    // between iterations, so an in-flight Codex turn kept
-                    // running and the worker appeared not to stop.
-                    if pause.load(Ordering::SeqCst) || stop_requested.load(Ordering::SeqCst) {
-                        let _ = output_tx.send(PaneOutput {
-                            text: "[Stop/pause requested - ending current turn]".to_string(),
-                            pane_id,
-                        });
-                        kill_process_group(child_pid);
-                        break;
-                    }
-
-                    if !process_exited {
-                        if let Ok(mut guard) = child_process.try_lock() {
-                            if let Some(ref mut child) = *guard {
-                                match child.try_wait() {
-                                    Ok(Some(status)) => {
-                                        process_exited = true;
-                                        if !status.success() {
-                                            let _ = output_tx.send(PaneOutput {
-                                                text: format!(
-                                                    "[Agent process exited with {}]",
-                                                    status
-                                                ),
-                                                pane_id,
-                                            });
-                                            exit_was_error = true;
-                                            had_error = true;
-                                        } else {
-                                            let _ = output_tx.send(PaneOutput {
-                                                text: "[Agent process exited normally]".to_string(),
-                                                pane_id,
-                                            });
-                                        }
-                                    }
-                                    Ok(None) => {}
-                                    Err(e) => {
-                                        let _ = output_tx.send(PaneOutput {
-                                            text: format!("[Error checking process status: {}]", e),
-                                            pane_id,
-                                        });
-                                    }
-                                }
-                            }
-                        }
-                    }
-
-                    let session_id_str = claude_session_id.to_string();
-                    match stdout_rx.recv_timeout(check_interval) {
-                        Ok(Some(line)) => {
-                            timeouts_after_exit = 0;
-                            if line.trim().is_empty() {
-                                continue;
-                            }
-
-                            // Capture Codex thread_id for session resume
-                            if *provider == Provider::Codex {
-                                if let Ok(codex_msg) =
-                                    serde_json::from_str::<CodexStreamMessage>(&line)
-                                {
-                                    if let CodexStreamMessage::ThreadStarted { thread_id } =
-                                        codex_msg
-                                    {
-                                        if let Ok(tid) = Uuid::parse_str(&thread_id) {
-                                            claude_session_id = tid;
-                                        }
-                                        continue;
-                                    }
-                                }
-                            }
-
-                            match parse_agent_output(provider, &line, &session_id_str) {
-                                Some(message) => {
-                                    let is_result =
-                                        matches!(message, ClaudeStreamMessage::Result { .. });
-                                    if let ClaudeStreamMessage::Result { is_error, .. } = &message {
-                                        if *is_error {
-                                            had_error = true;
-                                        }
-                                    }
-                                    let display_text = format_stream_message(&message);
-                                    let _ = output_tx.send(PaneOutput {
-                                        text: display_text,
-                                        pane_id,
-                                    });
-                                    let _ = server_tx.try_send(CliToServer::StreamMessage {
-                                        session_id,
-                                        message,
-                                        pane_type: Some(PaneType::Deadloop),
-                                        pane_id: Some(pane_id),
-                                    });
-                                    if is_result {
-                                        // Clear "Thinking..." as soon as the agent signals turn
-                                        // completion.
-                                        let _ = server_tx.try_send(CliToServer::PaneStatus {
-                                            session_id,
-                                            pane_type: PaneType::Deadloop,
-                                            pane_id: Some(pane_id),
-                                            status: None,
-                                        });
-                                        // Deadloop must iterate. Reap the agent + any
-                                        // background children it left running so the next
-                                        // iteration can start. (Interactive panes do NOT
-                                        // do this — see run_pane_session.)
-                                        kill_process_group(child_pid);
-                                    }
-                                }
-                                None => {
-                                    let _ = output_tx.send(PaneOutput {
-                                        text: line.clone(),
-                                        pane_id,
-                                    });
-                                    let _ = server_tx.try_send(CliToServer::Output {
-                                        session_id,
-                                        data: line,
-                                        output_type: shared::OutputType::Text,
-                                        pane_type: Some(PaneType::Deadloop),
-                                        pane_id: Some(pane_id),
-                                    });
-                                }
-                            }
-                        }
-                        Ok(None) => break,
-                        Err(mpsc::RecvTimeoutError::Timeout) => {
-                            if process_exited {
-                                timeouts_after_exit += 1;
-                                if timeouts_after_exit >= MAX_TIMEOUTS_AFTER_EXIT {
-                                    let _ = output_tx.send(PaneOutput {
-                                        text: if exit_was_error {
-                                            "[Process exited with error, restarting...]".to_string()
-                                        } else {
-                                            "[Process exited, restarting...]".to_string()
-                                        },
-                                        pane_id,
-                                    });
-                                    break;
-                                }
-                            }
-                        }
-                        Err(mpsc::RecvTimeoutError::Disconnected) => break,
-                    }
-                }
-
-                let _ = stdout_thread.join();
-                if let Some(handle) = stderr_thread {
-                    let stderr_timeout = thread::spawn(move || {
-                        let _ = handle.join();
-                    });
-                    thread::sleep(Duration::from_millis(500));
-                    drop(stderr_timeout);
-                }
-
-                if let Ok(mut guard) = child_process.lock() {
-                    if let Some(mut child) = guard.take() {
-                        match child.try_wait() {
-                            Ok(Some(_)) => {}
-                            Ok(None) => {
-                                let _ = output_tx.send(PaneOutput {
-                                    text: format!("[Killing stuck process {}]", child_pid),
-                                    pane_id,
-                                });
-                                let _ = child.kill();
-                                let _ = child.wait();
-                            }
-                            Err(_) => {
-                                let _ = child.kill();
-                                let _ = child.wait();
-                            }
-                        }
-                    }
-                }
-
-                let _ = server_tx.try_send(CliToServer::PaneStatus {
-                    session_id,
-                    pane_type: PaneType::Deadloop,
-                    pane_id: Some(pane_id),
-                    status: None,
-                });
-
-                if had_error || exit_was_error {
-                    // Stale-session recovery applies on ANY iteration —
-                    // codex's server can drop a thread mid-run (rollout
-                    // expiry, server-side wipe), not just at startup.
-                    // The stderr reader sets stale_session_detected on
-                    // "no rollout found" / "thread/resume failed".
-                    let stale = should_recover_deadloop_stale_session(
-                        stale_session_detected.swap(false, Ordering::SeqCst),
-                        first_message,
-                        using_resume,
-                        exit_was_error,
-                        had_error,
-                    );
-                    if stale {
-                        // Reset first_message so the next iteration takes
-                        // the "exec (no resume)" branch in build_agent_args.
-                        // Without this, the next turn can fall into the
-                        // "subsequent -> always resume" branch and try
-                        // exec resume on the just-minted id, which Codex
-                        // also does not know about.
-                        let old = reset_deadloop_codex_stale_session(
-                            &mut first_message,
-                            &mut try_resume_first,
-                            &mut claude_session_id,
-                            Uuid::new_v4(),
-                        );
-                        // Persist the fresh id straight into .apas so a
-                        // CLI reboot doesn't fall back to the dead one.
-                        // We don't have the full pane_metas / pane_pauses
-                        // Arcs in this scope, so change just this pane's
-                        // session_id under the project lock, leaving every
-                        // other pane and field as the file has them.
-                        if let Err(error) = crate::project_instances::update_pane(
-                            std::path::Path::new(working_dir),
-                            session_id,
-                            pane_id,
-                            |pane| pane.session_id = claude_session_id,
-                        ) {
-                            tracing::warn!(
-                                pane_id,
-                                %error,
-                                "could not record the fresh Codex session id in .apas"
-                            );
-                        }
-                        let _ = output_tx.send(PaneOutput {
-                            text: format!(
-                                "[Codex session {} is dead on the server; minted fresh id {} and will create a new thread next iteration]",
-                                &old.to_string()[..8],
-                                &claude_session_id.to_string()[..8],
-                            ),
-                            pane_id,
-                        });
-                        thread::sleep(Duration::from_secs(1));
-                    } else {
-                        thread::sleep(Duration::from_secs(2));
-                    }
-                } else {
-                    first_message = false;
-                    thread::sleep(Duration::from_secs(2));
-                }
-            }
-            Err(e) => {
-                let err_msg = format_spawn_error(provider, model.as_deref(), binary_path, &e);
-                let _ = output_tx.send(PaneOutput {
-                    text: err_msg.clone(),
-                    pane_id,
-                });
-                let _ = server_tx.try_send(CliToServer::PaneStatus {
-                    session_id,
-                    pane_type: PaneType::Deadloop,
-                    pane_id: Some(pane_id),
-                    status: None,
-                });
-                // Also notify web clients about the error
-                let _ = server_tx.try_send(CliToServer::StreamMessage {
-                    session_id,
-                    message: shared::ClaudeStreamMessage::Result {
-                        subtype: "text".to_string(),
-                        result: err_msg,
-                        is_error: true,
-                        total_cost_usd: 0.0,
-                        duration_ms: 0,
-                        session_id: session_id.to_string(),
-                        extra: serde_json::Value::Null,
-                    },
-                    pane_type: Some(PaneType::Deadloop),
-                    pane_id: Some(pane_id),
-                });
-                for _ in 0..5 {
-                    if shutdown.load(Ordering::SeqCst) || stop_requested.load(Ordering::SeqCst) {
-                        break;
-                    }
-                    thread::sleep(Duration::from_secs(1));
-                }
-            }
-        }
-    }
 }
 
 /// Check if claude code's on-disk session log exists for the given session
@@ -12286,64 +10066,6 @@ fn session_jsonl_exists(working_dir: &str, session_id: &Uuid) -> bool {
     session_jsonl_path(working_dir, session_id)
         .map(|p| p.exists())
         .unwrap_or(false)
-}
-
-#[derive(Debug, Clone)]
-struct DeadloopWatchdogState {
-    last_mtime: Option<std::time::SystemTime>,
-    last_activity: Instant,
-    last_nudge: Option<Instant>,
-}
-
-impl DeadloopWatchdogState {
-    fn new(now: Instant) -> Self {
-        Self {
-            last_mtime: None,
-            last_activity: now,
-            last_nudge: None,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DeadloopWatchdogDecision {
-    Noop,
-    Nudge { idle_minutes: u64 },
-}
-
-fn evaluate_deadloop_watchdog(
-    state: &mut DeadloopWatchdogState,
-    now: Instant,
-    idle_threshold: Duration,
-    session_mtime: Option<std::time::SystemTime>,
-    session_jsonl_path_known: bool,
-    supervisor_active: bool,
-) -> DeadloopWatchdogDecision {
-    if !supervisor_active || !session_jsonl_path_known {
-        return DeadloopWatchdogDecision::Noop;
-    }
-
-    if let Some(mtime) = session_mtime {
-        if state.last_mtime != Some(mtime) {
-            state.last_mtime = Some(mtime);
-            state.last_activity = now;
-            return DeadloopWatchdogDecision::Noop;
-        }
-    }
-
-    let idle = now.saturating_duration_since(state.last_activity);
-    let nudge_cooldown_over = state
-        .last_nudge
-        .map(|last_nudge| now.saturating_duration_since(last_nudge) >= idle_threshold)
-        .unwrap_or(true);
-    if idle >= idle_threshold && nudge_cooldown_over {
-        state.last_nudge = Some(now);
-        DeadloopWatchdogDecision::Nudge {
-            idle_minutes: idle.as_secs() / 60,
-        }
-    } else {
-        DeadloopWatchdogDecision::Noop
-    }
 }
 
 /// Per-pane background-task watcher for the streaming worker.
@@ -12831,23 +10553,11 @@ fn run_pane_session_streaming(
     // reads to recover claude's request_id + questions before pushing
     // the control_response.
     pending_questions: Arc<Mutex<HashMap<String, PendingAskQuestion>>>,
-    // effort_arc: live mirror of the pane's effort. spawn_loop re-reads
-    // this every iteration so a future respawn (process crash, /loop
-    // iteration, etc.) picks up the latest effort. The primary live-
-    // update path is the apply_flag_settings control_request — see the
-    // UpdatePaneEffort handler.
+    // Read the latest effort when a crashed provider respawns.
     effort_arc: Arc<Mutex<Option<String>>>,
-    // result_signal_tx: when Some, the stdout reader sends () on every
-    // Result event. Used by the deadloop driver to detect iteration
-    // boundary so it can throttle and re-inject the next prompt. None for
-    // plain interactive panes.
-    result_signal_tx: Option<mpsc::Sender<()>>,
-    // pane_type: tagged on every StreamMessage / PaneStatus / Output sent
-    // upstream so the server / web UI route correctly. Interactive for
-    // user-driven panes, Deadloop for the streaming-deadloop driver.
-    pane_type: PaneType,
 ) {
     use std::io::Write;
+    let pane_type = PaneType::Interactive;
 
     // effective_dir is what we pass to claude as cwd and what we use to
     // locate its session jsonl / background-task tmp dir. With no worktree
@@ -13122,7 +10832,6 @@ fn run_pane_session_streaming(
         let pane_type_reader = pane_type;
         let claude_session_id_str = claude_session_id.to_string();
         let reader_seen = seen_uuids.clone();
-        let reader_result_signal = result_signal_tx.clone();
         let reader_in_flight = in_flight_subagents.clone();
         let reader_thinking = thinking.clone();
         let reader_watched = watched_tasks.clone();
@@ -13347,12 +11056,6 @@ fn run_pane_session_streaming(
                                 pane_id = pane_id_reader,
                                 "streaming pane fully idle (parent done, all subagents done)",
                             );
-                            // Notify the deadloop driver (if attached) and
-                            // unblock the inner-loop input gate so any
-                            // pending user prompts can be flushed.
-                            if let Some(ref tx) = reader_result_signal {
-                                let _ = tx.send(());
-                            }
                         }
                     }
                     None => {
@@ -13694,324 +11397,6 @@ fn run_pane_session_streaming(
     }
 }
 
-/// Streaming variant for `Provider::Claude` deadloop panes (a.k.a. bots).
-///
-/// **Agent-driven via `/loop`**: rather than apas firing iteration prompts
-/// on a fixed timer, we kick off claude code's built-in `/loop` skill once
-/// at startup and let claude pace itself via `ScheduleWakeup`. The runtime
-/// fires the next iteration internally on the agent's chosen schedule
-/// (verified to work in `--print --input-format stream-json` mode by the
-/// /loop spike). When the agent has bg work in flight it can extend the
-/// next-wake delay; when it's truly done it can stop calling
-/// ScheduleWakeup, ending the loop naturally.
-///
-/// Driver responsibilities:
-///   * Send `/loop <prompt>` once on the streaming worker's `input_tx`
-///   * Watch `shutdown` / `stop_requested` / `pause` and react
-///   * On `stop_requested`: send a soft control_request via the streaming
-///     worker's interrupt channel (aborts the current turn AND cancels any
-///     pending ScheduleWakeup), drop input_tx so the worker tears down,
-///     fire FinalizeStopBot to flip the pane back to interactive mode
-///
-/// Codex bots keep the legacy per-iteration `--print` driver below.
-#[allow(clippy::too_many_arguments)]
-fn run_deadloop_session_streaming(
-    binary_path: &str,
-    working_dir: &str,
-    worktree_path: Option<String>,
-    system_prompt: Option<String>,
-    plan_review_mode_arc: Arc<Mutex<shared::PlanReviewMode>>,
-    pending_plan_reviews: Arc<Mutex<HashMap<String, PendingPlanReview>>>,
-    session_id: Uuid,
-    claude_session_id: Uuid,
-    pane_id: u32,
-    prompt: &str,
-    model: Option<String>,
-    effort: Option<String>,
-    min_iteration_interval_minutes: u64,
-    provider: &Provider,
-    output_tx: mpsc::Sender<PaneOutput>,
-    server_tx: tokio_mpsc::Sender<CliToServer>,
-    shutdown: Arc<AtomicBool>,
-    pause: Arc<AtomicBool>,
-    stop_requested: Arc<AtomicBool>,
-    child_process: Arc<Mutex<Option<std::process::Child>>>,
-    event_tx: mpsc::Sender<TuiEvent>,
-    interrupt_tx_slot: Arc<Mutex<Option<mpsc::Sender<()>>>>,
-    control_response_tx_slot: Arc<Mutex<Option<mpsc::Sender<String>>>>,
-    pending_questions: Arc<Mutex<HashMap<String, PendingAskQuestion>>>,
-    effort_arc: Arc<Mutex<Option<String>>>,
-    // Bugfix: register the local input_tx here so web/TUI input can
-    // reach a running deadloop pane. Pre-fix, deadloop input_tx lived
-    // only inside this function and external input hit "Pane worker
-    // unavailable; restart requested. Please resend." every time.
-    input_channels: InputChannels,
-    // Currently unused on the streaming path — the agent self-paces
-    // via its own ScheduleWakeup tool, so we don't drive the wait
-    // here. Kept in the signature for parity with the codex path; can
-    // be wired in if/when the streaming driver gains a between-turn
-    // wait we control.
-    file_watcher: Arc<crate::file_watcher::ProjectFileWatcher>,
-) {
-    let _ = file_watcher; // see note above
-    let _ = output_tx.send(PaneOutput {
-        text: format!(
-            "[Streaming /loop deadloop session: {}]",
-            &claude_session_id.to_string()[..8]
-        ),
-        pane_id,
-    });
-
-    let (input_tx, input_rx) = mpsc::channel::<PaneInput>();
-    // Register so external input flows here as if the deadloop were
-    // an interactive pane. The streaming worker writes everything from
-    // input_rx onto claude's stdin, so external input becomes another
-    // turn for the running /loop — the agent picks it up between its
-    // self-paced iterations.
-    {
-        let mut channels = input_channels.lock().unwrap();
-        channels.insert(pane_id, input_tx.clone());
-    }
-
-    // Spawn the streaming worker. It keeps claude alive; we kick off /loop
-    // exactly once and the runtime self-paces from there. We pass
-    // `result_signal_tx = None` because we don't gate on iterations — the
-    // agent picks its own cadence via ScheduleWakeup.
-    {
-        let binary_path = binary_path.to_string();
-        let working_dir = working_dir.to_string();
-        let worktree_path = worktree_path.clone();
-        let system_prompt = system_prompt.clone();
-        let plan_review_mode_arc_clone = plan_review_mode_arc.clone();
-        let pending_plan_reviews_clone = pending_plan_reviews.clone();
-        let model = model.clone();
-        let effort = effort.clone();
-        let provider = *provider;
-        let output_tx = output_tx.clone();
-        let server_tx = server_tx.clone();
-        let shutdown = shutdown.clone();
-        let child_process = child_process.clone();
-        let interrupt_tx_slot = interrupt_tx_slot.clone();
-        let control_response_tx_slot = control_response_tx_slot.clone();
-        let pending_questions = pending_questions.clone();
-        let effort_arc = effort_arc.clone();
-        thread::spawn(move || {
-            run_pane_session_streaming(
-                &binary_path,
-                &working_dir,
-                worktree_path,
-                system_prompt,
-                plan_review_mode_arc_clone,
-                pending_plan_reviews_clone,
-                session_id,
-                claude_session_id,
-                pane_id,
-                &provider,
-                model,
-                effort,
-                input_rx,
-                output_tx,
-                server_tx,
-                shutdown,
-                child_process,
-                interrupt_tx_slot,
-                control_response_tx_slot,
-                pending_questions,
-                effort_arc,
-                None, // no iteration gating; /loop runtime self-paces
-                PaneType::Deadloop,
-            );
-        });
-    }
-
-    // Kick off `/loop`. The runtime keeps re-firing the prompt on the
-    // schedule the agent dictates via ScheduleWakeup — no further action
-    // from this thread. `min_iteration_interval_minutes` is communicated
-    // to the agent in the wrapper so it can pick a sensible cadence
-    // (the runtime also enforces a ~120s floor independently).
-    let loop_cadence_hint = if min_iteration_interval_minutes > 0 {
-        format!(
-            "Iterate at roughly {}-minute cadence. Use ScheduleWakeup with delaySeconds={} between iterations, or longer if background work needs more time. ",
-            min_iteration_interval_minutes,
-            min_iteration_interval_minutes.saturating_mul(60),
-        )
-    } else {
-        String::new()
-    };
-    let loop_input = format!("/loop {}{}", loop_cadence_hint, prompt);
-    let _ = output_tx.send(PaneOutput {
-        text: format!(
-            "[Bot started in /loop mode (agent-paced); cadence hint: {}m]",
-            min_iteration_interval_minutes
-        ),
-        pane_id,
-    });
-    let _ = server_tx.try_send(CliToServer::UserInput {
-        session_id,
-        text: loop_input.clone(),
-        pane_type: Some(PaneType::Deadloop),
-        pane_id: Some(pane_id),
-    });
-    if input_tx.send((loop_input, false)).is_err() {
-        let _ = output_tx.send(PaneOutput {
-            text: "[Streaming worker exited before /loop kickoff; deadloop ending.]".to_string(),
-            pane_id,
-        });
-        return;
-    }
-
-    // Sit and watch shutdown / stop / pause. The /loop runtime drives
-    // claude on its own; we don't fire any further prompts — EXCEPT the
-    // watchdog below.
-    //
-    // Watchdog: the agent-paced design has a single point of failure.
-    // The agent calls ScheduleWakeup and we trust claude-code's /loop
-    // runtime to fire it; in the wild that timer has been observed to
-    // die silently (wakeup accepted at 06:28, due 06:38, never fired —
-    // child alive but dormant for 11h, zero session-jsonl writes, no
-    // error anywhere). Since we deliberately don't gate iterations, no
-    // one notices. So: watch the session jsonl's mtime as the activity
-    // signal (claude appends every event while working OR when a
-    // wakeup fires) and, if the pane has been dead-quiet well past its
-    // cadence, push a resume prompt through the pane's own input
-    // channel — it lands on claude's stdin as a user turn and the
-    // /loop picks it back up.
-    //
-    // Threshold: 3× cadence, floor 30 min. ScheduleWakeup legitimately
-    // sleeps up to 60 min, so a long-sleeping agent may get nudged
-    // ~half an hour early — that just runs an iteration sooner (an
-    // "Idle; waiting" no-op at worst), which is a far better failure
-    // mode than the hours-long stalls a lost wakeup causes.
-    let watchdog_jsonl = session_jsonl_path(
-        worktree_path.as_deref().unwrap_or(working_dir),
-        &claude_session_id,
-    );
-    let idle_threshold = Duration::from_secs(
-        std::cmp::max(min_iteration_interval_minutes.saturating_mul(3), 30) * 60,
-    );
-    let mut watchdog_state = DeadloopWatchdogState::new(Instant::now());
-    let mut watchdog_tick: u32 = 0;
-
-    let mut was_paused = false;
-    while !shutdown.load(Ordering::SeqCst) {
-        if stop_requested.load(Ordering::SeqCst) {
-            // Soft interrupt: aborts the current turn and (we expect) the
-            // pending ScheduleWakeup. Then drop input_tx so the streaming
-            // worker tears down — FinalizeStopBot will rebuild the pane
-            // worker as plain interactive mode.
-            if let Some(tx) = interrupt_tx_slot
-                .lock()
-                .ok()
-                .and_then(|g| g.as_ref().cloned())
-            {
-                let _ = tx.send(());
-            }
-            let _ = output_tx.send(PaneOutput {
-                text: "[Bot stop requested — interrupting /loop and finalizing.]".to_string(),
-                pane_id,
-            });
-            let _ = event_tx.send(TuiEvent::FinalizeStopBot {
-                pane_id,
-                stop_flag: stop_requested.clone(),
-            });
-            return;
-        }
-
-        // Pause for streaming /loop bots: there's no way to ask claude
-        // "wait" mid-run, so we treat pause as "abort the current turn,
-        // reap the process, and tear down this supervisor." The pane
-        // stays in Deadloop mode with child_process cleared; ResumePane
-        // fires a fresh StartBot which spins up claude again with the
-        // saved prompt (and --resume claude_session_id so context is
-        // preserved). Previously this branch just logged a note and let
-        // the loop continue, which made Pause functionally a no-op.
-        if pause.load(Ordering::SeqCst) {
-            if !was_paused {
-                was_paused = true;
-                if let Some(tx) = interrupt_tx_slot
-                    .lock()
-                    .ok()
-                    .and_then(|g| g.as_ref().cloned())
-                {
-                    let _ = tx.send(());
-                }
-                {
-                    let mut channels = input_channels.lock().unwrap();
-                    channels.remove(&pane_id);
-                }
-                if let Ok(mut child_guard) = child_process.lock() {
-                    if let Some(child) = child_guard.take() {
-                        let mut child = child;
-                        let _ = child.kill();
-                        let _ = child.wait();
-                    }
-                }
-                let _ = output_tx.send(PaneOutput {
-                    text: "[Bot paused — interrupted /loop and reaped claude. Click Resume to restart with the saved session.]".to_string(),
-                    pane_id,
-                });
-            }
-            return;
-        }
-
-        // Watchdog check every ~30s (loop ticks at 1s).
-        watchdog_tick += 1;
-        if watchdog_tick >= 30 {
-            watchdog_tick = 0;
-            let now = Instant::now();
-            let session_mtime = watchdog_jsonl
-                .as_ref()
-                .and_then(|p| std::fs::metadata(p).ok())
-                .and_then(|m| m.modified().ok());
-            if let DeadloopWatchdogDecision::Nudge { idle_minutes } = evaluate_deadloop_watchdog(
-                &mut watchdog_state,
-                now,
-                idle_threshold,
-                session_mtime,
-                watchdog_jsonl.is_some(),
-                true,
-            ) {
-                tracing::warn!(
-                    pane_id,
-                    idle_minutes,
-                    "watchdog: /loop pane silent past threshold — nudging agent"
-                );
-                let nudge = format!(
-                    "[watchdog] No pane activity for {} minutes — the scheduled /loop wakeup appears to have been lost. \
-                     Resume the loop now: run the next iteration per the original /loop instructions, then schedule the next wakeup as usual.",
-                    idle_minutes
-                );
-                let _ = output_tx.send(PaneOutput {
-                    text: format!(
-                        "[Watchdog: no activity for {}m — nudging stalled /loop]",
-                        idle_minutes
-                    ),
-                    pane_id,
-                });
-                let _ = server_tx.try_send(CliToServer::UserInput {
-                    session_id,
-                    text: nudge.clone(),
-                    pane_type: Some(PaneType::Deadloop),
-                    pane_id: Some(pane_id),
-                });
-                if input_tx.send((nudge, false)).is_err() {
-                    // Streaming worker is gone; nothing to nudge. The
-                    // inner worker normally respawns claude itself, so
-                    // a dead channel means the pane is being torn down.
-                    let _ = output_tx.send(PaneOutput {
-                        text:
-                            "[Watchdog: streaming worker gone — cannot nudge; pane needs a Reboot.]"
-                                .to_string(),
-                        pane_id,
-                    });
-                }
-            }
-        }
-
-        thread::sleep(Duration::from_secs(1));
-    }
-}
-
 /// Run a generic interactive pane session.
 /// Input comes from a single channel — both TUI and web input are routed through input_channels.
 #[allow(clippy::too_many_arguments)]
@@ -14069,8 +11454,6 @@ fn run_pane_session(
             control_response_tx_slot,
             pending_questions,
             effort_arc,
-            None, // no deadloop driver listening for Result events
-            PaneType::Interactive,
         );
     }
     let _ = plan_review_mode_arc; // non-claude legacy path doesn't gate
@@ -14182,7 +11565,6 @@ fn run_pane_session(
         // never reaped, or a parallel pane assigned the same id), kill it
         // before spawning a new --resume. Two concurrent --resume processes
         // on the same session would interleave writes to its .jsonl.
-        // Mirrors the deadloop spawn path.
         kill_processes_using_session(&claude_session_id.to_string());
 
         let mut command = Command::new(binary_path);
@@ -15147,6 +12529,13 @@ async fn run_server_connection(
                             match msg {
                                 Some(Ok(Message::Text(text))) => {
                                     if let Ok(server_msg) = serde_json::from_str::<ServerToCli>(&text) {
+                                        if let Some(pane_id) = retired_bot_request_target(&server_msg, &pane_metas) {
+                                            report_retired_launch_rejection(
+                                                &status_tx, &mut ws_sender, session_id,
+                                                pane_id, LEGACY_BOT_RETIRED,
+                                            ).await;
+                                            continue;
+                                        }
                                         match server_msg {
                                             ServerToCli::GeneratePaneWorkSummary { job } => {
                                                 if job.session_id != session_id {
@@ -15362,16 +12751,9 @@ async fn run_server_connection(
                                                             pane_id = target_pane,
                                                             "Missing input channel for pane; requesting pane worker recreation"
                                                         );
-                                                        // Only replay automatically for interactive panes —
-                                                        // the AddTabWithConfig handler's deadloop branch
-                                                        // can't route initial_input anywhere useful.
-                                                        let is_interactive = !matches!(meta.mode, shared::PaneMode::Deadloop);
-                                                        let queued = if is_interactive {
-                                                            replayed = true;
-                                                            buffered_input.take()
-                                                        } else {
-                                                            None
-                                                        };
+                                                        // Historical bots were rejected before routing.
+                                                        replayed = true;
+                                                        let queued = buffered_input.take();
                                                         let _ = tui_event_tx.send(TuiEvent::AddTabWithConfig {
                                                             pane_id: target_pane,
                                                             label: meta.label,
@@ -15464,190 +12846,28 @@ async fn run_server_connection(
                                                 }
                                             }
                                             ServerToCli::Heartbeat => {}
-                                            ServerToCli::PauseDeadloop { .. } => {
-                                                // Legacy: pause the default deadloop pane
-                                                if let Ok(pauses) = pane_pauses.lock() {
-                                                    if let Some(flag) = pauses.get(&shared::PANE_ID_DEADLOOP) {
-                                                        flag.store(true, Ordering::SeqCst);
-                                                    }
-                                                }
-                                                let _ = status_tx.send(PaneOutput {
-                                                    text: "[Pause command received from web]".to_string(),
-                                                    pane_id: shared::PANE_ID_DEADLOOP,
-                                                });
-                                                persist_legacy_deadloop_pause(&store, &pane_metas, true);
-                                                let status_msg = CliToServer::DeadloopStatus { session_id, is_paused: true };
-                                                let msg_text = serde_json::to_string(&status_msg).unwrap_or_default();
-                                                let _ = ws_sender.send(Message::Text(msg_text.into())).await;
-                                                let pane_msg = CliToServer::PanePaused { session_id, pane_id: shared::PANE_ID_DEADLOOP, is_paused: true };
-                                                let msg_text = serde_json::to_string(&pane_msg).unwrap_or_default();
-                                                let _ = ws_sender.send(Message::Text(msg_text.into())).await;
+                                            ServerToCli::PauseDeadloop { .. }
+                                            | ServerToCli::ResumeDeadloop { .. } => {
+                                                report_retired_launch_rejection(
+                                                    &status_tx, &mut ws_sender, session_id,
+                                                    shared::PANE_ID_DEADLOOP, LEGACY_BOT_RETIRED,
+                                                ).await;
                                             }
-                                            ServerToCli::ResumeDeadloop { .. } => {
-                                                // Legacy: resume the default deadloop pane
-                                                let retired = pane_metas
-                                                    .lock()
-                                                    .ok()
-                                                    .and_then(|panes| panes.get(&shared::PANE_ID_DEADLOOP).cloned())
-                                                    .is_some_and(|pane| shared::is_retired_launch(
-                                                        pane.provider,
-                                                        pane.model.as_deref(),
-                                                    ));
-                                                if retired {
-                                                    report_retired_launch_rejection(
-                                                        &status_tx,
-                                                        &mut ws_sender,
-                                                        session_id,
-                                                        shared::PANE_ID_DEADLOOP,
-                                                        "[Resume refused — unsupported provider has been retired]",
-                                                    )
-                                                    .await;
-                                                    continue;
-                                                }
-                                                if let Ok(pauses) = pane_pauses.lock() {
-                                                    if let Some(flag) = pauses.get(&shared::PANE_ID_DEADLOOP) {
-                                                        flag.store(false, Ordering::SeqCst);
-                                                    }
-                                                }
-                                                let _ = status_tx.send(PaneOutput {
-                                                    text: "[Resume command received from web]".to_string(),
-                                                    pane_id: shared::PANE_ID_DEADLOOP,
-                                                });
-                                                persist_legacy_deadloop_pause(&store, &pane_metas, false);
-                                                let status_msg = CliToServer::DeadloopStatus { session_id, is_paused: false };
-                                                let msg_text = serde_json::to_string(&status_msg).unwrap_or_default();
-                                                let _ = ws_sender.send(Message::Text(msg_text.into())).await;
-                                                let pane_msg = CliToServer::PanePaused { session_id, pane_id: shared::PANE_ID_DEADLOOP, is_paused: false };
-                                                let msg_text = serde_json::to_string(&pane_msg).unwrap_or_default();
-                                                let _ = ws_sender.send(Message::Text(msg_text.into())).await;
-                                            }
-                                            ServerToCli::PausePane { session_id: _, pane_id: target_pane } => {
-                                                if let Ok(pauses) = pane_pauses.lock() {
-                                                    if let Some(flag) = pauses.get(&target_pane) {
-                                                        flag.store(true, Ordering::SeqCst);
-                                                    }
-                                                }
-                                                let _ = status_tx.send(PaneOutput {
-                                                    text: format!("[Pane {} paused from web]", target_pane),
-                                                    pane_id: target_pane,
-                                                });
-                                                // Persist so a CLI reboot restores this pane as paused
-                                                // — without this, managed workers would respawn on boot.
-                                                save_pane_configs(
-                                                    &store,
-                                                    &pane_sessions,
-                                                    &pane_metas,
-                                                    &pane_pauses,
-                                                    &pane_stop_requests,
-                                                );
-                                                let pane_msg = CliToServer::PanePaused { session_id, pane_id: target_pane, is_paused: true };
-                                                let msg_text = serde_json::to_string(&pane_msg).unwrap_or_default();
-                                                let _ = ws_sender.send(Message::Text(msg_text.into())).await;
-                                                // Legacy compat: also send DeadloopStatus for pane 1 and
-                                                // keep the legacy `metadata.is_paused` flag in sync since
-                                                // the boot path ORs it with `pane.is_paused` for pane 1.
-                                                if target_pane == shared::PANE_ID_DEADLOOP {
-                                                    persist_legacy_deadloop_pause(&store, &pane_metas, true);
-                                                    let status_msg = CliToServer::DeadloopStatus { session_id, is_paused: true };
-                                                    let msg_text = serde_json::to_string(&status_msg).unwrap_or_default();
-                                                    let _ = ws_sender.send(Message::Text(msg_text.into())).await;
-                                                }
-                                            }
-                                            ServerToCli::ResumePane { session_id: _, pane_id: target_pane } => {
-                                                let retired = pane_metas
-                                                    .lock()
-                                                    .ok()
-                                                    .and_then(|panes| panes.get(&target_pane).cloned())
-                                                    .is_some_and(|pane| shared::is_retired_launch(
-                                                        pane.provider,
-                                                        pane.model.as_deref(),
-                                                    ));
-                                                if retired {
-                                                    report_retired_launch_rejection(
-                                                        &status_tx,
-                                                        &mut ws_sender,
-                                                        session_id,
-                                                        target_pane,
-                                                        "[Resume refused — unsupported provider has been retired]",
-                                                    )
-                                                    .await;
-                                                    continue;
-                                                }
-                                                let allowed = pane_metas
-                                                    .lock()
-                                                    .ok()
-                                                    .and_then(|panes| panes.get(&target_pane).cloned())
-                                                    .is_some_and(|pane| {
-                                                        existing_pane_relaunch_allowed()
-                                                    });
-                                                if !allowed {
-                                                    let _ = status_tx.send(PaneOutput {
-                                                        text: "[Resume refused by the current cluster policy]".to_string(),
-                                                        pane_id: target_pane,
-                                                    });
-                                                    continue;
-                                                }
-                                                if let Ok(pauses) = pane_pauses.lock() {
-                                                    if let Some(flag) = pauses.get(&target_pane) {
-                                                        flag.store(false, Ordering::SeqCst);
-                                                    }
-                                                }
-                                                let _ = status_tx.send(PaneOutput {
-                                                    text: format!("[Pane {} resumed from web]", target_pane),
-                                                    pane_id: target_pane,
-                                                });
-                                                save_pane_configs(
-                                                    &store,
-                                                    &pane_sessions,
-                                                    &pane_metas,
-                                                    &pane_pauses,
-                                                    &pane_stop_requests,
-                                                );
-                                                let pane_msg = CliToServer::PanePaused { session_id, pane_id: target_pane, is_paused: false };
-                                                let msg_text = serde_json::to_string(&pane_msg).unwrap_or_default();
-                                                let _ = ws_sender.send(Message::Text(msg_text.into())).await;
-                                                // Legacy compat: clear `metadata.is_paused` and emit
-                                                // DeadloopStatus when pane 1 resumes.
-                                                if target_pane == shared::PANE_ID_DEADLOOP {
-                                                    persist_legacy_deadloop_pause(&store, &pane_metas, false);
-                                                    let status_msg = CliToServer::DeadloopStatus { session_id, is_paused: false };
-                                                    let msg_text = serde_json::to_string(&status_msg).unwrap_or_default();
-                                                    let _ = ws_sender.send(Message::Text(msg_text.into())).await;
-                                                }
-                                                // Resume a paused deadloop: if the pane is still in
-                                                // Deadloop mode but its child_process has been
-                                                // cleared (the supervisor's pause path reaps claude
-                                                // and exits), spin a fresh worker via StartBot. With
-                                                // no fields set, StartBot reuses the prompt / model /
-                                                // effort / cadence saved in pane_metas, and the
-                                                // existing claude_session_id keeps context.
-                                                let needs_restart = {
-                                                    if let Ok(metas) = pane_metas.lock() {
-                                                        if let Some(meta) = metas.get(&target_pane) {
-                                                            meta.mode == shared::PaneMode::Deadloop
-                                                                && meta
-                                                                    .child_process
-                                                                    .lock()
-                                                                    .ok()
-                                                                    .map(|g| g.is_none())
-                                                                    .unwrap_or(false)
-                                                        } else {
-                                                            false
-                                                        }
-                                                    } else {
-                                                        false
-                                                    }
-                                                };
-                                                if needs_restart {
-                                                    let _ = tui_event_tx.send(TuiEvent::StartBot {
-                                                        pane_id: target_pane,
-                                                        prompt: None,
-                                                        min_iteration_interval_minutes: None,
-                                                        effort: None,
-                                                    });
-                                                }
+                                            ServerToCli::PausePane { pane_id: target_pane, .. }
+                                            | ServerToCli::ResumePane { pane_id: target_pane, .. } => {
+                                                report_retired_launch_rejection(
+                                                    &status_tx, &mut ws_sender, session_id,
+                                                    target_pane, LEGACY_BOT_RETIRED,
+                                                ).await;
                                             }
                                             ServerToCli::AddPane { session_id: _, pane_config, isolated_worktree, initial_input } => {
+                                                if pane_config.mode == shared::PaneMode::Deadloop {
+                                                    report_retired_launch_rejection(
+                                                        &status_tx, &mut ws_sender, session_id,
+                                                        pane_config.pane_id, LEGACY_BOT_RETIRED,
+                                                    ).await;
+                                                    continue;
+                                                }
                                                 if shared::is_retired_launch(
                                                     pane_config.provider,
                                                     pane_config.model.as_deref(),
@@ -15974,38 +13194,11 @@ async fn run_server_connection(
                                                     cleanup_action,
                                                 });
                                             }
-                                            ServerToCli::StartBot {
-                                                session_id: _,
-                                                pane_id: target_pane,
-                                                prompt: bot_prompt,
-                                                min_iteration_interval_minutes,
-                                                effort,
-                                            } => {
-                                                let retired = pane_metas
-                                                    .lock()
-                                                    .ok()
-                                                    .and_then(|panes| panes.get(&target_pane).cloned())
-                                                    .is_some_and(|pane| shared::is_retired_launch(
-                                                        pane.provider,
-                                                        pane.model.as_deref(),
-                                                    ));
-                                                if retired {
-                                                    report_retired_launch_rejection(
-                                                        &status_tx,
-                                                        &mut ws_sender,
-                                                        session_id,
-                                                        target_pane,
-                                                        "[Start refused — unsupported provider has been retired]",
-                                                    )
-                                                    .await;
-                                                    continue;
-                                                }
-                                                let _ = tui_event_tx.send(TuiEvent::StartBot {
-                                                    pane_id: target_pane,
-                                                    prompt: bot_prompt,
-                                                    min_iteration_interval_minutes,
-                                                    effort,
-                                                });
+                                            ServerToCli::StartBot { pane_id: target_pane, .. } => {
+                                                report_retired_launch_rejection(
+                                                    &status_tx, &mut ws_sender, session_id,
+                                                    target_pane, LEGACY_BOT_RETIRED,
+                                                ).await;
                                             }
                                             ServerToCli::StopBot { session_id: _, pane_id: target_pane } => {
                                                 let _ = tui_event_tx.send(TuiEvent::StopBot {

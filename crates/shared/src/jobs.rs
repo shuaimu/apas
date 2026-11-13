@@ -24,6 +24,8 @@ pub enum JobState {
     Verifying,
     Publishing,
     ReviewReady,
+    /// Successful read-only worker inspection; never evidence of code delivery.
+    Completed,
     Blocked,
     RecoveryRequired,
     Cancelling,
@@ -33,7 +35,10 @@ pub enum JobState {
 
 impl JobState {
     pub fn is_terminal(self) -> bool {
-        matches!(self, Self::ReviewReady | Self::Cancelled | Self::Failed)
+        matches!(
+            self,
+            Self::ReviewReady | Self::Completed | Self::Cancelled | Self::Failed
+        )
     }
 }
 
@@ -137,6 +142,8 @@ pub struct JobPolicy {
     pub max_active_machine: u32,
     pub max_active_cluster: u32,
     pub max_queued_project: u32,
+    #[serde(default)]
+    pub recurring: crate::workers::RecurringWorkerPolicy,
 }
 
 impl Default for JobPolicy {
@@ -152,6 +159,7 @@ impl Default for JobPolicy {
             max_active_machine: 1,
             max_active_cluster: 1,
             max_queued_project: 32,
+            recurring: crate::workers::RecurringWorkerPolicy::default(),
         }
     }
 }
@@ -169,6 +177,7 @@ pub struct JobPolicyOverride {
     pub max_active_machine: Option<u32>,
     pub max_active_cluster: Option<u32>,
     pub max_queued_project: Option<u32>,
+    pub recurring: Option<crate::workers::RecurringWorkerPolicy>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -290,6 +299,8 @@ pub struct JobTaskSpec {
     pub verification_profile: String,
     pub verification_profile_digest: String,
     pub model_profile: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker: Option<crate::workers::WorkerExecutionContext>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -773,6 +784,14 @@ pub enum JobWorkerReport {
     Settled {
         identity: JobRunIdentity,
         source_seq: u64,
+        usage: JobUsage,
+    },
+    /// A stopped execution's proposed durable checkpoint, not verified delivery.
+    WorkerResult {
+        identity: JobRunIdentity,
+        source_seq: u64,
+        result: crate::workers::WorkerResult,
+        evidence: JobStopEvidence,
         usage: JobUsage,
     },
     Stopped {

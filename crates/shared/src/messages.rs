@@ -1021,7 +1021,9 @@ impl ServerToCli {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum DaemonToServer {
     /// Capability-gated reports from the independent autonomous job host.
-    AutonomousJob { report: crate::jobs::JobWorkerReport },
+    AutonomousJob {
+        report: crate::jobs::JobWorkerReport,
+    },
 
     /// Daemon registers with the server using auth token + machine info
     Register {
@@ -1108,7 +1110,9 @@ pub enum DaemonToServer {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerToDaemon {
     /// Never sent to a daemon without `omp_job_worker_v1`.
-    AutonomousJob { command: crate::jobs::JobWorkerCommand },
+    AutonomousJob {
+        command: crate::jobs::JobWorkerCommand,
+    },
 
     /// Registration successful
     Registered {
@@ -1288,12 +1292,22 @@ pub enum MobileTelemetryEvent {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum WebToServer {
+    SubscribeWorker {
+        project_id: String,
+        worker_id: Uuid,
+        after_seq: u64,
+    },
+    UnsubscribeWorker {
+        worker_id: Uuid,
+    },
     SubscribeJob {
         project_id: String,
         job_id: Uuid,
         after_seq: u64,
     },
-    UnsubscribeJob { job_id: Uuid },
+    UnsubscribeJob {
+        job_id: Uuid,
+    },
 
     /// Authenticate with JWT token
     Authenticate {
@@ -1315,13 +1329,19 @@ pub enum WebToServer {
     ListMachines,
 
     /// Start a new session (optionally specify CLI client)
-    StartSession { cli_client_id: Option<Uuid> },
+    StartSession {
+        cli_client_id: Option<Uuid>,
+    },
 
     /// Resume an existing session
-    ResumeSession { session_id: Uuid },
+    ResumeSession {
+        session_id: Uuid,
+    },
 
     /// Attach to observe an existing CLI session (hybrid mode)
-    AttachSession { session_id: Uuid },
+    AttachSession {
+        session_id: Uuid,
+    },
 
     /// User input to send to Claude.
     /// When `session_id` is set, the server routes to that exact session
@@ -1737,7 +1757,9 @@ pub enum WebToServer {
     /// per-machine, and a machine running nothing has no project to route
     /// through. Restarting a daemon does not disturb the projects, panes, or
     /// agents on that host — the daemon owns no long-lived children.
-    RebootDaemon { machine_id: Uuid },
+    RebootDaemon {
+        machine_id: Uuid,
+    },
 
     /// Create a brand-new project instance under a repo on a chosen machine:
     /// the daemon clones `clone_url` into `~/apas_projects/<instance_name>`
@@ -1988,7 +2010,10 @@ pub enum WebToServer {
     /// Server replies `ServerToWeb::TerminalSnapshot` from its in-memory
     /// ring buffer; no CLI round-trip, so reattach is instant and works
     /// even while the CLI is mid-reconnect.
-    TerminalAttach { session_id: Uuid, pane_id: u32 },
+    TerminalAttach {
+        session_id: Uuid,
+        pane_id: u32,
+    },
 
     /// Fetch cached summaries and reconcile retained source for one pane.
     ListPaneWorkSummaries {
@@ -2008,7 +2033,9 @@ pub enum WebToServer {
 
     /// Redacted native/WebView health event. Accepted only from an
     /// authenticated mobile device session.
-    MobileTelemetry { event: MobileTelemetryEvent },
+    MobileTelemetry {
+        event: MobileTelemetryEvent,
+    },
 
     /// Liveness probe from the browser. Server echoes
     /// `ServerToWeb::Heartbeat` so the client can detect silently-stale
@@ -2124,8 +2151,27 @@ pub enum AddPaneStatus {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerToWeb {
-    JobSnapshot { detail: crate::jobs::JobDetail },
-    JobEvent { event: crate::jobs::JobEvent },
+    // Snapshot documents must not inflate every outbound frame: the websocket
+    // dispatcher has many frame temporaries, including before authentication.
+    WorkerSnapshot {
+        detail: Box<crate::workers::WorkerDetail>,
+    },
+    WorkerEvent {
+        event: crate::workers::WorkerEvent,
+    },
+    WorkerInboxChanged {},
+    WorkerSubscriptionRejected {
+        project_id: String,
+        worker_id: Uuid,
+        code: String,
+        resync_required: bool,
+    },
+    JobSnapshot {
+        detail: Box<crate::jobs::JobDetail>,
+    },
+    JobEvent {
+        event: crate::jobs::JobEvent,
+    },
     JobChanged {
         project_id: String,
         job_id: Uuid,
@@ -2170,7 +2216,9 @@ pub enum ServerToWeb {
     },
 
     /// Authentication failed
-    AuthenticationFailed { reason: String },
+    AuthenticationFailed {
+        reason: String,
+    },
 
     /// Correlated acceptance or rejection for a time-sensitive coding
     /// mutation. `accepted` means the current authorized CLI accepted the
@@ -2238,7 +2286,9 @@ pub enum ServerToWeb {
     },
 
     /// Session status update
-    SessionStatus { status: SessionStatus },
+    SessionStatus {
+        status: SessionStatus,
+    },
 
     /// Session attached confirmation (includes whether CLI is active)
     SessionAttached {
@@ -2284,13 +2334,19 @@ pub enum ServerToWeb {
     },
 
     /// Error message
-    Error { message: String },
+    Error {
+        message: String,
+    },
 
     /// List of available CLI clients
-    CliClients { clients: Vec<CliClientInfo> },
+    CliClients {
+        clients: Vec<CliClientInfo>,
+    },
 
     /// List of daemon-reported machines and projects
-    Machines { machines: Vec<MachineWithProjects> },
+    Machines {
+        machines: Vec<MachineWithProjects>,
+    },
 
     /// Structured message from Claude CLI stream-json output
     StreamMessage {
@@ -2311,7 +2367,9 @@ pub enum ServerToWeb {
     },
 
     /// List of persisted sessions
-    Sessions { sessions: Vec<SessionInfo> },
+    Sessions {
+        sessions: Vec<SessionInfo>,
+    },
 
     /// Project-wide authorization changed outside this socket. Clients use
     /// this as a refresh hint; the server remains the authorization boundary.
@@ -2364,7 +2422,10 @@ pub enum ServerToWeb {
     },
 
     /// Deadloop pause status update (legacy - use PanePaused for new code)
-    DeadloopStatus { session_id: Uuid, is_paused: bool },
+    DeadloopStatus {
+        session_id: Uuid,
+        is_paused: bool,
+    },
 
     /// Pane pause status update
     PanePaused {
@@ -2781,6 +2842,9 @@ pub struct MobilePaneSummary {
     pub label: Option<String>,
     pub kind: PaneKind,
     pub provider: Provider,
+    /// Historical deadloop panes remain readable but cannot accept new input.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<PaneMode>,
     /// Model/backend override used to associate provider-scoped availability
     /// with the same usage account the pane actually consumes.
     #[serde(default, skip_serializing_if = "Option::is_none")]

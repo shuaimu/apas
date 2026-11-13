@@ -39,3 +39,30 @@ This is a bounded-task service, not an unapproved backlog crawler, automatic iss
 - Web/mobile: Next.js `/code/jobs/...` routes and native Expo Jobs/detail/question/review routes, shared wire contracts with platform-specific rendering/storage, protected caches, accessible navigation and existing notification plumbing. No native WebView replacement for the new screens.
 - Operations: a supported rootless runtime, approved immutable worker/verifier images, bounded host-local storage/network profiles, scoped model credentials and separate publication credentials are explicit prerequisites. The inspected host has Podman installed but its current rootless preflight fails on a misconfigured runroot; the new feature must report unavailable until this is fixed. Native interaction acceptance also requires a real device or emulator; the existing Android export command is not such a test.
 - Verification: actual OMP/sandbox lifecycle and draft-PR smoke runs, authority/idempotency/recovery regressions, browser checks at 320px and common phone sizes, and native iOS/Android keyboard, suspend/reconnect, accessibility and review checks. Existing terminal/OMP-question work and all unrelated working-tree changes must be preserved.
+
+## Applicability after persistent-worker cutover
+
+`unify-autonomous-workers` supersedes this change's public standalone-task
+admission, retry, composition and Jobs navigation. The bounded engine, immutable
+job/run evidence, containment, questions, independent verification and trusted
+draft delivery remain in use. New jobs are internal executions claimed under an
+explicitly approved worker mandate and recurring allowance; they are not new
+standalone user admissions. Earlier finite-job links and receipts remain
+read-only, and instruction reuse opens an unapproved worker draft.
+
+Worker inspection is a successful bounded `completed` outcome with no candidate
+delivery. Worker implementation still requires this change's verifier and
+publisher. Protocol v1 remains a legacy drain/history contract; worker-originated
+execution requires `omp_persistent_worker_v1`, execution protocol v2 and fresh
+bootstrap/result qualification. New worker socket variants require
+`autonomous_workers_v1`. Missing recurring policy remains denied independently
+of the existing finite-job enablement.
+
+The successor's worker capabilities govern recurring selection, budget, lifecycle
+and client behavior where this historical proposal described a task-only product.
+The delta specifications below have been scoped accordingly; synchronize/archive
+the related changes together rather than restoring standalone creation.
+Completed implementation tasks and historical verification below remain evidence
+of what was exercised at that time, not evidence that any of the seven remaining
+real-host/device qualification gates passed. Bot conversion is not provided:
+bot records stay read-only and fresh workers require separate approval.

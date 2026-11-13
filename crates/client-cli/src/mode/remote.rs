@@ -535,6 +535,31 @@ async fn run_connection(
                             })
                             .await;
                     }
+                    Ok(ServerToCli::StartBot {
+                        session_id,
+                        pane_id,
+                        ..
+                    }) => {
+                        let _ = ws_tx_clone.send(CliToServer::Output {
+                            session_id,
+                            pane_id: Some(pane_id),
+                            pane_type: None,
+                            output_type: shared::OutputType::Error,
+                            data: "upgrade_required: Legacy bots are retired and retained as read-only history. Create and approve a fresh Autonomous worker independently; bot conversion is not supported.".into(),
+                        }).await;
+                    }
+                    Ok(ServerToCli::StopBot {
+                        session_id,
+                        pane_id,
+                    }) => {
+                        let _ = ws_tx_clone.send(CliToServer::Output {
+                            session_id,
+                            pane_id: Some(pane_id),
+                            pane_type: None,
+                            output_type: shared::OutputType::Error,
+                            data: "legacy_bot_stop_unproven: Remote mode does not own the legacy bot execution. Use its recorded owning runtime to drain known-live execution; no interactive pane was stopped and no complete-stop proof is claimed.".into(),
+                        }).await;
+                    }
                     Ok(ServerToCli::PauseDeadloop { .. })
                     | Ok(ServerToCli::ResumeDeadloop { .. })
                     | Ok(ServerToCli::PausePane { .. })
@@ -542,8 +567,6 @@ async fn run_connection(
                     | Ok(ServerToCli::RebootPane { .. })
                     | Ok(ServerToCli::AddPane { .. })
                     | Ok(ServerToCli::RemovePane { .. })
-                    | Ok(ServerToCli::StartBot { .. })
-                    | Ok(ServerToCli::StopBot { .. })
                     | Ok(ServerToCli::RequestPaneList { .. })
                     | Ok(ServerToCli::UpdatePaneEffort { .. })
                     | Ok(ServerToCli::UpdatePaneModel { .. })

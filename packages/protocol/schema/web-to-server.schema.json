@@ -11,6 +11,50 @@
           "format": "uint64",
           "minimum": 0
         },
+        "project_id": {
+          "type": "string"
+        },
+        "type": {
+          "type": "string",
+          "const": "subscribe_worker"
+        },
+        "worker_id": {
+          "type": "string",
+          "format": "uuid"
+        }
+      },
+      "required": [
+        "type",
+        "project_id",
+        "worker_id",
+        "after_seq"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "type": {
+          "type": "string",
+          "const": "unsubscribe_worker"
+        },
+        "worker_id": {
+          "type": "string",
+          "format": "uuid"
+        }
+      },
+      "required": [
+        "type",
+        "worker_id"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "after_seq": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
         "job_id": {
           "type": "string",
           "format": "uuid"

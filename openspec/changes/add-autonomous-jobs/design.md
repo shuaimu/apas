@@ -10,6 +10,16 @@ Responsive web currently ties mobile navigation to home/session state. Native Ex
 
 The tree contains unrelated ongoing changes, including terminal OMP-question support. Preserve them. This proposal does not deploy, start a provider, enable jobs or modify host configuration.
 
+**Successor boundary:** after `unify-autonomous-workers`, the task-only public
+admission/UI decisions in this historical design no longer select the product.
+The job engine is the internal bounded executor for approved standing mandates.
+Worker/item/reservation context is immutable on each execution; inspection has a
+read-only checkout and can complete without delivery. Implementation retains the
+candidate/verifier/publisher boundary below. Explicit worker-item retry preserves
+item and rolling allowances rather than reopening standalone job admission.
+The successor's contracts, v2 host readiness, lifecycle and worker surfaces take
+precedence. This does not close this change's outstanding operational gates.
+
 ## Goals / Non-Goals
 
 **Goals:** one clear ownership chain from approved task to exact candidate and draft PR; independently enforced execution limits; honest uncertain-state handling; the same server contract for browser and native clients; mobile operation without a terminal.

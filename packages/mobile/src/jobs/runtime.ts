@@ -6,6 +6,7 @@ import { loadCredentials } from "@/security/credentials";
 import { abortJobRequests, jobsApi } from "./api";
 import { authorizeJobStorageProject, setJobStorageAccount, commitJobSnapshot, drainJobStorage, jobCachedProjects, purgeJobStorage, readJobRecord, writeJobRecord } from "./storage";
 import type { JobSnapshot } from "./storage";
+import { acceptWorkersBootstrap, hydrateWorkers, invalidateWorkers, purgeWorkerAccess, setWorkerEnvironment, startWorkersRuntime, stopWorkersRuntime } from "@/workers/runtime";
 
 interface JobState {
   account: string | null;
@@ -30,6 +31,7 @@ let accountQueue: Promise<void> = Promise.resolve();
 
 export function invalidateJobs(): void {
   epoch++;
+  invalidateWorkers();
   useJobs.setState((state) => ({ authorized: false, entries: Object.fromEntries(Object.entries(state.entries).map(([id, value]) => [id, { ...value, ready: false }])) }));
 }
 
@@ -42,6 +44,7 @@ export async function hydrateJobs(): Promise<void> {
   const inbox = await readJobRecord<JobListResponse>({ account: owner.account, project: "", job: "" }, "inbox");
   const projects = await readJobRecord<JobState["projects"]>({ account: owner.account, project: "", job: "" }, "projects");
   useJobs.setState({ account: owner.account, inbox: inbox ?? empty.inbox, projects: projects ?? [] });
+  await hydrateWorkers(owner.account);
 }
 
 export function acceptJobsBootstrap(value: MobileBootstrapResponse): Promise<void> {
@@ -68,6 +71,7 @@ export function acceptJobsBootstrap(value: MobileBootstrapResponse): Promise<voi
     if (lifecycleAtStart !== lifecycle) return;
     useJobs.setState({ account: value.user_id, mutations: Boolean(value.features.coding_mutations), unavailable: info?.unavailable_reasons ?? ["Autonomous jobs are not available on this server"], inbox, projects });
     // A paginated inbox is not an authorization inventory. Recheck every cached project.
+    const authorizationEpoch = epoch;
     for (const project of await jobCachedProjects(value.user_id)) {
       try { await jobsApi.targets(project); authorizeJobStorageProject(value.user_id, project); }
       catch (error) {
@@ -76,6 +80,7 @@ export function acceptJobsBootstrap(value: MobileBootstrapResponse): Promise<voi
       }
     }
     if (lifecycleAtStart === lifecycle) useJobs.setState({ authorized: Boolean(info?.available) });
+    if (lifecycleAtStart === lifecycle && authorizationEpoch === epoch) await acceptWorkersBootstrap(value);
   };
   accountQueue = accountQueue.then(work, work);
   return accountQueue;
@@ -95,6 +100,7 @@ export async function purgeJobAccess(project?: string): Promise<void> {
     ...(!project ? { account: null } : {}),
   }));
   await purgeJobStorage(account ?? undefined, project);
+  await purgeWorkerAccess(project, true);
   if (account && project) {
     await writeJobRecord({ account, project: "", job: "" }, "inbox", useJobs.getState().inbox);
     const selection = await readJobRecord<{ project: string }>({ account, project: "", job: "" }, "composer-project");
@@ -209,13 +215,16 @@ export function setJobEnvironment(change: { online?: boolean; foreground?: boole
   running = null;
   invalidateJobs();
   useJobs.setState(change);
+  setWorkerEnvironment(change);
   void refreshJobs();
 }
 export function startJobsRuntime(): void {
+  startWorkersRuntime();
   timer ??= setInterval(() => { void refreshJobs(); }, 10_000);
   void refreshJobs();
 }
 export async function stopJobsRuntime(): Promise<void> {
+  const workersStopped = stopWorkersRuntime();
   lifecycle++;
   abortJobRequests();
   running = null;
@@ -227,6 +236,7 @@ export async function stopJobsRuntime(): Promise<void> {
   useJobs.setState({ ...empty });
   await accountQueue.catch(() => undefined);
   await Promise.allSettled(synchronizing.values());
+  await workersStopped;
   useJobs.setState({ ...empty });
   await drainJobStorage();
 }

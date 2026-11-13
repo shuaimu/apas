@@ -1,29 +1,29 @@
 ## Purpose
 
-Provide equivalent, accessible autonomous-job operation in the phone browser and native iOS/Android clients, including interrupted submissions, human decisions and durable review without requiring a terminal or desktop.
+Preserve accessible bounded-execution questions, evidence and earlier finite results in phone-browser and native clients. After persistent-worker cutover, `autonomous-worker-surfaces` owns creation, approval, recurring controls and Workers/Attention navigation; bounded job/run views are reached through an exact worker execution or a read-only earlier-result link.
 
 ## ADDED Requirements
 
 ### Requirement: Both mobile surfaces expose the complete job workflow
-Responsive web and native mobile SHALL each provide discoverable Jobs and Attention entry points, task composition, explicit admission review, queued/running status, questions, limits, cancellation, recovery, verification/diff review and draft-PR handoff. Ordinary job actions SHALL NOT require a terminal, desktop-only page or native WebView wrapper. Existing interactive session workflows SHALL remain available and visibly distinct from autonomous jobs. Missing authority or readiness SHALL produce a reason rather than a misleading enabled action.
+Responsive web and native mobile SHALL each expose the persistent worker workflow and exact bounded-execution status, questions, limits, recovery, verification/diff review and draft-PR handoff. Earlier finite results SHALL remain read-only. New standalone-job composition/admission/retry SHALL be retired in favor of reviewed worker approval. Ordinary worker/run actions SHALL NOT require a terminal, desktop-only page or native WebView wrapper. Existing interactive sessions SHALL remain visibly distinct. Missing authority or readiness SHALL produce a reason rather than a misleading enabled action.
 
 #### Scenario: User performs a job entirely from a phone
-- **WHEN** an authorized user creates, monitors, answers, cancels or reviews a job on either mobile surface
+- **WHEN** an authorized user creates a worker or monitors, answers, stops or reviews its bounded execution on either mobile surface
 - **THEN** every required action and its confirmed result are available in that surface
 - **AND** the user is never directed to the raw terminal to complete an ordinary job decision
 
 #### Scenario: Account can read jobs but cannot launch them
-- **WHEN** a project user opens Jobs without admission authority
+- **WHEN** a project user opens Workers or earlier results without unattended admission authority
 - **THEN** authorized job progress and review evidence remain readable
 - **AND** creation and control actions accurately explain their missing authority without exposing unauthorized machine inventory
 
 ### Requirement: Responsive web integrates autonomous work into each project
-The responsive-web project's existing add-agent control SHALL offer Interactive agent and Autonomous agent. Interactive creation SHALL retain the existing provider and worktree behavior. Autonomous creation SHALL keep the selected project fixed, prefer its current machine only when eligible and no saved or explicit choice exists, and require the existing immutable admission confirmation. Missing authority, policy, worker readiness or connectivity SHALL be explained without silently choosing another target or substituting an interactive pane.
+The responsive-web project's add control SHALL offer an interactive agent or autonomous worker. Interactive creation SHALL retain existing provider/worktree behavior. Worker creation SHALL keep the selected project fixed, prefer its current machine only when eligible and no saved or explicit choice exists, and require reviewed mandate/recurring approval. Missing authority, policy, worker readiness or connectivity SHALL be explained without silently changing target or substituting an interactive pane.
 
 #### Scenario: User creates autonomous work from a project
-- **WHEN** the user selects Autonomous agent from the project's add control
-- **THEN** composition and admission review remain in that project with its identity fixed
-- **AND** an accepted or recovered receipt opens that exact job inside the project without changing the selected session or creating a pane
+- **WHEN** the user selects Autonomous worker from the project's add control
+- **THEN** mandate composition and approval review remain in that project with its identity fixed
+- **AND** an accepted or recovered receipt opens that exact worker without changing the selected session or creating a pane
 
 #### Scenario: User switches between interactive and autonomous work
 - **WHEN** the user selects an autonomous job tab and returns to an interactive tab
@@ -42,11 +42,11 @@ The responsive-web project's existing add-agent control SHALL offer Interactive 
 
 
 ### Requirement: Every web project exposes an autonomous-agent overview
-Desktop and mobile web SHALL provide one visible project Overview entry, independent of retired team flags and worker readiness. It SHALL list the project's autonomous jobs with their full approved task descriptions, authoritative phase/attention, target and last confirmed update. Hidden views and completed jobs SHALL remain reachable through explicit bounded pagination. Opening a job SHALL reuse its existing detail view without changing session or pane identity, performing a runtime mutation or unmounting an interactive terminal.
+Desktop and mobile web SHALL provide one visible project Overview entry, independent of retired team flags and worker readiness. It SHALL list persistent workers with full descriptions, canonical status, host and next check, and retain separately identified earlier finite results through bounded project-scoped pages. Hidden and completed historical views SHALL remain reachable. Opening a worker or exact earlier result SHALL not change session/pane identity, mutate runtime state or unmount an interactive terminal.
 
 #### Scenario: User surveys current and retained autonomous work
 - **WHEN** an authorized project user opens Overview
-- **THEN** each returned job shows its task description and current status, including jobs whose tabs are hidden or whose execution has ended
+- **THEN** returned workers and earlier results expose their full description and current or retained status, including hidden views and ended executions
 - **AND** descriptions beyond the shortened title remain available in place, with older jobs accessible through bounded project-scoped pages
 - **AND** the page does not infer whole-project counts or percentage completion from a partial list
 
@@ -56,12 +56,12 @@ Desktop and mobile web SHALL provide one visible project Overview entry, indepen
 - **AND** cached statuses are visibly stale, missing cached descriptions are not fabricated from titles, and discovered revocation removes affected job content
 
 ### Requirement: Task composition persists drafts before uncertain network work
-The composer SHALL collect a project, instruction, acceptance criteria, eligible target/profile and bounded limits, then present the immutable admission preview for explicit confirmation. Draft content and mutation identity SHALL be persisted in account/project-scoped protected local storage before submission. Navigation, reload, process suspension or a failed request SHALL preserve the draft. A storage failure SHALL be shown before submission rather than falsely claiming recoverability. A timeout SHALL be unconfirmed, not automatically failed or successful.
+Worker composition SHALL persist account/project-scoped mandate/checklist, target/profile, cadence and finite per-run/rolling allowance drafts before submission, then present explicit recurring approval. A retained finite-job instruction MAY prefill an unapproved draft; no bot conversion is offered. Navigation, reload, suspension or failed requests SHALL preserve drafts and original mutation identities. Storage failure SHALL be shown before submission, and timeout SHALL remain unconfirmed rather than being treated as acceptance or replayed automatically.
 
 #### Scenario: App closes during admission
-- **WHEN** the server commits admission but the client closes before receiving the reply
-- **THEN** the next authenticated launch resolves the saved request identity before offering another submission
-- **AND** the recovered receipt opens the original job without a duplicate worker
+- **WHEN** the server commits worker approval but the client closes before receiving its reply
+- **THEN** the next authenticated launch resolves the saved approval request before offering another submission
+- **AND** the recovered receipt opens the original worker without duplicate execution
 
 #### Scenario: Selected target becomes unavailable
 - **WHEN** current readiness or authority invalidates the admission preview

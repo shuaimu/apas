@@ -23,10 +23,11 @@ owns local panes and worktrees, the server brokers project/session/job state,
 and the web UI exposes interactive panes and the separate Jobs/Attention workflow.
 
 A project is a directory with an `.apas` file. Interactive work happens in
-**panes**, each hosting one agent and controlled by a person. **Autonomous jobs**
-are a separate, default-disabled execution path with durable approvals, bounded
-workers, independent verification and draft-PR publication. They never orchestrate
-interactive panes or restore the removed managed-team mode.
+**panes**, each hosting one agent and controlled by a person. **Autonomous
+workers** own persistent, human-approved responsibilities and execute bounded
+internal jobs with independent verification and draft-PR publication. Recurring
+execution is default-disabled. Workers never orchestrate interactive panes or
+restore the removed managed-team mode.
 
 **Managed team mode was removed.** Four roles (Manager, Tech Lead, Developer,
 Reviewer) used to coordinate through `project_goal.md`, `team-todo.md` and
@@ -38,13 +39,14 @@ field carried at three levels. If you find a reference to a team role, the
 scratchpad, the TODO queue or `apas mcp-server`, it is stale — say so rather
 than reviving it.
 
-Two things that look like team mode and are not:
+Pane **`role` / `goal` / `backstory`** remain identity metadata anyone can set
+from the role modal, composed into the system prompt by
+`pane_identity::compose_system_prompt`.
 
-- **`role` / `goal` / `backstory` on a pane** — identity metadata anyone can set
-  from the role modal, composed into the pane's system prompt by
-  `pane_identity::compose_system_prompt`.
-- **The "Start bot" deadloop** — a pane repeating a prompt on an interval. It
-  predates team mode and outlives it.
+**The "Start bot" deadloop is retired too.** Its prompt, provider, cadence and
+conversation remain read-only history. Neither loading `.apas` nor reopening
+that history restores the loop. There is no bot-to-worker conversion: review the
+old responsibility and separately create and approve a new worker.
 
 ## Architecture
 
@@ -72,61 +74,90 @@ The server caches and broadcasts machine, session and pane state. The web UI
 lets a person open panes, talk to them, inspect their diffs, and hand off to a
 PR.
 
-### Autonomous jobs: deployment remains qualification-gated
+### Autonomous workers: deployment remains qualification-gated
 
-The job control plane lives in `crates/server/src/jobs.rs` and `db/jobs.rs`;
-host execution lives in `crates/client-cli/src/jobs/`. Job identities, receipts,
-events and policies are canonical Rust types in `crates/shared/src/jobs.rs`,
-exported through `@apas/protocol`. `/projects/` serves job JSON.
-The project's `+` is the responsive-web creation path; `/code/jobs/` remains
-the cross-project Jobs/Attention workflow. Native screens use the same contracts,
-not a WebView. Jobs are not `.apas` pane entries, terminal hosts or deadloops.
+The worker control plane lives in `crates/server/src/workers/` and
+`db/workers.rs`; `jobs.rs`, `db/jobs.rs` and `crates/client-cli/src/jobs/` remain
+the bounded execution, containment, verification and publication engine.
+Canonical contracts are `crates/shared/src/workers.rs` and `jobs.rs`, generated
+into `@apas/protocol`. `/projects/` serves their JSON APIs. Workers are not
+`.apas` panes, terminal hosts, forever-running provider sessions or managed teams.
 
-**No worker/verifier image or publication profile has been operationally
-qualified by this implementation.** Keep deployment policy and host
-`[autonomous_jobs].enabled` off until the real-host and device gates in
-`openspec/changes/add-autonomous-jobs/tasks.md` pass. Unit tests, a successful
-Podman `info`, synthetic job records and Expo export do not establish those gates.
+**No recurring worker/verifier image or publication profile has been
+operationally qualified by this implementation.** Keep deployment recurrence
+and host `[autonomous_jobs].enabled` off until the applicable gates in both
+`openspec/changes/unify-autonomous-workers/tasks.md` and
+`openspec/changes/add-autonomous-jobs/tasks.md` pass. Unit tests, Podman `info`,
+synthetic retained records and Expo export do not establish those gates.
 
-#### Using jobs inside a project
+#### Responsibilities, backlog and bounded execution
 
-On desktop and in the mobile-browser project screen, `+` offers **Interactive
-agent** or **Autonomous agent**. Interactive retains the existing provider
-picker and pane policy. Autonomous opens a project-fixed composer; the current
-machine is preferred only when fresh readiness, admission authority and policy
-permit it. An unavailable host is explained, not silently replaced. A recovered
-draft or explicit target choice takes precedence, including an explicit blank
-selection. Starting still requires an immutable preview and confirmed admission.
+A worker owns a versioned description and standing checklist, an exact approved
+machine/profile/base branch, a bounded prioritized backlog, a latest checkpoint
+and a durable inspection schedule. Approval covers future runs within those
+bounds, not arbitrary instructions or a change of host. Mandate replacement
+requires another preview and approval; each execution pins its own committed
+base, mandate/backlog revisions, purpose, item and allowance reservation.
 
-Job tabs sit beside interactive panes with phase/attention badges. Progress,
-questions, usage, explicit cancellation, verification, bounded diffs and draft-PR
-handoff remain inside the project. Selecting a job keeps the existing terminal
-mounted but hidden. **Hide removes a view, not an execution**; the project's
-**Overview** reopens hidden/completed work. View preferences and cached labels are
-account/project scoped; older opened results retain their labels even outside
-the loaded history page, and unrefreshed status is marked cached.
+An **inspection** receives a read-only checkout and can report `no_work`; it
+then becomes Idle with no provider process left running. A selected
+**implementation** receives a writable checkout and an immutable item. Only
+`candidate_ready` implementations enter independent verification and trusted
+draft publication. Inspections, `no_change` and blocked outcomes never masquerade
+as delivery. Each run creates a fresh bounded OMP session.
 
-**Overview is a project view, not a team-mode pane.** Its visible entry precedes
-interactive and job tabs on desktop and mobile web, independent of the vestigial
-team flag and worker readiness. Each autonomous job shows its approved instruction
-(expandable in full), authoritative phase/attention, host and last confirmed
-update. Hidden and completed jobs stay in the list; **Load older project jobs**
-extends it one bounded page at a time. Cached status is explicitly stale, and a
-loaded page is never presented as a whole-project count. Opening the overview
-or a job does not recreate the terminal. The existing desktop pane, policy and
-usage panels remain below the autonomous list.
+OMP writes one bounded structured result at `/session/apas-worker-result.json`.
+The host reads it only after genuine root/child settlement and positive complete
+termination. It rejects symlinks, non-regular/multiply-linked files, escaped
+paths, oversized content and mismatched worker/revision/reservation identities.
+Model proposals cannot overwrite intervening human backlog or mandate edits.
+An empty backlog is valid; no default TODO prompt or guessed work is injected.
 
-`GET /projects/:project/jobs` authorizes project content and filters by project
-before bounded pagination. Its `ProjectJobListResponse` adds each full instruction
-to the summary from the already-loaded durable row, without a detail request per
-job. The global list and stored detail contracts are unchanged. Obsolete cached
-pages lacking descriptions are ignored; their titles are not substituted for
-instructions, and unrelated cached details are not purged. Do not filter the
-global inbox's first page to build an overview: other projects can push every
-result out of that page.
-Access loss purges job content and requires an explicit recheck without remounting the
-interactive terminal. This browser integration does not enable a worker, change
-native navigation, or replace the real-host/device qualification below.
+Rolling **24-hour elapsed time, reported spend and execution-count ceilings**
+cover inspection, implementation, delegated work and retries. Admission reserves
+the entire per-run allowance atomically. Unknown accounting is not zero, and an
+unresolved reservation does not disappear at a window boundary. Per-item
+cumulative attempts and consumed allowance survive pause, resume, edits and
+restart. A due check waits for cadence, current authority, capacity and budget;
+missed checks coalesce rather than replaying a burst.
+
+One worker has at most one unresolved execution chain and one unresolved draft
+PR. Waiting for review uses no model calls. A verified external merge permits
+later inspection; a closed-unmerged or unexpectedly changed PR blocks automatic
+continuation. Failed items require an explicit retry under their retained limits.
+
+#### Browser and native workflow
+
+Desktop and mobile-browser `+` offers **Interactive agent** or **Autonomous
+worker**. The latter opens a project-fixed mandate/checklist composer; an
+unavailable preferred machine is explained, never silently replaced.
+`/code/workers/` is the cross-project Workers/Attention surface. Native uses the
+same contracts in native screens, not a WebView.
+
+Worker views sit beside interactive panes. **Overview** is visible even with
+zero panes and lists responsibilities, backlog/status and paginated history.
+Global inventory, project inventory, backlog and run history are independently
+paged; a loaded subset is not a whole-project count. Selecting or hiding a view
+does not close a terminal or change a worker's lifecycle.
+
+**Pause after this run** fences new dispatch but lets the admitted run finish.
+**Stop now** also requests whole-unit termination and fences publication; its
+receipt is not proof of a stop. Resume preserves budgets and never silently
+retries a failed item. **Check now** still respects cadence and allowance.
+Questions, candidate checks and publication recovery retain exact worker/run
+identities; an older review link never substitutes the latest candidate.
+
+Saved drafts and actor-scoped receipts recover lost replies without automatic
+POST replay. Reconnect rechecks authority; offline snapshots are marked stale
+and read-only. Account changes and discovered revocation purge protected
+browser/native caches. Routine idle checks do not create attention notifications.
+
+`/code/jobs/` remains **Earlier results**, not a second admission/retry surface.
+A positively stopped finite job or saved standalone draft may prefill a new
+worker proposal, but never transfers its grant or skips fresh approval.
+Historical bots cannot be converted or restarted. Their metadata alone does not
+veto an unrelated new worker; known-live legacy runtimes must be drained before
+rollout. User TODO/team files and unrelated interactive panes are left alone.
 
 #### Provision the host, not a shared home-directory fallback
 
@@ -178,12 +209,14 @@ profiles allowlist repositories and protected base refs and require
 
 Each worker's `qualification_file` records the exact resolved profile digest
 computed by `worker_profile_digest`, a non-future `qualified_at`, and successful
-`omp_rpc`, `child_questions` and `gateway_metering` evidence. Only record these
-after exercising the pinned image with real delegated work, multi-question
-confirmation, no timeout answer, aggregate usage and genuine settlement.
-Changing the worker or resolved model/verifier/publisher profile invalidates
-that qualification. Never create an affirmative evidence file just to make a
-readiness check green.
+`omp_rpc`, `child_questions` and `gateway_metering` evidence. Recurring execution
+also requires `execution_protocol_version = 2`, the exact `bootstrap_digest`,
+and `readonly_inspection`, `inspection_results` and `implementation_results`
+evidence. Record these only after exercising the pinned image with actual
+root/child work, question confirmation without timeout answers, aggregate usage,
+genuine settlement and both result dispositions. Changing the worker,
+bootstrap or resolved model/verifier/publisher profile invalidates qualification.
+Never create affirmative evidence merely to make readiness green.
 
 The worker has no external network route. Its run-scoped bridge reaches the
 trusted gateway over a Unix socket; only fixed model upstreams and explicit
@@ -195,20 +228,23 @@ checks repeat rather than trusting a stale green badge.
 
 #### Authority, evidence and recovery
 
-Deployment policy (`/admin/job-policy`) defaults disabled. Cluster and project
-overrides may only narrow inherited enablement, profile allowlists, capacity and
-limits; every hosting cluster participates. The system-administrator credential
-controls deployment policy, while hosting operators control their cluster and
-project overrides. Project content access alone does not authorize unattended
-admission on somebody else's machine. Existing management forms show requested
-and effective policy separately.
+Deployment policy (`/admin/job-policy`) and its separate `recurring.enabled`
+grant default disabled. Finite-job enablement never implies recurring authority.
+Cluster/project overrides may only narrow enablement, profile allowlists,
+capacity and ceilings across every hosting cluster; the minimum inspection
+interval can only increase. Widening writes are rejected, not silently clamped.
+The system-administrator credential controls deployment policy; hosting operators
+control their cluster/project overrides. Project content access alone is not
+compute authority. Management forms distinguish requested and effective policy.
 
-Admission pins the committed base, task, target, profiles and policy fingerprint.
-Actor-scoped mutation receipts survive restart; recovering a lost reply reads
-that receipt rather than resubmitting the prompt or answer. Unknown provider
-admission or ownership becomes `recovery_required`, never a replacement attempt.
-An answer remains pending until the provider confirms it. Recommendations are
-not answers, and `ask.timeout=0` forbids timeout defaults.
+A mandate approval pins its branch and target; execution admission resolves and
+pins the committed base and immutable task with the current policy fingerprint.
+Actor-scoped receipts survive restart. Recover a lost reply from its original
+receipt instead of resubmitting a prompt or answer. Unknown ownership becomes
+`recovery_required`, never a replacement attempt. Revocation fences future work
+and stops active work; restoring authority does not silently resume a worker.
+An answer stays pending until the provider confirms it. Recommendations are not
+answers, and `ask.timeout=0` forbids timeout defaults.
 
 The independent host enforces a **120-second lease**, renewed every **20 seconds**
 while authority remains valid, plus cumulative elapsed/attempt/spend limits.
@@ -223,8 +259,9 @@ candidate SHA; a worker's own test output is insufficient. Publication creates
 a draft PR on `apas/job-<uuid>`, never merges, and reconciles uncertain replies
 without blindly posting another PR.
 
-Retained job evidence has a 30-day policy; clients display explicit expiry.
-Unresolved execution/publication ownership is preserved instead of aged away.
+Per-run event replay and artifacts retain the existing 30-day policy; clients
+display explicit expiry. Worker mandates, checkpoints, accounting and unresolved
+execution/publication ownership are not discarded with replay history.
 Cancel/stop receipts prove requests, not termination. A run releases its slot
 only after positive whole-unit stop evidence. Project deletion also waits for
 host purge acknowledgement for every dispatched historical attempt; an offline
@@ -233,19 +270,29 @@ journal or fabricate an acknowledgement to unblock deletion.
 
 #### Rollout, rollback and observed verification
 
-Roll out **server/protocol → web and native clients → CLI/daemon**, leaving jobs
-disabled throughout qualification. `autonomous_jobs_v1` and `omp_job_worker_v1`
-are separate from interactive terminal capabilities. Legacy servers lacking
-the registered cluster-owner identity do not activate job execution. Existing
-mobile bootstrap/mutation/notification/deep-link flags still apply; details and
+Roll out **server/shared protocol → web and native clients → CLI/daemon**, with
+recurrence and host execution disabled throughout qualification.
+`autonomous_workers_v1` gates worker-aware clients; `omp_persistent_worker_v1`
+and execution protocol v2 gate new host execution. The older
+`autonomous_jobs_v1` / `omp_job_worker_v1` and v1 execution protocol remain for
+legacy evidence/drain, not new standalone admission or recurring execution.
+Interactive terminal capabilities and historical pane behavior are independent.
+Existing mobile bootstrap/mutation/notification/deep-link flags still apply;
 device gates are in `docs/mobile-development-and-operations.md`.
 
-For rollback, disable new admission first, retain upgraded controllers and
-hosts until active executions are positively stopped and required purges are
-acknowledged, and preserve SQLite/journals/evidence. Only then replace job-aware
-binaries with older versions. Turning off UI controls or downgrading the server
-does not prove that a disconnected worker stopped. Production deployment is a
-separate authorized operation, not part of implementing this change.
+Before enabling, positively drain known-live legacy bot/finite runtimes, qualify
+the pinned profiles and approve each new responsibility explicitly. Historical
+records are not operational qualification. Predecessor task-only requirements
+have been reconciled in its specs; synchronize/archive the related changes only
+after their remaining acceptance gates are satisfied.
+
+For rollback, disable new recurring admission first. Keep capable controllers
+and hosts until active execution is positively stopped and required historical
+host purges are acknowledged; preserve SQLite, receipts, journals and evidence.
+An unreachable host remains pending cleanup. Only then install older binaries;
+hiding UI controls or downgrading never proves a disconnected run stopped.
+Production deployment, policy enablement and approval of real workers each
+require a separate authorized operational action.
 
 Local verification on **2026-11-08** passed the Rust workspace (761 tests), static
 musl CLI build, protocol/terminal tests, web lint/typecheck/715 tests and
@@ -283,6 +330,24 @@ two reporting 26.10.9, and the APAS terminal retained the same running PTY
 identity. No project daemon/provider was restarted, no native build was released,
 and no job policy or execution profile was enabled. Worker/device qualification
 remains incomplete.
+
+On **2026-11-12**, the persistent-worker cutover passed local server/protocol,
+browser and native checks, plus production web build and Android export.
+Actual Chromium covered 320/390/768/1440px layouts, separate project/global
+navigation, zero panes, worker/run pagination, exact earlier candidate links,
+offline draft recovery, discovered revocation/cache purge, deliberately delayed
+view-preference hydration and unapproved finite-job reuse. Synthetic terminal
+frames verified that worker navigation retains the same xterm instance and
+sends no pane lifecycle/input commands. No real provider or PR was exercised.
+
+That smoke caught two real integration faults: inline job/worker snapshots
+amplified the WebSocket dispatcher's stack past the default Tokio stack, and a
+retained mobile terminal stayed visible after another pane was selected.
+Snapshot payloads are now boxed without changing JSON; the terminal remains
+mounted but is visible only for its selected pane. Behavioral regressions cover
+both. Exact check counts and the still-open host/device qualification gates are
+recorded in `openspec/changes/unify-autonomous-workers/tasks.md`. This local work
+did not deploy, enable a policy, approve a real worker or satisfy those gates.
 
 ### Project sidebar ordering
 
@@ -345,7 +410,7 @@ apas/
 │   │   │   ├── claude.rs      # Claude process wrapper
 │   │   │   ├── terminal_pane.rs # Pty host for kind:"terminal" panes (portable-pty)
 │   │   │   └── mode/
-│   │   │       ├── dual_pane.rs # Pane runtime: panes, deadloops, watchers
+│   │   │       ├── dual_pane.rs # Interactive pane runtime and transcript watchers
 │   │   │       ├── hybrid.rs    # Legacy single-pane local CLI + streaming
 │   │   │       ├── local.rs     # Offline mode
 │   │   │       └── remote.rs    # Remote-only mode
@@ -378,7 +443,8 @@ apas/
 │       │   │   ├── layout.tsx
 │       │   │   └── page.tsx
 │       │   ├── components/
-│       │   │   ├── overview/         # Manager/goal/TODO/pane-grid control surface
+│       │   │   ├── overview/         # Project policy, pane and usage panels
+│       │   │   ├── workers/          # Responsibilities, backlog and exact-run results
 │       │   │   ├── tabs/             # Pane tabs, task bars, diff modal
 │       │   │   │   └── TerminalPane.tsx  # xterm.js view for kind:"terminal" panes
 │       │   │   ├── chat/             # Message display
@@ -844,10 +910,10 @@ curl --fail --retry 15 --retry-all-errors --retry-delay 1 --max-time 3 https://a
 # Preserve the complete old pair for fast rollback, then activate the staged pair.
 ssh root@apas.mpaxos.com "rsync -a --ignore-existing /opt/apas/web/.next/static/ '$stage/web/.next/static/' && systemctl stop apas-web && mv /opt/apas/web '$backup/web' && { test ! -d /opt/apas/protocol || mv /opt/apas/protocol '$backup/protocol'; } && mv '$stage/protocol' /opt/apas/protocol && mv '$stage/web' /opt/apas/web && systemctl start apas-web"
 
-for path in / /login /machines /share /admin /code/jobs /code/jobs/new /health; do curl -fsSL "https://apas.mpaxos.com${path}" >/dev/null; done
-# Also verify referenced /_next/static assets, authenticated /projects/jobs JSON,
-# WebSocket/terminal attachment from the UI, and effective job policy remaining
-# disabled until qualification. Never print account tokens or terminal contents.
+for path in / /login /machines /share /admin /code/jobs /code/jobs/new /code/workers /code/workers/new /health; do curl -fsSL "https://apas.mpaxos.com${path}" >/dev/null; done
+# Also verify referenced /_next/static assets, authenticated /projects/workers JSON,
+# WebSocket/terminal attachment from the UI, and effective recurring-worker policy
+# remaining disabled until qualification. Never print tokens or terminal contents.
 ssh root@apas.mpaxos.com "systemctl is-active apas-web apas-server nginx && journalctl -u apas-web -u apas-server --since '5 minutes ago' -p err --no-pager -q"
 ```
 
@@ -882,8 +948,8 @@ explicitly there, as the deploy commands above do.
 
 ## Key Concepts
 
-1. **Pane Runtime**: The CLI restores panes from `.apas`, runs deadloop or
-   interactive processes, and can isolate a pane in a git worktree.
+1. **Pane Runtime**: The CLI restores interactive panes from `.apas` and can
+   isolate them in git worktrees. Legacy deadloop entries remain nonexecuting.
 2. **Hybrid Mode** (legacy): Single pane with local terminal + streaming.
 3. **Project-based Sessions**: Sessions are identified by project directory
    and `.apas` project metadata.
@@ -892,9 +958,9 @@ explicitly there, as the deploy commands above do.
    runtime paths.
 5. **Real-time Updates**: WebSocket connections broadcast live messages,
    machine config, and pane diffs.
-6. **Pane kinds**: `PaneConfig.kind` picks how a pane hosts its agent, and
-   is orthogonal to `provider` (which binary) and `mode` (how autonomous).
-   See "Terminal panes" below.
+6. **Pane kinds**: `PaneConfig.kind` selects the interactive hosting mechanism,
+   independently of `provider`. The old deadloop `mode` survives only for
+   history; recurring work belongs to autonomous workers. See "Terminal panes".
 
 ## Tab-type policy (`disallowed_tab_types`)
 

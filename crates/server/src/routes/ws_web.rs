@@ -41,6 +41,8 @@ fn is_read_only_message(message: &WebToServer) -> bool {
             | WebToServer::MobileTelemetry { .. }
             | WebToServer::SubscribeJob { .. }
             | WebToServer::UnsubscribeJob { .. }
+            | WebToServer::SubscribeWorker { .. }
+            | WebToServer::UnsubscribeWorker { .. }
             | WebToServer::Heartbeat
     )
 }
@@ -1659,6 +1661,8 @@ async fn send_policy_error(state: &AppState, connection_id: &Uuid, message: impl
         .await;
 }
 
+const RETIRED_BOT_MESSAGE: &str = "upgrade_required: Legacy bot history is read-only; create and explicitly approve a new independent worker.";
+
 /// Refuse typed input for `pane_id` with `message`, for a refusal that
 /// resending the same input cannot fix. Every client is sent the `Error`, as
 /// before. A connection that negotiated project instances and tagged the
@@ -1965,6 +1969,7 @@ pub(crate) fn pane_summaries(
                 pane_id: pane.pane_id,
                 label: pane.label,
                 kind: pane.kind,
+                mode: Some(pane.mode),
                 provider: pane.provider,
                 model: pane.model,
                 is_working,
@@ -2301,6 +2306,10 @@ async fn authorize_existing_pane_launch(
         send_policy_error(state, connection_id, "Pane not found").await;
         return false;
     };
+    if pane.mode == shared::PaneMode::Deadloop {
+        send_policy_error(state, connection_id, RETIRED_BOT_MESSAGE).await;
+        return false;
+    }
     if shared::is_retired_launch(pane.provider, pane.model.as_deref()) {
         send_policy_error(
             state,
@@ -2555,9 +2564,7 @@ async fn handle_add_pane(
                         status: shared::AddPaneStatus::Failed,
                         machine_id,
                         pane_id: None,
-                        error: Some(
-                            "This project is unavailable or access was denied".to_string(),
-                        ),
+                        error: Some("This project is unavailable or access was denied".to_string()),
                     },
                 )
                 .await;
@@ -2574,6 +2581,10 @@ async fn handle_add_pane(
         request_id,
         spec,
     };
+    if request.spec.mode == shared::PaneMode::Deadloop {
+        answer_add_pane_launch(state, &request, machine_id, Err(RETIRED_BOT_MESSAGE.into())).await;
+        return;
+    }
     match machine_id {
         Some(machine_id) => add_pane_on_machine(state, request, machine_id).await,
         None => {
@@ -2606,6 +2617,9 @@ async fn launch_new_pane(
         }
     }
     let spec = &request.spec;
+    if spec.mode == shared::PaneMode::Deadloop {
+        return Err(RETIRED_BOT_MESSAGE.into());
+    }
     new_pane_launch_refusal(
         state,
         &session_id,
@@ -2898,9 +2912,14 @@ async fn start_target(
             .await
             .unwrap_or(false)
     {
-        return Err(format!("Access denied: you cannot use {host} for this project"));
+        return Err(format!(
+            "Access denied: you cannot use {host} for this project"
+        ));
     }
     let spec = &request.spec;
+    if spec.mode == shared::PaneMode::Deadloop {
+        return Err(RETIRED_BOT_MESSAGE.into());
+    }
     new_pane_launch_refusal(
         state,
         &session_id,
@@ -3019,6 +3038,87 @@ mod retired_launch_authorization_tests {
             machine_id: None,
             hostname: None,
         }
+    }
+
+    #[tokio::test]
+    async fn historical_bot_cannot_relaunch_or_be_admitted_as_a_new_pane() {
+        let (state, connection, session, mut web_rx, mut cli_rx, _) = policy_state().await;
+        let mut historical = pane(7, shared::Provider::Claude, false);
+        historical.mode = shared::PaneMode::Deadloop;
+        historical.prompt = Some("Original private bot instructions".into());
+        state
+            .sessions
+            .set_session_panes(&session, vec![historical.clone()]);
+        assert!(!authorize_existing_pane_launch(&state, &connection, &session, 7).await);
+        assert!(
+            matches!(web_rx.try_recv(), Ok(ServerToWeb::Error { message }) if message.contains("upgrade_required"))
+        );
+        let user = state.sessions.get_session(&session).unwrap().user_id;
+        let request = NewPaneRequest {
+            connection_id: connection,
+            user_id: user,
+            web_policy_capable: true,
+            session_id: session,
+            request_id: Some("retired-bot-attempt".into()),
+            spec: NewPaneSpec {
+                provider: shared::Provider::Claude,
+                mode: shared::PaneMode::Deadloop,
+                kind: shared::PaneKind::Terminal,
+                label: None,
+                prompt: historical.prompt.clone(),
+                model: None,
+                isolated_worktree: false,
+                role: None,
+                goal: None,
+                backstory: None,
+                plan_review_mode: shared::PlanReviewMode::default(),
+                managed: false,
+            },
+        };
+        let failure = launch_new_pane(&state, &request, None, InstanceTarget::Primary)
+            .await
+            .unwrap_err();
+        assert!(failure.contains("upgrade_required"));
+        assert!(
+            cli_rx.try_recv().is_err(),
+            "retired mutations never reach an old CLI"
+        );
+        let retained = state.sessions.get_session_panes(&session);
+        assert_eq!(retained.len(), 1);
+        assert_eq!(retained[0].prompt, historical.prompt);
+        assert_eq!(retained[0].mode, shared::PaneMode::Deadloop);
+    }
+
+    #[tokio::test]
+    async fn historical_bot_typed_input_is_read_only_without_removing_history() {
+        let (state, connection, session, mut web_rx, mut cli_rx, _) = policy_state().await;
+        let user = state.sessions.get_session(&session).unwrap().user_id;
+        state.sessions.set_web_user(connection, user);
+        let mut historical = pane(7, shared::Provider::Claude, false);
+        historical.mode = shared::PaneMode::Deadloop;
+        historical.prompt = Some("Original prompt".into());
+        state.sessions.set_session_panes(&session, vec![historical]);
+        handle_web_input(
+            &state,
+            &connection,
+            Some(session),
+            Some(session),
+            "/loop work".into(),
+            None,
+            Some(7),
+            None,
+        )
+        .await;
+        assert!(
+            matches!(web_rx.try_recv(), Ok(ServerToWeb::Error { message }) if message.contains("read-only"))
+        );
+        assert!(cli_rx.try_recv().is_err());
+        assert_eq!(
+            state.sessions.get_session_panes(&session)[0]
+                .prompt
+                .as_deref(),
+            Some("Original prompt")
+        );
     }
 
     /// The allowlist decides what may be created. Refusing to bring back a pane
@@ -4675,6 +4775,23 @@ async fn handle_web_input(
             .map(|pane_type| shared::PaneConfig::pane_id_from_legacy(&pane_type))
             .unwrap_or(shared::PANE_ID_INTERACTIVE)
     });
+    if state
+        .sessions
+        .get_session_panes(&sid)
+        .iter()
+        .any(|pane| pane.pane_id == target_pane && pane.mode == shared::PaneMode::Deadloop)
+    {
+        refuse_input(
+            state,
+            connection_id,
+            sid,
+            target_pane,
+            client_msg_id.as_deref(),
+            RETIRED_BOT_MESSAGE.to_owned(),
+        )
+        .await;
+        return;
+    }
     if let Some(refusal) = pane_control_refusal(state, connection_id, &sid, target_pane).await {
         refuse_input(
             state,
@@ -4814,6 +4931,15 @@ async fn handle_remove_pane(
     else {
         return;
     };
+    if state
+        .sessions
+        .get_session_panes(&sid)
+        .iter()
+        .any(|pane| pane.pane_id == pane_id && pane.mode == shared::PaneMode::Deadloop)
+    {
+        send_policy_error(state, connection_id, RETIRED_BOT_MESSAGE).await;
+        return;
+    }
     tracing::info!(
         "Removing pane {} from session {} (cleanup_action={:?})",
         pane_id,
@@ -5161,6 +5287,23 @@ async fn handle_terminal_conversation_input(
         }
     }
 
+    if state
+        .sessions
+        .get_session_panes(&sid)
+        .iter()
+        .any(|pane| pane.pane_id == pane_id && pane.mode == shared::PaneMode::Deadloop)
+    {
+        refuse_input(
+            state,
+            connection_id,
+            sid,
+            pane_id,
+            client_msg_id.as_deref(),
+            RETIRED_BOT_MESSAGE.to_owned(),
+        )
+        .await;
+        return;
+    }
     if let Some(refusal) = pane_control_refusal(state, connection_id, &sid, pane_id).await {
         refuse_input(
             state,
@@ -5947,6 +6090,11 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
             if !crate::jobs::web_outbound_allowed(&outbound_state, connection_id, &msg).await {
                 continue;
             }
+            if !crate::workers::socket::web_outbound_allowed(&outbound_state, connection_id, &msg)
+                .await
+            {
+                continue;
+            }
             let msg = with_viewer_runtime_access(&outbound_state, &connection_id, msg).await;
             let text = serde_json::to_string(&msg).unwrap();
             if sender.send(Message::Text(text.into())).await.is_err() {
@@ -6042,8 +6190,30 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                 continue;
             }
             match parsed {
-                Ok(WebToServer::SubscribeJob { project_id, job_id, after_seq }) => {
-                    crate::jobs::subscribe(&state, connection_id, project_id, job_id, after_seq).await;
+                Ok(WebToServer::SubscribeWorker {
+                    project_id,
+                    worker_id,
+                    after_seq,
+                }) => {
+                    crate::workers::socket::subscribe(
+                        &state,
+                        connection_id,
+                        project_id,
+                        worker_id,
+                        after_seq,
+                    )
+                    .await;
+                }
+                Ok(WebToServer::UnsubscribeWorker { worker_id }) => {
+                    crate::workers::socket::unsubscribe(&state, connection_id, worker_id);
+                }
+                Ok(WebToServer::SubscribeJob {
+                    project_id,
+                    job_id,
+                    after_seq,
+                }) => {
+                    crate::jobs::subscribe(&state, connection_id, project_id, job_id, after_seq)
+                        .await;
                 }
                 Ok(WebToServer::UnsubscribeJob { job_id }) => {
                     state.jobs.subscriptions.remove(&(connection_id, job_id));
@@ -6136,7 +6306,10 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                             }
                                         };
                                     mobile_device_session_id = claims.device_session_id.clone();
-                                    state.jobs.connection_auth.insert(connection_id, (uid, claims.device_session_id.clone(), claims.exp));
+                                    state.jobs.connection_auth.insert(
+                                        connection_id,
+                                        (uid, claims.device_session_id.clone(), claims.exp),
+                                    );
                                     is_mobile_client =
                                         matches!(client_kind, Some(shared::ClientKind::Mobile))
                                             && mobile_device_session_id.is_some();
@@ -6151,6 +6324,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                                 shared::PROJECT_POLICY_CAPABILITY
                                                     | shared::PANE_WORK_SUMMARY_CAPABILITY
                                                     | shared::AUTONOMOUS_JOBS_CAPABILITY
+                                                    | shared::AUTONOMOUS_WORKERS_CAPABILITY
                                                     | shared::PROJECT_INSTANCES_CAPABILITY
                                                     | "mobile_bootstrap_v1"
                                                     | "mobile_coding_mutations_v1"
@@ -6498,41 +6672,8 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             .await;
                     }
                 }
-                Ok(WebToServer::ResumeDeadloop {
-                    session_id: msg_sid,
-                }) => {
-                    if let Some(sid) = resolve_pane_session(
-                        &state,
-                        &connection_id,
-                        msg_sid,
-                        session_id,
-                        shared::PANE_ID_DEADLOOP,
-                    )
-                    .await
-                    {
-                        if let Some(pane) = state
-                            .sessions
-                            .get_session_panes(&sid)
-                            .into_iter()
-                            .find(|pane| pane.mode == shared::PaneMode::Deadloop)
-                        {
-                            if !authorize_existing_pane_launch(
-                                &state,
-                                &connection_id,
-                                &sid,
-                                pane.pane_id,
-                            )
-                            .await
-                            {
-                                continue;
-                            }
-                        }
-                        tracing::info!("Resuming deadloop for session {}", sid);
-                        state
-                            .sessions
-                            .route_to_cli(&sid, ServerToCli::ResumeDeadloop { session_id: sid })
-                            .await;
-                    }
+                Ok(WebToServer::ResumeDeadloop { .. }) => {
+                    send_policy_error(&state, &connection_id, RETIRED_BOT_MESSAGE).await;
                 }
                 Ok(WebToServer::RebootCli {
                     session_id: msg_sid,
@@ -7867,6 +8008,10 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             send_policy_error(&state, &connection_id, "Pane not found").await;
                             continue;
                         };
+                        if existing.mode == shared::PaneMode::Deadloop {
+                            send_policy_error(&state, &connection_id, RETIRED_BOT_MESSAGE).await;
+                            continue;
+                        }
                         let desired_provider = provider.unwrap_or(existing.provider);
                         if provider.is_some()
                             && existing.kind == shared::PaneKind::Terminal
@@ -7931,56 +8076,8 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     handle_reorder_panes(&state, &connection_id, msg_sid, session_id, pane_ids)
                         .await;
                 }
-                Ok(WebToServer::StartBot {
-                    session_id: msg_sid,
-                    pane_id,
-                    prompt,
-                    min_iteration_interval_minutes,
-                    effort,
-                }) => {
-                    if let Some(sid) =
-                        resolve_pane_session(&state, &connection_id, msg_sid, session_id, pane_id)
-                            .await
-                    {
-                        let Ok((_project_id, _project_guard)) =
-                            state.active_session_operation(&sid.to_string()).await
-                        else {
-                            continue;
-                        };
-                        if !authorize_existing_pane_launch(&state, &connection_id, &sid, pane_id)
-                            .await
-                        {
-                            continue;
-                        }
-                        tracing::info!("Starting bot on pane {} for session {}", pane_id, sid);
-                        state
-                            .sessions
-                            .route_to_cli(
-                                &sid,
-                                ServerToCli::StartBot {
-                                    session_id: sid,
-                                    pane_id,
-                                    prompt: prompt.clone(),
-                                    min_iteration_interval_minutes,
-                                    effort: effort.clone(),
-                                },
-                            )
-                            .await;
-
-                        // Optimistically update cached pane state so web
-                        // reflects the change even if the CLI PaneList is lost.
-                        edit_roster_pane(&state, sid, pane_id, |pane| {
-                            pane.mode = shared::PaneMode::Deadloop;
-                            pane.prompt = prompt;
-                            pane.min_iteration_interval_minutes = min_iteration_interval_minutes
-                                .or(pane.min_iteration_interval_minutes);
-                            if let Some(requested_effort) = effort.as_deref() {
-                                pane.effort = normalize_start_bot_effort(requested_effort);
-                            }
-                            pane.stop_requested = false;
-                        })
-                        .await;
-                    }
+                Ok(WebToServer::StartBot { .. }) => {
+                    send_policy_error(&state, &connection_id, RETIRED_BOT_MESSAGE).await;
                 }
                 Ok(WebToServer::StopBot {
                     session_id: msg_sid,
@@ -8824,7 +8921,18 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
     // case another transient sender clone or a stalled transport remains.
     state.sessions.unregister_web(&connection_id);
     state.jobs.connection_auth.remove(&connection_id);
-    state.jobs.subscriptions.retain(|(connection, _), _| *connection != connection_id);
+    state
+        .jobs
+        .subscriptions
+        .retain(|(connection, _), _| *connection != connection_id);
+    state
+        .jobs
+        .worker_subscriptions
+        .retain(|(connection, _), _| *connection != connection_id);
+    state
+        .jobs
+        .worker_subscription_cursors
+        .retain(|(connection, _), _| *connection != connection_id);
     let mut send_task = send_task;
     if tokio::time::timeout(std::time::Duration::from_millis(250), &mut send_task)
         .await
@@ -9552,7 +9660,10 @@ mod project_instance_tests {
         typed(&p, &older.id, Some(4), Some("older-4")).await;
         let seen = older.drain();
         assert_eq!(errors(&seen), vec![refusal.clone()]);
-        assert!(input_refusals(&seen).is_empty(), "an older viewer gets the error alone");
+        assert!(
+            input_refusals(&seen).is_empty(),
+            "an older viewer gets the error alone"
+        );
 
         assert!(a.drain().is_empty(), "nothing reaches the running instance");
     }
@@ -9581,7 +9692,10 @@ mod project_instance_tests {
             .await;
         });
         let typed = a.rx.recv().await.expect("the text reaches the terminal");
-        assert!(matches!(typed, ServerToCli::TerminalInput { pane_id: 3, .. }));
+        assert!(matches!(
+            typed,
+            ServerToCli::TerminalInput { pane_id: 3, .. }
+        ));
         // The instance's connection closes before Enter is sent.
         drop(a);
         send.await.unwrap();
@@ -10306,7 +10420,12 @@ mod project_instance_tests {
             ServerToWeb::PaneList { panes, .. }
                 if panes.iter().map(|pane| pane.pane_id).collect::<Vec<_>>() == vec![7]
         )));
-        let forgotten = p.state.sessions.get_session(&p.session).unwrap().forgotten_panes;
+        let forgotten = p
+            .state
+            .sessions
+            .get_session(&p.session)
+            .unwrap()
+            .forgotten_panes;
         assert_eq!(forgotten.get(&2), Some(&None));
         assert_eq!(forgotten.get(&4), Some(&None));
 
@@ -10455,7 +10574,12 @@ mod project_instance_tests {
             .attach_web_to_session(&p.session, Uuid::new_v4(), None);
         assert!(resolve_pane_roster(&restarted, &p.session).await.is_some());
         let mut allocated: Vec<u32> = (0..fresh.len())
-            .map(|_| restarted.sessions.allocate_pane_id(&p.session, Some(p.m5)).unwrap())
+            .map(|_| {
+                restarted
+                    .sessions
+                    .allocate_pane_id(&p.session, Some(p.m5))
+                    .unwrap()
+            })
             .collect();
         allocated.sort();
         assert_eq!(allocated, fresh, "the restarted server avoids them too");
@@ -10476,7 +10600,11 @@ mod project_instance_tests {
             .sessions
             .get_session_panes(&p.session)
             .into_iter()
-            .chain(fresh.iter().map(|pane_id| pane(*pane_id, Some(p.m5), Some(HOST_A))))
+            .chain(
+                fresh
+                    .iter()
+                    .map(|pane_id| pane(*pane_id, Some(p.m5), Some(HOST_A))),
+            )
             .collect();
         p.state
             .sessions
@@ -10550,7 +10678,10 @@ mod project_instance_tests {
             (3, Some(p.m5), Some("renamed".to_string())),
             (9, Some(p.m6), None),
         ];
-        assert_eq!(summary(&p.state.sessions.get_session_panes(&p.session)), expected);
+        assert_eq!(
+            summary(&p.state.sessions.get_session_panes(&p.session)),
+            expected
+        );
         let persisted = p
             .state
             .storage
@@ -10572,7 +10703,10 @@ mod project_instance_tests {
 
         assert!(!edit_roster_pane(&p.state, p.session, 7, |pane| pane.label = None).await);
         assert!(web.drain().is_empty());
-        assert_eq!(summary(&p.state.sessions.get_session_panes(&p.session)), expected);
+        assert_eq!(
+            summary(&p.state.sessions.get_session_panes(&p.session)),
+            expected
+        );
     }
 
     /// A viewer arriving while `panes.json` cannot be read neither treats the
@@ -10601,7 +10735,10 @@ mod project_instance_tests {
             .state
             .sessions
             .seed_inferred_pane_roster(&p.session, vec![pane(2, None, None)]));
-        assert!(p.pane_ids().is_empty(), "no inferred pane became the roster");
+        assert!(
+            p.pane_ids().is_empty(),
+            "no inferred pane became the roster"
+        );
 
         let mut a = p.instance(p.m5, HOST_A);
         p.state
@@ -11346,7 +11483,10 @@ mod project_instance_tests {
         // Only a client that keeps an inventory per machine names one.
         let mut web = p.viewer(
             p.owner,
-            &[shared::PROJECT_POLICY_CAPABILITY, PROJECT_INSTANCES_CAPABILITY],
+            &[
+                shared::PROJECT_POLICY_CAPABILITY,
+                PROJECT_INSTANCES_CAPABILITY,
+            ],
         );
         let mut older = p.viewer(p.owner, &[shared::PROJECT_POLICY_CAPABILITY]);
         let inventory = |hosting: bool| shared::CliLifecycleInventory {
@@ -11833,7 +11973,10 @@ mod project_instance_tests {
         fn requester(&self) -> Endpoint<ServerToWeb> {
             self.viewer(
                 self.owner,
-                &[shared::PROJECT_POLICY_CAPABILITY, PROJECT_INSTANCES_CAPABILITY],
+                &[
+                    shared::PROJECT_POLICY_CAPABILITY,
+                    PROJECT_INSTANCES_CAPABILITY,
+                ],
             )
         }
 
@@ -12103,7 +12246,10 @@ mod project_instance_tests {
         );
         let added = added_panes(&older.drain());
         assert_eq!(added.len(), 1);
-        assert_eq!((added[0].machine_id, added[0].hostname.as_deref()), (None, None));
+        assert_eq!(
+            (added[0].machine_id, added[0].hostname.as_deref()),
+            (None, None)
+        );
     }
 
     /// A pane for a machine that has the project but is not running it
@@ -12130,7 +12276,10 @@ mod project_instance_tests {
             .instance_start_result(p.m6, start, &p.project_id(), true, None));
         let mut b = p.instance(p.m6, HOST_B);
         tokio::time::sleep(Duration::from_millis(50)).await;
-        assert!(added_panes(&b.drain()).is_empty(), "attached is not started");
+        assert!(
+            added_panes(&b.drain()).is_empty(),
+            "attached is not started"
+        );
         assert!(add_results(&web.drain()).is_empty());
 
         p.state.sessions.instance_started(p.session, p.m6, b.id);
@@ -12189,7 +12338,10 @@ mod project_instance_tests {
 
         let mut b = p.instance(p.m6, HOST_B);
         p.state.sessions.instance_started(p.session, p.m6, b.id);
-        let mut answered = vec![next_add_result(&mut web).await, next_add_result(&mut web).await];
+        let mut answered = vec![
+            next_add_result(&mut web).await,
+            next_add_result(&mut web).await,
+        ];
         answered.sort_by(|left, right| left.request_id.cmp(&right.request_id));
         assert_eq!(
             answered
@@ -12323,7 +12475,10 @@ mod project_instance_tests {
         let mut offline = p.daemon(p.m6, HOST_B, CAPABLE_DAEMON);
         p.state.sessions.unregister_daemon(&p.m6);
         p.add_pane(&web, Some(p.m6), Some("offline")).await;
-        assert_eq!(refusal(only(add_results(&web.drain()))), "zoo-006 is offline");
+        assert_eq!(
+            refusal(only(add_results(&web.drain()))),
+            "zoo-006 is offline"
+        );
 
         let m7 = Uuid::new_v4();
         let mut older = p.daemon(m7, HOST_C, &[shared::PROJECT_POLICY_CAPABILITY]);
@@ -12348,7 +12503,8 @@ mod project_instance_tests {
             refusal(only(add_results(&web.drain()))),
             "That machine is not available to you"
         );
-        p.add_pane(&web, Some(Uuid::new_v4()), Some("unknown")).await;
+        p.add_pane(&web, Some(Uuid::new_v4()), Some("unknown"))
+            .await;
         assert_eq!(
             refusal(only(add_results(&web.drain()))),
             "That machine is not available to you"
@@ -12373,7 +12529,10 @@ mod project_instance_tests {
         let result = only(add_results(&web.drain()));
         assert_eq!(result.status, shared::AddPaneStatus::Failed);
         let error = result.error.unwrap();
-        assert!(error.contains(HOST_A) && error.contains("cannot share it"), "{error}");
+        assert!(
+            error.contains(HOST_A) && error.contains("cannot share it"),
+            "{error}"
+        );
         assert!(!started(&mut d6));
         assert!(older.drain().is_empty());
     }
@@ -12425,7 +12584,10 @@ mod project_instance_tests {
         p.add_pane(&web, Some(Uuid::new_v4()), None).await;
         let received = web.drain();
         assert!(add_results(&received).is_empty());
-        assert_eq!(errors(&received), vec!["That machine is not available to you"]);
+        assert_eq!(
+            errors(&received),
+            vec!["That machine is not available to you"]
+        );
     }
 
     /// End to end over the CLI socket: the instance a pane waits for starts
@@ -12469,10 +12631,11 @@ mod project_instance_tests {
             &EncodingKey::from_secret(p.state.config.auth.jwt_secret.as_bytes()),
         )
         .unwrap();
-        let (mut socket, _) = connect_async(format!("ws://{address}/ws/cli")).await.unwrap();
-        let frame = |message: shared::CliToServer| {
-            Message::Text(serde_json::to_string(&message).unwrap())
-        };
+        let (mut socket, _) = connect_async(format!("ws://{address}/ws/cli"))
+            .await
+            .unwrap();
+        let frame =
+            |message: shared::CliToServer| Message::Text(serde_json::to_string(&message).unwrap());
         socket
             .send(frame(shared::CliToServer::Register {
                 token,

@@ -69,8 +69,8 @@ export default function CodeHomeScreen() {
         </View>
       </View>
       <View style={{ padding: 16, gap: 8 }}>
-        <JobAction onPress={() => router.push("/(code)/jobs")}>Autonomous jobs</JobAction>
-        <JobAction onPress={() => router.push("/(code)/(tabs)/attention")}>Attention: sessions and jobs</JobAction>
+        <JobAction onPress={() => router.push("/(code)/workers")}>Autonomous workers</JobAction>
+        <JobAction onPress={() => router.push("/(code)/(tabs)/attention")}>Attention: sessions and workers</JobAction>
       </View>
       <View style={styles.filters}>
         {FILTERS.map((item) => { const selectedFilter = filter === item.key; return <Pressable accessibilityRole="button" accessibilityState={{ selected: selectedFilter }} key={item.key} onPress={() => setFilter(item.key)} style={[styles.chip, { backgroundColor: selectedFilter ? theme.accent : theme.surfaceMuted }]}><Text style={{ color: selectedFilter ? "#fff" : theme.text, fontWeight: "600" }}>{item.label}</Text></Pressable>; })}

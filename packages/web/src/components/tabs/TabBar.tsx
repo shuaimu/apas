@@ -934,8 +934,8 @@ function AddTabButton({
               onClick={() => { setShowMenu(false); onAddAutonomous?.(); }}
               className="w-full min-h-11 text-left px-3 py-3 hover:bg-gray-100 dark:hover:bg-gray-700 disabled:opacity-60 disabled:cursor-not-allowed"
             >
-              <span className="block text-sm font-semibold">Autonomous agent</span>
-              <span className="block mt-1 text-xs text-gray-500 dark:text-gray-400">{autonomousUnavailableReason || (onAddAutonomous ? "Review a bounded task, worker readiness and limits." : "Open a project to configure autonomous work.")}</span>
+              <span className="block text-sm font-semibold">Autonomous worker</span>
+              <span className="block mt-1 text-xs text-gray-500 dark:text-gray-400">{autonomousUnavailableReason || (onAddAutonomous ? "Review a responsibility, standing checklist and recurring allowance." : "Open a project to configure autonomous work.")}</span>
             </button>
           </> : <>
             <button type="button" onClick={() => setInteractive(false)} className="min-h-11 w-full text-left px-3 text-sm text-blue-600 dark:text-blue-400 hover:bg-gray-100 dark:hover:bg-gray-700">Back to agent types</button>

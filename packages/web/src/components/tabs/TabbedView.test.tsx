@@ -2,10 +2,7 @@ import { act, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { paneKey, useStore, type PaneConfig } from "@/lib/store";
 import {
-  botPromptForPane,
-  CLASSIC_TODO_BOT_LOOP_PROMPT,
   confirmedPaneRebootTarget,
-  defaultBotPromptForPane,
   deriveInitialActiveTabId,
   lazyPaneMessageLoadTargets,
   requestConfirmedPaneReboot,
@@ -446,35 +443,3 @@ describe("pane reboot controls", () => {
   });
 });
 
-describe("botPromptForPane", () => {
-  it("uses explicit saved prompts before managed or classic fallbacks", () => {
-    expect(
-      botPromptForPane({
-        prompt: "Keep doing the custom thing.",
-        managed: true,
-        role: "developer",
-      }),
-    ).toBe("Keep doing the custom thing.");
-  });
-
-  it("uses the classic TODO.md loop for every pane", () => {
-    // The managed-team variant is gone with team mode, so a pane's role
-    // metadata no longer changes the loop it is given.
-    expect(botPromptForPane({ managed: false })).toBe(CLASSIC_TODO_BOT_LOOP_PROMPT);
-    expect(botPromptForPane({ managed: true, role: "developer" })).toBe(
-      CLASSIC_TODO_BOT_LOOP_PROMPT,
-    );
-    expect(CLASSIC_TODO_BOT_LOOP_PROMPT).toContain("TODO.md");
-  });
-
-  it("can ignore saved prompts when callers need the default fallback", () => {
-    const prompt = defaultBotPromptForPane({
-      prompt: "Old saved prompt.",
-      managed: true,
-      role: "reviewer",
-    });
-
-    expect(prompt).toBe(CLASSIC_TODO_BOT_LOOP_PROMPT);
-    expect(prompt).not.toContain("Old saved prompt.");
-  });
-});

@@ -2,12 +2,21 @@
 // Native API references are pinned to OMP 18.18.0. An incompatible image fails
 // before prompt admission; this program does not synthesize model responses.
 import { readFile, mkdir, writeFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
+
+const bootstrapDigest = `sha256:${createHash("sha256").update(await readFile(new URL(import.meta.url))).digest("hex")}`;
+const workerContract = { version: 2, resultVersion: 1,
+  resultPath: "/session/apas-worker-result.json", bootstrapDigest };
 
 const root = "/opt/omp/packages/coding-agent";
 const metadata = JSON.parse(await readFile(`${root}/package.json`, "utf8"));
 if (metadata.version !== "18.18.0") throw new Error("Unqualified OMP version");
 if (process.argv.slice(2).join(" ") === "--version") {
   process.stdout.write(`${metadata.version}\n`);
+  process.exit(0);
+}
+if (process.argv.slice(2).join(" ") === "--worker-contract") {
+  process.stdout.write(`${JSON.stringify(workerContract)}\n`);
   process.exit(0);
 }
 if (process.argv.length !== 2) throw new Error("Worker bootstrap accepts no caller overrides");
@@ -67,7 +76,7 @@ const settings = Settings.isolated({
 if (cfgAskTimeout.get(settings) !== 0) throw new Error("Effective ask timeout must be zero");
 const args = ["--mode", "rpc-ui", "--session-dir", "/session/history", "--model", selector,
   "--no-extensions", "--no-skills", "--no-rules"];
-process.stdout.write(`${JSON.stringify({ type: "apas_profile_ready", version: 1,
+process.stdout.write(`${JSON.stringify({ type: "apas_profile_ready", ...workerContract,
   ompVersion: metadata.version, askTimeout: 0, isolatedSettings: true,
   childQuestionEscalation: true })}\n`);
 await runRootCommand(parseArgs(args), args, {

@@ -13,7 +13,7 @@ import { connectionSupervisor } from "@/connection/runtime";
 import { MutationRefusedError } from "@/connection/supervisor";
 import { useTheme } from "@/design/tokens";
 import { readCachedSnapshot, readConversationPosition, readSelectedConversationPane, saveConversationPosition, saveSelectedConversationPane, type ConversationPosition } from "@/storage/cache";
-import { paneStatusIsPendingAnswer } from "@/state/paneStatus";
+import { paneIsRetiredBot, paneStatusIsPendingAnswer } from "@/state/paneStatus";
 import {
   instancesForSession,
   paneHostname,
@@ -24,6 +24,7 @@ import {
   type PaneReachability,
 } from "@/state/projectInstances";
 import { mutationsAllowed, PROJECT_INSTANCES_CAPABILITY, useMobileStore } from "@/state/store";
+import { LegacyBotHistory } from "@/components/LegacyBotHistory";
 
 const EMPTY_EVENTS: CodeEvent[] = [];
 const EMPTY_PANES: (PaneConfig | MobilePaneSummary)[] = [];
@@ -127,7 +128,11 @@ export default function SessionActivityScreen() {
     ? savedPositionResult.position
     : undefined;
   const selectedPane = panes.find((pane) => pane.id === activePaneId);
-  const selectedUnavailable = selectedPane ? paneUnavailableReason(selectedPane.reachability, selectedPane.host) : null;
+  const selectedConfig = (livePanes ?? bootstrapPanes)?.find((pane) => pane.pane_id === activePaneId);
+  const selectedIsRetiredBot = paneIsRetiredBot(selectedConfig);
+  const selectedUnavailable = selectedIsRetiredBot
+    ? "Earlier bot history is read-only. Create and approve a fresh worker separately; no old process or authority is adopted."
+    : selectedPane ? paneUnavailableReason(selectedPane.reachability, selectedPane.host) : null;
   const selectedIsTerminal = selectedPane?.kind === "terminal";
   const selectedStatus = activePaneId === null ? null : paneStatuses?.[String(activePaneId)] ?? null;
   const selectedAwaitingAnswer = paneStatusIsPendingAnswer(selectedStatus);
@@ -372,6 +377,7 @@ export default function SessionActivityScreen() {
         </View>
       </View>
       {panes.length > 0 ? <View style={styles.panes}><Text style={{ color: theme.textMuted }}>Conversation:</Text>{panes.map((pane) => <SecondaryButton key={pane.id} onPress={() => selectConversationPane(pane.id)}>{`${activePaneId === pane.id ? "✓ " : ""}${pane.displayLabel}${paneChipState(pane.reachability, paneStatuses?.[String(pane.id)])}`}</SecondaryButton>)}</View> : null}
+      {selectedIsRetiredBot && selectedConfig && <LegacyBotHistory pane={selectedConfig} project={session.project_id ?? sessionId} />}
       <FlatList
         ref={timeline}
         data={conversationEvents}
@@ -397,7 +403,7 @@ export default function SessionActivityScreen() {
       <View style={[styles.composer, { borderColor: theme.border, backgroundColor: theme.background }]}> 
         {connection === "ready" && selectedStatus ? <View testID="pane-working-status" accessibilityLiveRegion="polite" style={[styles.workingStatus, { backgroundColor: theme.surface }]}>{selectedAwaitingAnswer ? <Text style={[styles.pendingIcon, { color: theme.warning }]}>?</Text> : <ActivityIndicator size="small" color={theme.accent} />}<Text numberOfLines={1} style={[styles.workingText, { color: selectedAwaitingAnswer ? theme.warning : theme.accent }]}>{selectedStatus}</Text></View> : null}
         {selectedUnavailable ? <View testID="pane-unavailable" accessibilityLiveRegion="polite" style={[styles.unavailable, { backgroundColor: theme.surfaceMuted, borderColor: theme.warning }]}><Text style={{ color: theme.text }}>{selectedUnavailable}</Text></View> : null}
-        <FormField label="Message" value={followUp} onChangeText={(value) => { setFollowUp(value); setFollowUpRequestId(null); }} placeholder={selectedIsTerminal ? "Message this terminal conversation" : "Steer this exact session and pane"} multiline />
+        <FormField label="Message" value={followUp} editable={!selectedIsRetiredBot} onChangeText={(value) => { setFollowUp(value); setFollowUpRequestId(null); }} placeholder={selectedIsTerminal ? "Message this terminal conversation" : "Steer this exact session and pane"} multiline />
         <PrimaryButton disabled={!mutationsAllowed() || activePaneId === null || !followUp.trim() || (selectedIsTerminal && !terminalEnabled) || selectedUnavailable !== null} onPress={() => void steer()}>{followUpRequestId ? "Retry message safely" : "Send message"}</PrimaryButton>
       </View>
       <PaneWorkSummarySheet

@@ -212,7 +212,11 @@ impl Session {
                 ensure!(
                     !self.profile_ready
                         && !self.ready
-                        && frame["version"] == 1
+                        && frame["version"] == shared::WORKER_EXECUTION_PROTOCOL_VERSION
+                        && frame["resultVersion"] == shared::WORKER_RESULT_VERSION
+                        && frame["resultPath"]
+                            == format!("/session/{}", shared::WORKER_RESULT_FILENAME)
+                        && frame["bootstrapDigest"] == super::sandbox::bootstrap_digest()
                         && frame["ompVersion"] == "18.18.0"
                         && frame["askTimeout"] == 0
                         && frame["isolatedSettings"] == true
@@ -617,6 +621,50 @@ mod tests {
     }
     fn question() -> JobQuestion {
         parse_question(&identity(), &json!({"id":"dialog","questions":[{"id":"db","question":"Database?","options":[{"label":"A"},{"label":"B"}]}]}), "tool").unwrap()
+    }
+    #[test]
+    fn bootstrap_requires_versioned_result_contract_not_terminal_readiness() {
+        let identity = identity();
+        let mut session = Session::new(identity.run_id);
+        let mut frame = json!({"type":"apas_profile_ready","version":1,"ompVersion":"18.18.0","askTimeout":0,"isolatedSettings":true,"childQuestionEscalation":true});
+        assert!(session.accept(&identity, frame.clone()).is_err());
+        frame["version"] = json!(shared::WORKER_EXECUTION_PROTOCOL_VERSION);
+        frame["resultVersion"] = json!(shared::WORKER_RESULT_VERSION);
+        frame["resultPath"] = json!("/session/apas-worker-result.json");
+        frame["bootstrapDigest"] = json!(super::super::sandbox::bootstrap_digest());
+        session.accept(&identity, frame.clone()).unwrap();
+        assert!(
+            !session.qualified(),
+            "bootstrap alone cannot prove native settlement/question support"
+        );
+        let mut session = Session::new(identity.run_id);
+        frame["bootstrapDigest"] = json!("sha256:unqualified");
+        assert!(session.accept(&identity, frame).is_err());
+    }
+
+    #[test]
+    fn stopped_dialog_and_old_question_identity_cannot_accept_answers() {
+        let mut session = Session::new(Uuid::new_v4());
+        let mut question = question();
+        let id = question.id;
+        question.state = JobQuestionState::Cancelled;
+        session.questions.push(question);
+        let answers = vec![JobQuestionAnswer {
+            id: "db".into(),
+            selected_option_ids: vec!["option-1".into()],
+            custom_input: None,
+        }];
+        assert!(session
+            .reserve_answer(id, "dialog", "tool", &answers)
+            .is_err());
+        session.questions[0].state = JobQuestionState::Pending;
+        assert!(session
+            .reserve_answer(Uuid::new_v4(), "dialog", "tool", &answers)
+            .is_err());
+        assert!(session
+            .reserve_answer(id, "later-dialog", "tool", &answers)
+            .is_err());
+        assert_eq!(session.questions[0].state, JobQuestionState::Pending);
     }
     #[test]
     fn ambiguous_labels_rejected() {

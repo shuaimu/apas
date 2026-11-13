@@ -6,7 +6,6 @@ import { useParams, usePathname, useRouter, useSearchParams } from "next/navigat
 import { useStore } from "@/lib/store";
 import { onJobCachePurge } from "@/lib/jobCache";
 import { JobList } from "@/components/jobs/JobList";
-import { JobComposer } from "@/components/jobs/JobComposer";
 import { JobDetailScreen } from "@/components/jobs/JobDetail";
 import "./jobs.css";
 
@@ -39,12 +38,14 @@ function JobsRoute() {
   useEffect(() => { document.querySelector<HTMLElement>(".jobs-main h1")?.focus(); }, [pathname]);
   const path = params.path ?? [];
   const attention = query.get("view") === "attention";
-  const validDetail = path.length === 1 || path.length === 2 && path[1] === "review" || path.length === 3 && path[1] === "questions";
+  const exactRunPath = path.length >= 3 && path[1] === "runs";
+  const validDetail = path.length === 1 || path.length === 2 && path[1] === "review" || path.length === 3 && path[1] === "questions" || exactRunPath && (path.length === 3 || path.length === 4 && path[3] === "review" || path.length === 5 && path[3] === "questions");
+  const requestedRun = exactRunPath ? path[2] : query.get("run_id") ?? query.get("run") ?? undefined;
   return <div className="jobs-app">
     <a className="jobs-skip" href="#job-main">Skip to job content</a>
-    <header className="jobs-header"><Link href="/" className="job-brand">APAS · Code</Link><nav aria-label="Code navigation"><Link href="/">Sessions</Link><Link href="/code/jobs" aria-current={!path.length && !attention ? "page" : undefined}>Jobs</Link><Link href="/code/jobs?view=attention" aria-current={!path.length && attention ? "page" : undefined}>Attention</Link><Link href="/code/jobs/new" aria-current={path[0] === "new" ? "page" : undefined}>New job</Link></nav></header>
+    <header className="jobs-header"><Link href="/" className="job-brand">APAS · Code</Link><nav aria-label="Code navigation"><Link href="/">Sessions</Link><Link href="/code/workers">Workers</Link><Link href="/code/workers?view=attention">Attention</Link><Link href="/code/jobs" aria-current={!path.length ? "page" : undefined}>Earlier results</Link></nav></header>
     <main className="jobs-main" id="job-main" key={`${account}:${cacheEpoch}`}>
-      {!mounted || !token || !account ? <p role="status">Checking account…</p> : accessChanged ? <><h1 tabIndex={-1}>Job access changed</h1><p role="alert">Cached job content has been removed from this view. Recheck current authority before loading more content.</p><button onClick={() => setAccessChanged(false)}>Check current access</button></> : !path.length ? <JobList key={attention ? "attention" : "all"} attention={attention} /> : path[0] === "new" && path.length === 1 ? <JobComposer initialProject={query.get("project")} /> : validDetail ? <JobDetailScreen key={path.join(":")} id={path[0]} projectHint={query.get("project")} review={path[1] === "review"} questionId={path[1] === "questions" ? path[2] : undefined} /> : <><h1>Unknown job destination</h1><Link href="/code/jobs">Return to Jobs</Link></>}
+      {!mounted || !token || !account ? <p role="status">Checking account…</p> : accessChanged ? <><h1 tabIndex={-1}>Earlier-result access changed</h1><p role="alert">Cached content has been removed. Recheck current authority before loading more content.</p><button onClick={() => setAccessChanged(false)}>Check current access</button></> : !path.length ? <JobList key={attention ? "attention" : "all"} attention={attention} /> : path[0] === "new" && path.length === 1 ? <><h1>Standalone job creation is retired</h1><p>Earlier drafts are not recurring approvals. Open a worker draft to explicitly review its responsibility, provider and recurring allowance.</p><Link className="job-button" href={`/code/workers/new${query.get("project") ? `?project=${encodeURIComponent(query.get("project")!)}` : ""}`}>Open unapproved worker draft</Link></> : validDetail ? <JobDetailScreen key={path.join(":")} id={path[0]} projectHint={query.get("project")} runId={requestedRun} review={exactRunPath ? path[3] === "review" : path[1] === "review"} questionId={exactRunPath ? path[3] === "questions" ? path[4] : undefined : path[1] === "questions" ? path[2] : undefined} /> : <><h1>Unknown earlier-result destination</h1><Link href="/code/jobs">Return to earlier results</Link></>}
     </main>
   </div>;
 }

@@ -13,8 +13,9 @@ const mockDb = {
     if (mockFailWrite) throw new Error("device storage full");
     if (sql.startsWith("DELETE")) {
       for (const key of mockRows.keys()) {
-        const [account, project] = JSON.parse(key) as string[];
-        if (!args.length || (account === args[0] && (args.length === 1 || project === args[1]))) mockRows.delete(key);
+        const [account, project, job] = JSON.parse(key) as string[];
+        const globalWorkerPage = sql.includes("job_id LIKE 'worker:%'");
+        if (globalWorkerPage ? account === args[0] && project === "" && job.startsWith("worker:") : !args.length || (account === args[0] && (args.length === 1 || project === args[1]))) mockRows.delete(key);
       }
     } else {
       const key = JSON.stringify(args.length === 4 ? [...args.slice(0, 3), "snapshot"] : args.slice(0, 4));
@@ -57,10 +58,10 @@ test("a newer snapshot does not skip events missing from the local journal", asy
 
 test("drafts and uncertain identities are actor scoped and revoked writes cannot restore them", async () => {
   await writeJobRecord(scope, "answer", { request_id: "original", text: "private" });
-  expect(await readJobRecord({ ...scope, account: "actor-b" }, "answer")).toBeNull();
+  await expect(readJobRecord({ ...scope, account: "actor-b" }, "answer")).rejects.toThrow("authority changed");
   await purgeJobStorage(scope.account, scope.project);
   await expect(writeJobRecord(scope, "answer", { request_id: "original" })).rejects.toThrow("authority changed");
-  expect(await readJobRecord(scope, "answer")).toBeNull();
+  await expect(readJobRecord(scope, "answer")).rejects.toThrow("authority changed");
 });
 
 test("account change fences already queued writes and full purge removes all evidence", async () => {
@@ -70,4 +71,17 @@ test("account change fences already queued writes and full purge removes all evi
   await expect(pending).rejects.toThrow("authority changed");
   await purgeJobStorage();
   expect(mockRows.size).toBe(0);
+});
+
+test("worker scopes preserve exact run/question records and purge later global labels", async () => {
+  const worker = { ...scope, job: "worker:responsibility" };
+  await writeJobRecord(worker, "run:old:question:dialog:epoch:3", { text: "protected earlier answer" });
+  await writeJobRecord(worker, "run:new:question:dialog:epoch:4", { text: "different answer" });
+  await writeJobRecord({ ...scope, project: "", job: "worker:" }, "list:attention:later-page", { description: "protected label" });
+  await writeJobRecord({ ...scope, project: "other", job: "worker:other" }, "snapshot", { title: "still authorized" });
+  expect(await readJobRecord(worker, "run:old:question:dialog:epoch:3")).toEqual({ text: "protected earlier answer" });
+  await purgeJobStorage(scope.account, scope.project);
+  expect(await readJobRecord({ ...scope, project: "", job: "worker:" }, "list:attention:later-page")).toBeNull();
+  expect(await readJobRecord({ ...scope, project: "other", job: "worker:other" }, "snapshot")).toEqual({ title: "still authorized" });
+  await expect(writeJobRecord(worker, "run:old:artifact", "late response")).rejects.toThrow("authority changed");
 });
