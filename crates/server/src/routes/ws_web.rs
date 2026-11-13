@@ -21,7 +21,7 @@ use crate::mobile_metrics::MobileMetric;
 use crate::routes::auth::verify_token;
 use crate::session::instances::PaneOwner;
 use crate::session::pane_launches::{InstanceStartOutcome, InstanceStartWait};
-use crate::session::{CliRouteOutcome, InstanceAttachment};
+use crate::session::{AutopilotReceipt, CliRouteOutcome, InstanceAttachment};
 use crate::state::AppState;
 
 const SERVER_VERSION: &str = env!("APAS_SERVER_VERSION");
@@ -1908,6 +1908,313 @@ async fn handle_omp_question_answer(state: &AppState, connection_id: &Uuid, comm
         .await;
 }
 
+/// How long a requester waits for the tab's instance to answer an autopilot
+/// request before it is told the request is not confirmed. The instance's own
+/// waits (a second for its lock, two for the tab, and one more for a start
+/// the tab took) stay inside it.
+const AUTOPILOT_RECEIPT_WAIT: Duration = Duration::from_secs(5);
+
+/// Answer one autopilot request, to the connection that sent it and to no
+/// other. Older native builds drop their socket on a frame type they do not
+/// know, so nothing is sent to a connection that did not negotiate autopilot.
+async fn send_autopilot_receipt(
+    state: &AppState,
+    connection_id: &Uuid,
+    session_id: Uuid,
+    pane_id: u32,
+    request_id: String,
+    receipt: AutopilotReceipt,
+) {
+    if !state
+        .sessions
+        .web_supports_capability(connection_id, shared::TAB_AUTOPILOT_CAPABILITY)
+    {
+        return;
+    }
+    state
+        .sessions
+        .send_to_web(
+            connection_id,
+            ServerToWeb::PaneAutopilotReceipt {
+                session_id,
+                pane_id,
+                request_id,
+                outcome: receipt.outcome,
+                reason: receipt.reason,
+            },
+        )
+        .await;
+}
+
+/// The refusal for an autopilot request whose tab runs on an instance that
+/// did not advertise autopilot: an older CLI drops the frame without an
+/// answer, so it is never sent one. Clients show this same wording for such
+/// a tab.
+fn older_instance_autopilot_refusal(state: &AppState, instance: &InstanceAttachment) -> String {
+    let host = instance
+        .hostname
+        .as_deref()
+        .map(|host| host.trim().to_string())
+        .filter(|host| !host.is_empty())
+        .or_else(|| {
+            instance
+                .machine_id
+                .and_then(|machine_id| state.sessions.machine_hostname(&machine_id))
+                .map(|host| host.trim().to_string())
+                .filter(|host| !host.is_empty())
+        });
+    match host {
+        Some(host) => format!(
+            "{host} runs an older APAS that cannot run autopilot. Reboot {host} to update it."
+        ),
+        None => "This tab's machine runs an older APAS that cannot run autopilot. Reboot it to update it."
+            .to_string(),
+    }
+}
+
+/// Check one autopilot request and forward it to the instance that owns its
+/// tab. Returns the wait for that instance's receipt, or why the request is
+/// refused, in which case nothing reached the tab.
+///
+/// Access is the check input to the tab gets, on the machine of the instance
+/// that owns it, and reads the same when refused. It is the same for a start
+/// as for a stop: whoever may type into a tab may leave it on autopilot, and
+/// nobody else may stop it through APAS.
+async fn forward_pane_autopilot_control(
+    state: &AppState,
+    connection_id: &Uuid,
+    session_id: Uuid,
+    pane_id: u32,
+    request_id: &str,
+    action: &shared::AutopilotAction,
+) -> Result<tokio::sync::oneshot::Receiver<AutopilotReceipt>, String> {
+    use crate::session::autopilot::{AutopilotForwardError, AutopilotTarget};
+    let session_id = target_session(state, connection_id, Some(session_id), None)
+        .await
+        .map_err(|refusal| refusal.unwrap_or("Project is unavailable").to_string())?;
+    // Held until the request is handed over, as input holds it: a project
+    // being suspended or deleted waits for it, and none is forwarded after.
+    let Ok((_project_id, _project_guard)) = state
+        .active_session_operation(&session_id.to_string())
+        .await
+    else {
+        return Err("Project is unavailable".to_string());
+    };
+    // The loop runs inside the tab's own OMP process, so the request, its
+    // capability check and the waiter all name the instance that runs the tab.
+    let owner = match state.sessions.autopilot_target(&session_id, pane_id) {
+        AutopilotTarget::Unlisted => return Err("This tab is no longer available.".to_string()),
+        AutopilotTarget::LegacyBotHistory => {
+            return Err(
+                "Legacy bot history is read-only; it cannot be put on autopilot.".to_string(),
+            )
+        }
+        AutopilotTarget::NotOmpTerminal => {
+            return Err("Autopilot is available only on OMP terminal tabs.".to_string())
+        }
+        AutopilotTarget::Tab(PaneOwner::Instance(owner)) => owner,
+        AutopilotTarget::Tab(PaneOwner::NotRunning {
+            machine_id,
+            hostname,
+        }) => return Err(not_running_message(state, machine_id, hostname)),
+        AutopilotTarget::Tab(PaneOwner::NoInstance) => {
+            return Err("CLI client not connected".to_string())
+        }
+    };
+    if let Some(refusal) = instance_access_refusal(state, connection_id, &session_id, &owner).await
+    {
+        return Err(refusal);
+    }
+    if !state
+        .sessions
+        .cli_supports_capability(&owner.cli_id, shared::OMP_TAB_AUTOPILOT_CAPABILITY)
+    {
+        return Err(older_instance_autopilot_refusal(state, &owner));
+    }
+    // A frame that fails to parse is dropped without an answer, so a start's
+    // bounds arrive as optional fields and are checked here, where a refusal
+    // can say why. The instance and the tab check them again.
+    let command = action.validate()?;
+    // Queued for the instance without waiting, so a stalled instance cannot
+    // hold up this connection's other frames, and only if that instance still
+    // owns the tab now that the checks above have awaited.
+    state
+        .sessions
+        .forward_autopilot_request(session_id, pane_id, owner.cli_id, request_id, command)
+        .map_err(|error| match error {
+            AutopilotForwardError::AlreadyWaiting => {
+                "A request with this identifier is already being answered for this tab."
+            }
+            AutopilotForwardError::Undelivered => {
+                "The project runtime is unavailable; nothing was sent to the tab."
+            }
+        })
+        .map_err(str::to_string)
+}
+
+/// `ControlPaneAutopilot`: start, pause, resume or stop autopilot on one OMP
+/// terminal tab.
+///
+/// The request goes to the instance that owns the tab and to no other, and is
+/// refused, never redirected, when that machine is not running the project.
+/// Every answer is a `PaneAutopilotReceipt` to the requesting connection: a
+/// refusal with its reason, or what the instance answered. That answer is
+/// awaited in a task of its own, so a slow tab cannot hold up this
+/// connection's other frames, and requests are tracked by id, never one per
+/// tab: a stop is not refused because another request for the tab is still
+/// being answered. The server remembers request ids and nothing else; which
+/// autopilots exist is only what the tabs report.
+///
+/// `receipt_wait` is [`AUTOPILOT_RECEIPT_WAIT`]; tests shorten it.
+async fn handle_pane_autopilot_control(
+    state: &AppState,
+    connection_id: &Uuid,
+    command: WebToServer,
+    receipt_wait: Duration,
+) {
+    let WebToServer::ControlPaneAutopilot {
+        session_id,
+        pane_id,
+        request_id,
+        action,
+    } = command
+    else {
+        return;
+    };
+    let Some(user_id) = state.sessions.get_web_user(connection_id) else {
+        return;
+    };
+    // Checked first: everything below is answered with a frame that only a
+    // connection that negotiated autopilot is ever sent.
+    if !state
+        .sessions
+        .web_supports_capability(connection_id, shared::TAB_AUTOPILOT_CAPABILITY)
+    {
+        send_policy_error(
+            state,
+            connection_id,
+            "This client did not negotiate autopilot; reload it after updating the web deployment",
+        )
+        .await;
+        return;
+    }
+    if request_id.is_empty() || request_id.len() > shared::AUTOPILOT_REQUEST_ID_MAX_BYTES {
+        send_policy_error(state, connection_id, "Invalid autopilot request identifier").await;
+        return;
+    }
+    // A repeated copy of a request has no further effect; its first copy is
+    // answered, or was.
+    if !state.sessions.claim_autopilot_request(user_id, &request_id) {
+        tracing::debug!(%session_id, pane_id, "ignoring a repeated autopilot request");
+        return;
+    }
+    let receiver = match forward_pane_autopilot_control(
+        state,
+        connection_id,
+        session_id,
+        pane_id,
+        &request_id,
+        &action,
+    )
+    .await
+    {
+        Ok(receiver) => receiver,
+        Err(reason) => {
+            send_autopilot_receipt(
+                state,
+                connection_id,
+                session_id,
+                pane_id,
+                request_id,
+                AutopilotReceipt {
+                    outcome: shared::AutopilotReceiptOutcome::Refused,
+                    reason: Some(reason),
+                },
+            )
+            .await;
+            return;
+        }
+    };
+    let state = state.clone();
+    let connection_id = *connection_id;
+    tokio::spawn(async move {
+        let receipt = match tokio::time::timeout(receipt_wait, receiver).await {
+            Ok(Ok(receipt)) => receipt,
+            // No receipt in time, or the instance's connection closed first.
+            // The request was delivered, so a pause or a stop stays in force
+            // and a start may have been taken: not confirmed, never refused.
+            _ => {
+                state
+                    .sessions
+                    .drop_abandoned_autopilot_request(session_id, pane_id, &request_id);
+                AutopilotReceipt {
+                    outcome: shared::AutopilotReceiptOutcome::Uncertain,
+                    reason: None,
+                }
+            }
+        };
+        send_autopilot_receipt(
+            &state,
+            &connection_id,
+            session_id,
+            pane_id,
+            request_id,
+            receipt,
+        )
+        .await;
+    });
+}
+
+/// What a viewer that just attached is told about autopilot: the availability
+/// of every OMP terminal tab, with the state its instance last reported and
+/// when. Only a viewer that negotiated autopilot is sent anything; older
+/// native builds drop their socket on the frame. Each frame reads its state
+/// as it is queued (`send_to_web_with`), so a change broadcast meanwhile is
+/// never overtaken by an older copy.
+async fn replay_pane_autopilot_after_attach(
+    state: &AppState,
+    connection_id: &Uuid,
+    session_id: Uuid,
+) {
+    if !state
+        .sessions
+        .web_supports_capability(connection_id, shared::TAB_AUTOPILOT_CAPABILITY)
+    {
+        return;
+    }
+    let tabs: Vec<u32> = state
+        .sessions
+        .pane_autopilot_availabilities(&session_id)
+        .into_iter()
+        .map(|(pane_id, _)| pane_id)
+        .collect();
+    for pane_id in tabs {
+        state
+            .sessions
+            .send_to_web_with(connection_id, || {
+                state.sessions.pane_autopilot_frame(&session_id, pane_id)
+            })
+            .await;
+    }
+}
+
+/// Whether `message` may go out on `connection_id`: the autopilot frames only
+/// to a connection that negotiated them. Every sender already checks this;
+/// the connection's outbound task checks again, because one such frame on an
+/// older native build's socket closes it.
+fn autopilot_outbound_allowed(
+    state: &AppState,
+    connection_id: &Uuid,
+    message: &ServerToWeb,
+) -> bool {
+    !matches!(
+        message,
+        ServerToWeb::PaneAutopilotState { .. } | ServerToWeb::PaneAutopilotReceipt { .. }
+    ) || state
+        .sessions
+        .web_supports_capability(connection_id, shared::TAB_AUTOPILOT_CAPABILITY)
+}
+
 /// Load the latest effective policy for a launch-like mutation. Both ends of
 /// the data-plane must understand server-owned policy before a launch is
 /// routed; otherwise an older peer could silently apply local `.apas` state.
@@ -1965,8 +2272,20 @@ pub(crate) fn pane_summaries(
                         .filter(|limited| limited.applies_to_model(pane.model.as_deref()))
                 });
 
+            // Availability and condition only, never the prompt, and only for
+            // OMP terminal tabs. An older client ignores the block.
+            let autopilot = state
+                .sessions
+                .pane_autopilot_availability(session_id, pane.pane_id)
+                .map(|availability| {
+                    shared::PaneAutopilotSummary::from_state(
+                        availability.support,
+                        availability.state.as_deref(),
+                    )
+                });
+
             shared::MobilePaneSummary {
-                autopilot: None,
+                autopilot,
                 pane_id: pane.pane_id,
                 label: pane.label,
                 kind: pane.kind,
@@ -4244,12 +4563,19 @@ async fn reject_session_attachment(
         .await;
 }
 
-async fn resolve_target_session(
+/// Why a control names no session it can act on: what its sender is told, or
+/// `None` where it has always been told nothing.
+type SessionRefusal = Option<&'static str>;
+
+/// The session a control from `connection_id` acts on, or why there is none.
+/// Nothing is sent here: [`resolve_target_session`] reports a refusal as an
+/// `Error`, and an autopilot request reports it in its receipt.
+async fn target_session(
     state: &AppState,
     connection_id: &Uuid,
     msg_session_id: Option<Uuid>,
     fallback: Option<Uuid>,
-) -> Option<Uuid> {
+) -> Result<Uuid, SessionRefusal> {
     if let Some(sid) = msg_session_id {
         if state
             .sessions
@@ -4260,34 +4586,16 @@ async fn resolve_target_session(
                 None => false,
             };
             if !still_authorized {
-                state
-                    .sessions
-                    .send_to_web(
-                        connection_id,
-                        ServerToWeb::Error {
-                            message: "Access denied".to_string(),
-                        },
-                    )
-                    .await;
-                return None;
+                return Err(Some("Access denied"));
             }
             if state
                 .active_session_operation(&sid.to_string())
                 .await
                 .is_ok()
             {
-                return Some(sid);
+                return Ok(sid);
             }
-            state
-                .sessions
-                .send_to_web(
-                    connection_id,
-                    ServerToWeb::Error {
-                        message: "Project is unavailable".to_string(),
-                    },
-                )
-                .await;
-            return None;
+            return Err(Some("Project is unavailable"));
         }
         // Not registered as attached — but the web client may legitimately
         // own/have access to this session and simply hasn't finished its
@@ -4304,7 +4612,7 @@ async fn resolve_target_session(
                     .await
                     .is_err()
                 {
-                    return None;
+                    return Err(None);
                 }
                 // The session's attached instances, not its database row,
                 // say which CLIs run it.
@@ -4316,7 +4624,7 @@ async fn resolve_target_session(
                     connection_id,
                     sid
                 );
-                return Some(sid);
+                return Ok(sid);
             }
         }
         tracing::warn!(
@@ -4324,16 +4632,7 @@ async fn resolve_target_session(
             connection_id,
             sid
         );
-        state
-            .sessions
-            .send_to_web(
-                connection_id,
-                ServerToWeb::Error {
-                    message: "Not attached to that session".to_string(),
-                },
-            )
-            .await;
-        return None;
+        return Err(Some("Not attached to that session"));
     }
     if let Some(sid) = fallback {
         let still_authorized = match state.sessions.get_web_user(connection_id) {
@@ -4341,45 +4640,43 @@ async fn resolve_target_session(
             None => false,
         };
         if !still_authorized {
-            state
-                .sessions
-                .send_to_web(
-                    connection_id,
-                    ServerToWeb::Error {
-                        message: "Access denied".to_string(),
-                    },
-                )
-                .await;
-            return None;
+            return Err(Some("Access denied"));
         }
         if state
             .active_session_operation(&sid.to_string())
             .await
             .is_ok()
         {
-            return Some(sid);
+            return Ok(sid);
         }
-        state
-            .sessions
-            .send_to_web(
-                connection_id,
-                ServerToWeb::Error {
-                    message: "Project is unavailable".to_string(),
-                },
-            )
-            .await;
-        return None;
+        return Err(Some("Project is unavailable"));
     }
-    state
-        .sessions
-        .send_to_web(
-            connection_id,
-            ServerToWeb::Error {
-                message: "No session attached".to_string(),
-            },
-        )
-        .await;
-    None
+    Err(Some("No session attached"))
+}
+
+async fn resolve_target_session(
+    state: &AppState,
+    connection_id: &Uuid,
+    msg_session_id: Option<Uuid>,
+    fallback: Option<Uuid>,
+) -> Option<Uuid> {
+    match target_session(state, connection_id, msg_session_id, fallback).await {
+        Ok(session_id) => Some(session_id),
+        Err(refusal) => {
+            if let Some(message) = refusal {
+                state
+                    .sessions
+                    .send_to_web(
+                        connection_id,
+                        ServerToWeb::Error {
+                            message: message.to_string(),
+                        },
+                    )
+                    .await;
+            }
+            None
+        }
+    }
 }
 
 fn reboot_pane_cli_message(session_id: Uuid, pane_id: u32) -> ServerToCli {
@@ -5063,6 +5360,7 @@ async fn edit_roster_pane(
     pane_id: u32,
     edit: impl FnOnce(&mut shared::PaneConfig),
 ) -> bool {
+    let autopilot_before = state.sessions.pane_autopilot_availabilities(&session_id);
     let Some(panes) = state
         .sessions
         .update_session_pane(&session_id, pane_id, edit)
@@ -5074,6 +5372,12 @@ async fn edit_roster_pane(
         .sessions
         .route_to_web(&session_id, ServerToWeb::PaneList { session_id, panes })
         .await;
+    // A tab switched to OMP is a new OMP terminal tab to autopilot-capable
+    // viewers, who are told whether its instance can run autopilot. The
+    // instance's own roster report then changes nothing and says nothing.
+    state
+        .sessions
+        .broadcast_pane_autopilot_changes(&session_id, &autopilot_before);
     true
 }
 
@@ -6096,6 +6400,9 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
             {
                 continue;
             }
+            if !autopilot_outbound_allowed(&outbound_state, &connection_id, &msg) {
+                continue;
+            }
             let msg = with_viewer_runtime_access(&outbound_state, &connection_id, msg).await;
             let text = serde_json::to_string(&msg).unwrap();
             if sender.send(Message::Text(text.into())).await.is_err() {
@@ -6327,6 +6634,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                                     | shared::AUTONOMOUS_JOBS_CAPABILITY
                                                     | shared::AUTONOMOUS_WORKERS_CAPABILITY
                                                     | shared::PROJECT_INSTANCES_CAPABILITY
+                                                    | shared::TAB_AUTOPILOT_CAPABILITY
                                                     | "mobile_bootstrap_v1"
                                                     | "mobile_coding_mutations_v1"
                                                     | "mobile_terminal_v1"
@@ -7840,8 +8148,15 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                 Ok(command @ WebToServer::AnswerOmpQuestion { .. }) => {
                     handle_omp_question_answer(&state, &connection_id, command).await;
                 }
-                // Placeholder until the server handles autopilot (group 5).
-                Ok(WebToServer::ControlPaneAutopilot { .. }) => {}
+                Ok(command @ WebToServer::ControlPaneAutopilot { .. }) => {
+                    handle_pane_autopilot_control(
+                        &state,
+                        &connection_id,
+                        command,
+                        AUTOPILOT_RECEIPT_WAIT,
+                    )
+                    .await;
+                }
                 Ok(WebToServer::AnswerQuestion {
                     session_id: msg_sid,
                     tool_use_id,
@@ -8418,6 +8733,8 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                 )
                                 .await;
                         }
+
+                        replay_pane_autopilot_after_attach(&state, &connection_id, sid).await;
 
                         state
                             .sessions
@@ -12720,5 +13037,1193 @@ mod project_instance_tests {
             (shared::AddPaneStatus::Routed, Some(77))
         );
         server.abort();
+    }
+
+    /// What the CLI of a machine that has autopilot advertises.
+    const AUTOPILOT_CLI: &[&str] = &[
+        PROJECT_INSTANCES_CAPABILITY,
+        shared::PROJECT_POLICY_CAPABILITY,
+        shared::OMP_TAB_AUTOPILOT_CAPABILITY,
+    ];
+    /// What a web client that shows autopilot negotiates.
+    const AUTOPILOT_VIEWER: &[&str] = &[
+        PROJECT_INSTANCES_CAPABILITY,
+        shared::TAB_AUTOPILOT_CAPABILITY,
+    ];
+
+    use shared::AutopilotReceiptOutcome::{Accepted, Refused, Uncertain};
+    use shared::AutopilotSupport;
+
+    fn omp_tab(pane_id: u32, machine_id: Uuid, host: &str) -> PaneConfig {
+        let mut tab = pane(pane_id, Some(machine_id), Some(host));
+        tab.provider = shared::Provider::Omp;
+        tab
+    }
+
+    fn autopilot_spec() -> shared::AutopilotStartRequest {
+        shared::AutopilotStartRequest {
+            prompt: Some("Check the build and fix what fails.".to_string()),
+            repeat: Some(shared::AutopilotRepeat::AfterEachTurn),
+            iteration_limit: Some(shared::AutopilotLimit::None),
+            time_limit: Some(shared::AutopilotLimit::None),
+            end_without_tool_call: Some(true),
+        }
+    }
+
+    fn autopilot_start() -> shared::AutopilotAction {
+        shared::AutopilotAction::Start {
+            spec: autopilot_spec(),
+        }
+    }
+
+    fn autopilot_stop() -> shared::AutopilotAction {
+        shared::AutopilotAction::Stop {
+            autopilot_id: None,
+            now: false,
+        }
+    }
+
+    /// Every request a viewer can make of a tab's autopilot.
+    fn autopilot_actions() -> Vec<(&'static str, shared::AutopilotAction)> {
+        vec![
+            ("start", autopilot_start()),
+            (
+                "pause",
+                shared::AutopilotAction::Pause { autopilot_id: None },
+            ),
+            (
+                "resume",
+                shared::AutopilotAction::Resume {
+                    autopilot_id: Uuid::nil(),
+                },
+            ),
+            ("stop", autopilot_stop()),
+            (
+                "stop-now",
+                shared::AutopilotAction::Stop {
+                    autopilot_id: Some(Uuid::nil()),
+                    now: true,
+                },
+            ),
+        ]
+    }
+
+    /// `viewer` asks for `action` on the tab `pane_id`.
+    async fn autopilot(
+        p: &Project,
+        viewer: &Uuid,
+        pane_id: u32,
+        request_id: &str,
+        action: shared::AutopilotAction,
+    ) {
+        handle_pane_autopilot_control(
+            &p.state,
+            viewer,
+            WebToServer::ControlPaneAutopilot {
+                session_id: p.session,
+                pane_id,
+                request_id: request_id.to_string(),
+                action,
+            },
+            AUTOPILOT_RECEIPT_WAIT,
+        )
+        .await;
+    }
+
+    /// A receipt as a viewer reads it: request id, outcome and reason.
+    type Receipt = (String, shared::AutopilotReceiptOutcome, Option<String>);
+
+    fn receipt(
+        request_id: &str,
+        outcome: shared::AutopilotReceiptOutcome,
+        reason: Option<&str>,
+    ) -> Receipt {
+        (request_id.to_string(), outcome, reason.map(str::to_string))
+    }
+
+    fn receipts(messages: &[ServerToWeb]) -> Vec<Receipt> {
+        messages
+            .iter()
+            .filter_map(|message| match message {
+                ServerToWeb::PaneAutopilotReceipt {
+                    request_id,
+                    outcome,
+                    reason,
+                    ..
+                } => Some((request_id.clone(), *outcome, reason.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The next receipt a viewer is sent. A forwarded request is answered
+    /// from a task of its own, once the tab's instance has answered.
+    async fn next_receipt(web: &mut Endpoint<ServerToWeb>) -> Receipt {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let message = web.rx.recv().await.expect("web sender closed");
+                if let Some(receipt) = receipts(&[message]).pop() {
+                    return receipt;
+                }
+            }
+        })
+        .await
+        .expect("the request is answered")
+    }
+
+    /// The autopilot requests an instance was forwarded: pane, request id
+    /// and the strict command.
+    fn forwarded(cli: &mut Endpoint<ServerToCli>) -> Vec<(u32, String, shared::AutopilotCommand)> {
+        cli.drain()
+            .into_iter()
+            .filter_map(|message| match message {
+                ServerToCli::ControlPaneAutopilot {
+                    pane_id,
+                    request_id,
+                    command,
+                    ..
+                } => Some((pane_id, request_id, command)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The instance behind `cli` answers a request it was forwarded. False
+    /// when no such request waits for that instance.
+    fn answer(
+        p: &Project,
+        cli: &Endpoint<ServerToCli>,
+        pane_id: u32,
+        request_id: &str,
+        outcome: shared::AutopilotReceiptOutcome,
+        reason: Option<&str>,
+    ) -> bool {
+        p.state.sessions.finish_autopilot_request(
+            p.session,
+            pane_id,
+            cli.id,
+            request_id,
+            AutopilotReceipt {
+                outcome,
+                reason: reason.map(str::to_string),
+            },
+        )
+    }
+
+    /// The autopilot states a viewer was sent: pane, availability and the
+    /// time the state was last reported.
+    fn autopilot_states(messages: &[ServerToWeb]) -> Vec<(u32, AutopilotSupport, Option<String>)> {
+        messages
+            .iter()
+            .filter_map(|message| match message {
+                ServerToWeb::PaneAutopilotState {
+                    pane_id,
+                    support,
+                    reported_at,
+                    ..
+                } => Some((*pane_id, *support, reported_at.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A tab waiting for its next iteration, as its instance reports it.
+    fn waiting_autopilot() -> Box<shared::PaneAutopilotState> {
+        Box::new(shared::PaneAutopilotState {
+            autopilot: Some(shared::AutopilotView {
+                autopilot_id: Uuid::nil(),
+                spec: autopilot_spec().validate().unwrap(),
+                started_at: "2026-11-13T14:00:00Z".to_string(),
+                iterations: 7,
+                deadline: None,
+                next_iteration_at: Some("2026-11-13T14:30:00Z".to_string()),
+                condition: shared::AutopilotCondition {
+                    kind: shared::autopilot_condition::WAITING.to_string(),
+                    detail: Some(shared::autopilot_condition::WAIT_NEXT_ITERATION.to_string()),
+                    since: None,
+                },
+            }),
+            ..shared::PaneAutopilotState::default()
+        })
+    }
+
+    /// Whoever may type into a tab on its machine may start, pause, resume
+    /// and stop its autopilot, and nobody else. The hosting account may, and
+    /// so may a collaborator its cluster admits to the tab's machine. A
+    /// project user it does not admit there may not, nor an account without
+    /// access. A refusal reads as input to that tab does, and is the same
+    /// for a stop as for a start.
+    #[tokio::test]
+    async fn whoever_may_type_into_a_tab_may_control_its_autopilot() {
+        let (p, member) = hosted_project().await;
+        let stranger = Uuid::new_v4();
+        p.state.db.create_user(&user(stranger)).await.unwrap();
+        // The project is placed in the hosting account's cluster, which is
+        // that account's access to it.
+        p.state
+            .db
+            .add_project_cluster_placement(
+                &p.project_id(),
+                &p.host.to_string(),
+                &p.owner.to_string(),
+                "test",
+            )
+            .await
+            .unwrap();
+        let mut a = p.instance_with(p.m5, HOST_A, AUTOPILOT_CLI);
+        let mut b = p.instance_with(p.m6, HOST_B, AUTOPILOT_CLI);
+        let mut host_web = p.viewer(p.host, AUTOPILOT_VIEWER);
+        let mut member_web = p.viewer(member, AUTOPILOT_VIEWER);
+        // The project's owner is only a project user here: the project is
+        // hosted in another account's cluster, which admits the owner to none
+        // of its machines.
+        let mut owner_web = p.viewer(p.owner, AUTOPILOT_VIEWER);
+        // An account without access cannot attach at all.
+        let mut stranger_web = {
+            let id = Uuid::new_v4();
+            let (tx, rx) = mpsc::channel(256);
+            p.state.sessions.register_web(id, tx);
+            p.state.sessions.set_web_user(id, stranger);
+            p.state.sessions.set_web_capabilities(
+                id,
+                AUTOPILOT_VIEWER
+                    .iter()
+                    .map(|capability| capability.to_string())
+                    .collect(),
+            );
+            Endpoint { id, rx }
+        };
+        p.roster(vec![omp_tab(3, p.m5, HOST_A), omp_tab(4, p.m6, HOST_B)]);
+
+        // What input to the same tab is refused with.
+        typed(&p, &member_web.id, Some(4), None).await;
+        let member_refusal = only_error(&mut member_web);
+        assert!(
+            member_refusal.starts_with("Access denied") && member_refusal.contains(HOST_B),
+            "{member_refusal}"
+        );
+        typed(&p, &owner_web.id, Some(3), None).await;
+        let owner_refusal = only_error(&mut owner_web);
+        assert_eq!(owner_refusal, "Access denied");
+        typed(&p, &stranger_web.id, Some(3), None).await;
+        let stranger_refusal = only_error(&mut stranger_web);
+        assert_eq!(stranger_refusal, "Not attached to that session");
+        assert!(a.drain().is_empty() && b.drain().is_empty());
+
+        for (name, action) in autopilot_actions() {
+            let command = action.validate().unwrap();
+
+            // The hosting account, and a collaborator on a machine it may use.
+            for (who, web) in [("host", &mut host_web), ("member", &mut member_web)] {
+                let id = format!("{who}-{name}");
+                autopilot(&p, &web.id, 3, &id, action.clone()).await;
+                assert_eq!(
+                    forwarded(&mut a),
+                    vec![(3, id.clone(), command.clone())],
+                    "{id}"
+                );
+                assert!(answer(&p, &a, 3, &id, Accepted, None));
+                assert_eq!(next_receipt(web).await, receipt(&id, Accepted, None));
+            }
+            let id = format!("host-elsewhere-{name}");
+            autopilot(&p, &host_web.id, 4, &id, action.clone()).await;
+            assert_eq!(forwarded(&mut b), vec![(4, id.clone(), command.clone())]);
+            assert!(answer(&p, &b, 4, &id, Accepted, None));
+            assert_eq!(
+                next_receipt(&mut host_web).await,
+                receipt(&id, Accepted, None)
+            );
+
+            // The same collaborator on a machine it may not use, a project
+            // user with no machine, and an account with no access.
+            for (who, web, pane_id, refusal) in [
+                ("member-elsewhere", &mut member_web, 4, &member_refusal),
+                ("owner", &mut owner_web, 3, &owner_refusal),
+                ("stranger", &mut stranger_web, 3, &stranger_refusal),
+            ] {
+                let id = format!("{who}-{name}");
+                autopilot(&p, &web.id, pane_id, &id, action.clone()).await;
+                let delivered = web.drain();
+                assert_eq!(
+                    receipts(&delivered),
+                    vec![receipt(&id, Refused, Some(refusal))],
+                    "{id}"
+                );
+                assert!(
+                    errors(&delivered).is_empty(),
+                    "the receipt is the whole answer: {delivered:?}"
+                );
+            }
+            assert!(forwarded(&mut a).is_empty() && forwarded(&mut b).is_empty());
+        }
+    }
+
+    /// The one `Error` a viewer was sent since it was last read.
+    fn only_error(web: &mut Endpoint<ServerToWeb>) -> String {
+        let mut errors = errors(&web.drain());
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        errors.remove(0)
+    }
+
+    /// In a project on two machines a request reaches only the instance that
+    /// runs the tab, and only that instance can answer it. A tab whose
+    /// machine is not running the project is refused by naming the machine,
+    /// never redirected, for a stop as for a start.
+    #[tokio::test]
+    async fn an_autopilot_request_reaches_only_the_machine_that_runs_the_tab() {
+        let p = project().await;
+        let mut a = p.instance_with(p.m5, HOST_A, AUTOPILOT_CLI);
+        let mut b = p.instance_with(p.m6, HOST_B, AUTOPILOT_CLI);
+        let mut web = p.viewer(p.owner, AUTOPILOT_VIEWER);
+        p.roster(vec![
+            omp_tab(3, p.m5, HOST_A),
+            omp_tab(4, p.m6, HOST_B),
+            omp_tab(5, Uuid::new_v4(), HOST_C),
+        ]);
+
+        autopilot(&p, &web.id, 4, "start-on-6", autopilot_start()).await;
+        assert!(forwarded(&mut a).is_empty());
+        assert_eq!(
+            forwarded(&mut b),
+            vec![(
+                4,
+                "start-on-6".to_string(),
+                shared::AutopilotCommand::Start {
+                    spec: autopilot_spec().validate().unwrap()
+                }
+            )]
+        );
+        assert!(
+            !answer(&p, &a, 4, "start-on-6", Accepted, None),
+            "another machine's instance cannot answer for the tab's own"
+        );
+        assert!(answer(&p, &b, 4, "start-on-6", Accepted, None));
+        assert_eq!(
+            next_receipt(&mut web).await,
+            receipt("start-on-6", Accepted, None)
+        );
+
+        for (name, action) in autopilot_actions() {
+            let id = format!("stopped-{name}");
+            autopilot(&p, &web.id, 5, &id, action).await;
+            let delivered = web.drain();
+            assert_eq!(
+                receipts(&delivered),
+                vec![receipt(&id, Refused, Some(&not_running(HOST_C)))]
+            );
+            assert!(errors(&delivered).is_empty());
+        }
+
+        // zoo-006 stops running the project.
+        p.state
+            .sessions
+            .detach_cli_instance(&p.session, &b.id)
+            .unwrap();
+        autopilot(&p, &web.id, 4, "after-stop", autopilot_stop()).await;
+        assert_eq!(
+            receipts(&web.drain()),
+            vec![receipt(
+                "after-stop",
+                Refused,
+                Some("zoo-006 is not running this project. Start it on zoo-006 first.")
+            )]
+        );
+        assert!(forwarded(&mut a).is_empty() && forwarded(&mut b).is_empty());
+    }
+
+    /// Autopilot needs both ends. A tab on a machine whose CLI has no
+    /// autopilot is refused with the update text and sent nothing, because an
+    /// older CLI drops the frame without an answer. A viewer that did not
+    /// negotiate autopilot has its request ignored and is never sent an
+    /// autopilot frame, which would close an older native build's socket.
+    #[tokio::test]
+    async fn autopilot_is_gated_on_the_viewer_and_on_the_tabs_instance() {
+        let p = project().await;
+        let mut a = p.instance_with(p.m5, HOST_A, AUTOPILOT_CLI);
+        // zoo-006 has not been rebooted to update yet.
+        let mut b = p.instance(p.m6, HOST_B);
+        let mut web = p.viewer(p.owner, AUTOPILOT_VIEWER);
+        let mut older_web = p.viewer(p.owner, &[PROJECT_INSTANCES_CAPABILITY]);
+        p.roster(vec![omp_tab(3, p.m5, HOST_A), omp_tab(4, p.m6, HOST_B)]);
+
+        for (name, action) in autopilot_actions() {
+            let id = format!("older-machine-{name}");
+            autopilot(&p, &web.id, 4, &id, action).await;
+            assert_eq!(
+                receipts(&web.drain()),
+                vec![receipt(
+                    &id,
+                    Refused,
+                    Some("zoo-006 runs an older APAS that cannot run autopilot. Reboot zoo-006 to update it.")
+                )]
+            );
+        }
+        assert!(b.drain().is_empty());
+
+        autopilot(&p, &older_web.id, 3, "older-viewer", autopilot_start()).await;
+        assert!(forwarded(&mut a).is_empty());
+        let delivered = older_web.drain();
+        assert!(receipts(&delivered).is_empty());
+        assert_eq!(errors(&delivered).len(), 1, "{delivered:?}");
+
+        // What the tabs report, and what a viewer is replayed when it
+        // attaches, reaches the viewer that negotiated autopilot only.
+        let reported_at = Some("2026-11-13T14:07:00Z".to_string());
+        p.state.sessions.report_pane_autopilot(
+            &p.session,
+            a.id,
+            3,
+            AutopilotSupport::Supported,
+            Some(waiting_autopilot()),
+            reported_at.clone(),
+        );
+        // An instance without autopilot cannot report a state either.
+        p.state.sessions.report_pane_autopilot(
+            &p.session,
+            b.id,
+            4,
+            AutopilotSupport::Supported,
+            Some(waiting_autopilot()),
+            None,
+        );
+        for viewer in [&web.id, &older_web.id] {
+            replay_pane_autopilot_after_attach(&p.state, viewer, p.session).await;
+        }
+        let live = (3, AutopilotSupport::Supported, reported_at.clone());
+        assert_eq!(
+            autopilot_states(&web.drain()),
+            vec![
+                live.clone(),
+                // The replay carries the time the state was last reported.
+                live,
+                (4, AutopilotSupport::InstanceUpdateRequired, None),
+            ]
+        );
+        let delivered = older_web.drain();
+        assert!(autopilot_states(&delivered).is_empty(), "{delivered:?}");
+
+        // The connection's outbound task holds the same line.
+        let state_frame = p
+            .state
+            .sessions
+            .pane_autopilot_frame(&p.session, 3)
+            .unwrap();
+        let receipt_frame = ServerToWeb::PaneAutopilotReceipt {
+            session_id: p.session,
+            pane_id: 3,
+            request_id: "any".to_string(),
+            outcome: Uncertain,
+            reason: None,
+        };
+        let other_frame = ServerToWeb::PaneList {
+            session_id: p.session,
+            panes: Vec::new(),
+        };
+        for frame in [&state_frame, &receipt_frame] {
+            assert!(autopilot_outbound_allowed(&p.state, &web.id, frame));
+            assert!(!autopilot_outbound_allowed(&p.state, &older_web.id, frame));
+        }
+        assert!(autopilot_outbound_allowed(
+            &p.state,
+            &older_web.id,
+            &other_frame
+        ));
+    }
+
+    /// Requests are tracked by request id, never one per tab: a stop is
+    /// forwarded while a start for the same tab is still being answered, each
+    /// is answered on its own, and only to the connection that sent it. A
+    /// stop for a tab with no autopilot changes nothing, so the tab's
+    /// instance accepts it and the server relays that. A repeated copy of a
+    /// request has no further effect.
+    #[tokio::test]
+    async fn a_stop_is_taken_while_another_request_for_its_tab_is_being_answered() {
+        let p = project().await;
+        let mut a = p.instance_with(p.m5, HOST_A, AUTOPILOT_CLI);
+        let mut web = p.viewer(p.owner, AUTOPILOT_VIEWER);
+        let mut other_web = p.viewer(p.owner, AUTOPILOT_VIEWER);
+        p.roster(vec![omp_tab(3, p.m5, HOST_A)]);
+
+        autopilot(&p, &web.id, 3, "start-1", autopilot_start()).await;
+        autopilot(&p, &web.id, 3, "stop-1", autopilot_stop()).await;
+        assert_eq!(
+            forwarded(&mut a)
+                .into_iter()
+                .map(|(_, request_id, command)| (request_id, command.starts_work()))
+                .collect::<Vec<_>>(),
+            vec![("start-1".to_string(), true), ("stop-1".to_string(), false)],
+            "both reach the tab, in the order they were sent"
+        );
+        assert!(receipts(&web.drain()).is_empty(), "neither is answered yet");
+
+        // The stop found no autopilot to stop.
+        assert!(answer(&p, &a, 3, "stop-1", Accepted, None));
+        assert_eq!(
+            next_receipt(&mut web).await,
+            receipt("stop-1", Accepted, None)
+        );
+        let not_taken = "The tab did not take the request in time. Nothing was started.";
+        assert!(answer(&p, &a, 3, "start-1", Refused, Some(not_taken)));
+        assert_eq!(
+            next_receipt(&mut web).await,
+            receipt("start-1", Refused, Some(not_taken))
+        );
+
+        autopilot(&p, &web.id, 3, "stop-1", autopilot_stop()).await;
+        assert!(
+            forwarded(&mut a).is_empty(),
+            "a repeated copy is not sent on"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(receipts(&web.drain()).is_empty());
+        assert!(
+            receipts(&other_web.drain()).is_empty(),
+            "another connection of the same account hears no receipt"
+        );
+    }
+
+    /// A request the tab's instance does not answer in time is reported as
+    /// not confirmed, never as refused: it was delivered, so a pause or a
+    /// stop stays in force. So is one whose instance disconnects first,
+    /// without waiting out the time limit.
+    #[tokio::test]
+    async fn an_unanswered_autopilot_request_is_not_confirmed() {
+        let p = project().await;
+        let mut a = p.instance_with(p.m5, HOST_A, AUTOPILOT_CLI);
+        let mut web = p.viewer(p.owner, AUTOPILOT_VIEWER);
+        p.roster(vec![omp_tab(3, p.m5, HOST_A)]);
+
+        handle_pane_autopilot_control(
+            &p.state,
+            &web.id,
+            WebToServer::ControlPaneAutopilot {
+                session_id: p.session,
+                pane_id: 3,
+                request_id: "pause-1".to_string(),
+                action: shared::AutopilotAction::Pause { autopilot_id: None },
+            },
+            Duration::from_millis(50),
+        )
+        .await;
+        assert_eq!(forwarded(&mut a).len(), 1);
+        assert_eq!(
+            next_receipt(&mut web).await,
+            receipt("pause-1", Uncertain, None)
+        );
+        assert!(
+            !answer(&p, &a, 3, "pause-1", Accepted, None),
+            "a late receipt finds nothing waiting"
+        );
+
+        autopilot(&p, &web.id, 3, "stop-1", autopilot_stop()).await;
+        assert_eq!(forwarded(&mut a).len(), 1);
+        let sent = std::time::Instant::now();
+        p.state.sessions.unregister_cli(&a.id);
+        assert_eq!(
+            next_receipt(&mut web).await,
+            receipt("stop-1", Uncertain, None)
+        );
+        assert!(sent.elapsed() < AUTOPILOT_RECEIPT_WAIT);
+        assert!(
+            receipts(&web.drain()).is_empty(),
+            "each request is answered once"
+        );
+    }
+
+    /// A start is checked before anything reaches the tab, and refused with
+    /// what is wrong with it: a bound it breaks, or a limit it does not state
+    /// as a number or as none. So is a request for a tab that cannot be on
+    /// autopilot.
+    #[tokio::test]
+    async fn an_autopilot_request_that_cannot_be_served_is_refused_with_its_reason() {
+        let p = project().await;
+        let mut a = p.instance_with(p.m5, HOST_A, AUTOPILOT_CLI);
+        let mut web = p.viewer(p.owner, AUTOPILOT_VIEWER);
+        let mut structured = omp_tab(5, p.m5, HOST_A);
+        structured.kind = shared::PaneKind::Agent;
+        let mut history = omp_tab(6, p.m5, HOST_A);
+        history.mode = shared::PaneMode::Deadloop;
+        p.roster(vec![
+            omp_tab(3, p.m5, HOST_A),
+            pane(4, Some(p.m5), Some(HOST_A)),
+            structured,
+            history,
+        ]);
+        let start = |spec: shared::AutopilotStartRequest| shared::AutopilotAction::Start { spec };
+        let not_omp = "Autopilot is available only on OMP terminal tabs.";
+
+        let cases = [
+            (
+                "no-time-limit",
+                3,
+                start(shared::AutopilotStartRequest {
+                    time_limit: None,
+                    ..autopilot_spec()
+                }),
+                "Say whether autopilot has a time limit: a duration, or none.",
+            ),
+            (
+                "no-iteration-limit",
+                3,
+                start(shared::AutopilotStartRequest {
+                    iteration_limit: None,
+                    ..autopilot_spec()
+                }),
+                "Say whether autopilot has an iteration limit: a number, or none.",
+            ),
+            (
+                "empty-prompt",
+                3,
+                start(shared::AutopilotStartRequest {
+                    prompt: Some(" \n".to_string()),
+                    ..autopilot_spec()
+                }),
+                "Autopilot needs a prompt.",
+            ),
+            (
+                "short-interval",
+                3,
+                start(shared::AutopilotStartRequest {
+                    repeat: Some(shared::AutopilotRepeat::Every { seconds: 10 }),
+                    ..autopilot_spec()
+                }),
+                "The repeat interval must be between one minute and 24 hours.",
+            ),
+            ("claude-tab", 4, autopilot_start(), not_omp),
+            ("structured-pane", 5, autopilot_stop(), not_omp),
+            (
+                "bot-history",
+                6,
+                autopilot_start(),
+                "Legacy bot history is read-only; it cannot be put on autopilot.",
+            ),
+            (
+                "closed-tab",
+                9,
+                autopilot_stop(),
+                "This tab is no longer available.",
+            ),
+        ];
+        for (id, pane_id, action, reason) in cases {
+            if let shared::AutopilotAction::Start { spec } = &action {
+                if pane_id == 3 {
+                    assert_eq!(spec.validate().unwrap_err(), reason, "{id}");
+                }
+            }
+            autopilot(&p, &web.id, pane_id, id, action).await;
+            let delivered = web.drain();
+            assert_eq!(
+                receipts(&delivered),
+                vec![receipt(id, Refused, Some(reason))],
+                "{id}"
+            );
+            assert!(errors(&delivered).is_empty(), "{id}");
+        }
+
+        // An id that cannot be tracked is turned away before anything else.
+        for id in [
+            String::new(),
+            "x".repeat(shared::AUTOPILOT_REQUEST_ID_MAX_BYTES + 1),
+        ] {
+            autopilot(&p, &web.id, 3, &id, autopilot_stop()).await;
+            let delivered = web.drain();
+            assert!(receipts(&delivered).is_empty());
+            assert_eq!(
+                errors(&delivered),
+                vec!["Invalid autopilot request identifier".to_string()]
+            );
+        }
+        assert!(a.drain().is_empty(), "nothing reached the tab's instance");
+
+        // The longest id a viewer may send is taken.
+        let longest = "x".repeat(shared::AUTOPILOT_REQUEST_ID_MAX_BYTES);
+        autopilot(&p, &web.id, 3, &longest, autopilot_stop()).await;
+        assert_eq!(forwarded(&mut a).len(), 1);
+    }
+
+    /// Viewers are not told an instance's capabilities. When a machine that
+    /// has not been rebooted to update attaches while a capable viewer is
+    /// watching, that viewer is told that each of the machine's OMP tabs
+    /// needs an instance update, and session lists say the same. Once the
+    /// machine reconnects with autopilot its tabs are not reported, until it
+    /// reports them.
+    #[tokio::test]
+    async fn an_older_instance_attaching_tells_capable_viewers_which_tabs_need_its_update() {
+        let p = project().await;
+        let mut web = p.viewer(p.owner, AUTOPILOT_VIEWER);
+        let mut older_web = p.viewer(p.owner, &[PROJECT_INSTANCES_CAPABILITY]);
+        p.roster(vec![
+            omp_tab(3, p.m6, HOST_B),
+            omp_tab(4, p.m6, HOST_B),
+            pane(5, Some(p.m6), Some(HOST_B)),
+            omp_tab(6, p.m5, HOST_A),
+        ]);
+        let support = |pane_id: u32| {
+            pane_summaries(&p.state, &p.session, true)
+                .into_iter()
+                .find(|summary| summary.pane_id == pane_id)
+                .unwrap()
+                .autopilot
+                .map(|autopilot| autopilot.support)
+        };
+        assert_eq!(support(3), Some(AutopilotSupport::NotReported));
+
+        let _b = p.instance(p.m6, HOST_B);
+        assert_eq!(
+            autopilot_states(&web.drain()),
+            vec![
+                (3, AutopilotSupport::InstanceUpdateRequired, None),
+                (4, AutopilotSupport::InstanceUpdateRequired, None),
+                (6, AutopilotSupport::NotReported, None),
+            ]
+        );
+        assert_eq!(support(3), Some(AutopilotSupport::InstanceUpdateRequired));
+        assert_eq!(support(4), Some(AutopilotSupport::InstanceUpdateRequired));
+        assert_eq!(support(5), None, "not an OMP terminal tab");
+        assert_eq!(support(6), Some(AutopilotSupport::NotReported));
+
+        // The machine is rebooted to update and its instance attaches again.
+        let updated = p.instance_with(p.m6, HOST_B, AUTOPILOT_CLI);
+        assert_eq!(
+            autopilot_states(&web.drain()),
+            vec![
+                (3, AutopilotSupport::NotReported, None),
+                (4, AutopilotSupport::NotReported, None),
+                (6, AutopilotSupport::NotReported, None),
+            ]
+        );
+        p.state.sessions.report_pane_autopilot(
+            &p.session,
+            updated.id,
+            3,
+            AutopilotSupport::NeedsAgentReboot,
+            None,
+            None,
+        );
+        assert_eq!(
+            autopilot_states(&web.drain()),
+            vec![(3, AutopilotSupport::NeedsAgentReboot, None)]
+        );
+        assert!(autopilot_states(&older_web.drain()).is_empty());
+    }
+
+    /// Session lists carry a tab's autopilot condition and progress beside
+    /// its status, for OMP terminal tabs only and never with the prompt.
+    #[tokio::test]
+    async fn pane_summaries_carry_the_autopilot_condition_without_the_prompt() {
+        let p = project().await;
+        let a = p.instance_with(p.m5, HOST_A, AUTOPILOT_CLI);
+        p.roster(vec![
+            omp_tab(3, p.m5, HOST_A),
+            pane(4, Some(p.m5), Some(HOST_A)),
+        ]);
+        p.state.sessions.report_pane_autopilot(
+            &p.session,
+            a.id,
+            3,
+            AutopilotSupport::Supported,
+            Some(waiting_autopilot()),
+            Some("2026-11-13T14:07:00Z".to_string()),
+        );
+
+        let summaries = pane_summaries(&p.state, &p.session, true);
+        let on_autopilot = summaries[0].autopilot.clone().expect("an OMP terminal tab");
+        assert_eq!(on_autopilot.support, AutopilotSupport::Supported);
+        assert_eq!(on_autopilot.condition.as_deref(), Some("waiting"));
+        assert_eq!(on_autopilot.detail.as_deref(), Some("next_iteration"));
+        assert_eq!(
+            on_autopilot.next_iteration_at.as_deref(),
+            Some("2026-11-13T14:30:00Z")
+        );
+        assert_eq!(on_autopilot.iterations, Some(7));
+        assert_eq!(on_autopilot.iteration_limit, None, "no iteration limit");
+        assert!(summaries[1].autopilot.is_none());
+        // Autopilot is its own attribute: the tab's status is untouched.
+        assert!(!summaries[0].is_working && !summaries[0].awaiting_answer);
+        let listed = serde_json::to_string(&summaries).unwrap();
+        assert!(!listed.contains("Check the build"), "{listed}");
+    }
+
+    /// End to end over the web socket. A client that asks for autopilot is
+    /// told the server has it, is replayed each OMP tab's availability when
+    /// it attaches, after the roster that lists the tab, and is answered when
+    /// it sends a request. A client that does not ask negotiates nothing and
+    /// is sent no autopilot frame, whatever it sends.
+    #[tokio::test]
+    async fn a_web_client_that_asks_for_autopilot_is_replayed_and_answered_over_its_socket() {
+        use jsonwebtoken::{encode, EncodingKey, Header};
+        use tokio_tungstenite::{connect_async, tungstenite::Message};
+
+        type Socket = tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >;
+        async fn send(socket: &mut Socket, message: WebToServer) {
+            socket
+                .send(Message::Text(serde_json::to_string(&message).unwrap()))
+                .await
+                .unwrap();
+        }
+        /// Every frame up to and including the first that `last` accepts.
+        async fn receive_until(
+            socket: &mut Socket,
+            last: impl Fn(&ServerToWeb) -> bool,
+        ) -> Vec<ServerToWeb> {
+            let mut received = Vec::new();
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    let Message::Text(text) = socket.next().await.unwrap().unwrap() else {
+                        continue;
+                    };
+                    let message: ServerToWeb = serde_json::from_str(&text).unwrap();
+                    let done = last(&message);
+                    received.push(message);
+                    if done {
+                        return;
+                    }
+                }
+            })
+            .await
+            .expect("timed out waiting for the server");
+            received
+        }
+        async fn connect(url: &str, token: &str, capabilities: &[&str]) -> (Socket, Vec<String>) {
+            let (mut socket, _) = connect_async(url).await.unwrap();
+            send(
+                &mut socket,
+                WebToServer::Authenticate {
+                    token: token.to_string(),
+                    capabilities: capabilities
+                        .iter()
+                        .map(|capability| capability.to_string())
+                        .collect(),
+                    client_kind: None,
+                    app_version: None,
+                    protocol_version: None,
+                },
+            )
+            .await;
+            let frames = receive_until(&mut socket, |message| {
+                matches!(message, ServerToWeb::Authenticated { .. })
+            })
+            .await;
+            let Some(ServerToWeb::Authenticated {
+                negotiated_capabilities,
+                ..
+            }) = frames.last().cloned()
+            else {
+                unreachable!()
+            };
+            (socket, negotiated_capabilities)
+        }
+
+        let p = project().await;
+        let mut a = p.instance_with(p.m5, HOST_A, AUTOPILOT_CLI);
+        p.roster(vec![
+            omp_tab(3, p.m5, HOST_A),
+            pane(4, Some(p.m5), Some(HOST_A)),
+        ]);
+        let reported_at = Some("2026-11-13T14:07:00Z".to_string());
+        p.state.sessions.report_pane_autopilot(
+            &p.session,
+            a.id,
+            3,
+            AutopilotSupport::Supported,
+            Some(waiting_autopilot()),
+            reported_at.clone(),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let router = crate::routes::create_router(p.state.clone());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        let url = format!("ws://{address}/ws/web");
+        let token = encode(
+            &Header::default(),
+            &crate::routes::auth::Claims {
+                sub: p.owner.to_string(),
+                exp: (chrono::Utc::now() + chrono::Duration::hours(1)).timestamp() as usize,
+                device_session_id: None,
+                token_kind: None,
+                credential_version: None,
+            },
+            &EncodingKey::from_secret(p.state.config.auth.jwt_secret.as_bytes()),
+        )
+        .unwrap();
+        let attach = WebToServer::AttachSession {
+            session_id: p.session,
+        };
+        let attached =
+            |message: &ServerToWeb| matches!(message, ServerToWeb::SessionMessages { .. });
+        let autopilot_frames = |frames: &[ServerToWeb]| {
+            frames
+                .iter()
+                .filter(|message| {
+                    matches!(
+                        message,
+                        ServerToWeb::PaneAutopilotState { .. }
+                            | ServerToWeb::PaneAutopilotReceipt { .. }
+                    )
+                })
+                .count()
+        };
+
+        let (mut capable, negotiated) =
+            connect(&url, &token, &[shared::TAB_AUTOPILOT_CAPABILITY]).await;
+        assert_eq!(
+            negotiated,
+            vec![shared::TAB_AUTOPILOT_CAPABILITY.to_string()]
+        );
+        let (mut older, negotiated) = connect(&url, &token, &[]).await;
+        assert!(negotiated.is_empty(), "{negotiated:?}");
+
+        // The replay on attach: the OMP tab only, after the roster.
+        send(&mut capable, attach.clone()).await;
+        let frames = receive_until(&mut capable, attached).await;
+        assert_eq!(
+            autopilot_states(&frames),
+            vec![(3, AutopilotSupport::Supported, reported_at)]
+        );
+        let roster_at = frames
+            .iter()
+            .position(|message| matches!(message, ServerToWeb::PaneList { .. }))
+            .expect("the roster is sent");
+        let state_at = frames
+            .iter()
+            .position(|message| matches!(message, ServerToWeb::PaneAutopilotState { .. }))
+            .unwrap();
+        assert!(roster_at < state_at, "{frames:?}");
+        send(&mut older, attach).await;
+        let frames = receive_until(&mut older, attached).await;
+        assert_eq!(autopilot_frames(&frames), 0, "{frames:?}");
+
+        // A request is forwarded to the tab's instance and answered to its
+        // sender when that instance answers.
+        let stop = |request_id: &str| WebToServer::ControlPaneAutopilot {
+            session_id: p.session,
+            pane_id: 3,
+            request_id: request_id.to_string(),
+            action: autopilot_stop(),
+        };
+        send(&mut capable, stop("stop-1")).await;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(ServerToCli::ControlPaneAutopilot { request_id, .. }) =
+                    a.rx.recv().await
+                {
+                    assert_eq!(request_id, "stop-1");
+                    return;
+                }
+            }
+        })
+        .await
+        .expect("the request reaches the tab's instance");
+        assert!(answer(&p, &a, 3, "stop-1", Accepted, None));
+        let frames = receive_until(&mut capable, |message| {
+            matches!(message, ServerToWeb::PaneAutopilotReceipt { .. })
+        })
+        .await;
+        assert_eq!(receipts(&frames), vec![receipt("stop-1", Accepted, None)]);
+
+        // The other client's request is not forwarded, and neither the
+        // refusal nor a tab's next report reaches it as an autopilot frame.
+        send(&mut older, stop("stop-2")).await;
+        send(&mut older, WebToServer::Heartbeat).await;
+        let frames = receive_until(&mut older, |message| {
+            matches!(message, ServerToWeb::Heartbeat)
+        })
+        .await;
+        assert_eq!(errors(&frames).len(), 1, "{frames:?}");
+        p.state.sessions.report_pane_autopilot(
+            &p.session,
+            a.id,
+            3,
+            AutopilotSupport::NotReported,
+            None,
+            None,
+        );
+        let frames = receive_until(&mut capable, |message| {
+            matches!(message, ServerToWeb::PaneAutopilotState { .. })
+        })
+        .await;
+        assert_eq!(
+            autopilot_states(&frames),
+            vec![(3, AutopilotSupport::NotReported, None)]
+        );
+        send(&mut older, WebToServer::Heartbeat).await;
+        let frames = receive_until(&mut older, |message| {
+            matches!(message, ServerToWeb::Heartbeat)
+        })
+        .await;
+        assert_eq!(autopilot_frames(&frames), 0, "{frames:?}");
+        assert!(forwarded(&mut a).is_empty(), "stop-2 never reached the tab");
+        server.abort();
+    }
+
+    /// The request is handled on the requester's read loop, so nothing in it
+    /// waits for the tab's instance. When that instance's connection is
+    /// stalled the request is refused at once, saying nothing was sent, and
+    /// is not kept for later; a request that did reach the instance is still
+    /// answered when it answers.
+    #[tokio::test]
+    async fn a_stalled_instance_does_not_hold_up_the_requesters_connection() {
+        let p = project().await;
+        // An instance whose connection takes one frame and then stalls.
+        let mut a = {
+            let id = Uuid::new_v4();
+            let (tx, rx) = mpsc::channel(1);
+            p.state.sessions.register_cli(id, p.host, tx, None);
+            p.state.sessions.set_cli_capabilities(
+                id,
+                AUTOPILOT_CLI
+                    .iter()
+                    .map(|capability| capability.to_string())
+                    .collect(),
+            );
+            assert!(matches!(
+                p.state.sessions.attach_cli_instance(
+                    p.session,
+                    id,
+                    Some(p.m5),
+                    Some(format!("/work/{HOST_A}")),
+                    Some(HOST_A.to_string()),
+                ),
+                AttachOutcome::Attached { .. }
+            ));
+            Endpoint { id, rx }
+        };
+        let mut web = p.viewer(p.owner, AUTOPILOT_VIEWER);
+        p.roster(vec![omp_tab(3, p.m5, HOST_A)]);
+        assert!(a.drain().is_empty());
+
+        let pause = shared::AutopilotAction::Pause { autopilot_id: None };
+        autopilot(&p, &web.id, 3, "pause-1", pause).await;
+        let sent = std::time::Instant::now();
+        for (name, action) in autopilot_actions() {
+            let id = format!("stalled-{name}");
+            autopilot(&p, &web.id, 3, &id, action).await;
+            assert_eq!(
+                receipts(&web.drain()),
+                vec![receipt(
+                    &id,
+                    Refused,
+                    Some("The project runtime is unavailable; nothing was sent to the tab.")
+                )]
+            );
+            assert!(
+                !answer(&p, &a, 3, &id, Accepted, None),
+                "nothing waits for a request that was never sent"
+            );
+        }
+        assert!(
+            sent.elapsed() < Duration::from_secs(2),
+            "no request waited on the stalled connection"
+        );
+
+        assert_eq!(
+            forwarded(&mut a)
+                .into_iter()
+                .map(|(_, request_id, _)| request_id)
+                .collect::<Vec<_>>(),
+            vec!["pause-1".to_string()]
+        );
+        assert!(answer(&p, &a, 3, "pause-1", Accepted, None));
+        assert_eq!(
+            next_receipt(&mut web).await,
+            receipt("pause-1", Accepted, None)
+        );
+    }
+
+    /// A tab that names neither a machine nor a host is one no attached
+    /// machine runs once several run the project. Routing would hand its
+    /// controls to the primary; an autopilot request is refused instead, for
+    /// a stop as for a start.
+    #[tokio::test]
+    async fn an_autopilot_request_for_a_tab_no_machine_runs_is_not_sent_to_the_primary() {
+        let p = project().await;
+        let mut a = p.instance_with(p.m5, HOST_A, AUTOPILOT_CLI);
+        let mut b = p.instance_with(p.m6, HOST_B, AUTOPILOT_CLI);
+        let mut web = p.viewer(p.owner, AUTOPILOT_VIEWER);
+        let mut unowned = omp_tab(3, p.m5, HOST_A);
+        unowned.machine_id = None;
+        unowned.hostname = None;
+        p.roster(vec![unowned]);
+
+        for (name, action) in autopilot_actions() {
+            autopilot(&p, &web.id, 3, name, action).await;
+            assert_eq!(
+                receipts(&web.drain()),
+                vec![receipt(
+                    name,
+                    Refused,
+                    Some("This tab's machine is not running this project.")
+                )]
+            );
+        }
+        assert!(forwarded(&mut a).is_empty() && forwarded(&mut b).is_empty());
+    }
+
+    /// A tab's provider can be switched from the web. A tab switched away
+    /// from OMP has no autopilot left, and what its OMP agent last reported
+    /// does not come back if it is switched to OMP again. A tab switched to
+    /// OMP is a new OMP terminal tab: viewers that negotiated autopilot are
+    /// told whether its instance can run autopilot, which the instance's own
+    /// roster report, changing nothing, would never say.
+    #[tokio::test]
+    async fn a_tab_switched_to_omp_from_the_web_tells_capable_viewers_its_availability() {
+        let p = project().await;
+        let a = p.instance_with(p.m5, HOST_A, AUTOPILOT_CLI);
+        // zoo-006 has not been rebooted to update yet.
+        let _b = p.instance(p.m6, HOST_B);
+        let mut web = p.viewer(p.owner, AUTOPILOT_VIEWER);
+        let mut older_web = p.viewer(p.owner, &[PROJECT_INSTANCES_CAPABILITY]);
+        p.roster(vec![
+            omp_tab(3, p.m5, HOST_A),
+            pane(4, Some(p.m6), Some(HOST_B)),
+        ]);
+        p.state.sessions.report_pane_autopilot(
+            &p.session,
+            a.id,
+            3,
+            AutopilotSupport::Supported,
+            Some(waiting_autopilot()),
+            Some("2026-11-13T14:07:00Z".to_string()),
+        );
+        web.drain();
+        let switch = |pane_id: u32, provider: shared::Provider| {
+            edit_roster_pane(&p.state, p.session, pane_id, move |pane| {
+                pane.provider = provider
+            })
+        };
+
+        assert!(switch(3, shared::Provider::Claude).await);
+        assert!(p
+            .state
+            .sessions
+            .cached_pane_autopilot(&p.session, 3)
+            .is_none());
+        assert!(autopilot_states(&web.drain()).is_empty());
+
+        assert!(switch(3, shared::Provider::Omp).await);
+        assert_eq!(
+            autopilot_states(&web.drain()),
+            vec![(3, AutopilotSupport::NotReported, None)],
+            "the old agent's state is gone"
+        );
+        assert!(switch(4, shared::Provider::Omp).await);
+        assert_eq!(
+            autopilot_states(&web.drain()),
+            vec![(4, AutopilotSupport::InstanceUpdateRequired, None)]
+        );
+
+        // An edit that leaves the provider alone says nothing.
+        assert!(
+            edit_roster_pane(&p.state, p.session, 3, |pane| {
+                pane.label = Some("checks".to_string())
+            })
+            .await
+        );
+        assert!(autopilot_states(&web.drain()).is_empty());
+        assert!(autopilot_states(&older_web.drain()).is_empty());
     }
 }

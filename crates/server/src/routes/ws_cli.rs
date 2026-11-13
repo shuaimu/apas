@@ -540,6 +540,19 @@ async fn relay_primary_inventory_after_handover(state: &AppState, detach: &Insta
     .await;
 }
 
+/// The advertised CLI capabilities this server echoes in `Registered`: only
+/// those a CLI reads the echo of. A CLI that advertised
+/// `omp_tab_autopilot_v1` and does not see it echoed tells its OMP tabs that
+/// the server cannot control autopilot, and they hold. This server relays
+/// autopilot state and controls, so it must echo it.
+fn negotiated_cli_capabilities(advertised: &[String]) -> Vec<String> {
+    [shared::OMP_TAB_AUTOPILOT_CAPABILITY]
+        .into_iter()
+        .filter(|negotiable| advertised.iter().any(|capability| capability == negotiable))
+        .map(str::to_string)
+        .collect()
+}
+
 /// Minimum supported client version (YY.MM.COMMIT format)
 /// Update this when making breaking API changes
 const MIN_CLIENT_VERSION: &str = "26.01.0";
@@ -879,9 +892,11 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
 
                                         // Send registration success
                                         let response = ServerToCli::Registered {
-                                    cli_id,
-                                    negotiated_capabilities: Vec::new(),
-                                };
+                                            cli_id,
+                                            negotiated_capabilities: negotiated_cli_capabilities(
+                                                &cli_capabilities,
+                                            ),
+                                        };
                                         let text = serde_json::to_string(&response).unwrap();
                                         if sender.send(Message::Text(text.into())).await.is_err() {
                                             return;
@@ -1183,6 +1198,12 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                         .set_session_project(session_id, project_id.to_string());
                                 }
 
+                                // What autopilot-capable viewers hold for each OMP tab, read
+                                // before the roster is loaded and merged: a tab that either
+                                // adds, or gives to this instance, is told to them below.
+                                let autopilot_before =
+                                    state.sessions.pane_autopilot_availabilities(&session_id);
+
                                 // Merge this instance's roster into the project's, after loading the
                                 // persisted one so other machines' stopped tabs survive a server
                                 // restart. `None` means the CLI did not supply one and changes nothing;
@@ -1221,6 +1242,9 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                         )
                                         .await;
                                 }
+                                state
+                                    .sessions
+                                    .broadcast_pane_autopilot_changes(&session_id, &autopilot_before);
 
                                 // The session's database row describes its primary instance. Another
                                 // machine's instance must not rewrite its host or directory, or move
@@ -2161,6 +2185,10 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                 // replaces only its own, keeps every other machine's, and
                                 // keeps web-side labels and order. A pane mid-reboot (a close
                                 // followed by an add on the CLI) keeps its place.
+                                // Read before the roster is loaded, as at `SessionStart`: a
+                                // tab that comes with a late load is new to viewers too.
+                                let autopilot_before =
+                                    state.sessions.pane_autopilot_availabilities(&session_id);
                                 ensure_pane_roster_loaded(&state, &session_id).await;
                                 let reported: HashSet<u32> =
                                     panes.iter().map(|pane| pane.pane_id).collect();
@@ -2181,13 +2209,59 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                     panes,
                                 };
                                 state.sessions.route_to_web(&session_id, web_msg).await;
+                                // An OMP terminal tab this report added, or gave to this
+                                // instance, is told to autopilot-capable viewers after the
+                                // roster that lists it.
+                                state
+                                    .sessions
+                                    .broadcast_pane_autopilot_changes(&session_id, &autopilot_before);
                             }
                             Ok(CliToServer::Register { .. }) => {
                                 // Already registered, ignore
                             }
-                            // Placeholder until the server handles autopilot (group 5).
-                            Ok(CliToServer::PaneAutopilotReceipt { .. })
-                            | Ok(CliToServer::PaneAutopilotState { .. }) => {}
+                            Ok(CliToServer::PaneAutopilotReceipt {
+                                session_id,
+                                pane_id,
+                                request_id,
+                                outcome,
+                                reason,
+                            }) => {
+                                // Only the tab's instance gets this far, and the waiter
+                                // also names the connection the request was sent to. The
+                                // receipt says the tab took the request; what viewers are
+                                // shown changes only with the tab's reported state.
+                                state.sessions.finish_autopilot_request(
+                                    session_id,
+                                    pane_id,
+                                    cli_id,
+                                    &request_id,
+                                    crate::session::AutopilotReceipt { outcome, reason },
+                                );
+                            }
+                            Ok(CliToServer::PaneAutopilotState {
+                                session_id,
+                                pane_id,
+                                support,
+                                state: reported,
+                                reported_at,
+                            }) => {
+                                let Ok((_project_id, _operation_guard)) = state
+                                    .active_session_operation(&session_id.to_string())
+                                    .await
+                                else {
+                                    continue;
+                                };
+                                // Cached for viewers that attach later, and relayed only to
+                                // viewers that negotiated autopilot.
+                                state.sessions.report_pane_autopilot(
+                                    &session_id,
+                                    cli_id,
+                                    pane_id,
+                                    support,
+                                    reported,
+                                    reported_at,
+                                );
+                            }
                             Ok(CliToServer::PaneWorkSummaryResult { result }) => {
                                 let _ = state
                                     .pane_work_summaries
@@ -3095,23 +3169,39 @@ mod instance_tests {
 
     /// A registered CLI connection; `capable` advertises project instances.
     async fn connect_cli(harness: &Harness, capable: bool) -> (CliSocket, Uuid) {
-        let (mut socket, _) = connect_async(&harness.url).await.unwrap();
-        let mut capabilities = vec![shared::PROJECT_POLICY_CAPABILITY.to_string()];
+        let mut capabilities = vec![shared::PROJECT_POLICY_CAPABILITY];
         if capable {
-            capabilities.push(PROJECT_INSTANCES_CAPABILITY.to_string());
+            capabilities.push(PROJECT_INSTANCES_CAPABILITY);
         }
+        let (socket, cli_id, _) = register_cli(harness, &capabilities).await;
+        (socket, cli_id)
+    }
+
+    /// A CLI connection registered with `capabilities`, and the capabilities
+    /// the server echoed in its reply.
+    async fn register_cli(
+        harness: &Harness,
+        capabilities: &[&str],
+    ) -> (CliSocket, Uuid, Vec<String>) {
+        let (mut socket, _) = connect_async(&harness.url).await.unwrap();
         send(
             &mut socket,
             CliToServer::Register {
                 token: harness.token.clone(),
                 version: Some("26.11.0".to_string()),
-                capabilities,
+                capabilities: capabilities
+                    .iter()
+                    .map(|capability| capability.to_string())
+                    .collect(),
             },
         )
         .await;
         match receive(&mut socket, |message| matches!(message, ServerToCli::Registered { .. })).await
         {
-            ServerToCli::Registered { cli_id } => (socket, cli_id),
+            ServerToCli::Registered {
+                cli_id,
+                negotiated_capabilities,
+            } => (socket, cli_id, negotiated_capabilities),
             other => panic!("expected registration, got {other:?}"),
         }
     }
@@ -3712,5 +3802,290 @@ mod instance_tests {
             .collect();
         assert_eq!(aside.len(), 1, "{aside:?}");
         assert_eq!(std::fs::read(&aside[0]).unwrap(), b"[{\"pane_id\": 3,");
+    }
+
+    /// What the CLI of a machine that has autopilot advertises.
+    const AUTOPILOT_CLI: &[&str] = &[
+        shared::PROJECT_POLICY_CAPABILITY,
+        PROJECT_INSTANCES_CAPABILITY,
+        shared::OMP_TAB_AUTOPILOT_CAPABILITY,
+    ];
+
+    fn omp_tab(pane_id: u32) -> PaneConfig {
+        let mut tab = pane(pane_id);
+        tab.provider = Provider::Omp;
+        tab
+    }
+
+    fn autopilot_state(
+        session_id: Uuid,
+        pane_id: u32,
+        support: shared::AutopilotSupport,
+        reported_at: &str,
+    ) -> CliToServer {
+        CliToServer::PaneAutopilotState {
+            session_id,
+            pane_id,
+            support,
+            state: Some(Box::new(shared::PaneAutopilotState::default())),
+            reported_at: Some(reported_at.to_string()),
+        }
+    }
+
+    /// The autopilot states among `frames`: pane, availability and the time
+    /// the state was last reported.
+    fn autopilot_states(
+        frames: &[ServerToWeb],
+    ) -> Vec<(u32, shared::AutopilotSupport, Option<String>)> {
+        frames
+            .iter()
+            .filter_map(|message| match message {
+                ServerToWeb::PaneAutopilotState {
+                    pane_id,
+                    support,
+                    reported_at,
+                    ..
+                } => Some((*pane_id, *support, reported_at.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A CLI that advertised autopilot is told that this server controls it,
+    /// which is what lets its tabs go on submitting iterations. A CLI that
+    /// did not advertise it is echoed nothing, as from an older server.
+    #[tokio::test]
+    async fn registration_echoes_autopilot_to_a_cli_that_advertised_it() {
+        let harness = harness().await;
+        let (_with, _, echoed) = register_cli(&harness, AUTOPILOT_CLI).await;
+        assert_eq!(echoed, vec![shared::OMP_TAB_AUTOPILOT_CAPABILITY.to_string()]);
+        let (_without, _, echoed) = register_cli(
+            &harness,
+            &[shared::PROJECT_POLICY_CAPABILITY, PROJECT_INSTANCES_CAPABILITY],
+        )
+        .await;
+        assert!(echoed.is_empty(), "{echoed:?}");
+        assert!(super::negotiated_cli_capabilities(&[]).is_empty());
+    }
+
+    /// A tab's autopilot state and the receipt for a request come only from
+    /// the instance that runs the tab. The state is relayed to viewers that
+    /// negotiated autopilot and to no other, a tab a roster report adds is
+    /// told after the roster that lists it, and a tab whose instance leaves
+    /// is not reported.
+    #[tokio::test]
+    async fn a_tabs_autopilot_is_reported_by_its_own_instance_to_capable_viewers() {
+        use shared::AutopilotSupport::{NotReported, Supported};
+        let harness = harness().await;
+        let session = Uuid::new_v4();
+        let (m5, m6) = (Uuid::new_v4(), Uuid::new_v4());
+        let (mut a, a_id, _) = register_cli(&harness, AUTOPILOT_CLI).await;
+        let (mut b, _, _) = register_cli(&harness, AUTOPILOT_CLI).await;
+        start(&mut a, session_start(session, m5, HOST_A, Some(vec![omp_tab(3)]))).await;
+        start(&mut b, session_start(session, m6, HOST_B, Some(vec![omp_tab(4)]))).await;
+        let mut web = viewer_with(&harness, session, &[shared::TAB_AUTOPILOT_CAPABILITY]);
+        let mut older_web = viewer_with(&harness, session, &[PROJECT_INSTANCES_CAPABILITY]);
+        let sessions = &harness.state.sessions;
+
+        // zoo-006 cannot speak for zoo-005's tab: its report for that tab is
+        // dropped, and the one for its own tab, sent after it, is relayed.
+        send(&mut b, autopilot_state(session, 3, Supported, "2026-11-13T13:59:00Z")).await;
+        send(&mut b, autopilot_state(session, 4, Supported, "2026-11-13T14:00:00Z")).await;
+        let (own, before) = receive_web(&mut web, |message| {
+            matches!(message, ServerToWeb::PaneAutopilotState { pane_id: 4, .. })
+        })
+        .await;
+        let on_zoo_006 = (4, Supported, Some("2026-11-13T14:00:00Z".to_string()));
+        assert_eq!(autopilot_states(&[own]), vec![on_zoo_006.clone()]);
+        assert!(autopilot_states(&before).is_empty(), "{before:?}");
+
+        // zoo-005's own report is relayed. A CLI cannot say that an instance
+        // needs an update: only the server does.
+        send(&mut a, autopilot_state(session, 3, Supported, "2026-11-13T14:01:00Z")).await;
+        send(
+            &mut a,
+            autopilot_state(
+                session,
+                3,
+                shared::AutopilotSupport::InstanceUpdateRequired,
+                "2026-11-13T14:02:00Z",
+            ),
+        )
+        .await;
+        let (last, before) = receive_web(&mut web, |message| {
+            matches!(message, ServerToWeb::PaneAutopilotState { reported_at: Some(at), .. } if at == "2026-11-13T14:02:00Z")
+        })
+        .await;
+        assert_eq!(
+            autopilot_states(&[before, vec![last]].concat()),
+            vec![
+                (3, Supported, Some("2026-11-13T14:01:00Z".to_string())),
+                (3, NotReported, Some("2026-11-13T14:02:00Z".to_string())),
+            ]
+        );
+
+        // The same for a receipt: only the tab's instance answers a request.
+        let receipt = sessions
+            .begin_autopilot_request(session, 3, a_id, "stop-1")
+            .unwrap();
+        let answered = |reason: &str| CliToServer::PaneAutopilotReceipt {
+            session_id: session,
+            pane_id: 3,
+            request_id: "stop-1".to_string(),
+            outcome: shared::AutopilotReceiptOutcome::Accepted,
+            reason: Some(reason.to_string()),
+        };
+        send(&mut b, answered("from another machine")).await;
+        send(&mut a, answered("from the tab's machine")).await;
+        let receipt = tokio::time::timeout(Duration::from_secs(5), receipt)
+            .await
+            .expect("the receipt arrives")
+            .unwrap();
+        assert_eq!(receipt.reason.as_deref(), Some("from the tab's machine"));
+
+        // A new OMP tab is told after the roster that lists it, and a tab of
+        // another provider is not mentioned.
+        send(&mut a, CliToServer::PaneList {
+            session_id: session,
+            panes: vec![omp_tab(3), omp_tab(8), pane(9)],
+        })
+        .await;
+        let (added, before) = receive_web(&mut web, |message| {
+            matches!(message, ServerToWeb::PaneAutopilotState { .. })
+        })
+        .await;
+        assert_eq!(autopilot_states(&[added]), vec![(8, NotReported, None)]);
+        assert!(
+            before
+                .iter()
+                .any(|message| matches!(message, ServerToWeb::PaneList { .. })),
+            "{before:?}"
+        );
+
+        // zoo-005 drops off: its tabs are not reported, zoo-006's is as it was.
+        a.close(None).await.unwrap();
+        let (last, before) = receive_web(&mut web, |message| {
+            matches!(message, ServerToWeb::PaneAutopilotState { pane_id: 8, .. })
+        })
+        .await;
+        assert_eq!(
+            autopilot_states(&[before, vec![last]].concat()),
+            vec![(3, NotReported, None), on_zoo_006, (8, NotReported, None)]
+        );
+        assert!(sessions.cached_pane_autopilot(&session, 3).is_none());
+
+        // The viewer that did not negotiate autopilot saw none of it. Its own
+        // tab's output, sent last, is the first thing it is asked to match.
+        send(&mut b, terminal_output(session, 4)).await;
+        let (_, before) = receive_web(&mut older_web, |message| {
+            matches!(message, ServerToWeb::TerminalOutput { pane_id: 4, .. })
+        })
+        .await;
+        assert!(
+            !before.iter().any(|message| matches!(
+                message,
+                ServerToWeb::PaneAutopilotState { .. } | ServerToWeb::PaneAutopilotReceipt { .. }
+            )),
+            "{before:?}"
+        );
+    }
+
+    /// An iteration is marked in the conversation by an assistant tool-use
+    /// block with a reserved name, sent as not completing the turn. The
+    /// server stores and relays it like any tool-use block and acts on
+    /// nothing in it: the tab's status stays what it was, Working or idle,
+    /// and no question is registered.
+    #[tokio::test]
+    async fn an_iteration_marker_leaves_the_tabs_status_unchanged() {
+        let harness = harness().await;
+        let session = Uuid::new_v4();
+        let (mut a, _, _) = register_cli(&harness, AUTOPILOT_CLI).await;
+        start(
+            &mut a,
+            session_start(session, Uuid::new_v4(), HOST_A, Some(vec![omp_tab(3), omp_tab(4)])),
+        )
+        .await;
+        let mut web = viewer(&harness, session);
+        let sessions = &harness.state.sessions;
+        let marker = |pane_id: u32| CliToServer::StreamMessage {
+            session_id: session,
+            message: shared::ClaudeStreamMessage::Assistant {
+                message: shared::ClaudeAssistantMessage {
+                    content: vec![shared::ClaudeContentBlock::ToolUse {
+                        id: format!("autopilot-iteration-{pane_id}"),
+                        name: shared::AUTOPILOT_ITERATION_TOOL_NAME.to_string(),
+                        input: serde_json::to_value(shared::AutopilotIterationMarker {
+                            autopilot_id: Uuid::nil(),
+                            iteration: 3,
+                            limit: Some(20),
+                            prompt: None,
+                        })
+                        .unwrap(),
+                    }],
+                    model: String::new(),
+                    extra: serde_json::Value::Null,
+                },
+                session_id: "omp-session".to_string(),
+                extra: json!({ "terminal_turn_complete": false }),
+            },
+            pane_type: None,
+            pane_id: Some(pane_id),
+        };
+
+        // Tab 3 is Working, tab 4 is idle.
+        send(&mut a, CliToServer::PaneStatus {
+            session_id: session,
+            pane_type: PaneType::Interactive,
+            pane_id: Some(3),
+            status: Some("Working...".to_string()),
+        })
+        .await;
+        send(&mut a, marker(3)).await;
+        send(&mut a, marker(4)).await;
+        send(&mut a, terminal_output(session, 3)).await;
+        let (_, before) = receive_web(&mut web, |message| {
+            matches!(message, ServerToWeb::TerminalOutput { pane_id: 3, .. })
+        })
+        .await;
+
+        let relayed: Vec<u32> = before
+            .iter()
+            .filter_map(|message| match message {
+                ServerToWeb::StreamMessage { pane_id, .. } => *pane_id,
+                _ => None,
+            })
+            .collect();
+        assert_eq!(relayed, vec![3, 4], "the markers reach the conversation");
+        let statuses: Vec<(Option<u32>, Option<String>)> = before
+            .iter()
+            .filter_map(|message| match message {
+                ServerToWeb::PaneStatus {
+                    pane_id, status, ..
+                } => Some((*pane_id, status.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            statuses,
+            vec![(Some(3), Some("Working...".to_string()))],
+            "only the status the CLI sent"
+        );
+        assert_eq!(
+            sessions.get_pane_statuses(&session),
+            vec![(PaneType::Interactive, 3, "Working...".to_string())]
+        );
+        for pane_id in [3, 4] {
+            assert!(
+                sessions
+                    .claim_pending_decision(
+                        session,
+                        &format!("autopilot-iteration-{pane_id}"),
+                        Some(pane_id),
+                        shared::MutationKind::Question,
+                    )
+                    .is_none(),
+                "a marker is not a question"
+            );
+        }
     }
 }

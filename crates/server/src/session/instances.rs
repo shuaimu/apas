@@ -222,7 +222,7 @@ fn admission(existing: &InstanceAttachment, incoming: &InstanceAttachment) -> Ad
 }
 
 /// Which instance owns `pane_id`, by the pane's tag or attributed host.
-fn resolve_pane_owner(session: &SessionState, pane_id: u32) -> PaneOwner {
+pub(super) fn resolve_pane_owner(session: &SessionState, pane_id: u32) -> PaneOwner {
     let Some(primary) = session.instances.first() else {
         return PaneOwner::NoInstance;
     };
@@ -361,6 +361,12 @@ impl SessionState {
                 cleared_statuses.push((*pane_id, *pane_type));
             }
             keep
+        });
+        // The instance that reported these is gone, and viewers are told
+        // their state is not reported; its provider may well still be running
+        // under its pane host.
+        self.pane_autopilot.retain(|pane_id, report| {
+            report.reporter != instance.cli_id && !departing.touches(*pane_id)
         });
         self.sync_primary();
         LockedDetach {
@@ -515,6 +521,9 @@ impl SessionManager {
             self.broadcast_session_presence(&session_id, true);
             self.broadcast_cli_clients_update();
             self.broadcast_session_instances(&session_id);
+            // Viewers are not told an instance's capabilities, so they hear
+            // here whether each OMP tab's instance can run autopilot.
+            self.broadcast_pane_autopilot(&session_id, None);
         }
         outcome
     }
@@ -566,6 +575,11 @@ impl SessionManager {
                 .iter()
                 .map(|&index| session.instances[index].cli_id)
                 .collect();
+            // A replaced connection's autopilot reports are not the new one's:
+            // it reports every OMP tab again after its own registration.
+            session.pane_autopilot.retain(|_, report| {
+                report.reporter == cli_id || !replaced.contains(&report.reporter)
+            });
             match replace.split_first() {
                 Some((&first, rest)) => {
                     incoming.attached_at = session.instances[first].attached_at;
@@ -714,6 +728,7 @@ impl SessionManager {
             self.broadcast_session_presence(session_id, false);
         }
         self.broadcast_session_instances(session_id);
+        self.broadcast_pane_autopilot(session_id, None);
         if let Some(user_id) = self.cli_users.get(&instance.cli_id).map(|owner| *owner) {
             self.broadcast_machines_update_for_user(&user_id);
         }
@@ -1077,6 +1092,7 @@ impl SessionManager {
                 for pane_id in &removed {
                     session.pane_statuses.remove(pane_id);
                     session.pane_idle_since.remove(pane_id);
+                    session.pane_autopilot.remove(pane_id);
                 }
                 (merged, foreign)
             } else {
@@ -1088,8 +1104,18 @@ impl SessionManager {
                 session
                     .pane_idle_since
                     .retain(|pane_id, _| listed.contains(pane_id));
+                session
+                    .pane_autopilot
+                    .retain(|pane_id, _| listed.contains(pane_id));
                 (merged, Vec::new())
             };
+            // A tab that stopped being an OMP terminal tab, as after a change
+            // of provider, has no autopilot left to show.
+            session.pane_autopilot.retain(|pane_id, _| {
+                merged.iter().all(|pane| {
+                    pane.pane_id != *pane_id || super::autopilot::is_autopilot_tab(pane)
+                })
+            });
             let observed_at = chrono::Utc::now().to_rfc3339();
             for pane in &merged {
                 if !session.pane_statuses.contains_key(&pane.pane_id) {
@@ -1187,6 +1213,7 @@ impl SessionManager {
             session.panes.remove(index);
             session.pane_statuses.remove(&pane_id);
             session.pane_idle_since.remove(&pane_id);
+            session.pane_autopilot.remove(&pane_id);
             session.forgotten_panes.insert(pane_id, None);
         }
         self.terminal_states.remove(&(*session_id, pane_id));

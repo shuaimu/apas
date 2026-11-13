@@ -10,9 +10,11 @@ use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
 
+pub mod autopilot;
 pub mod instances;
 mod local_projects;
 pub mod pane_launches;
+pub(crate) use autopilot::AutopilotReceipt;
 pub use instances::{
     AttachOutcome, CliRouteOutcome, InboundPaneVerdict, InstanceAttachment, InstanceDetach,
     SessionLeave,
@@ -147,6 +149,13 @@ pub struct SessionManager {
     /// One native answer acceptance waiter per pane, removed on receipt,
     /// disconnect, or the bounded web-handler timeout.
     omp_answer_waiters: DashMap<(Uuid, u32), OmpAnswerWaiter>,
+    /// Request ids of each account's recent autopilot requests, so a repeated
+    /// copy of one has no further effect. Bounded per account.
+    autopilot_request_ids: DashMap<Uuid, VecDeque<String>>,
+    /// Autopilot requests forwarded to a tab's instance whose receipt has not
+    /// arrived, by session, pane and request id. Removed on receipt, on
+    /// disconnect, or when the requester stops waiting.
+    autopilot_waiters: DashMap<(Uuid, u32, String), autopilot::AutopilotWaiter>,
     /// Per-user mobile mutation request state. A retry with the same opaque
     /// request id either observes the retained acknowledgement or waits for
     /// the original in-flight operation; it never applies the action twice.
@@ -367,6 +376,11 @@ pub struct SessionState {
     /// working status. Kept separately because an absent pane status means
     /// idle, while the timestamp is needed to rank idle panes by recency.
     pub pane_idle_since: HashMap<u32, String>,
+    /// The autopilot state each OMP terminal tab's instance last reported.
+    /// In memory only, and pruned wherever `pane_statuses` is: a tab's
+    /// autopilot lives in its OMP session, and its instance reports it again
+    /// after every registration.
+    pub pane_autopilot: HashMap<u32, autopilot::PaneAutopilotReport>,
     /// Cached project_goal.md content (last `ProjectGoalChanged` from CLI).
     /// Replayed to newly-attaching web clients so a hard-refresh doesn't
     /// leave the Project goal textbox empty until the next file change.
@@ -420,6 +434,7 @@ impl SessionState {
             panes: Vec::new(),
             pane_statuses: HashMap::new(),
             pane_idle_since: HashMap::new(),
+            pane_autopilot: HashMap::new(),
             project_goal: None,
             working_dir: None,
             hostname: None,
@@ -449,6 +464,8 @@ impl SessionState {
         // was closed keeps reporting work in project lists, waiting-agent
         // lists and pane summaries with no pane to attribute it to.
         self.pane_statuses
+            .retain(|pane_id, _| pane_ids.contains(pane_id));
+        self.pane_autopilot
             .retain(|pane_id, _| pane_ids.contains(pane_id));
         for pane in &panes {
             if !self.pane_statuses.contains_key(&pane.pane_id) {
@@ -491,6 +508,8 @@ impl SessionManager {
             pending_terminal_transcript_echoes: DashMap::new(),
             pending_decisions: DashMap::new(),
             omp_answer_waiters: DashMap::new(),
+            autopilot_request_ids: DashMap::new(),
+            autopilot_waiters: DashMap::new(),
             mutation_requests: DashMap::new(),
             mutation_request_order: DashMap::new(),
             lifecycle_requests: DashMap::new(),
@@ -977,6 +996,9 @@ impl SessionManager {
         self.cli_versions.remove(cli_id);
         self.cli_capabilities.remove(cli_id);
         self.omp_answer_waiters
+            .retain(|_, pending| pending.cli_id != *cli_id);
+        // Dropping a waiter answers its request as not confirmed at once.
+        self.autopilot_waiters
             .retain(|_, pending| pending.cli_id != *cli_id);
         let keys_to_remove: Vec<(Uuid, Provider)> = self
             .cli_usage_limits
@@ -2477,6 +2499,7 @@ impl SessionManager {
             AttachOutcome::Attached { .. } => {
                 tracing::info!("CLI {} assigned to session {}", cli_id, session_id);
                 self.broadcast_session_instances(session_id);
+                self.broadcast_pane_autopilot(session_id, None);
                 true
             }
             AttachOutcome::Rejected { reason } => {
@@ -2612,6 +2635,7 @@ impl SessionManager {
             panes: s.panes.clone(),
             pane_statuses: s.pane_statuses.clone(),
             pane_idle_since: s.pane_idle_since.clone(),
+            pane_autopilot: s.pane_autopilot.clone(),
             project_goal: s.project_goal.clone(),
             working_dir: s.working_dir.clone(),
             hostname: s.hostname.clone(),
@@ -2723,6 +2747,12 @@ impl SessionManager {
             .iter_mut()
             .find(|pane| pane.pane_id == pane_id)?;
         edit(pane);
+        // A tab switched to another provider has no autopilot left to show,
+        // and what its OMP agent last reported must not come back if the tab
+        // is switched to OMP again.
+        if !autopilot::is_autopilot_tab(pane) {
+            session.pane_autopilot.remove(&pane_id);
+        }
         Some(session.panes.clone())
     }
 
