@@ -1629,10 +1629,20 @@ On **2026-11-13** the change reached production in two steps.
   was built at e02c0f7, so it carries this change together with the worker
   cutover, and it was deployed with that cutover, not separately. Its backups
   are under `/opt/apas/backups/deploy-20261113T013925Z`.
-- **CLI:** `master` was pushed at e386a1d. No daemon restarts by itself. Each
-  machine takes the new CLI at its next reboot from the Machines page, which
-  stays its owner's action. Until then a machine keeps the October CLI and
-  cannot share a project with other machines.
+- **CLI:** `master` was pushed at e386a1d, and again at 79c909a with two
+  documentation commits. No daemon restarts by itself. Each machine takes the
+  new CLI at its next reboot from the Machines page, which stays its owner's
+  action. Until then a machine keeps the October CLI and cannot share a
+  project with other machines.
+- **zoo-005 and zoo-006** were rebooted from the Machines page at 07:43 UTC
+  and run 26.11.16. zoo-005 built the CLI in about a minute and zoo-006
+  reused that build. Each daemon registered again within a second, all nine
+  project instances re-attached, and the server logged no error. On zoo-005
+  the new daemon holds a control connection to each of its 18 terminal
+  hosts, so every running agent there was kept. On zoo-006 two terminals
+  were not kept, for the `/tmp` reason described under "Persistent pane hosts
+  and CLI lifecycle": each got a fresh provider, and the two old ones ended
+  with their hosts' reboot lease 15 minutes later.
 
 Checks at the pushed commit:
 
@@ -2236,7 +2246,17 @@ and are never described as live-adopted.
 Pane-host state is host-local, volatile, and outside the project directory:
 
 - Root: `${XDG_RUNTIME_DIR}/apas/ph`, or `/tmp/apas-<uid>/apas/ph` when
-  `XDG_RUNTIME_DIR` is unavailable.
+  `XDG_RUNTIME_DIR` is unavailable. **The `/tmp` fallback loses terminals.**
+  The system's cleaner deletes files under `/tmp` after 10 days
+  (`q /tmp 1777 root root 10d`), so a host older than that has lost its
+  `runtime.json` and `credential` and keeps only its socket. Nothing notices
+  while the daemon that launched it keeps its connection. At the next daemon
+  reboot the host cannot be found, the tab gets a fresh provider that resumes
+  its conversation, and the old provider runs on, detached, until its lease
+  ends. zoo-006's daemon was started without `XDG_RUNTIME_DIR` and lost two
+  tabs this way on 2026-11-13. Check a daemon with
+  `tr '\0' '\n' < /proc/<pid>/environ | grep XDG_RUNTIME_DIR`, and start
+  daemons from a session that sets it until the fallback is moved off `/tmp`.
 - Logs: `${XDG_RUNTIME_DIR}/apas/pane-host-logs/<project>/<pane>-<runtime>.log`,
   0600, info level, rotated once at 1 MiB and pruned after 14 days. A host's
   stderr is the tmux pane it runs in, which vanishes with the process, and its
