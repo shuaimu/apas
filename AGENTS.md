@@ -23,7 +23,9 @@ owns local panes and worktrees, the server brokers project/session/job state,
 and the web UI exposes interactive panes and the separate Jobs/Attention workflow.
 
 A project is a directory with an `.apas` file. Interactive work happens in
-**panes**, each hosting one agent and controlled by a person. **Autonomous
+**panes**, each hosting one agent and controlled by a person. A person can
+also leave one OMP terminal tab repeating a prompt on **autopilot** (see
+"Autopilot on OMP terminal tabs"). **Autonomous
 workers** own persistent, human-approved responsibilities and execute bounded
 internal jobs with independent verification and draft-PR publication. Recurring
 execution is default-disabled. Workers never orchestrate interactive panes or
@@ -46,7 +48,10 @@ from the role modal, composed into the system prompt by
 **The "Start bot" deadloop is retired too.** Its prompt, provider, cadence and
 conversation remain read-only history. Neither loading `.apas` nor reopening
 that history restores the loop. There is no bot-to-worker conversion: review the
-old responsibility and separately create and approve a new worker.
+old responsibility and separately create and approve a new worker. Autopilot is
+not the bot restored either: it is a loop a person starts inside one OMP
+terminal tab's own session, it shares no code or state with the bot, and a
+legacy bot pane cannot be put on autopilot.
 
 ## Architecture
 
@@ -376,7 +381,9 @@ Pending answer takes precedence when both status flags are set. Stopped projects
 retain gray dots labeled Not running. Hover titles and accessible labels name each pane
 and its status; crowded rows wrap rather than hide panes.
 Desktop dots sit beside the activity label; mobile dots follow the hostname
-or project path.
+or project path. A tab that is on autopilot has a ring around its dot and
+", on autopilot" in its label; the dot's colour still says Working, Pending
+answer or Idle. A paused or ended autopilot adds nothing to the dot.
 
 The dots use each displayed session's reported pane roster and canonical
 `is_working` / `awaiting_answer` flags, not the project's aggregate working
@@ -409,6 +416,8 @@ apas/
 │   │   │   ├── worktree.rs    # Isolated worktree creation/diff/cleanup
 │   │   │   ├── claude.rs      # Claude process wrapper
 │   │   │   ├── terminal_pane.rs # Pty host for kind:"terminal" panes (portable-pty)
+│   │   │   ├── omp_activity.mjs # Extension loaded into every OMP tab: activity, questions, autopilot loop
+│   │   │   ├── omp_autopilot.rs # Autopilot: files between the CLI and a tab, request exchange, state relay
 │   │   │   └── mode/
 │   │   │       ├── dual_pane.rs # Interactive pane runtime and transcript watchers
 │   │   │       ├── hybrid.rs    # Legacy single-pane local CLI + streaming
@@ -423,7 +432,8 @@ apas/
 │   │   │   ├── storage.rs   # File-based message storage (JSONL)
 │   │   │   ├── db/          # SQLite database
 │   │   │   ├── session/     # Session manager (instances.rs: a session's per-machine attachments;
-│   │   │   │                #   pane_launches.rs: pane ids and new panes in flight)
+│   │   │   │                #   pane_launches.rs: pane ids and new panes in flight;
+│   │   │   │                #   autopilot.rs: each OMP tab's reported autopilot and request routing)
 │   │   │   └── routes/
 │   │   │       ├── project_join.rs # GET /projects/by-remote and clone-to-join
 │   │   │       ├── ws_cli.rs  # CLI WebSocket handler, pane/session replay
@@ -433,6 +443,7 @@ apas/
 │   └── shared/          # Shared types between CLI and server
 │       ├── src/
 │       │   ├── lib.rs
+│       │   ├── autopilot.rs # Autopilot wire types: spec, actions, state, summary, marker
 │       │   └── messages.rs  # Shared WebSocket/machine message types
 │       └── Cargo.toml
 │
@@ -456,6 +467,7 @@ apas/
 │       │       ├── projectInstances.ts # A session's instances, one per machine
 │       │       ├── tabHosts.ts       # Which machine runs each tab, and why a tab cannot be used
 │       │       ├── machineChoice.ts  # The "Run on" step for a new tab
+│       │       ├── autopilot.ts      # Autopilot: frame parsing, the control's model, texts
 │       │       └── mobileSelectedPane.ts # Which pane a session screen opens on
 │       └── package.json
 │
@@ -725,7 +737,9 @@ Running one project on several machines adds `ServerToWeb::SessionInstances`,
 `AddPane { machine_id, request_id }` answered by `ServerToWeb::AddPaneResult`,
 `ForgetMachinePanes`, `CreateProjectInstance { join_project_id }`, the
 `all_instances` flag on project Start/Stop, `DaemonToServer::ProjectRuntimeStarted`,
-and the input `MutationAck`. Every `ServerToCli` variant is classified by
+and the input `MutationAck`. Autopilot adds `ControlPaneAutopilot` (web to
+server to the tab's CLI), `PaneAutopilotReceipt` and `PaneAutopilotState` (CLI
+to server to web), and `negotiated_capabilities` on `ServerToCli::Registered`. Every `ServerToCli` variant is classified by
 `ServerToCli::scope()`, which routes it; see "A project's tabs can run on several
 machines".
 
@@ -960,7 +974,8 @@ explicitly there, as the deploy commands above do.
    machine config, and pane diffs.
 6. **Pane kinds**: `PaneConfig.kind` selects the interactive hosting mechanism,
    independently of `provider`. The old deadloop `mode` survives only for
-   history; recurring work belongs to autonomous workers. See "Terminal panes".
+   history; recurring contained work belongs to autonomous workers, and an
+   OMP terminal tab can repeat one prompt on autopilot. See "Terminal panes".
 
 ## Tab-type policy (`disallowed_tab_types`)
 
@@ -1821,7 +1836,9 @@ The extension writes `omp-activity.json` by private temp-and-rename under the
 same host-local `apas/panes/<project>/<pane>` runtime tree as Claude's hook.
 Its launch generation, provider PID/start time, and exact session-directory
 scope must match; stale reports and inherited subagent environments cannot
-report for the parent. Reports contain no conversation or credentials.
+report for the parent. Activity reports contain no conversation or
+credentials. The separate autopilot state report (`omp-autopilot.json`) does
+carry the autopilot's prompt; see "Autopilot on OMP terminal tabs".
 No global OMP settings or extensions are replaced.
 
 Existing pane hosts are adopted without restarting providers, so they keep
@@ -2347,3 +2364,159 @@ reconnect disguised as reboot. Rollback disables new host creation; already
 running compatible hosts should be allowed to close normally or stopped by a
 new daemon. Forcing an old CLI/daemon to clean them up interrupts active
 terminal turns.
+
+## Autopilot on OMP terminal tabs
+
+**Autopilot** lets one OMP terminal tab keep working by itself: APAS submits
+the same prompt to that tab again and again, until a limit is reached, someone
+stops it, or something goes wrong. It is the light, in-tab way to leave an
+agent running. It is not an autonomous worker: there is no container, no
+independent verification, no budget and no draft PR, and the agent keeps the
+tab's ordinary permissions on its machine. The design record is
+`openspec/changes/add-omp-tab-autopilot/`; the doc comments in
+`crates/shared/src/autopilot.rs` and `crates/client-cli/src/omp_autopilot.rs`
+are the binding statement of the wire and of the files between the CLI and
+the tab.
+
+**The loop runs inside the tab's OMP process**, in APAS's embedded extension
+(`omp_activity.mjs`), not in the CLI and not on the server. Each iteration is
+`pi.sendUserMessage(prompt, { attribution: "agent", deliverAs: "aside" })`, so
+it is a real turn of the tab's own conversation and survives a browser being
+closed, a daemon reboot and a server restart. Nothing is typed into the
+terminal. The CLI passes requests to the tab and relays its state; the server
+authorizes, routes and caches.
+
+### Starting one
+
+The pane toolbar of an OMP terminal tab has an **Autopilot** control before
+the Terminal/Conversation switch. On a phone it is **Start autopilot** in the
+Pane actions sheet. The dialog asks for:
+
+- **The prompt**, at most 16,000 bytes. It is submitted as text: slash
+  commands and skills in it are not run. OMP still applies its own keywords,
+  `@path` mentions and a `+500k`-style token budget to it.
+- **When to repeat**: as soon as each turn ends (five seconds after the tab
+  settles), or every N minutes (one minute to one day). An interval is
+  measured from one submission to the next and never interrupts a turn.
+- **Limits, both optional**: a number of iterations and a length of time.
+  **"No limit" is the default for both**, by the owner's decision. There is no
+  token or spend limit.
+- **Optionally, "end when an iteration makes no tool call"**.
+
+**Anyone who may type into the tab may start, pause, resume and stop its
+autopilot** (`check_session_runtime_access`, the check input uses). The agent
+then works under that machine's OMP login and spends that login's quota,
+whoever started it. One tab has at most one autopilot.
+
+### What pauses or ends it
+
+With no limit set, these are all that stop an autopilot:
+
+- **Stop** ends it and lets a turn in progress finish. **Stop now** also
+  aborts that turn; background jobs the agent started keep running. **Pause**
+  keeps it for a later **Resume**.
+- **Three failed iterations in a row** pause it. After each failure it waits
+  60 seconds first. OMP's own retries happen inside one iteration.
+- **A person's interrupt pauses it**: Esc during a turn, during a retry wait
+  or during an automatic compaction, and a wait for background work that was
+  ended in the terminal.
+- **Leaving the conversation ends it**: `/new`, `/resume`, `/fork`, `/branch`
+  and a promoted `/btw` answer.
+- **OMP's own goal, loop or plan mode, or autoresearch**, switched on in the
+  terminal, pauses it, and it cannot start or resume while one of them is on
+  or paused. APAS shows goal and loop mode but never switches them.
+- **A restart of the tab's agent** brings it back paused, never running. If
+  the agent process exits by itself, the CLI reports "Paused: the agent
+  process exited"; reboot the agent first.
+- **The limits**, where set. The time limit lets a turn in progress finish.
+
+**A tab that APAS cannot control stops submitting.** The CLI writes a
+heartbeat for each tab every three seconds. The tab holds, without ending,
+when the heartbeat is older than 60 seconds, when the CLI has not reached the
+server for more than ten minutes, or when the server the CLI last registered
+with cannot control autopilot (an older server). That last hold stays when
+such a server goes away, until a server that can control the tab has
+registered. A held tab continues when control returns, and becomes "Paused:
+APAS could not control this tab for more than four hours" otherwise. A CLI
+that has not registered since it started says so, and the tab holds: a daemon
+restarted in the middle of an outage must not give a tab ten more minutes.
+
+A provider usage limit is a failed iteration like any other, unless OMP's
+`retry.waitForUsageReset` setting is on: then OMP waits inside the iteration,
+but only for a reset time the provider states, and OMP's own description
+advises leaving it off for unattended runs.
+
+### What you see
+
+- The control and a status line show the tab's reported condition: starting,
+  running an iteration, waiting (for the next iteration, for the tab to
+  settle, for background work), holding, paused with its reason, or ended
+  with its reason. An ended reason clears by itself after a later turn.
+- Each iteration appears in the Conversation view as one marker line, with
+  its number and the prompt on the first one, never as a message a person
+  sent.
+- A tab on autopilot is marked on its tab, on its pane dot (a ring, and
+  ", on autopilot" in the label), on the Overview card and on the phone's tab
+  chip. The idle lists gain an **On autopilot** group; paused and ended tabs
+  stay among the idle ones with their reason.
+- A tab keeps reading **Working** from ten seconds before an iteration is due
+  until 15 seconds after it was submitted, so a tab that repeats at once does
+  not flicker Idle between turns.
+- No push notification is sent for any autopilot event.
+
+A request is answered once: accepted, refused with the reason, or not
+confirmed. **A request is never sent again automatically**, also not after a
+reconnect: a replayed start could start a second run. A tab whose state is not
+reported offers Stop and Stop now only.
+
+### How it is built
+
+- **Tab ↔ CLI** is a handful of private files in the pane's runtime directory
+  (`omp_autopilot.rs` lists them): the CLI's heartbeat, a start-or-resume
+  request the tab takes by renaming it, a pause-or-stop request the tab never
+  deletes, the tab's acknowledgements, its state report, and a lock. Every
+  file carries the launch id; reports also carry OMP's pid and start time, and
+  the CLI trusts nothing else. A start that the tab has not taken within two
+  seconds is withdrawn and answered "not taken", never left to fire later.
+- **The journal** is `apas-autopilot` custom entries in the OMP session, so an
+  autopilot belongs to its conversation. The CLI's transcript reader pairs
+  each journaled iteration with the agent-attributed message after it.
+- **The server keeps nothing durable.** It caches each tab's last report in
+  memory, drops it when the reporting instance detaches, and the CLI reports
+  every OMP tab again after each registration. The CLI sends no state to a
+  server that did not echo the capability: such a server cannot parse the
+  frame and would log every one.
+- **State reaches a viewer a few seconds late.** The CLI relays it from the
+  three-second pane watcher, so the first frame after a reconnect can be one
+  poll old.
+- **The state report contains the prompt.** It is sent only to viewers who
+  may read the session; session lists and the mobile bootstrap carry a
+  summary without it.
+
+### Capabilities, rollout and rollback
+
+Three independent markers gate it. The CLI advertises `omp_tab_autopilot_v1`
+and the server echoes it in `Registered`; viewers negotiate
+`tab_autopilot_v1`; each provider launch records `"features":
+["autopilot_v1"]` in `omp-launch.json`. The minimum OMP is **18.18.2**; an
+older one reports itself unsupported.
+
+Deploy **server → web → CLI**, as usual. Then:
+
+- A machine gains autopilot when its daemon is rebooted to update from the
+  Machines page, which restarts every project on that host.
+- **A tab gains it at its next agent launch.** An agent that was running
+  before its machine was updated keeps the old extension, and its control
+  reads "Reboot this tab's agent to use autopilot. Rebooting ends its turn in
+  progress." Both reboots stay the owner's action.
+- Older viewers are sent no autopilot frame; older native builds would drop
+  their socket on one. Native has no autopilot controls.
+
+To roll back, **stop running autopilots first**. A server rolled back alone
+makes every tab hold and then pause; a web rolled back alone leaves running
+autopilots with no control to stop them except the terminal (Esc pauses one).
+
+**Repeat the real-OMP check when OMP's minor version changes.** The loop
+depends on OMP's event order, which is not a documented contract. The check
+harness is `~/.cache/apas-autopilot-check` on zoo-005 (`NOTES.md` there lists
+what OMP 18.20.0 was seen to do).
