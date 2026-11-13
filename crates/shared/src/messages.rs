@@ -581,6 +581,34 @@ pub enum CliToServer {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         error: Option<String>,
     },
+
+    /// How the tab's instance answered one [`ServerToCli::ControlPaneAutopilot`].
+    /// It says whether the tab took the request, not what the tab is doing:
+    /// only [`Self::PaneAutopilotState`] changes the displayed state.
+    PaneAutopilotReceipt {
+        session_id: Uuid,
+        pane_id: u32,
+        request_id: String,
+        outcome: crate::AutopilotReceiptOutcome,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+    },
+
+    /// What one OMP terminal tab reports about autopilot. Sent on every
+    /// change and for every OMP tab after each registration.
+    PaneAutopilotState {
+        session_id: Uuid,
+        pane_id: u32,
+        /// Never [`crate::AutopilotSupport::InstanceUpdateRequired`], which
+        /// only the server adds.
+        support: crate::AutopilotSupport,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        state: Option<Box<crate::PaneAutopilotState>>,
+        /// RFC 3339 time at which the CLI last saw the tab refresh its
+        /// report. A client shows it when the state stops being refreshed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reported_at: Option<String>,
+    },
 }
 
 /// Messages sent from server to CLI client
@@ -588,7 +616,16 @@ pub enum CliToServer {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerToCli {
     /// Registration successful
-    Registered { cli_id: Uuid },
+    Registered {
+        cli_id: Uuid,
+        /// The capabilities this CLI advertised that the server implements
+        /// and echoes, as [`ServerToDaemon::Registered`] does. Today that is
+        /// [`crate::OMP_TAB_AUTOPILOT_CAPABILITY`]: a CLI that does not see it
+        /// echoed tells its tabs that the server cannot control autopilot.
+        /// Empty from an older server, and then left off the wire.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        negotiated_capabilities: Vec<String>,
+    },
 
     /// Registration failed
     RegistrationFailed { reason: String },
@@ -880,6 +917,17 @@ pub enum ServerToCli {
     GeneratePaneWorkSummary {
         job: crate::PaneWorkSummaryGenerationJob,
     },
+
+    /// Start, pause, resume or stop autopilot on one OMP terminal tab. Sent
+    /// only to an instance that advertised
+    /// [`crate::OMP_TAB_AUTOPILOT_CAPABILITY`], and answered with exactly one
+    /// [`CliToServer::PaneAutopilotReceipt`].
+    ControlPaneAutopilot {
+        session_id: Uuid,
+        pane_id: u32,
+        request_id: String,
+        command: crate::AutopilotCommand,
+    },
 }
 
 /// Which attached instance of a session a [`ServerToCli`] message is for.
@@ -980,7 +1028,8 @@ impl ServerToCli {
             | Self::UpdatePaneReviewMode { pane_id, .. }
             | Self::UpdatePaneManualMode { pane_id, .. }
             | Self::TerminalInput { pane_id, .. }
-            | Self::TerminalResize { pane_id, .. } => Pane(*pane_id),
+            | Self::TerminalResize { pane_id, .. }
+            | Self::ControlPaneAutopilot { pane_id, .. } => Pane(*pane_id),
             // The summarizer runs no tools, but it hands this pane's
             // conversation to a provider under the receiving host's own
             // summary configuration, including whether a provider other than
@@ -2037,6 +2086,18 @@ pub enum WebToServer {
         event: MobileTelemetryEvent,
     },
 
+    /// Start, pause, resume or stop autopilot on one OMP terminal tab.
+    /// Accepted from anyone who may send input to that tab on its machine,
+    /// and only from a connection that negotiated
+    /// [`crate::TAB_AUTOPILOT_CAPABILITY`]. Answered to the sender with one
+    /// [`ServerToWeb::PaneAutopilotReceipt`]. A client never resends it.
+    ControlPaneAutopilot {
+        session_id: Uuid,
+        pane_id: u32,
+        request_id: String,
+        action: crate::AutopilotAction,
+    },
+
     /// Liveness probe from the browser. Server echoes
     /// `ServerToWeb::Heartbeat` so the client can detect silently-stale
     /// connections (mobile OS throttling, NAT timeout, swallowed RST)
@@ -2659,6 +2720,30 @@ pub enum ServerToWeb {
         availability: crate::PaneWorkSummaryAvailability,
     },
 
+    /// The answer to one [`WebToServer::ControlPaneAutopilot`], sent to the
+    /// requesting connection only.
+    PaneAutopilotReceipt {
+        session_id: Uuid,
+        pane_id: u32,
+        request_id: String,
+        outcome: crate::AutopilotReceiptOutcome,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+    },
+
+    /// Autopilot availability and state of one OMP terminal tab, sent only
+    /// to viewers that negotiated [`crate::TAB_AUTOPILOT_CAPABILITY`]. A
+    /// client that holds none for an OMP terminal tab shows not reported.
+    PaneAutopilotState {
+        session_id: Uuid,
+        pane_id: u32,
+        support: crate::AutopilotSupport,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        state: Option<Box<crate::PaneAutopilotState>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reported_at: Option<String>,
+    },
+
     /// Echo of `WebToServer::Heartbeat`. The browser's liveness loop
     /// uses any inbound frame (including this one) as proof the WS is
     /// healthy; a missing echo within `livenessMs` triggers reconnect.
@@ -2876,6 +2961,11 @@ pub struct MobilePaneSummary {
     /// Display name for the pane's host badge; see [`PaneConfig::hostname`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hostname: Option<String>,
+    /// Autopilot availability and condition of an OMP terminal tab, without
+    /// its prompt. Absent for other panes and from older servers; an older
+    /// client ignores it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub autopilot: Option<crate::PaneAutopilotSummary>,
 }
 
 /// Aggregated usage counters for a pane or project over one time window.
@@ -4665,13 +4755,16 @@ mod tests {
     #[test]
     fn test_server_to_cli_serialization() {
         let cli_id = Uuid::new_v4();
-        let msg = ServerToCli::Registered { cli_id };
+        let msg = ServerToCli::Registered {
+            cli_id,
+            negotiated_capabilities: Vec::new(),
+        };
         let json = serde_json::to_string(&msg).unwrap();
         assert!(json.contains("\"type\":\"registered\""));
 
         let deserialized: ServerToCli = serde_json::from_str(&json).unwrap();
         match deserialized {
-            ServerToCli::Registered { cli_id: cid } => assert_eq!(cid, cli_id),
+            ServerToCli::Registered { cli_id: cid, .. } => assert_eq!(cid, cli_id),
             _ => panic!("Expected Registered variant"),
         }
 
@@ -5779,6 +5872,7 @@ mod project_instances_tests {
             (
                 ServerToCli::Registered {
                     cli_id: Uuid::new_v4(),
+                    negotiated_capabilities: Vec::new(),
                 },
                 Connection,
             ),
@@ -5992,6 +6086,18 @@ mod project_instances_tests {
             (
                 ServerToCli::GeneratePaneWorkSummary { job: summary_job },
                 Pane(9),
+            ),
+            (
+                ServerToCli::ControlPaneAutopilot {
+                    session_id: s,
+                    pane_id: 3,
+                    request_id: "autopilot-1".into(),
+                    command: crate::AutopilotCommand::Stop {
+                        autopilot_id: None,
+                        now: true,
+                    },
+                },
+                Pane(3),
             ),
             (
                 ServerToCli::AddPane {
@@ -6573,6 +6679,119 @@ mod project_instances_tests {
                 assert_eq!(cluster_owner_user_id, Some(owner));
             }
         }
+    }
+
+    /// A project CLI learns from its registration whether the server can
+    /// control autopilot, the same way a daemon learns about instances: an
+    /// older server sends no list, an empty list stays off the wire, and a CLI
+    /// built before the field existed still reads a reply that carries it.
+    #[test]
+    fn cli_registration_says_whether_the_server_controls_autopilot() {
+        let cli_id = Uuid::new_v4();
+        let older_server: ServerToCli =
+            serde_json::from_value(json!({ "type": "registered", "cli_id": cli_id })).unwrap();
+        match older_server {
+            ServerToCli::Registered {
+                negotiated_capabilities,
+                ..
+            } => assert!(negotiated_capabilities.is_empty()),
+            other => panic!("expected Registered, got {other:?}"),
+        }
+
+        let nothing_echoed = serde_json::to_value(ServerToCli::Registered {
+            cli_id,
+            negotiated_capabilities: Vec::new(),
+        })
+        .unwrap();
+        assert!(
+            nothing_echoed.get("negotiated_capabilities").is_none(),
+            "an empty list stays off the wire: {nothing_echoed}"
+        );
+
+        let echoed = serde_json::to_value(ServerToCli::Registered {
+            cli_id,
+            negotiated_capabilities: vec![crate::OMP_TAB_AUTOPILOT_CAPABILITY.to_string()],
+        })
+        .unwrap();
+        assert_eq!(
+            echoed["negotiated_capabilities"],
+            json!([crate::OMP_TAB_AUTOPILOT_CAPABILITY])
+        );
+
+        // The variant as today's CLI declares it.
+        #[derive(Debug, Deserialize)]
+        #[serde(tag = "type", rename_all = "snake_case")]
+        enum OlderServerToCli {
+            Registered { cli_id: Uuid },
+        }
+        match serde_json::from_value::<OlderServerToCli>(echoed).unwrap() {
+            OlderServerToCli::Registered { cli_id: got } => assert_eq!(got, cli_id),
+        }
+    }
+
+    /// The autopilot frames keep their wire shape: a viewer's start with
+    /// nothing in it still parses, a forwarded command is strict, and the
+    /// state is boxed without changing its JSON.
+    #[test]
+    fn autopilot_frames_round_trip() {
+        let session_id = Uuid::new_v4();
+        let empty_start: WebToServer = serde_json::from_value(json!({
+            "type": "control_pane_autopilot",
+            "session_id": session_id,
+            "pane_id": 7,
+            "request_id": "r-1",
+            "action": { "kind": "start", "spec": {} },
+        }))
+        .unwrap();
+        match empty_start {
+            WebToServer::ControlPaneAutopilot { action, .. } => assert!(action.validate().is_err()),
+            other => panic!("expected ControlPaneAutopilot, got {other:?}"),
+        }
+
+        let forwarded = ServerToCli::ControlPaneAutopilot {
+            session_id,
+            pane_id: 7,
+            request_id: "r-2".into(),
+            command: crate::AutopilotCommand::Resume {
+                autopilot_id: Uuid::nil(),
+            },
+        };
+        let value = serde_json::to_value(&forwarded).unwrap();
+        assert_eq!(value["type"], "control_pane_autopilot");
+        assert_eq!(value["command"]["kind"], "resume");
+        let mut unknown = value.clone();
+        unknown["command"]["force"] = json!(true);
+        assert!(serde_json::from_value::<ServerToCli>(unknown).is_err());
+
+        let state = CliToServer::PaneAutopilotState {
+            session_id,
+            pane_id: 7,
+            support: crate::AutopilotSupport::NeedsAgentReboot,
+            state: Some(Box::new(crate::PaneAutopilotState::default())),
+            reported_at: None,
+        };
+        let value = serde_json::to_value(&state).unwrap();
+        assert_eq!(
+            value,
+            json!({
+                "type": "pane_autopilot_state",
+                "session_id": session_id,
+                "pane_id": 7,
+                "support": "needs_agent_reboot",
+                "state": {},
+            })
+        );
+        let receipt = ServerToWeb::PaneAutopilotReceipt {
+            session_id,
+            pane_id: 7,
+            request_id: "r-1".into(),
+            outcome: crate::AutopilotReceiptOutcome::Uncertain,
+            reason: None,
+        };
+        assert_eq!(
+            serde_json::to_value(&receipt).unwrap()["outcome"],
+            "uncertain"
+        );
     }
 
     /// A refused input comes back as a rejection carrying the input's

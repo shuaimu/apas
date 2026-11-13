@@ -130,6 +130,16 @@ fn inbound_scope(message: &CliToServer) -> InboundScope {
             session_id,
             pane_id,
             ..
+        }
+        | CliToServer::PaneAutopilotReceipt {
+            session_id,
+            pane_id,
+            ..
+        }
+        | CliToServer::PaneAutopilotState {
+            session_id,
+            pane_id,
+            ..
         } => Pane(*session_id, *pane_id),
         CliToServer::SessionEnd { session_id, .. }
         | CliToServer::PaneList { session_id, .. }
@@ -868,7 +878,10 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                         cli_capabilities = capabilities;
 
                                         // Send registration success
-                                        let response = ServerToCli::Registered { cli_id };
+                                        let response = ServerToCli::Registered {
+                                    cli_id,
+                                    negotiated_capabilities: Vec::new(),
+                                };
                                         let text = serde_json::to_string(&response).unwrap();
                                         if sender.send(Message::Text(text.into())).await.is_err() {
                                             return;
@@ -2172,6 +2185,9 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             Ok(CliToServer::Register { .. }) => {
                                 // Already registered, ignore
                             }
+                            // Placeholder until the server handles autopilot (group 5).
+                            Ok(CliToServer::PaneAutopilotReceipt { .. })
+                            | Ok(CliToServer::PaneAutopilotState { .. }) => {}
                             Ok(CliToServer::PaneWorkSummaryResult { result }) => {
                                 let _ = state
                                     .pane_work_summaries
@@ -2923,6 +2939,26 @@ mod instance_tests {
                     accepted: true,
                     pending: false,
                     error: None,
+                },
+                Pane(s, 4),
+            ),
+            (
+                CliToServer::PaneAutopilotReceipt {
+                    session_id: s,
+                    pane_id: 4,
+                    request_id: "autopilot-1".into(),
+                    outcome: shared::AutopilotReceiptOutcome::Accepted,
+                    reason: None,
+                },
+                Pane(s, 4),
+            ),
+            (
+                CliToServer::PaneAutopilotState {
+                    session_id: s,
+                    pane_id: 4,
+                    support: shared::AutopilotSupport::Supported,
+                    state: None,
+                    reported_at: None,
                 },
                 Pane(s, 4),
             ),

@@ -33,6 +33,30 @@ describe("Rust protocol golden fixtures", () => {
     });
   }
 
+  it("keeps an older client connected: its schema accepts a pane summary with the autopilot block", async () => {
+    const { default: Ajv2020 } = await import("ajv/dist/2020.js");
+    const legacySchema = JSON.parse(readFileSync(
+      fileURLToPath(new URL("./legacy/server-to-web.pre-autopilot.schema.json", import.meta.url)), "utf8"));
+    const validate = new Ajv2020({ allErrors: true, strict: false }).compile(legacySchema);
+    const sessions = JSON.parse(readFileSync(`${fixturesDirectory}/server-sessions-autopilot.json`, "utf8"));
+    expect(sessions.sessions[0].panes[0].autopilot.support).toBe("supported");
+    expect(validate(sessions)).toBe(true);
+    // The new frames are what that schema cannot read, which is why the
+    // server sends them only to viewers that negotiated tab_autopilot_v1.
+    const state = JSON.parse(readFileSync(`${fixturesDirectory}/server-pane-autopilot-state.json`, "utf8"));
+    expect(validate(state)).toBe(false);
+    const receipt = JSON.parse(readFileSync(`${fixturesDirectory}/server-pane-autopilot-receipt.json`, "utf8"));
+    expect(validate(receipt)).toBe(false);
+  });
+
+  it("parses an autopilot start that says nothing, and refuses an invented outcome", () => {
+    const start = JSON.parse(readFileSync(`${fixturesDirectory}/web-control-pane-autopilot-start.json`, "utf8"));
+    expect(validateClientMessage({ ...start, action: { kind: "start", spec: {} } }).valid).toBe(true);
+    expect(validateClientMessage({ ...start, action: { kind: "restart" } }).valid).toBe(false);
+    const receipt = JSON.parse(readFileSync(`${fixturesDirectory}/server-pane-autopilot-receipt.json`, "utf8"));
+    expect(validateServerMessage({ ...receipt, outcome: "probably" }).valid).toBe(false);
+  });
+
   it("rejects an unknown client mutation", () => {
     expect(validateClientMessage({ type: "invented_mutation" }).valid).toBe(false);
   });

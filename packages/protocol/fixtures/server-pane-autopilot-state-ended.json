@@ -1,0 +1,30 @@
+{
+  "type": "pane_autopilot_state",
+  "session_id": "20000000-0000-4000-8000-000000000001",
+  "pane_id": 4,
+  "support": "supported",
+  "state": {
+    "last_ended": {
+      "autopilot_id": "60000000-0000-4000-8000-000000000001",
+      "spec": {
+        "prompt": "Check the build and fix what fails.",
+        "repeat": {
+          "kind": "every",
+          "seconds": 900
+        },
+        "iteration_limit": {
+          "kind": "none"
+        },
+        "time_limit": {
+          "kind": "none"
+        },
+        "end_without_tool_call": false
+      },
+      "started_at": "2026-11-13T14:00:00Z",
+      "iterations": 31,
+      "reason": "conversation_changed",
+      "ended_at": "2026-11-13T19:02:11Z",
+      "turn_since": false
+    }
+  }
+}

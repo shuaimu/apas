@@ -495,7 +495,7 @@ async fn connect_to_server(
             Some(Ok(Message::Text(text))) => {
                 let response: ServerToCli = serde_json::from_str(&text)?;
                 match response {
-                    ServerToCli::Registered { cli_id } => {
+                    ServerToCli::Registered { cli_id, .. } => {
                         tracing::debug!("Connected to server as CLI {}", cli_id);
                         break;
                     }

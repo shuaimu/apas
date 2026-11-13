@@ -12149,7 +12149,7 @@ async fn run_server_connection(
                                         Err(_) => continue,
                                     };
                                     match response {
-                                        ServerToCli::Registered { cli_id } => {
+                                        ServerToCli::Registered { cli_id, .. } => {
                                             return Some(Ok(cli_id));
                                         }
                                         ServerToCli::RegistrationFailed { reason } => {

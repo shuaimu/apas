@@ -1,0 +1,64 @@
+{
+  "type": "sessions",
+  "sessions": [
+    {
+      "id": "20000000-0000-4000-8000-000000000001",
+      "project_id": "30000000-0000-4000-8000-000000000001",
+      "cli_client_id": "40000000-0000-4000-8000-000000000002",
+      "working_dir": "/workspace/project",
+      "hostname": "zoo-005",
+      "git_remote": "github.com/example/project",
+      "status": "active",
+      "created_at": "2026-11-11T12:00:00Z",
+      "is_shared": false,
+      "is_active": true,
+      "is_working": true,
+      "panes": [
+        {
+          "pane_id": 3,
+          "kind": "terminal",
+          "provider": "omp",
+          "is_working": true,
+          "awaiting_answer": false,
+          "machine_id": "50000000-0000-4000-8000-000000000001",
+          "hostname": "zoo-005",
+          "autopilot": {
+            "support": "supported",
+            "condition": "waiting",
+            "detail": "next_iteration",
+            "next_iteration_at": "2026-11-13T14:30:00Z",
+            "iterations": 2,
+            "iteration_limit": 20
+          }
+        },
+        {
+          "pane_id": 4,
+          "kind": "terminal",
+          "provider": "omp",
+          "is_working": false,
+          "awaiting_answer": false,
+          "machine_id": "50000000-0000-4000-8000-000000000002",
+          "hostname": "zoo-006",
+          "autopilot": {
+            "support": "needs_agent_reboot"
+          }
+        }
+      ],
+      "instances": [
+        {
+          "machine_id": "50000000-0000-4000-8000-000000000001",
+          "hostname": "zoo-005",
+          "working_dir": "/workspace/project",
+          "primary": true,
+          "runtime_access": true
+        },
+        {
+          "machine_id": "50000000-0000-4000-8000-000000000002",
+          "hostname": "zoo-006",
+          "working_dir": "/workspace/project",
+          "primary": false
+        }
+      ]
+    }
+  ]
+}

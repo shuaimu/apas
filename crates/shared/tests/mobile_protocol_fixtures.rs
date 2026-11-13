@@ -213,3 +213,109 @@ fn multi_machine_fixtures_populate_the_new_fields() {
         other => panic!("unexpected {other:?}"),
     }
 }
+
+/// The autopilot fixtures carry what they exist to exercise: a start with its
+/// limits, a state with its condition, and a pane summary without a prompt.
+#[test]
+fn autopilot_fixtures_populate_the_new_fields() {
+    use shared::{
+        AutopilotAction, AutopilotLimit, AutopilotReceiptOutcome, AutopilotRepeat,
+        AutopilotSupport,
+    };
+
+    match web("web-control-pane-autopilot-start.json") {
+        WebToServer::ControlPaneAutopilot {
+            pane_id,
+            request_id,
+            action,
+            ..
+        } => {
+            assert_eq!(pane_id, 4);
+            assert_eq!(request_id, "autopilot-1");
+            let shared::AutopilotCommand::Start { spec } = action.validate().unwrap() else {
+                panic!("expected a start");
+            };
+            assert_eq!(spec.repeat, AutopilotRepeat::Every { seconds: 900 });
+            assert_eq!(spec.iteration_limit, AutopilotLimit::AtMost { value: 20 });
+            assert_eq!(spec.time_limit, AutopilotLimit::None);
+        }
+        other => panic!("expected ControlPaneAutopilot, got {other:?}"),
+    }
+    assert!(matches!(
+        web("web-control-pane-autopilot-stop.json"),
+        WebToServer::ControlPaneAutopilot {
+            action: AutopilotAction::Stop {
+                autopilot_id: Some(_),
+                now: true
+            },
+            ..
+        }
+    ));
+    assert!(matches!(
+        web("web-control-pane-autopilot-resume.json"),
+        WebToServer::ControlPaneAutopilot {
+            action: AutopilotAction::Resume { .. },
+            ..
+        }
+    ));
+
+    match server("server-pane-autopilot-receipt.json") {
+        ServerToWeb::PaneAutopilotReceipt {
+            outcome, reason, ..
+        } => {
+            assert_eq!(outcome, AutopilotReceiptOutcome::Refused);
+            assert!(reason.is_some());
+        }
+        other => panic!("expected PaneAutopilotReceipt, got {other:?}"),
+    }
+    match server("server-pane-autopilot-state.json") {
+        ServerToWeb::PaneAutopilotState {
+            support,
+            state,
+            reported_at,
+            ..
+        } => {
+            assert_eq!(support, AutopilotSupport::Supported);
+            assert!(reported_at.is_some());
+            let state = state.expect("state");
+            let autopilot = state.autopilot.as_ref().expect("autopilot");
+            assert_eq!(autopilot.iterations, 2);
+            assert_eq!(autopilot.condition.kind, "waiting");
+            assert!(autopilot.next_iteration_at.is_some());
+            assert!(autopilot.deadline.is_none());
+            let goal = state.omp_modes.as_ref().and_then(|modes| modes.goal.as_ref());
+            assert_eq!(goal.map(|goal| goal.status.as_str()), Some("paused"));
+        }
+        other => panic!("expected PaneAutopilotState, got {other:?}"),
+    }
+    match server("server-pane-autopilot-state-ended.json") {
+        ServerToWeb::PaneAutopilotState { state, .. } => {
+            let ended = state.and_then(|state| state.last_ended).expect("ended");
+            assert_eq!(ended.reason, "conversation_changed");
+            assert_eq!(ended.spec.iteration_limit, AutopilotLimit::None);
+        }
+        other => panic!("expected PaneAutopilotState, got {other:?}"),
+    }
+    assert!(matches!(
+        server("server-pane-autopilot-state-unavailable.json"),
+        ServerToWeb::PaneAutopilotState {
+            support: AutopilotSupport::InstanceUpdateRequired,
+            state: None,
+            ..
+        }
+    ));
+
+    let ServerToWeb::Sessions { sessions } = server("server-sessions-autopilot.json") else {
+        panic!("expected Sessions");
+    };
+    let panes = &sessions[0].panes;
+    let summary = panes[0].autopilot.as_ref().expect("autopilot summary");
+    assert_eq!(summary.support, AutopilotSupport::Supported);
+    assert_eq!(summary.condition.as_deref(), Some("waiting"));
+    assert_eq!(summary.iteration_limit, Some(20));
+    assert_eq!(
+        panes[1].autopilot.as_ref().map(|summary| summary.support),
+        Some(AutopilotSupport::NeedsAgentReboot)
+    );
+    assert!(!fixture("server-sessions-autopilot.json").contains("prompt"));
+}

@@ -1,0 +1,44 @@
+{
+  "type": "pane_autopilot_state",
+  "session_id": "20000000-0000-4000-8000-000000000001",
+  "pane_id": 4,
+  "support": "supported",
+  "reported_at": "2026-11-13T14:16:05Z",
+  "state": {
+    "autopilot": {
+      "autopilot_id": "60000000-0000-4000-8000-000000000001",
+      "spec": {
+        "prompt": "Check the build and fix what fails.",
+        "repeat": {
+          "kind": "every",
+          "seconds": 900
+        },
+        "iteration_limit": {
+          "kind": "at_most",
+          "value": 20
+        },
+        "time_limit": {
+          "kind": "none"
+        },
+        "end_without_tool_call": false
+      },
+      "started_at": "2026-11-13T14:00:00Z",
+      "iterations": 2,
+      "next_iteration_at": "2026-11-13T14:30:00Z",
+      "condition": {
+        "kind": "waiting",
+        "detail": "next_iteration",
+        "since": "2026-11-13T14:18:00Z"
+      }
+    },
+    "omp_modes": {
+      "goal": {
+        "status": "paused",
+        "objective": "Ship the parser",
+        "token_budget": 200000,
+        "tokens_used": 507,
+        "goal_status": "paused"
+      }
+    }
+  }
+}

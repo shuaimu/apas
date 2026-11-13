@@ -301,7 +301,7 @@ async fn run_connection(
             Some(Ok(Message::Text(text))) => {
                 let response: ServerToCli = serde_json::from_str(&text)?;
                 match response {
-                    ServerToCli::Registered { cli_id: id } => {
+                    ServerToCli::Registered { cli_id: id, .. } => {
                         cli_id = id;
                         tracing::info!("Connected and registered as CLI {}", cli_id);
                         println!("Connected to server. CLI ID: {}", cli_id);
@@ -532,6 +532,22 @@ async fn run_connection(
                                 accepted: false,
                                 pending: false,
                                 error: Some("Remote-only mode has no OMP terminal dialogs".into()),
+                            })
+                            .await;
+                    }
+                    Ok(ServerToCli::ControlPaneAutopilot {
+                        session_id,
+                        pane_id,
+                        request_id,
+                        ..
+                    }) => {
+                        let _ = ws_tx_clone
+                            .send(CliToServer::PaneAutopilotReceipt {
+                                session_id,
+                                pane_id,
+                                request_id,
+                                outcome: shared::AutopilotReceiptOutcome::Refused,
+                                reason: Some("Remote-only mode has no OMP terminal tabs".into()),
                             })
                             .await;
                     }

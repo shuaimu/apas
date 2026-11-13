@@ -1,0 +1,11 @@
+{
+  "type": "control_pane_autopilot",
+  "session_id": "20000000-0000-4000-8000-000000000001",
+  "pane_id": 4,
+  "request_id": "autopilot-2",
+  "action": {
+    "kind": "stop",
+    "autopilot_id": "60000000-0000-4000-8000-000000000001",
+    "now": true
+  }
+}

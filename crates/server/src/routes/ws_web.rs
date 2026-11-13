@@ -1966,6 +1966,7 @@ pub(crate) fn pane_summaries(
                 });
 
             shared::MobilePaneSummary {
+                autopilot: None,
                 pane_id: pane.pane_id,
                 label: pane.label,
                 kind: pane.kind,
@@ -7839,6 +7840,8 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                 Ok(command @ WebToServer::AnswerOmpQuestion { .. }) => {
                     handle_omp_question_answer(&state, &connection_id, command).await;
                 }
+                // Placeholder until the server handles autopilot (group 5).
+                Ok(WebToServer::ControlPaneAutopilot { .. }) => {}
                 Ok(WebToServer::AnswerQuestion {
                     session_id: msg_sid,
                     tool_use_id,

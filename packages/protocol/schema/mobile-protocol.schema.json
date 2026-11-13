@@ -87,6 +87,413 @@
         }
       ]
     },
+    "AutopilotAction": {
+      "description": "What a viewer asks a tab's autopilot to do\n(`WebToServer::ControlPaneAutopilot.action`).",
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "start"
+            },
+            "spec": {
+              "$ref": "#/$defs/AutopilotStartRequest"
+            }
+          },
+          "required": [
+            "kind",
+            "spec"
+          ]
+        },
+        {
+          "description": "Stop further iterations and let a turn in progress continue. The id is\na hint: a pause applies to whatever autopilot is current, because a\npause must not be refused for a stale view.",
+          "type": "object",
+          "properties": {
+            "autopilot_id": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "format": "uuid"
+            },
+            "kind": {
+              "type": "string",
+              "const": "pause"
+            }
+          },
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "description": "Continue the named paused autopilot. Refused when that is not the\ntab's paused autopilot.",
+          "type": "object",
+          "properties": {
+            "autopilot_id": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "kind": {
+              "type": "string",
+              "const": "resume"
+            }
+          },
+          "required": [
+            "kind",
+            "autopilot_id"
+          ]
+        },
+        {
+          "description": "End autopilot. With `now`, also interrupt the turn in progress. The id\nis a hint, as for pause.",
+          "type": "object",
+          "properties": {
+            "autopilot_id": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "format": "uuid"
+            },
+            "kind": {
+              "type": "string",
+              "const": "stop"
+            },
+            "now": {
+              "type": "boolean",
+              "default": false
+            }
+          },
+          "required": [
+            "kind"
+          ]
+        }
+      ]
+    },
+    "AutopilotCondition": {
+      "description": "What a tab on autopilot is doing. `kind` and `detail` are plain strings\nfrom [`autopilot_condition`], not enums, because a tab's extension can be\nnewer or older than the CLI, the server and the viewer that read its\nreport. A reader shows a value it does not know as it would an unknown\nstate, and never drops the report.",
+      "type": "object",
+      "properties": {
+        "detail": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "kind": {
+          "type": "string"
+        },
+        "since": {
+          "description": "RFC 3339 time the condition began.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "kind"
+      ]
+    },
+    "AutopilotEnded": {
+      "description": "A tab's last ended autopilot, kept so its reason can be shown and its\nvalues offered for a new start.",
+      "type": "object",
+      "properties": {
+        "autopilot_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "ended_at": {
+          "type": "string"
+        },
+        "iterations": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "reason": {
+          "description": "One of the `END_*` values of [`autopilot_condition`].",
+          "type": "string"
+        },
+        "spec": {
+          "$ref": "#/$defs/AutopilotSpec"
+        },
+        "started_at": {
+          "type": "string"
+        },
+        "turn_since": {
+          "description": "Whether a turn that started after the autopilot ended has run. Lists\nstop showing the reason once one has.",
+          "type": "boolean",
+          "default": false
+        }
+      },
+      "required": [
+        "autopilot_id",
+        "spec",
+        "started_at",
+        "iterations",
+        "reason",
+        "ended_at"
+      ]
+    },
+    "AutopilotLimit": {
+      "description": "One limit, as an explicit value. \"No limit\" is a value of its own and is\nnever expressed by leaving the limit out: a field that one version drops\nmust not turn a limited autopilot into an unlimited one.",
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "none"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "description": "Iterations for an iteration limit, seconds for a time limit.",
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "at_most"
+            },
+            "value": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "value"
+          ]
+        }
+      ]
+    },
+    "AutopilotReceiptOutcome": {
+      "description": "How a request was answered. `Accepted` means the tab took the request; the\ndisplayed state changes only when the tab reports it.",
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "accepted"
+          ]
+        },
+        {
+          "description": "With a reason. Nothing was started or changed.",
+          "type": "string",
+          "const": "refused"
+        },
+        {
+          "description": "Not confirmed in time. A pause or a stop stays in force until the tab\napplies it. A start or a resume may have been taken; the tab's\nreported state shows it. A client never resends by itself.",
+          "type": "string",
+          "const": "uncertain"
+        }
+      ]
+    },
+    "AutopilotRepeat": {
+      "description": "When the next iteration is due.",
+      "oneOf": [
+        {
+          "description": "Five seconds after the tab settles.",
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "after_each_turn"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "description": "This long after the previous iteration was submitted, and never\nsooner than five seconds after the tab settles.",
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "every"
+            },
+            "seconds": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "seconds"
+          ]
+        }
+      ]
+    },
+    "AutopilotSpec": {
+      "description": "One autopilot as it runs: a prompt, a timing and optional limits. This is\nthe strict form the server forwards and the tab reports back.",
+      "type": "object",
+      "properties": {
+        "end_without_tool_call": {
+          "description": "End after an iteration whose turn completes without a tool call.",
+          "type": "boolean"
+        },
+        "iteration_limit": {
+          "description": "Most iterations it may submit; the first counts.",
+          "$ref": "#/$defs/AutopilotLimit"
+        },
+        "prompt": {
+          "description": "Submitted as typed text each iteration. Slash commands, skills and\nprompt templates in it are not run.",
+          "type": "string"
+        },
+        "repeat": {
+          "$ref": "#/$defs/AutopilotRepeat"
+        },
+        "time_limit": {
+          "description": "Seconds from the start after which autopilot ends. Paused, waiting and\nholding time counts.",
+          "$ref": "#/$defs/AutopilotLimit"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "prompt",
+        "repeat",
+        "iteration_limit",
+        "time_limit",
+        "end_without_tool_call"
+      ]
+    },
+    "AutopilotStartRequest": {
+      "description": "What a viewer asks for in a start. Every field is optional on purpose: on\nthis wire a frame that fails to parse is dropped without an answer, so the\nrequest has to parse for the server to refuse it with a reason.\n[`AutopilotStartRequest::validate`] turns it into the strict\n[`AutopilotSpec`] or says what is wrong.",
+      "type": "object",
+      "properties": {
+        "end_without_tool_call": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "iteration_limit": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AutopilotLimit"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "prompt": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "repeat": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AutopilotRepeat"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "time_limit": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AutopilotLimit"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    },
+    "AutopilotSupport": {
+      "description": "Whether autopilot can be used on one OMP terminal tab.",
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "supported",
+            "unavailable_on_platform"
+          ]
+        },
+        {
+          "description": "The tab's agent was launched with autopilot support and no fresh state\nreport exists, or nothing has arrived from the tab's instance. Shown\nas not reported, never as off. Stop and Stop now stay available.",
+          "type": "string",
+          "const": "not_reported"
+        },
+        {
+          "description": "The agent was started by an APAS that had no autopilot. It is never\nrebooted automatically.",
+          "type": "string",
+          "const": "needs_agent_reboot"
+        },
+        {
+          "description": "The tab's OMP is below the minimum version or lacks a call autopilot\nuses.",
+          "type": "string",
+          "const": "unsupported_omp"
+        },
+        {
+          "description": "Added by the server for viewers, never sent by a CLI: the instance\nthat owns the tab is attached without [`OMP_TAB_AUTOPILOT_CAPABILITY`].",
+          "type": "string",
+          "const": "instance_update_required"
+        }
+      ]
+    },
+    "AutopilotView": {
+      "description": "A tab's current autopilot: on, or paused.",
+      "type": "object",
+      "properties": {
+        "autopilot_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "condition": {
+          "$ref": "#/$defs/AutopilotCondition"
+        },
+        "deadline": {
+          "description": "RFC 3339 time the time limit ends, when the autopilot has one.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "iterations": {
+          "description": "Iterations submitted so far.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "next_iteration_at": {
+          "description": "RFC 3339 time the next iteration is due, while it waits for that.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "spec": {
+          "$ref": "#/$defs/AutopilotSpec"
+        },
+        "started_at": {
+          "description": "RFC 3339.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "autopilot_id",
+        "spec",
+        "started_at",
+        "iterations",
+        "condition"
+      ]
+    },
     "ClaudeAssistantMessage": {
       "description": "Claude assistant message structure",
       "type": "object",
@@ -3041,6 +3448,17 @@
       "description": "One agent pane, as mobile needs to list it.",
       "type": "object",
       "properties": {
+        "autopilot": {
+          "description": "Autopilot availability and condition of an OMP terminal tab, without\nits prompt. Absent for other panes and from older servers; an older\nclient ignores it.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PaneAutopilotSummary"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "awaiting_answer": {
           "description": "True while this pane is blocked on an unresolved agent question. This\nis neither active work nor idle time and takes presentation precedence\nover provider availability.",
           "type": "boolean",
@@ -3416,6 +3834,89 @@
         }
       ]
     },
+    "OmpGoalModeView": {
+      "description": "OMP's built-in goal mode, as OMP reports it. APAS shows it and never\nswitches it.",
+      "type": "object",
+      "properties": {
+        "goal_status": {
+          "description": "OMP's own goal status, such as budget-limited; known only after its\nfirst `goal_updated`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "objective": {
+          "description": "Cut to 500 characters by the tab.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "status": {
+          "description": "\"active\" or \"paused\".",
+          "type": "string"
+        },
+        "token_budget": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "tokens_used": {
+          "description": "Known only after OMP's first `goal_updated`.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "status"
+      ]
+    },
+    "OmpLoopModeView": {
+      "description": "OMP's built-in loop mode.",
+      "type": "object",
+      "properties": {
+        "status": {
+          "description": "\"active\" or \"paused\".",
+          "type": "string"
+        }
+      },
+      "required": [
+        "status"
+      ]
+    },
+    "OmpModesView": {
+      "description": "OMP's own self-continuing modes on a tab, however they were switched on.",
+      "type": "object",
+      "properties": {
+        "goal": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/OmpGoalModeView"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "loop": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/OmpLoopModeView"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    },
     "OmpQuestionAnswer": {
       "description": "A native OMP answer. Question identity and selections must not be flattened\ninto question text or comma-separated labels.",
       "type": "object",
@@ -3546,6 +4047,111 @@
             "approval_request"
           ]
         }
+      ]
+    },
+    "PaneAutopilotState": {
+      "description": "What one OMP terminal tab reports about autopilot.",
+      "type": "object",
+      "properties": {
+        "autopilot": {
+          "description": "The current autopilot, on or paused.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AutopilotView"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "last_ended": {
+          "description": "The last ended one, until another starts.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AutopilotEnded"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "omp_modes": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/OmpModesView"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "reported_by_cli": {
+          "description": "True for the one state the CLI reports itself: the pause it shows after\nthe tab's agent process has exited. No Resume, Stop or Stop now is\noffered for it.",
+          "type": "boolean"
+        }
+      }
+    },
+    "PaneAutopilotSummary": {
+      "description": "The autopilot part of a pane summary in session lists. It never carries\nthe prompt.",
+      "type": "object",
+      "properties": {
+        "condition": {
+          "description": "[`AutopilotCondition::kind`] of the current autopilot, or \"ended\" for\nan ended one whose reason lists still show.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "detail": {
+          "description": "The condition's detail, or the end reason.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "iteration_limit": {
+          "description": "Absent when there is no iteration limit.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "iterations": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "next_iteration_at": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "omp_goal": {
+          "description": "\"active\" or \"paused\" for OMP's own goal mode.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "omp_loop": {
+          "description": "\"active\" or \"paused\" for OMP's own loop mode.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "support": {
+          "$ref": "#/$defs/AutopilotSupport"
+        }
+      },
+      "required": [
+        "support"
       ]
     },
     "PaneCleanupAction": {
@@ -5839,6 +6445,88 @@
           ]
         },
         {
+          "description": "The answer to one [`WebToServer::ControlPaneAutopilot`], sent to the\nrequesting connection only.",
+          "type": "object",
+          "properties": {
+            "outcome": {
+              "$ref": "#/$defs/AutopilotReceiptOutcome"
+            },
+            "pane_id": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0
+            },
+            "reason": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "request_id": {
+              "type": "string"
+            },
+            "session_id": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "type": {
+              "type": "string",
+              "const": "pane_autopilot_receipt"
+            }
+          },
+          "required": [
+            "type",
+            "session_id",
+            "pane_id",
+            "request_id",
+            "outcome"
+          ]
+        },
+        {
+          "description": "Autopilot availability and state of one OMP terminal tab, sent only\nto viewers that negotiated [`crate::TAB_AUTOPILOT_CAPABILITY`]. A\nclient that holds none for an OMP terminal tab shows not reported.",
+          "type": "object",
+          "properties": {
+            "pane_id": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0
+            },
+            "reported_at": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "session_id": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "state": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/PaneAutopilotState"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "support": {
+              "$ref": "#/$defs/AutopilotSupport"
+            },
+            "type": {
+              "type": "string",
+              "const": "pane_autopilot_state"
+            }
+          },
+          "required": [
+            "type",
+            "session_id",
+            "pane_id",
+            "support"
+          ]
+        },
+        {
           "description": "Echo of `WebToServer::Heartbeat`. The browser's liveness loop\nuses any inbound frame (including this one) as proof the WS is\nhealthy; a missing echo within `livenessMs` triggers reconnect.",
           "type": "object",
           "properties": {
@@ -8092,6 +8780,38 @@
           "required": [
             "type",
             "event"
+          ]
+        },
+        {
+          "description": "Start, pause, resume or stop autopilot on one OMP terminal tab.\nAccepted from anyone who may send input to that tab on its machine,\nand only from a connection that negotiated\n[`crate::TAB_AUTOPILOT_CAPABILITY`]. Answered to the sender with one\n[`ServerToWeb::PaneAutopilotReceipt`]. A client never resends it.",
+          "type": "object",
+          "properties": {
+            "action": {
+              "$ref": "#/$defs/AutopilotAction"
+            },
+            "pane_id": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0
+            },
+            "request_id": {
+              "type": "string"
+            },
+            "session_id": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "type": {
+              "type": "string",
+              "const": "control_pane_autopilot"
+            }
+          },
+          "required": [
+            "type",
+            "session_id",
+            "pane_id",
+            "request_id",
+            "action"
           ]
         },
         {

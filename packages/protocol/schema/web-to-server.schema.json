@@ -1870,6 +1870,38 @@
       ]
     },
     {
+      "description": "Start, pause, resume or stop autopilot on one OMP terminal tab.\nAccepted from anyone who may send input to that tab on its machine,\nand only from a connection that negotiated\n[`crate::TAB_AUTOPILOT_CAPABILITY`]. Answered to the sender with one\n[`ServerToWeb::PaneAutopilotReceipt`]. A client never resends it.",
+      "type": "object",
+      "properties": {
+        "action": {
+          "$ref": "#/$defs/AutopilotAction"
+        },
+        "pane_id": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "request_id": {
+          "type": "string"
+        },
+        "session_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "type": {
+          "type": "string",
+          "const": "control_pane_autopilot"
+        }
+      },
+      "required": [
+        "type",
+        "session_id",
+        "pane_id",
+        "request_id",
+        "action"
+      ]
+    },
+    {
       "description": "Liveness probe from the browser. Server echoes\n`ServerToWeb::Heartbeat` so the client can detect silently-stale\nconnections (mobile OS throttling, NAT timeout, swallowed RST)\nwithout depending on `readyState`.",
       "type": "object",
       "properties": {
@@ -1884,6 +1916,214 @@
     }
   ],
   "$defs": {
+    "AutopilotAction": {
+      "description": "What a viewer asks a tab's autopilot to do\n(`WebToServer::ControlPaneAutopilot.action`).",
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "start"
+            },
+            "spec": {
+              "$ref": "#/$defs/AutopilotStartRequest"
+            }
+          },
+          "required": [
+            "kind",
+            "spec"
+          ]
+        },
+        {
+          "description": "Stop further iterations and let a turn in progress continue. The id is\na hint: a pause applies to whatever autopilot is current, because a\npause must not be refused for a stale view.",
+          "type": "object",
+          "properties": {
+            "autopilot_id": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "format": "uuid"
+            },
+            "kind": {
+              "type": "string",
+              "const": "pause"
+            }
+          },
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "description": "Continue the named paused autopilot. Refused when that is not the\ntab's paused autopilot.",
+          "type": "object",
+          "properties": {
+            "autopilot_id": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "kind": {
+              "type": "string",
+              "const": "resume"
+            }
+          },
+          "required": [
+            "kind",
+            "autopilot_id"
+          ]
+        },
+        {
+          "description": "End autopilot. With `now`, also interrupt the turn in progress. The id\nis a hint, as for pause.",
+          "type": "object",
+          "properties": {
+            "autopilot_id": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "format": "uuid"
+            },
+            "kind": {
+              "type": "string",
+              "const": "stop"
+            },
+            "now": {
+              "type": "boolean",
+              "default": false
+            }
+          },
+          "required": [
+            "kind"
+          ]
+        }
+      ]
+    },
+    "AutopilotLimit": {
+      "description": "One limit, as an explicit value. \"No limit\" is a value of its own and is\nnever expressed by leaving the limit out: a field that one version drops\nmust not turn a limited autopilot into an unlimited one.",
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "none"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "description": "Iterations for an iteration limit, seconds for a time limit.",
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "at_most"
+            },
+            "value": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "value"
+          ]
+        }
+      ]
+    },
+    "AutopilotRepeat": {
+      "description": "When the next iteration is due.",
+      "oneOf": [
+        {
+          "description": "Five seconds after the tab settles.",
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "after_each_turn"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "description": "This long after the previous iteration was submitted, and never\nsooner than five seconds after the tab settles.",
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "every"
+            },
+            "seconds": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "seconds"
+          ]
+        }
+      ]
+    },
+    "AutopilotStartRequest": {
+      "description": "What a viewer asks for in a start. Every field is optional on purpose: on\nthis wire a frame that fails to parse is dropped without an answer, so the\nrequest has to parse for the server to refuse it with a reason.\n[`AutopilotStartRequest::validate`] turns it into the strict\n[`AutopilotSpec`] or says what is wrong.",
+      "type": "object",
+      "properties": {
+        "end_without_tool_call": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "iteration_limit": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AutopilotLimit"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "prompt": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "repeat": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AutopilotRepeat"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "time_limit": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AutopilotLimit"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    },
     "CliLifecycleOperation": {
       "description": "A project-level lifecycle operation.\n\nOnly reboot is a user decision. Transport recovery used to be a second\nvariant here, driven by a `Reconnect Server` button, and was withdrawn: the\nCLI already re-dials a lost transport on its own with bounded backoff, and a\nrequest to do so has to travel over the very transport that is down.",
       "type": "string",

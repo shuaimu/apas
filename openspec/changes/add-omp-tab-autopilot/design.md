@@ -654,7 +654,9 @@ supplies, such as a goal's objective, is cut to 500 characters with a
 marker. The request files have the same cap. `omp-activity.json` keeps its
 six fields, so an older CLI still reads it. The types that read reports
 accept unknown fields, because a tab's extension can be newer than the CLI
-reading it.
+reading it. The one strict part is the spec inside a report: a reader that
+cannot parse a newer spec shows the tab as not reported, where Stop still
+works, instead of showing limits it may have misread.
 
 These files are not an authority boundary. They are private to the OS account,
 and the checks show which launch a file belongs to, not who wrote it. Any

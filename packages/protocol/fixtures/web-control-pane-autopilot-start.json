@@ -1,0 +1,24 @@
+{
+  "type": "control_pane_autopilot",
+  "session_id": "20000000-0000-4000-8000-000000000001",
+  "pane_id": 4,
+  "request_id": "autopilot-1",
+  "action": {
+    "kind": "start",
+    "spec": {
+      "prompt": "Check the build and fix what fails.",
+      "repeat": {
+        "kind": "every",
+        "seconds": 900
+      },
+      "iteration_limit": {
+        "kind": "at_most",
+        "value": 20
+      },
+      "time_limit": {
+        "kind": "none"
+      },
+      "end_without_tool_call": false
+    }
+  }
+}

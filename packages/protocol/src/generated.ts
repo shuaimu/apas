@@ -65,6 +65,15 @@ export type PaneMode = "deadloop" | "interactive";
  */
 export type Provider =
   ("codex" | "deepseek" | "opencode" | "cursor-agent") | "claude" | "minimax" | "glm" | "pi" | "omp";
+/**
+ * Whether autopilot can be used on one OMP terminal tab.
+ */
+export type AutopilotSupport =
+  | ("supported" | "unavailable_on_platform")
+  | "not_reported"
+  | "needs_agent_reboot"
+  | "unsupported_omp"
+  | "instance_update_required";
 export type CodeEventKind =
   | "instruction"
   | "agent_status"
@@ -578,6 +587,24 @@ export type ServerToWeb =
       [k: string]: unknown;
     }
   | {
+      outcome: AutopilotReceiptOutcome;
+      pane_id: number;
+      reason?: string | null;
+      request_id: string;
+      session_id: string;
+      type: "pane_autopilot_receipt";
+      [k: string]: unknown;
+    }
+  | {
+      pane_id: number;
+      reported_at?: string | null;
+      session_id: string;
+      state?: PaneAutopilotState | null;
+      support: AutopilotSupport;
+      type: "pane_autopilot_state";
+      [k: string]: unknown;
+    }
+  | {
       type: "heartbeat";
       [k: string]: unknown;
     };
@@ -718,6 +745,22 @@ export type LocalProjectRegistrationResult =
       error: string;
       status: "failed";
       [k: string]: unknown;
+    };
+/**
+ * How a request was answered. `Accepted` means the tab took the request; the
+ * displayed state changes only when the tab reports it.
+ */
+export type AutopilotReceiptOutcome = "accepted" | "refused" | "uncertain";
+/**
+ * When the next iteration is due.
+ */
+export type AutopilotRepeat =
+  | {
+      kind: "after_each_turn";
+    }
+  | {
+      kind: "every";
+      seconds: number;
     };
 /**
  * Messages sent from web client to server
@@ -1312,6 +1355,14 @@ export type WebToServer =
       [k: string]: unknown;
     }
   | {
+      action: AutopilotAction;
+      pane_id: number;
+      request_id: string;
+      session_id: string;
+      type: "control_pane_autopilot";
+      [k: string]: unknown;
+    }
+  | {
       type: "heartbeat";
       [k: string]: unknown;
     };
@@ -1335,6 +1386,45 @@ export type PlanReviewMode = "always" | "risky_only" | "never";
  */
 export type MobileTelemetryEvent =
   "terminal_bridge_ready" | "terminal_bridge_rejected_message" | "terminal_bridge_crash";
+/**
+ * What a viewer asks a tab's autopilot to do
+ * (`WebToServer::ControlPaneAutopilot.action`).
+ */
+export type AutopilotAction =
+  | {
+      kind: "start";
+      spec: AutopilotStartRequest;
+      [k: string]: unknown;
+    }
+  | {
+      autopilot_id?: string | null;
+      kind: "pause";
+      [k: string]: unknown;
+    }
+  | {
+      autopilot_id: string;
+      kind: "resume";
+      [k: string]: unknown;
+    }
+  | {
+      autopilot_id?: string | null;
+      kind: "stop";
+      now?: boolean;
+      [k: string]: unknown;
+    };
+/**
+ * One limit, as an explicit value. "No limit" is a value of its own and is
+ * never expressed by leaving the limit out: a field that one version drops
+ * must not turn a limited autopilot into an unlimited one.
+ */
+export type AutopilotLimit =
+  | {
+      kind: "none";
+    }
+  | {
+      kind: "at_most";
+      value: number;
+    };
 export type WorkerResultDisposition = "select_work" | "no_work" | "candidate_ready" | "blocked" | "no_change";
 export type WorkerConversionSource = {
   job_id: string;
@@ -1725,6 +1815,12 @@ export interface SessionInstanceInfo {
  */
 export interface MobilePaneSummary {
   /**
+   * Autopilot availability and condition of an OMP terminal tab, without
+   * its prompt. Absent for other panes and from older servers; an older
+   * client ignores it.
+   */
+  autopilot?: PaneAutopilotSummary | null;
+  /**
    * True while this pane is blocked on an unresolved agent question. This
    * is neither active work nor idle time and takes presentation precedence
    * over provider availability.
@@ -1774,6 +1870,37 @@ export interface MobilePaneSummary {
    * block separately so shared/mobile snapshots do not turn it into idle.
    */
   usage_limited?: UsageLimited | null;
+  [k: string]: unknown;
+}
+/**
+ * The autopilot part of a pane summary in session lists. It never carries
+ * the prompt.
+ */
+export interface PaneAutopilotSummary {
+  /**
+   * [`AutopilotCondition::kind`] of the current autopilot, or "ended" for
+   * an ended one whose reason lists still show.
+   */
+  condition?: string | null;
+  /**
+   * The condition's detail, or the end reason.
+   */
+  detail?: string | null;
+  /**
+   * Absent when there is no iteration limit.
+   */
+  iteration_limit?: number | null;
+  iterations?: number | null;
+  next_iteration_at?: string | null;
+  /**
+   * "active" or "paused" for OMP's own goal mode.
+   */
+  omp_goal?: string | null;
+  /**
+   * "active" or "paused" for OMP's own loop mode.
+   */
+  omp_loop?: string | null;
+  support: AutopilotSupport;
   [k: string]: unknown;
 }
 /**
@@ -2929,6 +3056,171 @@ export interface PaneWorkSummary {
   window_start: string;
   [k: string]: unknown;
 }
+/**
+ * What one OMP terminal tab reports about autopilot.
+ */
+export interface PaneAutopilotState {
+  /**
+   * The current autopilot, on or paused.
+   */
+  autopilot?: AutopilotView | null;
+  /**
+   * The last ended one, until another starts.
+   */
+  last_ended?: AutopilotEnded | null;
+  omp_modes?: OmpModesView | null;
+  /**
+   * True for the one state the CLI reports itself: the pause it shows after
+   * the tab's agent process has exited. No Resume, Stop or Stop now is
+   * offered for it.
+   */
+  reported_by_cli?: boolean;
+  [k: string]: unknown;
+}
+/**
+ * A tab's current autopilot: on, or paused.
+ */
+export interface AutopilotView {
+  autopilot_id: string;
+  condition: AutopilotCondition;
+  /**
+   * RFC 3339 time the time limit ends, when the autopilot has one.
+   */
+  deadline?: string | null;
+  /**
+   * Iterations submitted so far.
+   */
+  iterations: number;
+  /**
+   * RFC 3339 time the next iteration is due, while it waits for that.
+   */
+  next_iteration_at?: string | null;
+  spec: AutopilotSpec;
+  /**
+   * RFC 3339.
+   */
+  started_at: string;
+  [k: string]: unknown;
+}
+/**
+ * What a tab on autopilot is doing. `kind` and `detail` are plain strings
+ * from [`autopilot_condition`], not enums, because a tab's extension can be
+ * newer or older than the CLI, the server and the viewer that read its
+ * report. A reader shows a value it does not know as it would an unknown
+ * state, and never drops the report.
+ */
+export interface AutopilotCondition {
+  detail?: string | null;
+  kind: string;
+  /**
+   * RFC 3339 time the condition began.
+   */
+  since?: string | null;
+  [k: string]: unknown;
+}
+/**
+ * One autopilot as it runs: a prompt, a timing and optional limits. This is
+ * the strict form the server forwards and the tab reports back.
+ */
+export interface AutopilotSpec {
+  /**
+   * End after an iteration whose turn completes without a tool call.
+   */
+  end_without_tool_call: boolean;
+  /**
+   * Most iterations it may submit; the first counts.
+   */
+  iteration_limit:
+    | {
+        kind: "none";
+      }
+    | {
+        kind: "at_most";
+        value: number;
+      };
+  /**
+   * Submitted as typed text each iteration. Slash commands, skills and
+   * prompt templates in it are not run.
+   */
+  prompt: string;
+  repeat: AutopilotRepeat;
+  /**
+   * Seconds from the start after which autopilot ends. Paused, waiting and
+   * holding time counts.
+   */
+  time_limit:
+    | {
+        kind: "none";
+      }
+    | {
+        kind: "at_most";
+        value: number;
+      };
+}
+/**
+ * A tab's last ended autopilot, kept so its reason can be shown and its
+ * values offered for a new start.
+ */
+export interface AutopilotEnded {
+  autopilot_id: string;
+  ended_at: string;
+  iterations: number;
+  /**
+   * One of the `END_*` values of [`autopilot_condition`].
+   */
+  reason: string;
+  spec: AutopilotSpec;
+  started_at: string;
+  /**
+   * Whether a turn that started after the autopilot ended has run. Lists
+   * stop showing the reason once one has.
+   */
+  turn_since?: boolean;
+  [k: string]: unknown;
+}
+/**
+ * OMP's own self-continuing modes on a tab, however they were switched on.
+ */
+export interface OmpModesView {
+  goal?: OmpGoalModeView | null;
+  loop?: OmpLoopModeView | null;
+  [k: string]: unknown;
+}
+/**
+ * OMP's built-in goal mode, as OMP reports it. APAS shows it and never
+ * switches it.
+ */
+export interface OmpGoalModeView {
+  /**
+   * OMP's own goal status, such as budget-limited; known only after its
+   * first `goal_updated`.
+   */
+  goal_status?: string | null;
+  /**
+   * Cut to 500 characters by the tab.
+   */
+  objective?: string | null;
+  /**
+   * "active" or "paused".
+   */
+  status: string;
+  token_budget?: number | null;
+  /**
+   * Known only after OMP's first `goal_updated`.
+   */
+  tokens_used?: number | null;
+  [k: string]: unknown;
+}
+/**
+ * OMP's built-in loop mode.
+ */
+export interface OmpLoopModeView {
+  /**
+   * "active" or "paused".
+   */
+  status: string;
+  [k: string]: unknown;
+}
 export interface MobileTaskLaunchRequest {
   instruction: string;
   /**
@@ -2967,6 +3259,21 @@ export interface OmpQuestionAnswer {
   customInput?: string | null;
   id: string;
   selectedOptions: string[];
+  [k: string]: unknown;
+}
+/**
+ * What a viewer asks for in a start. Every field is optional on purpose: on
+ * this wire a frame that fails to parse is dropped without an answer, so the
+ * request has to parse for the server to refuse it with a reason.
+ * [`AutopilotStartRequest::validate`] turns it into the strict
+ * [`AutopilotSpec`] or says what is wrong.
+ */
+export interface AutopilotStartRequest {
+  end_without_tool_call?: boolean | null;
+  iteration_limit?: AutopilotLimit | null;
+  prompt?: string | null;
+  repeat?: AutopilotRepeat | null;
+  time_limit?: AutopilotLimit | null;
   [k: string]: unknown;
 }
 export interface WorkerProtocolContract {

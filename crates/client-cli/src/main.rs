@@ -17,6 +17,7 @@ mod host_storage;
 mod jobs;
 mod mode;
 mod omp_activity;
+mod omp_autopilot;
 mod omp_local;
 mod pane_host;
 mod pane_identity;

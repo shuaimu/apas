@@ -1,0 +1,8 @@
+{
+  "type": "pane_autopilot_receipt",
+  "session_id": "20000000-0000-4000-8000-000000000001",
+  "pane_id": 4,
+  "request_id": "autopilot-1",
+  "outcome": "refused",
+  "reason": "This tab is already on autopilot. Stop it first."
+}
