@@ -2487,8 +2487,9 @@ reported offers Stop and Stop now only.
   server that did not echo the capability: such a server cannot parse the
   frame and would log every one.
 - **State reaches a viewer a few seconds late.** The CLI relays it from the
-  three-second pane watcher, so the first frame after a reconnect can be one
-  poll old.
+  three-second pane watcher. The first frame after a reconnect can be older
+  still, by about ten seconds in the smoke runs, and the next poll corrects
+  it.
 - **The state report contains the prompt.** It is sent only to viewers who
   may read the session; session lists and the mobile bootstrap carry a
   summary without it.
@@ -2520,3 +2521,86 @@ autopilots with no control to stop them except the terminal (Esc pauses one).
 depends on OMP's event order, which is not a documented contract. The check
 harness is `~/.cache/apas-autopilot-check` on zoo-005 (`NOTES.md` there lists
 what OMP 18.20.0 was seen to do).
+
+### Verification
+
+**Verified on 2026-11-13.** At the change's last code commit the Rust
+workspace (shared 94, server 453 and CLI 592 tests), the static musl CLI
+build, the protocol (67 tests, typecheck, and the extension's 137 node tests),
+web (1,146 tests, lint and typecheck) and native (136 tests, lint and
+typecheck, unchanged) pass, as does `openspec validate --strict`.
+
+**The built extension ran on OMP 18.20.0** with DeepSeek V4 Flash, in an
+isolated agent directory on zoo-005 with a stand-in for the CLI. It covered:
+
+- both timings, the iteration limit, the time limit (during a turn, while
+  paused, and ending before the next iteration) and no limit;
+- the no-tool-call ending and the pause after three failed iterations;
+- Esc during a turn, a retry wait and an automatic compaction; Esc on a wait
+  for background work, and a killed background job;
+- pause, resume, Stop and Stop now;
+- an agent killed and restarted, which came back paused;
+- `/new`, a promoted `/btw` answer and a return with `/resume`;
+- the three holds, a hold between two timed iterations, and a hold kept
+  after its server went away;
+- the goal, loop and plan mode rules.
+
+A session file from that run is the CLI transcript reader's test fixture.
+
+**A two-host smoke** ran on zoo-005 and zoo-006 with isolated servers and
+daemons in namespaces and real OMP tabs, beside the production daemons, which
+it never touched:
+
+- A request reached only its tab's machine, in both directions.
+- An account without access, a stopped machine and a machine on the previous
+  CLI were each refused with the specified text, and nothing was delivered.
+- A viewer that did not negotiate autopilot was sent no autopilot frame and
+  kept its ordinary frames.
+- Across a server restart the tab kept iterating and its state was sent again
+  without anyone asking.
+- Under a server rolled back alone the tab held and submitted nothing. It
+  kept holding with no server at all, and continued by itself once the new
+  server registered.
+- An agent's exit was reported by the CLI as a pause, and its reboot brought
+  the autopilot back paused.
+
+**A browser run** in headless Chromium at 1440 px and at 390 and 360 px drove
+one autopilot end to end through the server and the CLI to OMP: the start
+dialog and its refusals, the markers, pause, resume, Stop, Stop now, a
+reload, the agent-exited pause and the reboot, the lists and the phone's
+notice and sheets.
+
+The runs found five defects, all fixed and run again:
+
+- a hold that ended when a server that could not control autopilot went away;
+- state frames sent to a server that had not negotiated them, which logged
+  each one;
+- the start dialog's prompt field collapsing to about 10 px on a phone or a
+  short window;
+- start sheet fields small enough for iOS to zoom on focus;
+- a pause reason cut short in the phone's raw terminal view. A paused
+  autopilot's reason now has a line of its own there.
+
+The last of those fixes first made the notice one line taller while a tab
+waited than while it ran, which resized the terminal twice an iteration. The
+condition's three lines now fit under the buttons at any root font size. That
+correction is covered by a unit test and by the measured heights, not by
+another browser run.
+
+Not exercised:
+
+- on a real OMP: a submission OMP drops, Stop and Stop now around a late or
+  run-less submission, a reload (OMP has no command for one), the pause after
+  four hours, autoresearch and exhausted retries. The extension's tests cover
+  these with the event orders recorded in the design;
+- a member who can open a session but may not use its machine, and any shared
+  collaborator;
+- OMP's goal and loop notices, the holds and the not-reported state in a
+  browser;
+- a real phone, the on-screen keyboard over the start sheet, and iOS;
+- OMP versions other than 18.20.0. 18.18.2, the minimum, was checked by
+  reading its source only.
+
+On a 360 px phone the selected tab chip can sit off-screen until the chip row
+is scrolled. The row behaved that way before; the autopilot glyph adds about
+16 px to a marked chip.
