@@ -2604,3 +2604,30 @@ Not exercised:
 On a 360 px phone the selected tab chip can sit off-screen until the chip row
 is scrolled. The row behaved that way before; the autopilot glyph adds about
 16 px to a marked chip.
+
+### Rollout record
+
+On **2026-11-13** autopilot reached production in the usual order.
+
+- **Server** has run the new binary since 19:38 UTC, and **web** release
+  `20261113T193707Z` (version 26.11.30, built at 1c24f56) since 19:39 UTC.
+  Backups are under `/opt/apas/backups/deploy-20261113T193707Z`. The nginx
+  configuration did not change: autopilot adds no route.
+- The server was down for about a second. All nine project instances and the
+  daemons registered again by themselves, viewers re-attached, and the server
+  logged no error and no frame it could not parse.
+- Ten public routes answered `200` with no redirect, 21 referenced static
+  assets answered `200`, `/projects/by-remote` and `/projects/workers`
+  answered JSON from `apas-server` with and without a credential, and both
+  dependency graphs audited clean. No job policy row exists and there is no
+  worker, so recurring execution stays disabled.
+- **CLI:** `master` was pushed at 1c24f56. No daemon and no agent was
+  restarted. Until a machine's daemon is rebooted from the Machines page, its
+  OMP tabs show the control disabled with "<host> runs an older APAS that
+  cannot run autopilot. Reboot <host> to update it." After that reboot, each
+  tab still needs its agent rebooted once before it can run autopilot.
+
+Not checked in production: the autopilot control itself in a signed-in
+browser, and a real autopilot. Both wait for the first machine to be rebooted
+and the first tab's agent to be relaunched.
+
