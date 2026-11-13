@@ -905,6 +905,13 @@ describe("the raw terminal view", () => {
     expect(terminal.contains(notice())).toBe(true);
     expect(notice().getAttribute("data-autopilot")).toBe("on");
     expect(within(notice()).getByRole("status").textContent).toMatch(/^Autopilot · Waiting for the next iteration at \S/);
+    // Three lines of 0.9rem stay under the 2.75rem buttons, so the row, and
+    // with it the terminal, keeps its height from one condition to the next.
+    const onStatus = within(notice()).getByRole("status");
+    expect(onStatus.className.split(" ")).toContain("flex-1");
+    expect(onStatus.querySelector("span")?.className.split(" "))
+      .toEqual(expect.arrayContaining(["leading-[0.9rem]", "line-clamp-3"]));
+    expect(button(notice(), "Pause").className.split(" ")).toContain("min-h-11");
     expect(within(notice()).getAllByRole("button").map((element) => element.textContent))
       .toEqual(["Pause", "Stop", "Details"]);
     // It stands above the terminal, not over it.
@@ -918,6 +925,15 @@ describe("the raw terminal view", () => {
     expect(notice().getAttribute("data-autopilot")).toBe("paused");
     expect(within(notice()).getByRole("status").textContent).toBe("Autopilot · Paused");
     expect(button(notice(), "Resume").disabled).toBe(false);
+    // A pause's reason has a line of its own and is never cut: beside three
+    // buttons a phone showed "Paused: the turn…".
+    report(7, autopilot("paused", "interrupted"));
+    const pausedStatus = within(notice()).getByRole("status");
+    expect(pausedStatus.textContent).toBe("Autopilot · Paused: the turn was interrupted");
+    expect(pausedStatus.className.split(" ")).toContain("basis-full");
+    expect(pausedStatus.querySelector("span")?.className ?? "").not.toMatch(/truncate|line-clamp/);
+    expect(pausedStatus.parentElement?.className.split(" ")).toContain("flex-wrap");
+    report(7, autopilot("paused", "requested"));
 
     // Stop asks here too, and Details opens over the terminal.
     fireEvent.click(button(notice(), "Stop"));

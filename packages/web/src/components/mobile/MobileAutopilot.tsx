@@ -227,13 +227,26 @@ export function MobileAutopilotTerminalNotice({
       data-autopilot={model.phase}
       className="shrink-0 border-b border-neutral-800 px-2 text-xs text-neutral-200"
     >
-      <div className="flex items-center gap-1">
-        <p role="status" className="flex min-w-0 flex-1 items-center gap-1.5 px-1">
+      {/* Beside three buttons a 360px phone leaves the condition about 17
+          characters a line. While the tab is on autopilot it gets three
+          lines that together stay under the buttons' 2.75rem, whatever the
+          root font size: a row that grew from "running" to "waiting" resized
+          the terminal twice an iteration. A pause's reason is what the
+          person needs to read, so it gets a line of its own and the actions
+          go under it. */}
+      <div className={`flex items-center gap-1 ${model.phase === "on" ? "" : "flex-wrap"}`}>
+        <p
+          role="status"
+          className={`flex min-w-0 items-center gap-1.5 px-1 ${model.phase === "on" ? "flex-1" : "basis-full pt-2"}`}
+        >
           <Repeat
             aria-hidden="true"
             className={`h-3.5 w-3.5 shrink-0 ${model.phase === "on" ? "text-indigo-300" : "text-amber-300"}`}
           />
-          <span className="min-w-0 break-words line-clamp-2" title={`Autopilot · ${model.statusText}`}>
+          <span
+            className={`min-w-0 break-words ${model.phase === "on" ? "leading-[0.9rem] line-clamp-3" : ""}`}
+            title={`Autopilot · ${model.statusText}`}
+          >
             Autopilot · {model.statusText}
           </span>
         </p>
