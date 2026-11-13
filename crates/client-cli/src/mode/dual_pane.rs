@@ -780,6 +780,34 @@ fn conversation_turn_to_stream_messages(
             pane_id: Some(turn.pane_id),
         }];
     }
+    // Where an autopilot iteration starts. The provider recorded its prompt
+    // as a user message, but nothing may store it as one: `UserInput` is the
+    // person's own message and moves their counters. A tool-use block under a
+    // reserved name is stored as it is and acted on by nobody.
+    if let Some(marker) = &turn.autopilot_iteration {
+        return vec![CliToServer::StreamMessage {
+            session_id,
+            message: shared::ClaudeStreamMessage::Assistant {
+                message: shared::ClaudeAssistantMessage {
+                    content: vec![shared::ClaudeContentBlock::ToolUse {
+                        id: format!(
+                            "apas-autopilot:{}:{}",
+                            marker.autopilot_id, marker.iteration
+                        ),
+                        name: shared::AUTOPILOT_ITERATION_TOOL_NAME.to_string(),
+                        input: serde_json::to_value(marker).unwrap_or_default(),
+                    }],
+                    model: String::new(),
+                    extra: serde_json::Value::Null,
+                },
+                session_id: sid,
+                // An iteration starts a turn. It never completes one.
+                extra: serde_json::json!({ "terminal_turn_complete": false }),
+            },
+            pane_type: None,
+            pane_id: Some(turn.pane_id),
+        }];
+    }
     if let Some(question) = &turn.question {
         return vec![CliToServer::StreamMessage {
             session_id,
@@ -865,6 +893,92 @@ fn conversation_turn_to_stream_messages(
     }
 
     out
+}
+
+/// Publish the turns one poll found past a terminal pane's cursor, and the
+/// status frames that follow from them. Returns whether the batch may have
+/// changed the pane's status on the server, so the caller reasserts what the
+/// provider is actually doing.
+///
+/// `live_working` is true while the pane's own live report says Working, as
+/// the OMP extension keeps saying between two immediate autopilot iterations
+/// and while a turn continues by itself. The server and the web both clear a
+/// terminal tab's status when a turn's last message arrives marked complete,
+/// so that message is then sent unmarked and the explicit clear is skipped:
+/// no Idle goes out for a tab that has not stopped. When the tab does stop,
+/// its report says Idle and that is published as any activity change is.
+#[allow(clippy::too_many_arguments)]
+fn publish_terminal_turns(
+    server_tx: &tokio_mpsc::Sender<CliToServer>,
+    session_id: Uuid,
+    conversation_id: Uuid,
+    pane_id: u32,
+    provider: &Provider,
+    turns: &[crate::conversation::TurnRecord],
+    cursor: &mut usize,
+    completed: &mut usize,
+    awaiting_answer: bool,
+    live_working: bool,
+) -> bool {
+    let previous_cursor = *cursor;
+    let completion_count = turns.iter().filter(|turn| turn.completes_work).count();
+    if turns.len() > previous_cursor {
+        for turn in &turns[previous_cursor..] {
+            // OMP question records have an independent replay
+            // cursor; restoring a pane must not suppress them,
+            // nor should their upserts replay/bill prose.
+            if *provider == Provider::Omp && (turn.question.is_some() || turn.answer.is_some()) {
+                continue;
+            }
+            let held;
+            let turn = if live_working && turn.completes_work {
+                held = crate::conversation::TurnRecord {
+                    completes_work: false,
+                    ..turn.clone()
+                };
+                &held
+            } else {
+                turn
+            };
+            for msg in conversation_turn_to_stream_messages(turn, session_id, conversation_id) {
+                let _ = server_tx.blocking_send(msg);
+            }
+        }
+        *cursor = turns.len();
+    }
+    if awaiting_answer {
+        // Repeated while unresolved so a server reconnect can
+        // recover the actionable state even though old chat
+        // turns are deliberately not replayed.
+        let _ = server_tx.blocking_send(CliToServer::PaneStatus {
+            session_id,
+            pane_type: PaneType::Interactive,
+            pane_id: Some(pane_id),
+            status: Some(shared::PANE_STATUS_PENDING_ANSWER.to_string()),
+        });
+    }
+    // Codex writes task_complete after its assistant message.
+    // If the prior poll already advanced the turn cursor, no
+    // new StreamMessage exists to carry the completion marker,
+    // so send the status transition explicitly.
+    let completion_was_on_new_turn = turns
+        .get(previous_cursor..)
+        .is_some_and(|new_turns| new_turns.iter().any(|turn| turn.completes_work));
+    let completion_without_new_turn = completion_count > *completed && !completion_was_on_new_turn;
+    if completion_without_new_turn && !live_working {
+        let _ = server_tx.blocking_send(CliToServer::PaneStatus {
+            session_id,
+            pane_type: PaneType::Interactive,
+            pane_id: Some(pane_id),
+            status: None,
+        });
+    }
+    *completed = completion_count;
+
+    completion_without_new_turn
+        || turns[previous_cursor..]
+            .iter()
+            .any(|turn| !turn.is_assistant() || turn.completes_work)
 }
 
 /// The transcript belongs to the directory in which the provider process is
@@ -2788,6 +2902,9 @@ async fn run_inner(
     // reconnect generation that makes an unchanged active turn publish once
     // after every successful session registration.
     let server_connection_generation = Arc::new(AtomicU64::new(0));
+    // Explicit connection state, for the heartbeat that tells each OMP tab
+    // whether its controller is present and can reach the server.
+    let server_link = Arc::new(crate::omp_autopilot::ServerLink::new());
 
     // Shutdown flag
     // Supplied by the caller so a project can be stopped from outside; a
@@ -3049,6 +3166,7 @@ async fn run_inner(
         let event_tx_for_server = event_tx.clone();
         let project_policy_for_server = project_policy.clone();
         let connection_generation_for_server = server_connection_generation.clone();
+        let server_link_for_server = server_link.clone();
         let instance = instance.clone();
         let store = store.clone();
         tokio::spawn(async move {
@@ -3074,6 +3192,7 @@ async fn run_inner(
                 instance,
                 store,
                 connection_generation_for_server,
+                server_link_for_server,
                 reboot_handoff,
             )
             .await
@@ -3283,6 +3402,22 @@ async fn run_inner(
             }
         });
     }
+    // Autopilot's controller heartbeat. A thread of its own, which never
+    // sends on `server_tx`: that queue fills during an outage and the pane
+    // watcher below then blocks at its next send, which would make every
+    // busy OMP tab look abandoned after a minute.
+    {
+        let metas_for_heartbeat = pane_metas.clone();
+        let shutdown_for_heartbeat = shutdown.clone();
+        thread::spawn(move || {
+            crate::omp_autopilot::run_controller_heartbeat(
+                || omp_terminal_runtime_dirs(session_id, &metas_for_heartbeat),
+                &server_link,
+                &shutdown_for_heartbeat,
+                crate::omp_autopilot::HEARTBEAT_INTERVAL,
+            );
+        });
+    }
     // Project flag poller. Re-reads .apas every ~5s and pushes the
     // current `auto_approve_todos` / `auto_merge_prs` values upstream
     // so the web's Overview toggles hydrate on attach and survive a
@@ -3360,6 +3495,10 @@ async fn run_inner(
             let mut provider_activities: HashMap<u32, (TranscriptActivity, u64)> = HashMap::new();
             let mut pi_readers: HashMap<u32, PiTranscriptReader> = HashMap::new();
             let mut omp_questions: HashMap<u32, OmpQuestionReplay> = HashMap::new();
+            // What each OMP tab last reported about autopilot, and what was
+            // last relayed of it.
+            let mut autopilot_relays: HashMap<u32, crate::omp_autopilot::PaneAutopilotRelay> =
+                HashMap::new();
             // Per-pane claude transcript watch state (growth + idle tracking
             // for in-TUI session-switch detection).
             let mut claude_watch: HashMap<u32, ClaudeWatchState> = HashMap::new();
@@ -3408,6 +3547,11 @@ async fn run_inner(
                 };
                 pi_readers.retain(|id, _| panes.iter().any(|(pane_id, ..)| pane_id == id));
                 omp_questions.retain(|id, _| panes.iter().any(|(pane_id, ..)| pane_id == id));
+                autopilot_relays.retain(|id, _| {
+                    panes
+                        .iter()
+                        .any(|(pane_id, provider, ..)| pane_id == id && *provider == Provider::Omp)
+                });
                 provider_activities.retain(|id, _| panes.iter().any(|(pane_id, ..)| pane_id == id));
                 #[cfg(target_os = "linux")]
                 let mut codex_process_paths = HashMap::new();
@@ -3477,6 +3621,25 @@ async fn run_inner(
                     } else {
                         None
                     };
+                    if provider == Provider::Omp {
+                        // Relayed before anything below can skip the pane: a
+                        // tab reports its autopilot whether or not it has a
+                        // session file yet.
+                        relay_pane_autopilot(
+                            &mut autopilot_relays,
+                            &terminal_panes_for_turns,
+                            &server_tx_for_turns,
+                            session_id,
+                            pane_id,
+                            crate::omp_activity::pane_runtime_dir(session_id, pane_id).as_deref(),
+                            process_group_id,
+                            lifecycle,
+                            connection_generation,
+                        );
+                    }
+                    let live_working = omp_report
+                        .as_ref()
+                        .is_some_and(|report| report.activity == TranscriptActivity::Working);
                     if matches!(
                         lifecycle,
                         Some(
@@ -3870,66 +4033,24 @@ async fn run_inner(
                         *cursor = turns.len();
                         *completed = completion_count;
                     }
-                    let previous_cursor = *cursor;
                     let awaiting_answer = terminal_questions_for_turns
                         .lock()
                         .map(|mut pending| {
                             reconcile_terminal_questions_for_pane(&mut pending, pane_id, &turns)
                         })
                         .unwrap_or(false);
-                    if turns.len() > previous_cursor {
-                        for turn in &turns[previous_cursor..] {
-                            // OMP question records have an independent replay
-                            // cursor; restoring a pane must not suppress them,
-                            // nor should their upserts replay/bill prose.
-                            if provider == Provider::Omp
-                                && (turn.question.is_some() || turn.answer.is_some())
-                            {
-                                continue;
-                            }
-                            for msg in
-                                conversation_turn_to_stream_messages(turn, session_id, conv_id)
-                            {
-                                let _ = server_tx_for_turns.blocking_send(msg);
-                            }
-                        }
-                        *cursor = turns.len();
-                    }
-                    if awaiting_answer {
-                        // Repeated while unresolved so a server reconnect can
-                        // recover the actionable state even though old chat
-                        // turns are deliberately not replayed.
-                        let _ = server_tx_for_turns.blocking_send(CliToServer::PaneStatus {
-                            session_id,
-                            pane_type: PaneType::Interactive,
-                            pane_id: Some(pane_id),
-                            status: Some(shared::PANE_STATUS_PENDING_ANSWER.to_string()),
-                        });
-                    }
-                    // Codex writes task_complete after its assistant message.
-                    // If the prior poll already advanced the turn cursor, no
-                    // new StreamMessage exists to carry the completion marker,
-                    // so send the status transition explicitly.
-                    let completion_was_on_new_turn = turns
-                        .get(previous_cursor..)
-                        .is_some_and(|new_turns| new_turns.iter().any(|turn| turn.completes_work));
-                    let completion_without_new_turn =
-                        completion_count > *completed && !completion_was_on_new_turn;
-                    if completion_without_new_turn {
-                        let _ = server_tx_for_turns.blocking_send(CliToServer::PaneStatus {
-                            session_id,
-                            pane_type: PaneType::Interactive,
-                            pane_id: Some(pane_id),
-                            status: None,
-                        });
-                    }
-                    *completed = completion_count;
-
-                    let conversation_changed_status = question_changed_status
-                        || completion_without_new_turn
-                        || turns[previous_cursor..]
-                            .iter()
-                            .any(|turn| !turn.is_assistant() || turn.completes_work);
+                    let conversation_changed_status = publish_terminal_turns(
+                        &server_tx_for_turns,
+                        session_id,
+                        conv_id,
+                        pane_id,
+                        &provider,
+                        &turns,
+                        cursor,
+                        completed,
+                        awaiting_answer,
+                        live_working,
+                    ) || question_changed_status;
                     publish_terminal_activity(
                         &mut provider_activities,
                         &server_tx_for_turns,
@@ -8679,6 +8800,7 @@ mod tests {
                 }),
             }),
             answer: None,
+            autopilot_iteration: None,
         };
         let mut pending = HashMap::new();
 
@@ -8716,6 +8838,7 @@ mod tests {
                 tool_use_id: "question-7".to_string(),
                 recorded: "A".to_string(),
             }),
+            autopilot_iteration: None,
         };
         assert!(!reconcile_terminal_questions_for_pane(
             &mut pending,
@@ -8840,6 +8963,7 @@ mod tests {
             completes_work: false,
             question: None,
             answer: None,
+            autopilot_iteration: None,
         }
     }
 
@@ -9189,6 +9313,468 @@ mod tests {
             } => assert_eq!(extra["terminal_turn_complete"], true),
             other => panic!("expected assistant message, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn an_iteration_is_published_as_the_reserved_tool_use_and_never_as_user_input() {
+        use crate::transcript::autopilot_fixture::{
+            self as fixture, FIRST, FIRST_PROMPT, SECOND, SECOND_PROMPT,
+        };
+
+        // The session file as OMP writes it, read the way the pane watcher
+        // reads it, and published the way one poll publishes new turns.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(format!(
+            "2026-11-13T15-43-48-634Z_{}.jsonl",
+            fixture::SESSION
+        ));
+        std::fs::write(&path, fixture::session()).unwrap();
+        let mut reader = crate::transcript::PiTranscriptReader::default();
+        let turns = reader.read_omp(&path, 42).unwrap().turns.clone();
+        let (server_tx, mut server_rx) = tokio_mpsc::channel(256);
+        let (mut cursor, mut completed) = (0, 0);
+        super::publish_terminal_turns(
+            &server_tx,
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            42,
+            &Provider::Omp,
+            &turns,
+            &mut cursor,
+            &mut completed,
+            false,
+            false,
+        );
+        assert_eq!(cursor, turns.len());
+
+        let mut typed = Vec::new();
+        let mut markers = Vec::new();
+        while let Ok(frame) = server_rx.try_recv() {
+            match frame {
+                // The one frame that is stored as the person's own message
+                // and moves the session's time of last user input.
+                CliToServer::UserInput { text, .. } => typed.push(text),
+                CliToServer::StreamMessage {
+                    message: shared::ClaudeStreamMessage::Assistant { message, extra, .. },
+                    pane_id,
+                    ..
+                } => {
+                    for block in message.content {
+                        let shared::ClaudeContentBlock::ToolUse { id, name, input } = block else {
+                            continue;
+                        };
+                        assert_eq!(name, shared::AUTOPILOT_ITERATION_TOOL_NAME);
+                        assert_eq!(name, "ApasAutopilotIteration");
+                        // An iteration starts a turn: the tab's status is
+                        // not cleared by it.
+                        assert_eq!(extra["terminal_turn_complete"], false);
+                        assert_eq!(pane_id, Some(42));
+                        markers.push((id, input));
+                    }
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(
+            typed,
+            [
+                "Copied instruction.",
+                "Also update the changelog.",
+                "And bump the version.",
+                "Why did you stop?",
+            ]
+        );
+        let inputs: Vec<&serde_json::Value> = markers.iter().map(|(_, input)| input).collect();
+        assert_eq!(
+            inputs,
+            [
+                &serde_json::json!({
+                    "autopilot_id": FIRST, "iteration": 1, "limit": 20, "prompt": FIRST_PROMPT,
+                }),
+                &serde_json::json!({ "autopilot_id": FIRST, "iteration": 2, "limit": 20 }),
+                // The dropped submission left no marker; the first one after
+                // the resume carries the prompt again.
+                &serde_json::json!({
+                    "autopilot_id": FIRST, "iteration": 3, "limit": 20, "prompt": FIRST_PROMPT,
+                }),
+                // No iteration limit: no `limit`.
+                &serde_json::json!({
+                    "autopilot_id": SECOND, "iteration": 1, "prompt": SECOND_PROMPT,
+                }),
+                &serde_json::json!({ "autopilot_id": SECOND, "iteration": 2 }),
+            ]
+        );
+        let ids: HashSet<&String> = markers.iter().map(|(id, _)| id).collect();
+        assert_eq!(
+            ids.len(),
+            markers.len(),
+            "each marker is its own tool-use block"
+        );
+    }
+
+    #[test]
+    fn a_tab_whose_live_report_says_working_is_not_sent_idle_when_a_turn_completes() {
+        use crate::transcript::TranscriptActivity::{Idle, Working};
+
+        let mut done = recorded_turn("assistant", "The build is green.");
+        done.completes_work = true;
+        let turns = [recorded_turn("user", "check the build"), done];
+        // One poll of the pane watcher: the user turn went out earlier, the
+        // reply that completes the turn is new. `cursor` 2 instead is the
+        // case of a completion found on a reply that was already published.
+        let poll = |cursor: usize, live_working: bool| {
+            let (server_tx, mut server_rx) = tokio_mpsc::channel(16);
+            let (mut cursor, mut completed) = (cursor, 0);
+            let mut states = HashMap::from([(42, (Working, 1))]);
+            let changed = super::publish_terminal_turns(
+                &server_tx,
+                Uuid::nil(),
+                Uuid::nil(),
+                42,
+                &Provider::Omp,
+                &turns,
+                &mut cursor,
+                &mut completed,
+                false,
+                live_working,
+            );
+            assert_eq!((cursor, completed), (2, 1));
+            super::publish_terminal_activity(
+                &mut states,
+                &server_tx,
+                Uuid::nil(),
+                42,
+                Some(if live_working { Working } else { Idle }),
+                1,
+                changed,
+            );
+            let mut completions = Vec::new();
+            let mut statuses = Vec::new();
+            while let Ok(frame) = server_rx.try_recv() {
+                match frame {
+                    CliToServer::StreamMessage {
+                        message: shared::ClaudeStreamMessage::Assistant { extra, .. },
+                        ..
+                    } => completions.push(extra["terminal_turn_complete"].clone()),
+                    CliToServer::PaneStatus { status, .. } => statuses.push(status),
+                    other => panic!("unexpected frame {other:?}"),
+                }
+            }
+            (completions, statuses)
+        };
+
+        // Between two immediate iterations the extension keeps saying
+        // Working. The completing message goes out unmarked and no
+        // status-none frame follows it.
+        let (completions, statuses) = poll(1, true);
+        assert_eq!(completions, [serde_json::json!(false)]);
+        assert_eq!(statuses, [Some("Working...".to_string())]);
+        let (completions, statuses) = poll(2, true);
+        assert!(completions.is_empty());
+        assert_eq!(statuses, [Some("Working...".to_string())]);
+
+        // A tab that has stopped is cleared as before.
+        let (completions, statuses) = poll(1, false);
+        assert_eq!(completions, [serde_json::json!(true)]);
+        assert_eq!(statuses, [None]);
+        let (completions, statuses) = poll(2, false);
+        assert!(completions.is_empty());
+        assert_eq!(statuses, [None, None]);
+    }
+
+    #[test]
+    fn an_autopilot_request_is_refused_for_a_tab_that_cannot_take_it() {
+        use shared::AutopilotReceiptOutcome::Refused;
+
+        let session_id = Uuid::new_v4();
+        let mut omp = test_pane_meta(Provider::Omp, false, None, Arc::new(Mutex::new(None)));
+        omp.kind = shared::PaneKind::Terminal;
+        omp.mode = shared::PaneMode::Interactive;
+        let mut codex = test_pane_meta(Provider::Codex, false, None, Arc::new(Mutex::new(None)));
+        codex.kind = shared::PaneKind::Terminal;
+        codex.mode = shared::PaneMode::Interactive;
+        // Read-only legacy bot history, whatever its provider says.
+        let mut bot = test_pane_meta(Provider::Omp, false, None, Arc::new(Mutex::new(None)));
+        bot.kind = shared::PaneKind::Terminal;
+        let pane_metas: PaneMetas =
+            Arc::new(Mutex::new(HashMap::from([(7, omp), (8, codex), (9, bot)])));
+        let terminal_panes: TerminalPanes = Arc::new(Mutex::new(HashMap::new()));
+        let control = |target_session, pane_id, command: &shared::AutopilotCommand| {
+            super::control_pane_autopilot(
+                session_id,
+                target_session,
+                pane_id,
+                "request-1",
+                command,
+                &pane_metas,
+                &terminal_panes,
+            )
+        };
+        let stop = shared::AutopilotCommand::Stop {
+            autopilot_id: None,
+            now: true,
+        };
+        let start = |prompt: &str| shared::AutopilotCommand::Start {
+            spec: shared::AutopilotSpec {
+                prompt: prompt.into(),
+                repeat: shared::AutopilotRepeat::AfterEachTurn,
+                iteration_limit: shared::AutopilotLimit::None,
+                time_limit: shared::AutopilotLimit::None,
+                end_without_tool_call: true,
+            },
+        };
+
+        // The bounds are checked again on the tab's machine.
+        let receipt = control(session_id, 7, &start("line\r\n"));
+        assert_eq!(receipt.outcome, Refused);
+        assert_eq!(
+            receipt.reason.as_deref(),
+            Some("The prompt contains control characters other than newline and tab.")
+        );
+        // Another provider, legacy bot history, no such tab, another project.
+        let not_a_tab = Some("This tab is not an OMP terminal tab of this project.");
+        for (target_session, pane_id) in [
+            (session_id, 8),
+            (session_id, 9),
+            (session_id, 10),
+            (Uuid::new_v4(), 7),
+        ] {
+            let receipt = control(target_session, pane_id, &stop);
+            assert_eq!(
+                (receipt.outcome, receipt.reason.as_deref()),
+                (Refused, not_a_tab)
+            );
+        }
+        // An OMP tab whose agent process is not running: nothing there could
+        // apply even a stop. Where no tab can run autopilot at all, that is
+        // what a request is told.
+        let cannot = if cfg!(target_os = "linux") {
+            "This tab's agent is not running. Reboot it first; its autopilot comes back paused."
+        } else {
+            "Autopilot is not available for tabs on this machine."
+        };
+        for command in [&stop, &start("Check the build.")] {
+            let receipt = control(session_id, 7, command);
+            assert_eq!(receipt.outcome, Refused);
+            assert_eq!(receipt.reason.as_deref(), Some(cannot));
+        }
+    }
+
+    /// The pane watcher's step for one OMP tab, driven with real terminal
+    /// runtimes: a provider that ends by itself is relayed as the pause this
+    /// CLI reports on the tab's behalf, and one this CLI stopped is not.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn the_watcher_relays_a_pause_only_for_an_agent_that_ended_by_itself() {
+        use crate::omp_autopilot as autopilot;
+        use shared::{autopilot_condition, AutopilotSupport, TerminalLifecycle};
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let agent = root.path().join("agent");
+        std::fs::write(&agent, "#!/bin/sh\nexec sleep 600\n").unwrap();
+        std::fs::set_permissions(&agent, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::create_dir(root.path().join("sessions")).unwrap();
+        let session_id = Uuid::new_v4();
+        let (server_tx, mut server_rx) = tokio_mpsc::channel(256);
+        let terminal_panes: TerminalPanes = Arc::new(Mutex::new(HashMap::new()));
+        let mut relays = HashMap::new();
+        let runtime_of = |pane_id: u32| root.path().join(format!("runtime-{pane_id}"));
+        for pane_id in [7, 8] {
+            crate::pane_host::ensure_private_dir(&runtime_of(pane_id)).unwrap();
+        }
+
+        // One poll of the watcher for one tab, and the frame it sent, if any.
+        let mut poll = |pane_id: u32, lifecycle: Option<TerminalLifecycle>| {
+            let group = terminal_panes
+                .lock()
+                .unwrap()
+                .get(&pane_id)
+                .and_then(crate::terminal_pane::TerminalRuntimeHandle::process_group_id);
+            super::relay_pane_autopilot(
+                &mut relays,
+                &terminal_panes,
+                &server_tx,
+                session_id,
+                pane_id,
+                Some(&runtime_of(pane_id)),
+                group,
+                lifecycle,
+                1,
+            );
+            let mut frames = Vec::new();
+            while let Ok(frame) = server_rx.try_recv() {
+                if let CliToServer::PaneAutopilotState {
+                    session_id: sent_for,
+                    pane_id: sent_pane,
+                    support,
+                    state,
+                    ..
+                } = frame
+                {
+                    assert_eq!((sent_for, sent_pane), (session_id, pane_id));
+                    frames.push((support, state.map(|state| *state)));
+                }
+            }
+            assert!(frames.len() <= 1, "one poll sends at most one frame");
+            frames.pop()
+        };
+        // Launch a tab's agent and let its extension report an autopilot.
+        let launch = |pane_id: u32| {
+            let runtime = runtime_of(pane_id);
+            let (_, launch) =
+                crate::omp_activity::install(&runtime, &root.path().join("sessions")).unwrap();
+            // Any provider without launch files of its own will do: the
+            // process only has to be the tab's own process group.
+            let handle = crate::terminal_pane::TerminalHandle::spawn(
+                pane_id,
+                session_id,
+                Uuid::new_v4(),
+                &Provider::Codex,
+                agent.to_str().unwrap(),
+                root.path().to_str().unwrap(),
+                &[],
+                false,
+                None,
+                server_tx.clone(),
+            )
+            .unwrap();
+            let pid = handle.process_group_id().unwrap();
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let process_start = loop {
+                match crate::omp_activity::process_start(pid) {
+                    Some(start) => break start,
+                    None => {
+                        assert!(Instant::now() < deadline, "the agent never led its group");
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                }
+            };
+            let report = autopilot::StateReport {
+                v: autopilot::FORMAT_VERSION,
+                counter: 1,
+                launch_id: launch.launch_id,
+                pid,
+                process_start,
+                session_id: "01a1d594-4d99-729d-a0a1-0d838bc273a9".into(),
+                support: "supported".into(),
+                unsupported_reason: None,
+                autopilot: Some(shared::AutopilotView {
+                    autopilot_id: Uuid::from_u128(u128::from(pane_id)),
+                    spec: shared::AutopilotSpec {
+                        prompt: "Check the build.".into(),
+                        repeat: shared::AutopilotRepeat::AfterEachTurn,
+                        iteration_limit: shared::AutopilotLimit::None,
+                        time_limit: shared::AutopilotLimit::None,
+                        end_without_tool_call: false,
+                    },
+                    started_at: "2026-11-13T14:00:00Z".into(),
+                    iterations: 3,
+                    deadline: None,
+                    next_iteration_at: None,
+                    condition: shared::AutopilotCondition {
+                        kind: autopilot_condition::RUNNING.into(),
+                        detail: None,
+                        since: None,
+                    },
+                }),
+                last_ended: None,
+                omp_modes: None,
+            };
+            crate::omp_activity::write_private_atomic(
+                &runtime.join(autopilot::STATE_FILE),
+                &serde_json::to_vec(&report).unwrap(),
+            )
+            .unwrap();
+            let handle = crate::terminal_pane::TerminalRuntimeHandle::Direct(handle);
+            terminal_panes
+                .lock()
+                .unwrap()
+                .insert(pane_id, handle.clone());
+            (handle, pid)
+        };
+
+        // A tab exists before its agent is launched. It has not reported;
+        // it does not need a reboot.
+        assert_eq!(poll(7, None), Some((AutopilotSupport::NotReported, None)));
+
+        let (ended, pid) = launch(7);
+        let (support, state) = poll(7, Some(ended.lifecycle())).unwrap();
+        assert_eq!(support, AutopilotSupport::Supported);
+        let on = state.unwrap();
+        assert!(!on.reported_by_cli);
+        assert_eq!(on.autopilot.as_ref().unwrap().iterations, 3);
+
+        // The agent ends, and nobody here asked for that.
+        unsafe { libc::kill(pid, libc::SIGKILL) };
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while ended.lifecycle() != TerminalLifecycle::Exited {
+            assert!(Instant::now() < deadline, "the exit was never seen");
+            thread::sleep(Duration::from_millis(5));
+        }
+        let (support, state) = poll(7, Some(ended.lifecycle())).unwrap();
+        assert_eq!(support, AutopilotSupport::Supported);
+        let paused = state.unwrap();
+        assert!(paused.reported_by_cli);
+        let autopilot = paused.autopilot.unwrap();
+        assert_eq!(
+            (
+                autopilot.condition.kind.as_str(),
+                autopilot.condition.detail.as_deref()
+            ),
+            (
+                autopilot_condition::PAUSED,
+                Some(autopilot_condition::PAUSE_AGENT_EXITED)
+            )
+        );
+        assert_eq!(
+            (autopilot.autopilot_id, autopilot.iterations),
+            (Uuid::from_u128(7), 3)
+        );
+        // It stays that way from poll to poll.
+        assert_eq!(poll(7, Some(ended.lifecycle())), None);
+
+        // An agent this CLI stops, as a close, an agent reboot and a project
+        // stop do, is only not reported any more. A hosted runtime reports
+        // such an exit as one too; it is still not the agent ending by itself.
+        let (stopped, _) = launch(8);
+        assert_eq!(
+            poll(8, Some(stopped.lifecycle())).unwrap().0,
+            AutopilotSupport::Supported
+        );
+        stopped.shutdown();
+        assert_eq!(
+            poll(8, Some(stopped.lifecycle())),
+            Some((AutopilotSupport::NotReported, None))
+        );
+        assert_eq!(poll(8, Some(TerminalLifecycle::Exited)), None);
+
+        // Nothing could apply a request for the tab whose agent is gone.
+        let mut omp = test_pane_meta(Provider::Omp, false, None, Arc::new(Mutex::new(None)));
+        omp.kind = shared::PaneKind::Terminal;
+        omp.mode = shared::PaneMode::Interactive;
+        let pane_metas: PaneMetas = Arc::new(Mutex::new(HashMap::from([(7, omp)])));
+        let stop = shared::AutopilotCommand::Stop {
+            autopilot_id: None,
+            now: false,
+        };
+        let receipt = super::control_pane_autopilot(
+            session_id,
+            session_id,
+            7,
+            "request-1",
+            &stop,
+            &pane_metas,
+            &terminal_panes,
+        );
+        assert_eq!(
+            (receipt.outcome, receipt.reason.as_deref()),
+            (
+                shared::AutopilotReceiptOutcome::Refused,
+                Some("This tab's agent is not running. Reboot it first; its autopilot comes back paused.")
+            )
+        );
+        ended.shutdown();
     }
 
     #[test]
@@ -9781,6 +10367,9 @@ mod tests {
         let incapable = super::InstanceIdentity::new(pinned.resolved_machine_id(), &pinned);
         let capabilities = super::cli_capabilities(&incapable, true, true);
         assert!(!capabilities.contains(&instances));
+        // Speaking the autopilot protocol does not depend on the instance.
+        // Whether a tab can run autopilot is reported per tab.
+        assert!(capabilities.contains(&shared::OMP_TAB_AUTOPILOT_CAPABILITY.to_string()));
         assert!(capabilities.contains(&shared::PANE_WORK_SUMMARY_CAPABILITY.to_string()));
         assert!(capabilities.contains(&shared::PERSISTENT_TERMINAL_HOST_CAPABILITY.to_string()));
     }
@@ -11968,6 +12557,119 @@ pub enum ProjectOutcome {
 /// else.
 pub type ProjectStopReason = Arc<Mutex<Option<String>>>;
 
+/// Answer one `ServerToCli::ControlPaneAutopilot`. It blocks while the tab
+/// answers, so it runs off the async path, and every path through it ends in
+/// exactly one receipt.
+fn control_pane_autopilot(
+    session_id: Uuid,
+    target_session: Uuid,
+    pane_id: u32,
+    request_id: &str,
+    command: &shared::AutopilotCommand,
+    pane_metas: &PaneMetas,
+    terminal_panes: &TerminalPanes,
+) -> crate::omp_autopilot::Receipt {
+    // Legacy bot history is read-only and is never started through autopilot.
+    let omp_terminal_tab = target_session == session_id
+        && pane_metas.lock().is_ok_and(|metas| {
+            metas.get(&pane_id).is_some_and(|meta| {
+                meta.kind.is_terminal()
+                    && meta.provider == Provider::Omp
+                    && meta.mode != shared::PaneMode::Deadloop
+            })
+        });
+    let runtime = terminal_panes
+        .lock()
+        .ok()
+        .and_then(|runtimes| runtimes.get(&pane_id).cloned());
+    let agent_running = runtime.as_ref().is_some_and(|runtime| {
+        matches!(
+            runtime.lifecycle(),
+            shared::TerminalLifecycle::Running | shared::TerminalLifecycle::Disconnected
+        )
+    });
+    if let Some(reason) =
+        crate::omp_autopilot::refusal_before_exchange(command, omp_terminal_tab, agent_running)
+    {
+        return crate::omp_autopilot::Receipt::refused(reason);
+    }
+    #[cfg(target_os = "linux")]
+    let group = runtime
+        .as_ref()
+        .and_then(TerminalRuntimeHandle::process_group_id);
+    #[cfg(not(target_os = "linux"))]
+    let group = None;
+    crate::omp_autopilot::exchange(session_id, pane_id, group, request_id, command)
+}
+
+/// One poll of one OMP terminal tab's autopilot: read what the tab reports
+/// in its runtime directory and send it when it changed, or when the CLI has
+/// registered again.
+///
+/// `lifecycle` is the tab's runtime as this poll found it, `None` when the
+/// CLI holds none. An exit the CLI asked for (a close, an agent reboot, a
+/// project stop) is not the agent ending by itself, and only the latter is
+/// reported as a pause on the tab's behalf.
+#[allow(clippy::too_many_arguments)]
+fn relay_pane_autopilot(
+    relays: &mut HashMap<u32, crate::omp_autopilot::PaneAutopilotRelay>,
+    terminal_panes: &TerminalPanes,
+    server_tx: &tokio_mpsc::Sender<CliToServer>,
+    session_id: Uuid,
+    pane_id: u32,
+    runtime: Option<&Path>,
+    process_group_id: Option<i32>,
+    lifecycle: Option<shared::TerminalLifecycle>,
+    connection_generation: u64,
+) {
+    use crate::omp_autopilot::AgentProcess;
+
+    let agent = match lifecycle {
+        None => AgentProcess::NotLaunched,
+        Some(shared::TerminalLifecycle::Exited)
+            if terminal_panes.lock().is_ok_and(|runtimes| {
+                runtimes
+                    .get(&pane_id)
+                    .is_some_and(|runtime| !runtime.shutdown_requested())
+            }) =>
+        {
+            AgentProcess::ExitedByItself
+        }
+        Some(_) => AgentProcess::Launched,
+    };
+    if let Some(frame) = relays.entry(pane_id).or_default().poll(
+        runtime,
+        process_group_id,
+        agent,
+        connection_generation,
+    ) {
+        let _ = server_tx.blocking_send(CliToServer::PaneAutopilotState {
+            session_id,
+            pane_id,
+            support: frame.support,
+            state: frame.state.map(Box::new),
+            reported_at: frame.reported_at,
+        });
+    }
+}
+
+/// The runtime directories of this project's OMP terminal tabs, which is
+/// where each one's heartbeat goes.
+fn omp_terminal_runtime_dirs(session_id: Uuid, pane_metas: &PaneMetas) -> Vec<PathBuf> {
+    pane_metas
+        .lock()
+        .map(|metas| {
+            metas
+                .iter()
+                .filter(|(_, meta)| meta.kind.is_terminal() && meta.provider == Provider::Omp)
+                .filter_map(|(pane_id, _)| {
+                    crate::omp_activity::pane_runtime_dir(session_id, *pane_id)
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// What this runtime tells the server it can do when it registers.
 ///
 /// `PROJECT_INSTANCES_CAPABILITY` only from a capable instance, which tags
@@ -11986,6 +12688,9 @@ fn cli_capabilities(
         shared::PI_TERMINAL_CAPABILITY.to_string(),
         shared::OMP_TERMINAL_CAPABILITY.to_string(),
         shared::OMP_QUESTION_CAPABILITY.to_string(),
+        // The build speaks the autopilot protocol. Whether one tab can run
+        // autopilot is data, reported per tab as its support value.
+        shared::OMP_TAB_AUTOPILOT_CAPABILITY.to_string(),
         shared::CLI_LIFECYCLE_CAPABILITY.to_string(),
     ];
     if pane_summaries {
@@ -12053,6 +12758,10 @@ async fn run_server_connection(
     instance: InstanceIdentity,
     store: ProjectStore,
     server_connection_generation: Arc<AtomicU64>,
+    // Whether this runtime is registered, when the server was last heard
+    // from, and whether it can control autopilot: what the heartbeat tells
+    // each OMP tab.
+    server_link: Arc<crate::omp_autopilot::ServerLink>,
     mut reboot_handoff: Option<(std::path::PathBuf, crate::pane_host::RebootHandoffMarker)>,
 ) -> Result<()> {
     use futures::{SinkExt, StreamExt};
@@ -12082,10 +12791,13 @@ async fn run_server_connection(
     };
     let (summary_result_tx, mut summary_result_rx) =
         tokio_mpsc::channel::<shared::PaneWorkSummaryGenerationResult>(1);
+    // Results of the blocking exchanges with an OMP tab's extension: question
+    // answers and autopilot receipts. They go out ahead of the project queue.
     let (omp_answer_tx, mut omp_answer_rx) = tokio_mpsc::channel::<CliToServer>(32);
 
     while !shutdown.load(Ordering::SeqCst) {
         let ws_url = format!("{}/ws/cli", server_url);
+        server_link.reconnecting();
 
         if connection_count > 0 {
             let _ = status_tx.send(PaneOutput {
@@ -12149,8 +12861,11 @@ async fn run_server_connection(
                                         Err(_) => continue,
                                     };
                                     match response {
-                                        ServerToCli::Registered { cli_id, .. } => {
-                                            return Some(Ok(cli_id));
+                                        ServerToCli::Registered {
+                                            cli_id,
+                                            negotiated_capabilities,
+                                        } => {
+                                            return Some(Ok((cli_id, negotiated_capabilities)));
                                         }
                                         ServerToCli::RegistrationFailed { reason } => {
                                             return Some(Err(reason));
@@ -12178,7 +12893,8 @@ async fn run_server_connection(
                     .await;
 
                 match registration_timeout {
-                    Ok(Some(Ok(cli_id))) => {
+                    Ok(Some(Ok((cli_id, negotiated_capabilities)))) => {
+                        server_link.registered(&negotiated_capabilities);
                         let _ = status_tx.send(PaneOutput {
                             text: format!("[Server: Connected ({})]", &cli_id.to_string()[..8]),
                             pane_id: shared::PANE_ID_DEADLOOP,
@@ -12526,6 +13242,12 @@ async fn run_server_connection(
                             }
                         }
                         msg = ws_receiver.next() => {
+                            if matches!(msg, Some(Ok(_))) {
+                                // Pongs included: the server answers this
+                                // CLI's own ping, so a live link is never
+                                // silent for long.
+                                server_link.frame_arrived();
+                            }
                             match msg {
                                 Some(Ok(Message::Text(text))) => {
                                     if let Ok(server_msg) = serde_json::from_str::<ServerToCli>(&text) {
@@ -13900,6 +14622,25 @@ async fn run_server_connection(
                                                         session_id: target_session, pane_id, tool_use_id,
                                                         request_id, accepted: result.is_ok(), pending,
                                                         error: result.err().map(|error| error.to_string()),
+                                                    });
+                                                });
+                                            }
+                                            ServerToCli::ControlPaneAutopilot {
+                                                session_id: target_session, pane_id, request_id, command,
+                                            } => {
+                                                let metas = pane_metas.clone();
+                                                let runtimes = terminal_panes.clone();
+                                                let result_tx = omp_answer_tx.clone();
+                                                // The exchange waits on the tab for seconds, and this task
+                                                // also serves every other message for the project.
+                                                tokio::task::spawn_blocking(move || {
+                                                    let receipt = control_pane_autopilot(
+                                                        session_id, target_session, pane_id,
+                                                        &request_id, &command, &metas, &runtimes,
+                                                    );
+                                                    let _ = result_tx.blocking_send(CliToServer::PaneAutopilotReceipt {
+                                                        session_id: target_session, pane_id, request_id,
+                                                        outcome: receipt.outcome, reason: receipt.reason,
                                                     });
                                                 });
                                             }

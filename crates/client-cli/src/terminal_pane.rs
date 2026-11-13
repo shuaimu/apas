@@ -173,6 +173,18 @@ impl TerminalRuntimeHandle {
             .unwrap_or(TerminalLifecycle::Unknown)
     }
 
+    /// Whether this CLI asked the runtime to end: a close, a provider reboot
+    /// or a project stop. An exit seen without it is the provider ending by
+    /// itself.
+    pub fn shutdown_requested(&self) -> bool {
+        let shutting_down = match self {
+            Self::Direct(handle) => &handle.shutting_down,
+            #[cfg(unix)]
+            Self::Hosted(handle) => &handle.shutting_down,
+        };
+        shutting_down.load(Ordering::SeqCst)
+    }
+
     pub fn state_message(&self, session_id: Uuid) -> CliToServer {
         match self {
             Self::Direct(handle) => handle.state_message(session_id),
@@ -1600,6 +1612,62 @@ mod tests {
                 ),
             );
             handle.shutdown();
+        });
+
+        match previous_runtime {
+            Some(value) => std::env::set_var("XDG_RUNTIME_DIR", value),
+            None => std::env::remove_var("XDG_RUNTIME_DIR"),
+        }
+    }
+
+    /// Autopilot reports a pause on a tab's behalf only when its agent ended
+    /// by itself. A close, a provider reboot and a project stop end it too,
+    /// and those must read as asked for.
+    #[test]
+    fn an_exit_this_cli_asked_for_is_told_apart_from_a_provider_ending_by_itself() {
+        let _env = crate::project::test_support::env_lock();
+        let runtime = tempfile::tempdir().unwrap();
+        let previous_runtime = std::env::var_os("XDG_RUNTIME_DIR");
+        std::env::set_var("XDG_RUNTIME_DIR", runtime.path());
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let (tx, mut rx) = tokio_mpsc::channel(64);
+            let spawn = |binary: &str| {
+                TerminalRuntimeHandle::Direct(
+                    TerminalHandle::spawn(
+                        1,
+                        Uuid::new_v4(),
+                        Uuid::new_v4(),
+                        &Provider::Claude,
+                        binary,
+                        "/tmp",
+                        &[],
+                        false,
+                        None,
+                        tx.clone(),
+                    )
+                    .expect("spawn pty"),
+                )
+            };
+
+            let ended = spawn("/bin/true");
+            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                while ended.lifecycle() != TerminalLifecycle::Exited {
+                    rx.recv().await.expect("the pty reader reports the exit");
+                }
+            })
+            .await
+            .expect("the provider never exited");
+            assert!(!ended.shutdown_requested());
+
+            let closed = spawn("/bin/cat");
+            assert!(!closed.shutdown_requested());
+            closed.shutdown();
+            assert!(closed.shutdown_requested());
         });
 
         match previous_runtime {

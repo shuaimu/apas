@@ -312,6 +312,7 @@ pub fn parse_claude(raw: &str) -> Vec<TurnRecord> {
             completes_work,
             question,
             answer,
+            autopilot_iteration: None,
         });
     }
     out
@@ -389,6 +390,7 @@ pub fn parse_codex(raw: &str) -> Vec<TurnRecord> {
             // the claude parser recognises questions.
             question: None,
             answer: None,
+            autopilot_iteration: None,
         });
     }
     out
@@ -490,6 +492,7 @@ pub fn parse_opencode(raw: &str) -> Vec<TurnRecord> {
             // the claude parser recognises questions.
             question: None,
             answer: None,
+            autopilot_iteration: None,
         });
     }
     turns
@@ -805,6 +808,79 @@ struct PiEntryLink<'a> {
     parent: Option<std::borrow::Cow<'a, str>>,
 }
 
+/// The autopilot journal of the OMP session being read, as far along the
+/// active branch as the reader has walked. It alone decides which user
+/// messages are iterations: text is never compared, because OMP stores the
+/// expanded text of a prompt.
+#[derive(Default)]
+struct AutopilotJournal {
+    /// The spec of each autopilot's start entry, for its prompt and limit.
+    specs: HashMap<Uuid, shared::AutopilotSpec>,
+    /// Autopilots whose next marker carries the prompt: after a start, and
+    /// after each resume.
+    prompt_due: HashSet<Uuid>,
+    /// Iteration entries that no message has paired with yet, oldest first.
+    unpaired: Vec<(Uuid, u64)>,
+}
+
+impl AutopilotJournal {
+    fn record(&mut self, data: &Value, session_id: Option<&str>) {
+        use crate::omp_autopilot::journal_kind;
+        use serde::Deserialize;
+
+        let Ok(entry) = crate::omp_autopilot::JournalEntry::deserialize(data) else {
+            return;
+        };
+        // A fork copies the journal of the session it was made from. Those
+        // entries describe that session, not this one.
+        if session_id != Some(entry.session_id.as_str()) {
+            return;
+        }
+        let autopilot = entry.autopilot_id;
+        match entry.kind.as_str() {
+            journal_kind::START => {
+                if let Some(spec) = entry.spec {
+                    self.specs.insert(autopilot, spec);
+                }
+                self.prompt_due.insert(autopilot);
+            }
+            journal_kind::RESUME => {
+                self.prompt_due.insert(autopilot);
+            }
+            journal_kind::ITERATION => {
+                if let Some(iteration) = entry.iteration {
+                    // One submission is outstanding at a time, so an earlier
+                    // entry of this autopilot that never paired never will.
+                    self.unpaired.retain(|(id, _)| *id != autopilot);
+                    self.unpaired.push((autopilot, iteration));
+                }
+            }
+            journal_kind::NOT_SUBMITTED => {
+                // OMP did not accept the submission: it cancels the
+                // iteration entry it follows.
+                if let Some(index) = self.unpaired.iter().rposition(|(id, _)| *id == autopilot) {
+                    self.unpaired.remove(index);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// The marker of an agent-attributed user message, when it pairs with
+    /// the nearest earlier iteration entry that is still unpaired.
+    fn pair(&mut self) -> Option<shared::AutopilotIterationMarker> {
+        let (autopilot_id, iteration) = self.unpaired.pop()?;
+        let spec = self.specs.get(&autopilot_id);
+        let prompt_due = self.prompt_due.remove(&autopilot_id);
+        Some(shared::AutopilotIterationMarker {
+            autopilot_id,
+            iteration,
+            limit: spec.and_then(|spec| spec.iteration_limit.value()),
+            prompt: spec.filter(|_| prompt_due).map(|spec| spec.prompt.clone()),
+        })
+    }
+}
+
 #[cfg(test)]
 fn parse_pi_snapshot(raw: &[u8], pane_id: u32) -> PiSnapshot {
     parse_pi_provider_snapshot(raw, pane_id, false)
@@ -850,6 +926,7 @@ fn parse_pi_provider_snapshot(raw: &[u8], pane_id: u32, omp: bool) -> PiSnapshot
         .and_then(|header| header["id"].as_str().map(str::to_owned));
     let mut omp_asks = HashMap::new();
     let mut pending_asks = HashSet::new();
+    let mut autopilot = AutopilotJournal::default();
     let mut halted = false;
     // Do not search backward through all visible turns for every tool-only
     // completion. Long autonomous runs may have no assistant text at all.
@@ -888,6 +965,12 @@ fn parse_pi_provider_snapshot(raw: &[u8], pane_id: u32, omp: bool) -> PiSnapshot
                     TranscriptActivity::PendingAnswer
                 });
             }
+            (Some("custom"), Some(crate::omp_autopilot::JOURNAL_ENTRY_TYPE)) if omp => {
+                autopilot.record(
+                    entry.get("data").unwrap_or(&Value::Null),
+                    snapshot.session_id.as_deref(),
+                );
+            }
             _ => {}
         }
         if kind != Some("message") {
@@ -908,6 +991,17 @@ fn parse_pi_provider_snapshot(raw: &[u8], pane_id: u32, omp: bool) -> PiSnapshot
                 } else {
                     TranscriptActivity::PendingAnswer
                 });
+                // An iteration is whatever the session's own journal says
+                // autopilot submitted. A message a person sent is never one,
+                // whatever was journaled before it.
+                if message.get("attribution").and_then(Value::as_str) == Some("agent") {
+                    if let Some(marker) = autopilot.pair() {
+                        let mut turn = omp_tool_turn(pane_id, pi_timestamp(&entry, message));
+                        turn.autopilot_iteration = Some(marker);
+                        out.push(turn);
+                        continue;
+                    }
+                }
                 let text = pi_text(content);
                 if text.trim().is_empty() {
                     continue;
@@ -924,6 +1018,7 @@ fn parse_pi_provider_snapshot(raw: &[u8], pane_id: u32, omp: bool) -> PiSnapshot
                     completes_work: false,
                     question: None,
                     answer: None,
+                    autopilot_iteration: None,
                 });
             }
             "assistant" => {
@@ -1027,6 +1122,7 @@ fn parse_pi_provider_snapshot(raw: &[u8], pane_id: u32, omp: bool) -> PiSnapshot
                     completes_work,
                     question: None,
                     answer: None,
+                    autopilot_iteration: None,
                 });
                 last_assistant = Some(out.len() - 1);
             }
@@ -1069,6 +1165,7 @@ pub(crate) fn omp_tool_turn(pane_id: u32, ts: String) -> TurnRecord {
         completes_work: false,
         question: None,
         answer: None,
+        autopilot_iteration: None,
     }
 }
 
@@ -1478,6 +1575,207 @@ fn codex_working_state(raw: &str) -> Option<bool> {
     None
 }
 
+/// An OMP session file with two autopilots in it, for the tests here and in
+/// the project runtime.
+///
+/// The entries have the shape OMP 18.20.0 writes: copied from sessions
+/// captured for this change's provider checks, with their own ids, parent
+/// links and `message.attribution`. The `apas-autopilot` entries are what the
+/// APAS extension appends; the provider checks confirmed how `pi.appendEntry`
+/// records a custom entry, not this journal's content, which is the contract
+/// in `omp_autopilot.rs`.
+#[cfg(test)]
+pub(crate) mod autopilot_fixture {
+    use serde_json::{json, Value};
+
+    pub(crate) const SESSION: &str = "01a1d594-4d99-729d-a0a1-0d838bc273a9";
+    /// The session this one was forked from. A fork copies its entries.
+    pub(crate) const FORKED_FROM: &str = "01a1d59b-9acf-71dc-aa87-55d2826a616e";
+    pub(crate) const FIRST: &str = "11111111-1111-4111-8111-111111111111";
+    pub(crate) const SECOND: &str = "22222222-2222-4222-8222-222222222222";
+    pub(crate) const FIRST_PROMPT: &str = "Check the build and fix what fails.";
+    pub(crate) const SECOND_PROMPT: &str = "Look at the alerts.\n\tPage nobody.";
+
+    pub(crate) struct Session {
+        lines: Vec<String>,
+        parent: Value,
+        entries: u32,
+    }
+
+    impl Session {
+        pub(crate) fn new() -> Self {
+            let title = json!({
+                "type": "title", "v": 1, "title": "Check the build", "source": "auto",
+                "updatedAt": "2026-11-13T15:44:41.119Z", "pad": "        ",
+            });
+            let header = json!({
+                "type": "session", "version": 3, "id": SESSION,
+                "timestamp": "2026-11-13T15:43:48.634Z",
+                "cwd": "/home/users/shuai/.cache/apas-autopilot-check/work",
+            });
+            let mut session = Self {
+                lines: vec![title.to_string(), header.to_string()],
+                parent: Value::Null,
+                entries: 0,
+            };
+            session.push(json!({
+                "type": "model_change", "model": "deepseek/deepseek-v4-flash",
+                "resolvedModelIsFallback": false,
+            }));
+            session.push(json!({
+                "type": "thinking_level_change", "thinkingLevel": "high", "configured": null,
+            }));
+            session
+        }
+
+        fn push(&mut self, mut entry: Value) {
+            self.entries += 1;
+            let id = format!("{:08x}", 0x7c02_b4bb + self.entries);
+            entry["id"] = json!(id);
+            entry["parentId"] = std::mem::replace(&mut self.parent, json!(id));
+            entry["timestamp"] = json!(format!("2026-11-13T15:44:{:02}.756Z", self.entries % 60));
+            entry["runtime"] = json!({ "version": "18.20.0" });
+            self.lines.push(entry.to_string());
+        }
+
+        /// One `apas-autopilot` entry of `autopilot` in `session`.
+        pub(crate) fn journal(&mut self, session: &str, autopilot: &str, kind: &str, more: Value) {
+            let mut data = json!({
+                "v": 1, "autopilot_id": autopilot, "session_id": session, "kind": kind,
+                "at": "2026-11-13T15:44:06Z",
+            });
+            for (key, value) in more.as_object().into_iter().flatten() {
+                data[key] = value.clone();
+            }
+            self.push(json!({ "type": "custom", "customType": "apas-autopilot", "data": data }));
+        }
+
+        /// A recorded prompt, behind the reminder entry OMP writes before it.
+        pub(crate) fn user(&mut self, attribution: &str, text: &str) {
+            let reminder = json!({
+                "conversation": "user:1794584646075:agent", "turn": "user:1794584646075:agent",
+                "reminder": "<system-reminder>\nToday: 2026-11-13\n</system-reminder>",
+                "placement": "prefix", "firstTurn": "d7d5f0de0ed049c1",
+            });
+            self.push(json!({
+                "type": "custom", "customType": "date-cwd-reminder", "data": reminder,
+            }));
+            let message = json!({
+                "role": "user", "content": [{ "type": "text", "text": text }],
+                "attribution": attribution, "timestamp": 1794584646075u64,
+            });
+            self.push(json!({ "type": "message", "message": message }));
+        }
+
+        pub(crate) fn assistant(&mut self, text: &str) {
+            self.push(json!({
+                "type": "custom", "customType": "system-prompt-digest", "data": "9a14208174d86536",
+            }));
+            let usage = json!({
+                "input": 8421, "output": 3, "cacheRead": 0, "cacheWrite": 0, "totalTokens": 8424,
+                "cost": {
+                    "input": 0.00126315, "output": 1.8e-06, "cacheRead": 0, "cacheWrite": 0,
+                    "total": 0.00126495,
+                },
+            });
+            let message = json!({
+                "role": "assistant", "content": [{ "type": "text", "text": text }],
+                "api": "openai-completions", "provider": "deepseek", "model": "deepseek-v4-flash",
+                "usage": usage, "stopReason": "stop", "timestamp": 1794584646759u64,
+                "responseId": "44878d81-a763-474e-b5ed-ac91534664be",
+                "duration": 1112.5, "ttft": 1096.5, "completedAt": 1794584647873u64,
+                "contextSnapshot": {
+                    "promptTokens": 8421, "nonMessageTokens": 6826, "toolSchemaTokens": 4595,
+                    "compactionEpoch": 0,
+                },
+            });
+            self.push(json!({ "type": "message", "message": message }));
+        }
+
+        pub(crate) fn file(&self) -> String {
+            self.lines.join("\n") + "\n"
+        }
+    }
+
+    /// The data of a start entry, less what [`Session::journal`] adds.
+    pub(crate) fn start(prompt: &str, iteration_limit: Value) -> Value {
+        json!({
+            "spec": {
+                "prompt": prompt, "repeat": { "kind": "after_each_turn" },
+                "iteration_limit": iteration_limit, "time_limit": { "kind": "none" },
+                "end_without_tool_call": false,
+            },
+            "started_at": "2026-11-13T15:44:06Z",
+        })
+    }
+
+    /// Two autopilots, a submission OMP dropped, a person's messages sent
+    /// during autopilot, a pause and resume, and the journal a fork copied.
+    pub(crate) fn session() -> String {
+        let mut session = Session::new();
+        let no_limit = json!({ "kind": "none" });
+
+        // Copied by the fork, with the prompt that autopilot had submitted.
+        // Its entries name the other session.
+        let copied = "33333333-3333-4333-8333-333333333333";
+        let instruction = "Copied instruction.";
+        session.journal(
+            FORKED_FROM,
+            copied,
+            "start",
+            start(instruction, no_limit.clone()),
+        );
+        session.journal(FORKED_FROM, copied, "iteration", json!({ "iteration": 4 }));
+        session.user("agent", instruction);
+        session.assistant("Copied reply.");
+        let left = json!({ "iterations": 4, "reason": "conversation_changed" });
+        session.journal(FORKED_FROM, copied, "end", left);
+
+        let twenty = json!({ "kind": "at_most", "value": 20 });
+        session.journal(SESSION, FIRST, "start", start(FIRST_PROMPT, twenty));
+        session.journal(SESSION, FIRST, "iteration", json!({ "iteration": 1 }));
+        // OMP stores the expanded text of a prompt, so it need not be the
+        // prompt that was submitted.
+        session.user("agent", "Check the build and fix what fails. (expanded)");
+        session.assistant("The build is green.");
+
+        // A person steers the tab between two iterations.
+        session.user("user", "Also update the changelog.");
+        session.assistant("Changelog updated.");
+
+        // A person's message is recorded after the iteration was journaled
+        // and before OMP records its prompt.
+        session.journal(SESSION, FIRST, "iteration", json!({ "iteration": 2 }));
+        session.user("user", "And bump the version.");
+        session.user("agent", FIRST_PROMPT);
+        session.assistant("Nothing failed.");
+
+        // OMP dropped the third submission. The person asks about it.
+        session.journal(SESSION, FIRST, "iteration", json!({ "iteration": 3 }));
+        session.journal(SESSION, FIRST, "not_submitted", json!({ "iteration": 3 }));
+        let interrupted = json!({ "iterations": 2, "reason": "interrupted" });
+        session.journal(SESSION, FIRST, "pause", interrupted);
+        session.user("user", "Why did you stop?");
+        session.assistant("You interrupted me.");
+
+        session.journal(SESSION, FIRST, "resume", json!({ "iterations": 2 }));
+        session.journal(SESSION, FIRST, "iteration", json!({ "iteration": 3 }));
+        session.user("agent", FIRST_PROMPT);
+        session.assistant("Still green.");
+        let stopped = json!({ "iterations": 3, "reason": "stopped" });
+        session.journal(SESSION, FIRST, "end", stopped);
+
+        // A second autopilot, with no iteration limit.
+        session.journal(SESSION, SECOND, "start", start(SECOND_PROMPT, no_limit));
+        session.journal(SESSION, SECOND, "iteration", json!({ "iteration": 1 }));
+        session.user("agent", SECOND_PROMPT);
+        session.assistant("No open alerts.");
+        session.journal(SESSION, SECOND, "iteration", json!({ "iteration": 2 }));
+        session.user("agent", SECOND_PROMPT);
+        session.file()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1506,6 +1804,258 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n")
             .into_bytes()
+    }
+
+    #[test]
+    fn an_iteration_is_a_marker_by_the_sessions_own_journal_and_never_a_user_turn() {
+        use autopilot_fixture::{FIRST, FIRST_PROMPT, SECOND, SECOND_PROMPT};
+
+        let raw = autopilot_fixture::session();
+        let snapshot = parse_pi_provider_snapshot(raw.as_bytes(), 7, true);
+        assert_eq!(
+            snapshot.session_id.as_deref(),
+            Some(autopilot_fixture::SESSION)
+        );
+
+        // What a person sent stays theirs, in order; so does a prompt that a
+        // fork copied from another session's autopilot. No iteration is here.
+        let said: Vec<&str> = snapshot
+            .turns
+            .iter()
+            .filter(|turn| turn.role == "user")
+            .map(|turn| turn.text.as_str())
+            .collect();
+        assert_eq!(
+            said,
+            [
+                "Copied instruction.",
+                "Also update the changelog.",
+                "And bump the version.",
+                "Why did you stop?",
+            ]
+        );
+
+        let marker = |autopilot: &str, iteration, limit, prompt: Option<&str>| {
+            shared::AutopilotIterationMarker {
+                autopilot_id: Uuid::parse_str(autopilot).unwrap(),
+                iteration,
+                limit,
+                prompt: prompt.map(str::to_string),
+            }
+        };
+        let markers: Vec<_> = snapshot
+            .turns
+            .iter()
+            .filter_map(|turn| turn.autopilot_iteration.clone())
+            .collect();
+        assert_eq!(
+            markers,
+            [
+                // The prompt comes from the start entry, not from the text
+                // OMP stored, and only on the first marker.
+                marker(FIRST, 1, Some(20), Some(FIRST_PROMPT)),
+                marker(FIRST, 2, Some(20), None),
+                // The dropped third submission has no marker. The one after
+                // the resume is the third, and carries the prompt again.
+                marker(FIRST, 3, Some(20), Some(FIRST_PROMPT)),
+                // No iteration limit: `limit` is left out.
+                marker(SECOND, 1, None, Some(SECOND_PROMPT)),
+                marker(SECOND, 2, None, None),
+            ]
+        );
+
+        // A marker is its own kind of turn: no text, no question, nothing a
+        // completion or the question replay would act on.
+        for turn in snapshot
+            .turns
+            .iter()
+            .filter(|turn| turn.autopilot_iteration.is_some())
+        {
+            assert!(turn.is_assistant() && turn.text.is_empty());
+            assert!(turn.question.is_none() && turn.answer.is_none());
+            assert!(!turn.completes_work && !turn.has_usage());
+        }
+        // Each one stands where its prompt was recorded, before the reply.
+        let order: Vec<&str> = snapshot
+            .turns
+            .iter()
+            .map(
+                |turn| match (&turn.autopilot_iteration, turn.role.as_str()) {
+                    (Some(_), _) => "iteration",
+                    (None, role) => role,
+                },
+            )
+            .collect();
+        assert_eq!(
+            order,
+            [
+                "user",
+                "assistant",
+                "iteration",
+                "assistant",
+                "user",
+                "assistant",
+                "user",
+                "iteration",
+                "assistant",
+                "user",
+                "assistant",
+                "iteration",
+                "assistant",
+                "iteration",
+                "assistant",
+                "iteration",
+            ]
+        );
+        // The second autopilot's last iteration is still running.
+        assert_eq!(snapshot.activity, Some(TranscriptActivity::Working));
+
+        // Pi has no APAS extension: the same file read as Pi's has no markers.
+        let pi = parse_pi_snapshot(raw.as_bytes(), 7);
+        assert!(pi
+            .turns
+            .iter()
+            .all(|turn| turn.autopilot_iteration.is_none()));
+    }
+
+    /// A session written by OMP 18.20.0 with the built extension loaded, on
+    /// 2026-11-13, with only its working directory shortened. Four autopilots
+    /// ran in it and nobody typed a message: one ended at its iteration limit;
+    /// one was paused, resumed and stopped; one was stopped at once in the
+    /// middle of its turn; and one was interrupted with Esc, resumed, and
+    /// ended when `/new` left the conversation.
+    const OMP_AUTOPILOT_CAPTURE: &str =
+        include_str!("testdata/omp-18.20.0-autopilot-session.jsonl");
+
+    #[test]
+    fn a_captured_autopilot_session_reads_as_iteration_markers_and_no_user_turns() {
+        let snapshot = parse_pi_provider_snapshot(OMP_AUTOPILOT_CAPTURE.as_bytes(), 7, true);
+        let markers: Vec<_> = snapshot
+            .turns
+            .iter()
+            .filter_map(|turn| turn.autopilot_iteration.as_ref())
+            .map(|marker| {
+                (
+                    marker.autopilot_id.to_string()[..8].to_string(),
+                    marker.iteration,
+                    marker.limit,
+                )
+            })
+            .collect();
+        let expected: Vec<(String, u64, Option<u64>)> = [
+            ("07396902", 1, Some(3)),
+            ("07396902", 2, Some(3)),
+            ("07396902", 3, Some(3)),
+            ("41eb2b26", 1, None),
+            ("41eb2b26", 2, None),
+            ("41eb2b26", 3, None),
+            ("d1954ac9", 1, None),
+            ("5eb22679", 1, None),
+            ("5eb22679", 2, None),
+            ("5eb22679", 3, None),
+        ]
+        .into_iter()
+        .map(|(id, iteration, limit)| (id.to_string(), iteration, limit))
+        .collect();
+        assert_eq!(markers, expected);
+
+        // OMP wrapped each prompt in a reminder entry and stored it as a user
+        // message; none of them is shown as something a person sent.
+        assert!(snapshot.turns.iter().all(|turn| turn.role != "user"));
+        // Each autopilot's first marker carries the prompt from its start
+        // entry, backticks and all.
+        let first = snapshot
+            .turns
+            .iter()
+            .find_map(|turn| turn.autopilot_iteration.as_ref())
+            .unwrap();
+        assert_eq!(
+            first.prompt.as_deref(),
+            Some("Run `date +%s` with the bash tool and reply with only the number.")
+        );
+        for id in ["41eb2b26", "d1954ac9", "5eb22679"] {
+            let marker = snapshot
+                .turns
+                .iter()
+                .filter_map(|turn| turn.autopilot_iteration.as_ref())
+                .find(|marker| marker.autopilot_id.to_string().starts_with(id))
+                .unwrap();
+            assert!(marker.prompt.as_deref().is_some_and(|p| p.contains("date +%s")));
+        }
+        // The replies are still there, between the markers.
+        assert!(snapshot
+            .turns
+            .iter()
+            .any(|turn| turn.autopilot_iteration.is_none() && turn.text == "1794594534"));
+
+        // The same bytes read as Pi's have no markers: Pi has no extension.
+        let pi = parse_pi_snapshot(OMP_AUTOPILOT_CAPTURE.as_bytes(), 7);
+        assert!(pi
+            .turns
+            .iter()
+            .all(|turn| turn.autopilot_iteration.is_none()));
+    }
+
+    #[test]
+    fn only_a_journaled_agent_message_pairs_and_a_dropped_submission_pairs_with_nothing() {
+        use autopilot_fixture::{start, Session, FIRST, SESSION};
+        use serde_json::json;
+
+        let limit = json!({ "kind": "at_most", "value": 5 });
+        let iterations = |session: &Session| -> Vec<u64> {
+            parse_pi_provider_snapshot(session.file().as_bytes(), 7, true)
+                .turns
+                .iter()
+                .filter_map(|turn| turn.autopilot_iteration.as_ref())
+                .map(|marker| marker.iteration)
+                .collect()
+        };
+
+        // An agent-attributed message with nothing journaled before it is
+        // some other extension's, and stays a message.
+        let mut session = Session::new();
+        session.user("agent", "Reply with exactly: pong");
+        assert!(iterations(&session).is_empty());
+
+        // "not submitted" cancels the entry it follows, so a later
+        // agent-attributed message has nothing to pair with.
+        session.journal(SESSION, FIRST, "start", start("go", limit));
+        session.journal(SESSION, FIRST, "iteration", json!({ "iteration": 1 }));
+        session.journal(SESSION, FIRST, "not_submitted", json!({ "iteration": 1 }));
+        session.user("agent", "go");
+        assert!(iterations(&session).is_empty());
+
+        // One entry pairs with one message. A person's message with the very
+        // text of the prompt is still a person's message.
+        session.journal(SESSION, FIRST, "iteration", json!({ "iteration": 1 }));
+        session.user("user", "go");
+        session.user("agent", "something else entirely");
+        session.user("agent", "go");
+        assert_eq!(iterations(&session), [1]);
+        let snapshot = parse_pi_provider_snapshot(session.file().as_bytes(), 7, true);
+        let said: Vec<&str> = snapshot
+            .turns
+            .iter()
+            .filter(|turn| turn.autopilot_iteration.is_none())
+            .map(|turn| turn.text.as_str())
+            .collect();
+        assert_eq!(said, ["Reply with exactly: pong", "go", "go", "go"]);
+
+        // A start entry whose spec this build cannot read still lets its
+        // iterations be told apart; only the prompt and the limit are unknown.
+        let mut newer = Session::new();
+        let mut unknown = start("go", json!({ "kind": "none" }));
+        unknown["spec"]["token_limit"] = json!(1000);
+        newer.journal(SESSION, FIRST, "start", unknown);
+        newer.journal(SESSION, FIRST, "iteration", json!({ "iteration": 1 }));
+        newer.user("agent", "go");
+        let snapshot = parse_pi_provider_snapshot(newer.file().as_bytes(), 7, true);
+        let marker = snapshot.turns[0].autopilot_iteration.as_ref().unwrap();
+        assert_eq!(
+            (marker.iteration, marker.limit, &marker.prompt),
+            (1, None, &None)
+        );
+        assert_eq!(snapshot.turns.len(), 1);
     }
 
     #[test]

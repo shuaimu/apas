@@ -118,7 +118,7 @@ pub fn submit_answer(
     )
 }
 
-fn pane_runtime_dir(project_id: Uuid, pane_id: u32) -> Option<PathBuf> {
+pub(crate) fn pane_runtime_dir(project_id: Uuid, pane_id: u32) -> Option<PathBuf> {
     Some(
         crate::config::Config::runtime_dir()
             .ok()?
@@ -357,9 +357,22 @@ fn submit_answer_at(
 }
 
 #[derive(Serialize, Deserialize)]
-struct Launch {
-    launch_id: Uuid,
+pub(crate) struct Launch {
+    pub(crate) launch_id: Uuid,
     session_dir: PathBuf,
+    /// What the extension written beside this record can do. A record from
+    /// before autopilot has none, and its agent needs a reboot to gain it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) features: Vec<String>,
+}
+
+/// The record of the pane's current provider launch, when the runtime
+/// directory and the record are private to this account.
+pub(crate) fn read_launch(runtime_dir: &Path) -> Option<Launch> {
+    if !private_metadata(runtime_dir, true) {
+        return None;
+    }
+    read_private_json(&runtime_dir.join(LAUNCH_FILE))
 }
 
 #[derive(Serialize, Deserialize)]
@@ -413,20 +426,33 @@ pub fn prepare(
     }
 }
 
-fn install(runtime_dir: &Path, session_dir: &Path) -> Result<(PathBuf, Launch)> {
+pub(crate) fn install(runtime_dir: &Path, session_dir: &Path) -> Result<(PathBuf, Launch)> {
     if !private_metadata(runtime_dir, true) {
         bail!("insecure OMP runtime directory {}", runtime_dir.display());
     }
     let launch = Launch {
         launch_id: Uuid::new_v4(),
         session_dir: fs::canonicalize(session_dir)?,
+        features: vec![crate::omp_autopilot::LAUNCH_FEATURE.to_string()],
     };
     // Invalidate the old generation before an old provider can publish another report.
     write_private_atomic(
         &runtime_dir.join(LAUNCH_FILE),
         &serde_json::to_vec(&launch)?,
     )?;
-    for name in [REPORT_FILE, QUESTION_FILE, SUBMISSION_FILE, ACK_FILE] {
+    // An unapplied pause or stop is not carried over to the new provider:
+    // its autopilot comes back paused anyway.
+    for name in [
+        REPORT_FILE,
+        QUESTION_FILE,
+        SUBMISSION_FILE,
+        ACK_FILE,
+        crate::omp_autopilot::CONTROLLER_FILE,
+        crate::omp_autopilot::REQUEST_FILE,
+        crate::omp_autopilot::STOP_FILE,
+        crate::omp_autopilot::ACK_FILE,
+        crate::omp_autopilot::STATE_FILE,
+    ] {
         match fs::remove_file(runtime_dir.join(name)) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -488,7 +514,10 @@ fn read_private_json<T: serde::de::DeserializeOwned>(path: &Path) -> Option<T> {
     read_private_json_bounded(path, MAX_REPORT_BYTES)
 }
 
-fn read_private_json_bounded<T: serde::de::DeserializeOwned>(path: &Path, limit: u64) -> Option<T> {
+pub(crate) fn read_private_json_bounded<T: serde::de::DeserializeOwned>(
+    path: &Path,
+    limit: u64,
+) -> Option<T> {
     if !private_metadata(path, false) {
         return None;
     }
@@ -512,7 +541,7 @@ fn read_private_json_bounded<T: serde::de::DeserializeOwned>(path: &Path, limit:
     serde_json::from_slice(&bytes).ok()
 }
 
-fn private_metadata(path: &Path, directory: bool) -> bool {
+pub(crate) fn private_metadata(path: &Path, directory: bool) -> bool {
     fs::symlink_metadata(path).is_ok_and(|metadata| {
         (if directory {
             metadata.is_dir()
@@ -523,18 +552,18 @@ fn private_metadata(path: &Path, directory: bool) -> bool {
 }
 
 #[cfg(unix)]
-fn private_owner(metadata: &fs::Metadata) -> bool {
+pub(crate) fn private_owner(metadata: &fs::Metadata) -> bool {
     use std::os::unix::fs::MetadataExt;
     metadata.uid() == unsafe { libc::geteuid() } && metadata.mode() & 0o077 == 0
 }
 
 #[cfg(not(unix))]
-fn private_owner(_metadata: &fs::Metadata) -> bool {
+pub(crate) fn private_owner(_metadata: &fs::Metadata) -> bool {
     false
 }
 
 #[cfg(target_os = "linux")]
-fn process_start(pid: i32) -> Option<String> {
+pub(crate) fn process_start(pid: i32) -> Option<String> {
     let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     let (_, fields) = stat.rsplit_once(") ")?;
     let mut fields = fields.split_whitespace();
@@ -551,11 +580,11 @@ fn process_start(pid: i32) -> Option<String> {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn process_start(_pid: i32) -> Option<String> {
+pub(crate) fn process_start(_pid: i32) -> Option<String> {
     None
 }
 
-fn write_private_atomic(path: &Path, body: &[u8]) -> Result<()> {
+pub(crate) fn write_private_atomic(path: &Path, body: &[u8]) -> Result<()> {
     let temporary = path.with_extension(format!("tmp-{}", Uuid::new_v4().simple()));
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
@@ -941,6 +970,59 @@ mod tests {
         fixture.provider.kill().unwrap();
         fixture.provider.wait().unwrap();
         assert_eq!(fixture.activity(), None);
+    }
+
+    #[test]
+    fn each_launch_records_the_autopilot_marker_and_clears_the_autopilot_files() {
+        use crate::omp_autopilot as autopilot;
+
+        let fixture = Fixture::new();
+        let launch = read_launch(&fixture.runtime).unwrap();
+        assert_eq!(launch.launch_id, fixture.report.launch_id);
+        assert_eq!(launch.features, [autopilot::LAUNCH_FEATURE]);
+        let record: serde_json::Value =
+            serde_json::from_slice(&fs::read(fixture.runtime.join(LAUNCH_FILE)).unwrap()).unwrap();
+        assert_eq!(record["features"], serde_json::json!(["autopilot_v1"]));
+
+        // An unapplied pause or stop is among them: it is not carried over.
+        let files = [
+            autopilot::CONTROLLER_FILE,
+            autopilot::REQUEST_FILE,
+            autopilot::STOP_FILE,
+            autopilot::ACK_FILE,
+            autopilot::STATE_FILE,
+        ];
+        for name in files {
+            write_private_atomic(&fixture.runtime.join(name), b"{}").unwrap();
+        }
+        let (_, relaunched) = install(&fixture.runtime, &fixture.session_dir).unwrap();
+        assert_ne!(relaunched.launch_id, launch.launch_id);
+        for name in files {
+            assert!(
+                !fixture.runtime.join(name).exists(),
+                "{name} survived a launch"
+            );
+        }
+    }
+
+    #[test]
+    fn a_launch_record_from_before_autopilot_still_reads_and_has_no_marker() {
+        let fixture = Fixture::new();
+        let old = serde_json::json!({
+            "launch_id": fixture.report.launch_id,
+            "session_dir": fs::canonicalize(&fixture.session_dir).unwrap(),
+        });
+        write_private_atomic(
+            &fixture.runtime.join(LAUNCH_FILE),
+            &serde_json::to_vec(&old).unwrap(),
+        )
+        .unwrap();
+        let launch = read_launch(&fixture.runtime).unwrap();
+        assert_eq!(launch.launch_id, fixture.report.launch_id);
+        assert!(launch.features.is_empty());
+        // Activity reporting, which predates the marker, is unaffected.
+        fixture.publish();
+        assert_eq!(fixture.activity(), Some(TranscriptActivity::PendingAnswer));
     }
 
     #[test]

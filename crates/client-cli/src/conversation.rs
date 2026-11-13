@@ -63,6 +63,12 @@ pub struct TurnRecord {
     /// confirmed by what the provider recorded, never by what we sent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub answer: Option<TurnAnswer>,
+    /// Set when this turn marks where an autopilot iteration starts. The
+    /// provider recorded the iteration's prompt as a user message; it is
+    /// published as this marker and never as something a person sent. Kept
+    /// apart from `question`, which the question replay owns.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub autopilot_iteration: Option<shared::AutopilotIterationMarker>,
 }
 
 /// A question turn, carrying the provider's own tool call verbatim so the web
@@ -121,6 +127,7 @@ mod tests {
             completes_work: false,
             question: None,
             answer: None,
+            autopilot_iteration: None,
         }
     }
 
