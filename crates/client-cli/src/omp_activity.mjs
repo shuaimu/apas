@@ -926,11 +926,15 @@ export default function apasActivity(omp) {
     // cannot show or stop this tab.
     function holdReason() {
       if (beat.seenAt === undefined || elapsed() - beat.seenAt > AUTOPILOT_HEARTBEAT_FRESH_MS) return "controller";
+      // What the last registration said, also while the connection is down:
+      // a tab held under a server that cannot control it stays held when that
+      // server goes away, until a server that can has registered.
+      if (beat.last.server_controls_autopilot !== true) return "server";
       if (beat.last.connected !== true) {
         // A heartbeat that does not say for how long cannot show a short outage.
         return beat.last.unreachable_secs <= AUTOPILOT_SERVER_UNREACHABLE_SECS ? undefined : "server";
       }
-      return beat.last.server_controls_autopilot === true ? undefined : "server";
+      return undefined;
     }
 
     function keep(result) {

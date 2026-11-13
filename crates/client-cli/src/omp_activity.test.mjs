@@ -1970,8 +1970,8 @@ test("autopilot holds without its controller, through a long outage and on a ser
     const f = await tab(t);
     await start(f);
     await run(f, { tools: 1 });
-    // A short outage holds nothing.
-    f.controller.report = { connected: false, unreachable_secs: 600, server_controls_autopilot: false };
+    // A short outage of a server that could control the tab holds nothing.
+    f.controller.report = { connected: false, unreachable_secs: 600 };
     f.beat();
     await f.advance(5000);
     assert.equal(f.omp.calls.length, 2);
@@ -1990,6 +1990,13 @@ test("autopilot holds without its controller, through a long outage and on a ser
     await run(f, { tools: 1 });
     // A server that was rolled back keeps the CLI connected but relays nothing.
     f.controller.report = { server_controls_autopilot: false };
+    f.beat();
+    await f.advance(20000);
+    assert.equal(f.omp.calls.length, 3);
+    assert.equal(condition(f), "holding:server");
+    // That server going away ends nothing: the hold stays until a server
+    // that can control the tab has registered, however short the outage.
+    f.controller.report = { connected: false, unreachable_secs: 15, server_controls_autopilot: false };
     f.beat();
     await f.advance(20000);
     assert.equal(f.omp.calls.length, 3);
