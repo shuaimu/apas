@@ -233,7 +233,7 @@ export function MobileAutopilotTerminalNotice({
             aria-hidden="true"
             className={`h-3.5 w-3.5 shrink-0 ${model.phase === "on" ? "text-indigo-300" : "text-amber-300"}`}
           />
-          <span className="min-w-0 truncate" title={`Autopilot · ${model.statusText}`}>
+          <span className="min-w-0 break-words line-clamp-2" title={`Autopilot · ${model.statusText}`}>
             Autopilot · {model.statusText}
           </span>
         </p>

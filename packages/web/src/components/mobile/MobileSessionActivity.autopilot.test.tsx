@@ -242,6 +242,10 @@ describe("starting autopilot from a phone", () => {
     fireEvent.click(button(openActions(), "Start autopilot"));
     expect(screen.queryByRole("dialog", { name: "Pane actions" })).toBeNull();
     const sheet = screen.getByRole("dialog", { name: "Start autopilot — OMP 1" });
+    // 16px fields, so iOS does not zoom the page on focus, and a prompt
+    // field that keeps its height in the scrolling sheet.
+    const promptField = within(sheet).getByLabelText("Prompt");
+    expect(promptField.className.split(" ")).toEqual(expect.arrayContaining(["text-[16px]", "shrink-0"]));
     // A bottom sheet, and the keyboard does not open over the statement.
     expect(sheet.className).toContain("rounded-t-[1.4rem]");
     expect(sheet.parentElement?.className).toContain("items-end");

@@ -131,6 +131,22 @@ describe("a tab that is not on autopilot", () => {
     expect(send).not.toHaveBeenCalled();
   });
 
+  it("keeps the prompt field's height when the dialog has to scroll", () => {
+    // The dialog is a scrolling column and the textarea is the one child
+    // that can shrink: in a browser it collapsed to a sliver on a phone and
+    // on a short window, hiding what was typed.
+    seed({ support: "supported" });
+    renderControl();
+    fireEvent.click(controlButton());
+
+    const dialog = screen.getByRole("dialog", { name: "Start autopilot — OMP 1" });
+    expect(dialog.className.split(" ")).toEqual(expect.arrayContaining(["flex-col", "overflow-y-auto"]));
+    const prompt = screen.getByLabelText("Prompt") as HTMLTextAreaElement;
+    expect(prompt.rows).toBe(5);
+    expect(prompt.className.split(" ")).toContain("shrink-0");
+    expect(prompt.className.split(" ")).toContain("text-sm");
+  });
+
   it("states what the mode is and is not before a start is sent", () => {
     seed({ support: "supported" });
     renderControl();

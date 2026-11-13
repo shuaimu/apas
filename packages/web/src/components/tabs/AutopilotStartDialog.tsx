@@ -12,8 +12,8 @@ import {
   type AutopilotStartForm,
 } from "@/lib/autopilot";
 
-const FIELD =
-  "rounded border border-zinc-600 bg-zinc-800 px-2 py-1 text-sm text-zinc-100 focus:outline-none focus:ring-2 focus:ring-indigo-500 disabled:opacity-50";
+const FIELD_BASE =
+  "rounded border border-zinc-600 bg-zinc-800 px-2 py-1 text-zinc-100 focus:outline-none focus:ring-2 focus:ring-indigo-500 disabled:opacity-50";
 
 /**
  * The start dialog for one tab's autopilot. It states what the mode is and is
@@ -46,6 +46,8 @@ export function AutopilotStartDialog({
   variant?: "dialog" | "sheet";
 }) {
   const sheet = variant === "sheet";
+  // iOS zooms the page when a focused field's text is smaller than 16px.
+  const FIELD = `${FIELD_BASE} ${sheet ? "text-[16px]" : "text-sm"}`;
   const [form, setForm] = useState<AutopilotStartForm>(() => autopilotStartForm(last));
   // The no-tool-call ending is proposed on only for "as soon as each turn
   // ends". The proposal follows the timing until the person decides.
@@ -109,7 +111,9 @@ export function AutopilotStartDialog({
           // On a phone the keyboard would cover the statement above, which is
           // to be read before anything is typed.
           autoFocus={!sheet}
-          className={`${FIELD} mb-3 resize-y`}
+          // It is the one child that can shrink, and the dialog scrolls: on a
+          // phone or a short window it would collapse to a sliver otherwise.
+          className={`${FIELD} mb-3 shrink-0 resize-y`}
         />
 
         <fieldset className="mb-3">
