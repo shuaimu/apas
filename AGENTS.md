@@ -1576,7 +1576,8 @@ runs it as its only runtime, which lists them again.
 
 ### Verification
 
-**Verified on 2026-11-12; not deployed.** At the final commit the Rust
+**Verified on 2026-11-12 and rolled out on 2026-11-13** (see "Rollout record"
+below). At the change's final commit the Rust
 workspace (shared 83, server 371 and CLI 562 tests), the protocol
 (54 tests and typecheck), web (883 tests, lint and typecheck) and native
 (113 tests, lint and typecheck) checks pass, as does
@@ -1613,13 +1614,55 @@ Chromium layout check of the chip at 360–390px, not by another two-host run.
 
 Not exercised:
 
-- the join route through nginx (check it at deploy, as above);
 - the interactive `[Y/n]` join prompt;
 - **Clone here** in a browser (only its protocol frames ran);
 - an older CLI's `SessionStart` rejected beside an instance;
 - the web's handling of a refused send (the UI disables sending to such a tab);
 - the start-then-add failure paths;
 - the native app on a device.
+
+### Rollout record
+
+On **2026-11-13** the change reached production in two steps.
+
+- **Server and web** have run release `20261113T013925Z` since 01:48 UTC. It
+  was built at e02c0f7, so it carries this change together with the worker
+  cutover, and it was deployed with that cutover, not separately. Its backups
+  are under `/opt/apas/backups/deploy-20261113T013925Z`.
+- **CLI:** `master` was pushed at e386a1d. No daemon restarts by itself. Each
+  machine takes the new CLI at its next reboot from the Machines page, which
+  stays its owner's action. Until then a machine keeps the October CLI and
+  cannot share a project with other machines.
+
+Checks at the pushed commit:
+
+- The join route answers `401` with JSON from `apas-server` through nginx.
+- The Rust workspace (1,072 tests), the protocol (57 tests and typecheck),
+  native (136 tests, lint and typecheck) and the web lint and typecheck pass.
+  The web tests passed 954 of 956 in a run that shared the host with two
+  builds. The two failures were worker-run component tests that timed out, and
+  they pass when run alone.
+- The CLI builds as the updater ships it (static musl, release).
+- On zoo-005 and zoo-006, with an isolated server and daemons beside
+  production, the end-to-end run passed: both machines ran one project, and a
+  tab was routed to its machine and took input.
+- Every restart phase of the pane-host scenario passed there too (183 checks):
+  three reboot paths of the secondary machine, a crash and restart, and a
+  reboot of the primary, each taking the same live terminal back.
+
+The last phase of that scenario failed, and the reason matters in operation.
+**A machine can look offline for about 30 seconds after its daemon is
+rebooted, and a Start, Stop or project-wide Close aimed at it in that window
+does not reach it.** In the run, a project-wide Close sent four seconds after
+rebooting zoo-005 stopped zoo-006's instance and left zoo-005's running.
+zoo-005's project had re-attached at once, but its daemon's own channel
+re-registered 30 s later; the other restarts took under 0.2 s. The suspected
+cause is the registry lock: `with_project_registry_lock` takes a blocking
+`flock` in the shared config directory, and on this NFS 4.1 mount a lock that
+the server denies is retried only after 30 s. That code predates this change
+and is in the October CLI too. The cause is not confirmed and nothing is
+fixed. Until it is, wait for a rebooted machine to show as online before
+acting on its projects.
 
 ## Terminal-pane history: read the provider's transcript
 
