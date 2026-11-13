@@ -3409,10 +3409,11 @@ async fn run_inner(
     {
         let metas_for_heartbeat = pane_metas.clone();
         let shutdown_for_heartbeat = shutdown.clone();
+        let server_link_for_heartbeat = server_link.clone();
         thread::spawn(move || {
             crate::omp_autopilot::run_controller_heartbeat(
                 || omp_terminal_runtime_dirs(session_id, &metas_for_heartbeat),
-                &server_link,
+                &server_link_for_heartbeat,
                 &shutdown_for_heartbeat,
                 crate::omp_autopilot::HEARTBEAT_INTERVAL,
             );
@@ -3463,6 +3464,7 @@ async fn run_inner(
         let pauses_for_turns = pane_pauses.clone();
         let stop_requests_for_turns = pane_stop_requests.clone();
         let connection_generation_for_turns = server_connection_generation.clone();
+        let server_link_for_turns = server_link.clone();
         let terminal_panes_for_turns = terminal_panes.clone();
         let opencode_for_turns = opencode_path.clone();
         let configured_opencode_for_turns = config.local.opencode_path.clone();
@@ -3635,6 +3637,7 @@ async fn run_inner(
                             process_group_id,
                             lifecycle,
                             connection_generation,
+                            server_link_for_turns.controls_autopilot(),
                         );
                     }
                     let live_working = omp_report
@@ -9585,7 +9588,10 @@ mod tests {
         }
 
         // One poll of the watcher for one tab, and the frame it sent, if any.
-        let mut poll = |pane_id: u32, lifecycle: Option<TerminalLifecycle>| {
+        let mut poll_as = |pane_id: u32,
+                           lifecycle: Option<TerminalLifecycle>,
+                           generation: u64,
+                           server_relays: bool| {
             let group = terminal_panes
                 .lock()
                 .unwrap()
@@ -9600,7 +9606,8 @@ mod tests {
                 Some(&runtime_of(pane_id)),
                 group,
                 lifecycle,
-                1,
+                generation,
+                server_relays,
             );
             let mut frames = Vec::new();
             while let Ok(frame) = server_rx.try_recv() {
@@ -9618,6 +9625,18 @@ mod tests {
             }
             assert!(frames.len() <= 1, "one poll sends at most one frame");
             frames.pop()
+        };
+        // A server that did not negotiate autopilot is sent nothing, whatever
+        // the tab says. Registering with one that did is a new generation,
+        // and that server is then told where the tab stands.
+        assert_eq!(poll_as(8, None, 1, false), None);
+        assert_eq!(poll_as(8, None, 1, false), None);
+        assert_eq!(
+            poll_as(8, None, 2, true),
+            Some((AutopilotSupport::NotReported, None))
+        );
+        let mut poll = |pane_id: u32, lifecycle: Option<TerminalLifecycle>| {
+            poll_as(pane_id, lifecycle, 2, true)
         };
         // Launch a tab's agent and let its extension report an autopilot.
         let launch = |pane_id: u32| {
@@ -12621,6 +12640,7 @@ fn relay_pane_autopilot(
     process_group_id: Option<i32>,
     lifecycle: Option<shared::TerminalLifecycle>,
     connection_generation: u64,
+    server_relays: bool,
 ) {
     use crate::omp_autopilot::AgentProcess;
 
@@ -12643,6 +12663,13 @@ fn relay_pane_autopilot(
         agent,
         connection_generation,
     ) {
+        // The tab is read either way, so that an exit is still told apart.
+        // A server that did not negotiate autopilot is sent nothing: it
+        // would log each frame as one it cannot parse. Every registration
+        // is a new generation, so a capable server is told everything then.
+        if !server_relays {
+            return;
+        }
         let _ = server_tx.blocking_send(CliToServer::PaneAutopilotState {
             session_id,
             pane_id,

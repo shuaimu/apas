@@ -932,6 +932,12 @@ impl ServerLink {
         self.connected.store(true, Ordering::SeqCst);
     }
 
+    /// Whether the server of the last registration relays autopilot. One that
+    /// does not cannot parse a state frame, and logs each one it is sent.
+    pub fn controls_autopilot(&self) -> bool {
+        self.controls_autopilot.load(Ordering::SeqCst)
+    }
+
     /// Any frame arrived from the server.
     pub fn frame_arrived(&self) {
         *self
