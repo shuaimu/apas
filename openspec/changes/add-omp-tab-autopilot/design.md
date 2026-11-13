@@ -1,10 +1,10 @@
 ## Context
 
-See `proposal.md` for the motivation. This document is a proposed design; no
-part of it is implemented, and no claim here was checked by running OMP. Every
-statement about OMP comes from reading its source at tag v18.18.9, the version
-installed on the zoo hosts, and is marked where it is an inference. The first
-task group checks those statements before anything is built on them.
+See `proposal.md` for the motivation. The statements about OMP were first read
+from its source at tag v18.18.9. On 2026-11-13 the first task group ran them
+against OMP 18.20.0, the version APAS launches on the zoo hosts, in an
+isolated OMP with a real model. "Provider checks" below lists what was seen,
+what was corrected, and what was not run.
 
 What exists and shapes the approach:
 
@@ -80,6 +80,51 @@ What OMP 18.18.9 offers an extension:
 - Managed timers (`ctx.setTimeout`, `ctx.setInterval`), `pi.appendEntry()` for
   journal entries, `ctx.sessionManager.getBranch()`, `ctx.ui.setStatus()`,
   `getEditorText()` and `setEditorText()`, and the SDK's exported `VERSION`.
+
+## Provider checks
+
+Run on 2026-11-13 on zoo-005, outside the repository
+(`~/.cache/apas-autopilot-check`): OMP 18.20.0's TUI in its own tmux server,
+with its own agent directory, a throwaway extension that logs events and takes
+commands, and DeepSeek V4 Flash through this machine's DeepSeek key. No
+production tab, daemon or OMP directory was touched.
+
+Seen as the design assumed:
+
+- An agent-attributed aside prompt starts a turn on an idle tab, is taken at
+  the next step boundary of a live run, and is recorded without a run when
+  that run is interrupted first.
+- Esc during a turn, the extension's own `ctx.abort()` and a cancelled `ask`
+  all end the turn `aborted` with "Interrupted by user".
+- A turn that leaves a background job ends with `willContinue` and
+  `awaitingAsyncWork`. The job's end starts a wake turn. After Esc on the wait
+  row the job's end records its result and starts nothing, with no event for
+  the Esc. `ctx.abort()` does not end such a wait.
+- A provider error ends the turn `error`, and OMP retries with a doubling
+  delay. Esc, or `ctx.abort()`, during a retry wait gives `auto_retry_end`
+  with "Retry cancelled".
+- Esc during an automatic compaction gives `auto_compaction_end` with
+  `aborted: true`.
+- A journal entry is on the active branch at `session_start` after
+  `--continue`. An entry appended in a before-handler lands in the
+  conversation being left, a fork copies it, and appending in
+  `session_before_branch` makes OMP refuse a `/btw` branch.
+- Goal, loop and plan mode are reported through `getState()`, `mode_changed`
+  and `goal_updated`. Autoresearch shows only as `init_experiment` among the
+  active tools.
+- `VERSION` can be imported in the compiled binary, and `setStatus` shows a
+  line in the terminal.
+- `ask` sends an HTML form with no question list, so the shipped question
+  bridge publishes nothing for it. Pending answer is still reported.
+
+Corrected in the decisions below: the plan-mode reason (decision 11), what a
+killed job looks like (decision 4), which command emits which session event
+(decision 6), and what the call's promise means (decision 3).
+
+Not run: retries running out; the "." shortcut, interrupt-and-send and a
+shell command typed in the terminal; a session reload; OMP's own loop
+repeating; a background job that never ends; a `/compact` that is cancelled
+during a turn; and any OMP version other than 18.20.0.
 
 ## Goals / Non-Goals
 
@@ -184,10 +229,10 @@ The design needs at least OMP 18.18.2: before it, `sendUserMessage` resolved
 when a prompt was dropped, so a dropped iteration would leave autopilot
 waiting for a turn that never comes. A check that each function exists cannot
 see that change, so the extension reads the SDK's `VERSION` as well as
-checking for every call it uses, `ctx.sessionModes` included. Task 1.6 finds
-the real minimum, which may be higher: this tag's changelog does not say
-when `awaitingAsyncWork`, the job snapshot's delivery fields and aside
-delivery for `sendUserMessage` arrived.
+checking for every call it uses, `ctx.sessionModes` included. Task 1.6
+confirmed 18.18.2 as the minimum from the source at that tag, which already
+has `awaitingAsyncWork`, the job snapshot's delivery fields and aside
+delivery for `sendUserMessage`. No version below 18.20.0 was run.
 
 Alternative rejected: drive `ctx.sessionModes` for goal mode and use the
 extension only for timed repeats. It keeps the racy stop and the invisible
@@ -314,8 +359,9 @@ event stream, so no end of that turn reaches the extension. OMP resumes the
 turn when the compaction commits or is a no-op and `compaction.autoContinue`
 is on. When it is cancelled or fails nothing follows, and autopilot stays
 "running an iteration" until a later run ends, a person pauses or stops it,
-or a time limit, if one was set, ends it. This is read from the source, and
-task 1.3 observes it.
+or a time limit, if one was set, ends it. Task 1.3 saw the committed case: no
+event for the cut turn, then `session_compact`, then a new `agent_start`. The
+cancelled case was not run.
 
 When the tab is settled and an iteration is due, the extension does the rest
 in one synchronous step from a managed timer. It reads its request files and
@@ -336,8 +382,15 @@ A submission is outstanding from the call until the extension sees OMP
 record its own user message (`message_start`, role user, attribution agent,
 not earlier than the call), or the call rejects, or the session is switched
 or reloaded, which discards a queued prompt without rejecting the call.
-Task 1.2 settles how its own message is told from OMP's other
-agent-attributed user messages.
+The extension knows its own message by role user, attribution agent, the
+same text and a timestamp not earlier than the call. The other
+agent-attributed messages OMP records, such as a background job's result and
+plan mode's context, have the role custom.
+
+The promise the call returns is not the signal. On an idle tab it resolves
+only when the whole run has ended, also when that run was aborted. Into a
+live run it resolves at once, seconds before the prompt is recorded. It
+rejects only for a dropped prompt.
 
 An iteration that OMP has accepted cannot be recalled. `ctx.isIdle()` is
 also true during a manual `/compact` or a handoff, which an extension cannot
@@ -350,8 +403,9 @@ run as well and reports "Stopped" when it has ended. OMP can also record the
 prompt without a run, when the run that was to take it is interrupted first;
 the prompt then stays in the conversation and the next turn answers it. The
 extension then reports "Stopped" once the message is recorded and
-`ctx.isIdle()` is true, and does not wait for an `agent_end`. This behaviour
-is inferred from the source and is the first thing task 1.2 checks.
+`ctx.isIdle()` is true, and does not wait for an `agent_end`. Task 1.2 saw
+exactly this: the aborted run's `agent_end`, then the prompt's
+`message_start` on an idle tab, and no run.
 
 A call that rejects while its submission is still outstanding is journaled
 as "not submitted" and uses up no iteration. OMP hands a dropped prompt back
@@ -368,11 +422,16 @@ the same default text, whether it came from Esc, from the extension's own
 in the session tree. So a drop without a refusal reason, which the
 extension's own abort did not cause, is treated as a person's interrupt and
 pauses autopilot (decision 4). A drop that carries a refusal reason, or a
-rejection with any other error, is a failed iteration. Task 1.2 checks what
-a rejection carries. A rejection that arrives after the extension saw its
-own message recorded journals nothing and changes no count: that iteration
-is classified once, by how its turn ended (decision 4), and as failed when
-no `turn_end` was seen.
+rejection with any other error, is a failed iteration. Task 1.2 produced one
+drop: a prompt submitted on an idle tab first triggered an automatic
+compaction, and cancelling that compaction rejected the call with
+`PromptDroppedError` and the default text, put the prompt in the input line,
+and printed an error line in the terminal. No `agent_start` followed. An
+abort a few milliseconds after the call does not drop the prompt: the run
+starts and is then aborted like any turn. A rejection that arrives after the
+extension saw its own message recorded journals nothing and changes no
+count: that iteration is classified once, by how its turn ended (decision
+4), and as failed when no `turn_end` was seen.
 
 A turn the person starts is not autopilot's. The extension sees its
 `agent_end` like any other and submits the next iteration when it is due and
@@ -465,9 +524,9 @@ prompt that appears nowhere.
      a run has started in between. Five seconds is the delay after a settle,
      and it covers a result that OMP has taken from its job list and not yet
      injected. This is what follows Esc on the wait row, once the jobs it
-     was waiting for have ended. A killed job looks the same to an
-     extension, so killing the job a turn was waiting for pauses autopilot
-     too.
+     was waiting for have ended. A job killed with `/jobs kill` is listed
+     as cancelled and also wakes nothing, so killing the job a turn was
+     waiting for pauses autopilot too.
   3. OMP reports a cancelled retry (`auto_retry_end` with `success: false`
      and the final error "Retry cancelled") that the extension did not
      cause: "Paused: the turn was interrupted". Esc during a retry wait, the
@@ -476,8 +535,8 @@ prompt that appears nowhere.
      is not a failed iteration.
   4. OMP reports a cancelled automatic compaction (`auto_compaction_end`
      with `aborted: true`), an automatic handoff included, that the
-     extension did not cause: the same pause. That OMP sends this for Esc is
-     read from the source, and task 1.3 observes it. A compaction or a
+     extension did not cause: the same pause. Task 1.3 saw OMP send this for
+     Esc, before the run's `agent_end`. A compaction or a
      handoff that a person started in the terminal emits no extension event,
      so Esc on one cannot be seen and does not pause autopilot.
   5. A submission is dropped with no refusal reason, and the extension did
@@ -494,8 +553,8 @@ interrupted or fails ends autopilot at its iteration limit.
 
 All of these are soft in one sense: none stops a turn already running. Stop
 now does, with `ctx.abort()`. What that call does about background work
-depends on the tab's state. This is read from the source, and task 1.3
-checks it.
+depends on the tab's state. Task 1.3 saw the second case; the first is read
+from the source.
 
 - When Stop now interrupts a running turn, the jobs that turn launched keep
   running. OMP then records their results in the conversation without
@@ -622,7 +681,8 @@ prompt. Every entry names its autopilot and its session, and the extension
 reads the active branch (`getBranch()`), ignoring entries of another
 session.
 
-The extension reads the latest entry of the current session back whenever
+The extension reads the latest `apas-autopilot` entry of the current session
+back (OMP appends custom entries of its own, such as `session_exit`) whenever
 the tab arrives in a conversation: at `session_start`, which fires once per
 process, and after every `session_switch`, `session_branch` and
 `session_tree`, through which a person returns with `/resume` or moves by a
@@ -679,8 +739,14 @@ OMP's reload is a switch to the same session file. The extension recognises
 it by the session file, which does not change, and keeps the autopilot. It
 resets its settled state and its outstanding-submission marker, because a
 reload aborts a running turn without an event reaching the extension and
-discards queued input. Task 1.4 checks these events, and that registering
-the `session_before_*` handlers has no side effect of its own.
+discards queued input. No built-in command reloads a session; only another
+extension's command can, so this was not run. Task 1.4 saw the other events
+as described, with one difference in naming: in 18.20.0 `/branch` rewinds
+inside the same file and emits the tree events, `/fork` is a switch with the
+reason `fork`, and only a promoted `/btw` answer emits the branch events.
+Registering the three `session_before_*` handlers only makes OMP emit them.
+The extension must not register `input`, `session_stop` or `user_bash`
+handlers, whose presence OMP does act on.
 
 Alternative rejected: keep the autopilot in `.apas`. `PaneConfig` is replaced
 wholesale by instance reports, is stripped by older CLIs, has about forty
@@ -1002,8 +1068,11 @@ supplies that.
 Autopilot refuses to start or resume while goal, loop or plan mode is in any
 state other than off, and pauses if one is switched on, because OMP's loop
 suppresses its own goal continuation and two drivers on one tab cannot both
-be right. Plan mode is in the rule for another reason: by reading, a prompt
-submitted in plan mode may not start a turn, and task 1.5 confirms it. The
+be right. Plan mode is in the rule for the same reason. Task 1.5 showed that a
+prompt submitted in plan mode does start a turn, and that plan mode then
+continues by itself and asks the person about the plan. `/plan` typed a
+second time pauses plan mode and does not leave it, so a paused plan mode
+also blocks autopilot. The
 same applies to autoresearch, a third self-continuing mode that
 `ctx.sessionModes` does not report. The extension detects it from its
 experiment tool `init_experiment` being among `pi.getActiveTools()` and
