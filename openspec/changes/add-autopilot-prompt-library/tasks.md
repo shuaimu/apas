@@ -19,7 +19,7 @@
 
 ## 4. Verification and rollout
 
-- [ ] 4.1 The complete gates: Rust workspace, static musl CLI build, protocol, web suite with lint, typecheck and build, native unchanged, `openspec validate --strict`
+- [x] 4.1 The complete gates: Rust workspace, static musl CLI build, protocol, web suite with lint, typecheck and build, native unchanged, `openspec validate --strict`
 - [x] 4.2 Look at the dialog with saved prompts in a browser at desktop and phone width (2026-11-14: read-only viewer with a stand-in list at 1440x900, 390 and 360 px; a real save and its receipt were not seen, because the viewer forwards no request)
 - [ ] 4.3 Run "APAS worker" on a real OMP tab in a scratch project with a whitepaper and an OpenSpec tree: a spec step, an implementation step, a report entry, an answered entry, a blocking question, and the two-turn ending
-- [ ] 4.4 Deploy server, then web, then push the CLI
+- [x] 4.4 Deploy server, then web, then push the CLI (2026-11-14: release 20261114T044521Z at ae14eb3; machines gain saving at their daemon reboot)

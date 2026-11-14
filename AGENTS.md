@@ -2720,6 +2720,18 @@ tabs may change them.
   "<host> runs an older APAS that cannot save prompts. Reboot <host> to update
   it." Deploy server, web, then CLI; each machine gains it at its daemon
   reboot.
+- **Rolled out on 2026-11-14.** Server and web release `20261114T044521Z`
+  (version 26.11.43, built at ae14eb3) since 04:46 UTC, backups under
+  `/opt/apas/backups/deploy-20261114T044521Z`; `master` pushed for the CLI.
+  All project instances and three daemons registered again, the server logged
+  no error and no frame it could not parse, ten public routes and 18 static
+  assets answered `200`, and viewers now negotiate
+  `project_autopilot_prompts_v1`. Gates at ae14eb3: shared 104 + 4 + 1,
+  server 463, CLI 610 (1 ignored), static musl build, protocol 77 and the
+  extension's 137, web 1,285 with lint, typecheck and build, native 136,
+  `openspec validate --all --strict`. Not yet seen: a real save and its
+  receipt (the browser check used a stand-in list and forwards no request),
+  and any machine saving before its daemon is rebooted onto this CLI.
 
 **Anyone who may type into the tab may start, pause, resume and stop its
 autopilot** (`check_session_runtime_access`, the check input uses). The agent
