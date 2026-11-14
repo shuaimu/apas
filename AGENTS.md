@@ -410,7 +410,7 @@ did not deploy, enable a policy, approve a real worker or satisfy those gates.
 Overview tab, and the prompt templates in the Start autopilot dialog, with the
 smaller fixes made beside them (the last `team_available` reads in server, web
 and CLI, and the one-machine reboot confirmation). The design record is
-`openspec/changes/refine-interactive-workspace/`.
+`openspec/changes/archive/2026-11-13-refine-interactive-workspace/`.
 
 - **Server** has run the new binary since 00:25 UTC, and **web** release
   `20261114T002349Z` (version 26.11.36, built at 58a548d) since 00:25 UTC.
@@ -2408,7 +2408,7 @@ since the provider catalog no longer has a Pi group. Its tab card reads
 
 Most of this section has been seen in unit tests only: no tab of this
 deployment uses Pi. See "What was checked for these four" near the top, and
-the change's record, `openspec/changes/refine-interactive-workspace/`.
+the change's record, `openspec/changes/archive/2026-11-13-refine-interactive-workspace/`.
 
 **Deploying it** follows the usual order: server, then web, then CLI. On its
 first start the new server drops `terminal:pi:official:default` from stored
@@ -2609,10 +2609,34 @@ Pane actions sheet. The dialog asks for:
   token or spend limit.
 - **Optionally, "end when an iteration makes no tool call"**.
 
-**The dialog has a Template control above the prompt** with three built-in
+**The dialog has a Template control above the prompt** with four built-in
 prompts and **My own text**:
 
-- **Implement from a design document**, the default. Each iteration closes one
+- **APAS worker**, the default since 2026-11-14. It keeps three layers in
+  line, one step per iteration. The **whitepaper** (`docs/whitepaper.md`, or
+  the files under `docs/whitepaper/` or `docs/book/`, or else the document the
+  README or `AGENTS.md` names as the whitepaper, book or main design) belongs
+  to a person: the agent reads it and never changes it. What it would change
+  there, its questions and the assumptions it made go to
+  `docs/apas-worker/report.md`, one entry each with a status line; the person
+  answers with an `Answer:` line under an entry, and the next iteration acts
+  on it first. A question that blocks all remaining work is also asked with
+  OMP's `ask` tool, which holds the turn, and so the autopilot, until someone
+  answers it in the Conversation view or the terminal; such an answer is
+  written into the report too, and a dismissed question is not taken as an
+  answer. An answer never lets the agent edit the whitepaper: an accepted
+  change waits until the person makes it. The **OpenSpec specs** are the
+  agent's to change as long as no requirement contradicts the whitepaper,
+  through OpenSpec changes checked with `openspec validate --strict`; details
+  the whitepaper leaves open are the agent's to decide. The
+  **implementation** is the agent's to change as long as it does what the
+  specs require. Nothing is removed only because the layer above does not
+  mention it. It never does a task outside the checkout (deploying, servers,
+  accounts) and installs nothing. Its notes between iterations are
+  `docs/apas-worker/progress.md`. The whitepaper rule is in the prompt only,
+  with a `git status` check before each commit that undoes only the agent's
+  own edit; a project that wants it enforced can add a commit hook.
+- **Implement from a design document**. Each iteration closes one
   gap between the design and the code, with tests and a commit. It uses
   `docs/design.md`, or else only the one document the README or `AGENTS.md`
   names as the project's current design, architecture or specification. With
@@ -2642,14 +2666,15 @@ The templates live in `packages/web/src/lib/autopilotTemplates.ts`, whose
 header says how such a prompt has to be written. The same text is submitted
 every iteration, so each describes one step. Each forbids pushing, rewriting
 history (stash, reset, clean, amend, rebase, skipping hooks) and touching
-changes the agent did not make. The first two also say where their notes are
-(`docs/autopilot-progress.md`, `TODO.md`) and how to mark a step that cannot
-be done, so the next iteration does not take it again. Keep the tests green
+changes the agent did not make. The first three also say where their notes are
+(`docs/apas-worker/progress.md`, `docs/autopilot-progress.md`, `TODO.md`)
+and how to mark a step that cannot be done, so the next iteration does not
+take it again. Keep the tests green
 keeps no notes and marks nothing: it relies on the conversation alone to skip
 a failure it already tried twice.
 A unit test puts every template through the start's own validation.
 
-**The first two templates end a run in two turns, and only if the
+**The first three templates end a run in two turns, and only if the
 no-tool-call option is ticked.** Finding out that nothing is left takes tool
 calls. So one turn finds nothing left and ends its reply with "Nothing is left
 to do."; the next sees that sentence, calls no tool and replies "Nothing has

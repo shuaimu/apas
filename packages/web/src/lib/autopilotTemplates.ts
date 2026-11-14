@@ -56,6 +56,42 @@ const NOT_YOURS_STEP = `${NOT_YOURS} and judge your own step by the checks those
 const GIVE_UP = "commit nothing that is broken, and take your own unfinished edits of this turn back out, only those";
 const COMMIT_RULES = "Commit only files that belong to this step: no temporary files, logs or build output. Leave changes you did not make as they are, whether they are committed or not: do not undo them and do not commit them. Do not stash, reset, clean, amend or rebase anything, and do not skip commit hooks. Do not push.";
 
+// The APAS worker keeps three layers in line, each owned differently: the
+// whitepaper (a person's; the agent reads it and never changes it), the
+// OpenSpec specs (the agent's, bound by the whitepaper) and the code (the
+// agent's, bound by the specs). What the agent would change in the
+// whitepaper goes to a report the person reads; a question that blocks the
+// work is also asked with the agent's question tool, which holds the turn,
+// and so the autopilot, until someone answers it.
+const WORKER_DIR = "docs/apas-worker";
+const WORKER_REPORT = `${WORKER_DIR}/report.md`;
+const WORKER_PROGRESS = `${WORKER_DIR}/progress.md`;
+
+const APAS_WORKER_PROMPT = `You are this project's APAS worker. Keep three layers in line with each other, and do one step of that work in this turn, then stop: the same prompt is sent again for the next step. Decide by yourself everything the whitepaper leaves open, taking the option that is honest, complete and cuts no corner. Ask the person only what the whitepaper's author alone can settle, as the paragraph after step 9 says.
+
+The three layers, and what you may do with each:
+- The whitepaper is the design a person writes and owns: docs/whitepaper.md, or the files under docs/whitepaper/ or docs/book/, all of them if several exist. If none exists, it is the document or folder the README or AGENTS.md names as the project's whitepaper, book or main design document, never anything under openspec/. You may read it and nothing else: never create, edit, move, reformat or delete anything in it. When you think it is wrong, unclear, contradicts itself or should say more, write that in ${WORKER_REPORT} instead. If docs/apas-worker lies inside the whitepaper, use apas-worker/ in its place.
+- The OpenSpec specs (openspec/specs and openspec/changes) are yours to write, change and reorganise, as long as no requirement contradicts the whitepaper. Details it leaves open are yours to decide.
+- The implementation (the code, its tests and its other documentation) is yours to change, as long as it does what the specs require and nothing they forbid.
+
+${END_GUARD}
+
+1. Find the whitepaper and read it in full. Read ${WORKER_REPORT} and ${WORKER_PROGRESS} if they exist: the report holds what you asked or proposed and the person's answers, the progress file holds the notes of earlier turns.
+2. If the person has answered an entry in the report (a line starting with "Answer:" under it) and you have not acted on it yet, acting on it is this turn's step: go to step 5. An answer never lets you edit the whitepaper: if it accepts a change there, write under the entry that the person makes it, and the entry stays open until the whitepaper says it. An entry the whitepaper now settles is answered too.
+3. Compare the specs with the whitepaper: a requirement that contradicts it, or something it asks for that no requirement covers. Then compare the code with the specs: a requirement or scenario that is missing, incomplete or wrong in it, or behaviour no spec covers. Read the files themselves; do not rely on the notes alone. Nothing is removed only because the layer above does not mention it: write the spec for uncovered behaviour, or, if that spec would contradict the whitepaper, ask about it in the report and leave the code as it is.
+4. Pick the single most valuable step. A failing check in committed code comes first, then a spec that contradicts the whitepaper, then code that contradicts a spec, then what is missing, the spec before the code; in each, a part that others build on comes before the parts built on it. Pass over a step the notes mark blocked, unless you have a new way to try it. A step that waits for an open entry in the report counts as blocked. If the step is too large for one turn, take its first part that is useful by itself and write the rest into the notes.
+5. Do it in its layer. A change to the specs is an OpenSpec change: create it with "openspec new change <name>", write the proposal, the spec deltas, a design where one helps, and tasks, and check it with "openspec validate <name> --strict --no-interactive", which must pass. A change to the code either carries out tasks of an open OpenSpec change, ticking each as it is done, or makes the code meet a requirement already in openspec/specs, named in the commit message. Once all of a change's tasks are done and its checks pass, archive it with "openspec archive <name> --yes", never with --skip-specs. Never do a task outside this checkout, such as deploying or changing a server or an account: leave it unticked; a change waiting only on such tasks counts as blocked. If the project has no openspec directory yet, this turn's step is "openspec init --tools none". A command this machine does not have blocks the step: do not install it. Implement completely: no stubs, no placeholder values, nothing left "for later" in the code, and tests that would fail without the change.
+6. ${CHECKS} ${NOT_YOURS_STEP}
+7. Rewrite ${WORKER_PROGRESS}: what this turn did, what is left in the order you would do it, which steps are blocked and why, and anything the next turn must know. Keep it short and current. Add to ${WORKER_REPORT} anything for the person: a proposed change to the whitepaper (where, what it says now, what you would write, why), a question, or an assumption later steps depend on, where the whitepaper allowed more than one reading. Start a new report with a line telling the person to answer an entry with a line starting "Answer:" under it. Give each entry a heading with the date and a short title, and a line "Status: open"; set it to resolved once you have acted on the answer. Do not repeat an open entry, and never delete one the person has not resolved.
+8. Check with git status that you added, changed, moved or removed nothing under the whitepaper in this turn. If you did, undo only your own edit, by hand, never with git checkout or restore: the person may have uncommitted edits there. Then commit the step with the notes, with a message that says what was done and which layer it was in. ${COMMIT_RULES} Changing committed specs and code is still your job here, and the person's answers are committed with your changes to the report.
+9. Say in two or three sentences what you did and what comes next.
+
+If a step needs an answer only the whitepaper's author can give, write the question in ${WORKER_REPORT} and commit it. If another step can go ahead, take that one instead. If none can, also ask it with your tool for asking the person questions if you have one, then wait for the answer, never twice for one entry. Write an answer given there under the entry as its "Answer:" line and act on it as step 2 says. A question dismissed, cancelled or timed out is not answered: never take a default or recommended option, and the step is blocked.
+
+If you cannot finish the step or make a check pass in this turn, ${GIVE_UP}. Write in ${WORKER_PROGRESS} what you tried and why it failed, mark that step blocked, and commit the notes alone.
+
+If no whitepaper exists, change nothing, say where you looked, and ${SAY_NOTHING_LEFT} If step 3 finds the three layers in line, or only blocked steps are left, skip steps 4 to 9: do not invent work and never write a whitepaper yourself. Record that in ${WORKER_PROGRESS} if it does not say so already, commit it, name the report entries that wait for an answer, and end your reply with the same sentence.`;
+
 const DESIGN_DOCUMENT_PROMPT = `Bring this project's implementation up to its design document. Do one step of that work in this turn, then stop: the same prompt is sent again for the next step. ${DECIDE}
 
 ${END_GUARD}
@@ -103,6 +139,13 @@ If you cannot fix the failure in this turn, say what you found, ${GIVE_UP}. If t
 
 /** The first one is what a tab with no earlier autopilot is offered. */
 export const AUTOPILOT_TEMPLATES: readonly AutopilotTemplate[] = [
+  {
+    id: "apas_worker",
+    name: "APAS worker",
+    description: `Keeps the OpenSpec specs in line with your whitepaper and the code in line with the specs, one step and one commit per iteration. It never edits the whitepaper: proposals and questions go to ${WORKER_REPORT}.`,
+    prompt: APAS_WORKER_PROMPT,
+    endsWithoutToolCall: true,
+  },
   {
     id: "design_document",
     name: "Implement from a design document",

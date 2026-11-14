@@ -71,6 +71,7 @@ describe("a tab with no earlier autopilot", () => {
     expect(view.prompt().value).toBe(DEFAULT_AUTOPILOT_TEMPLATE.prompt);
     // Every template by name, then the entry for the person's own text.
     expect(Array.from(view.template().options).map((option) => option.textContent)).toEqual([
+      "APAS worker",
       "Implement from a design document",
       "Work through TODO.md",
       "Keep the tests green",

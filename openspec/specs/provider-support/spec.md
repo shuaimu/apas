@@ -5,23 +5,28 @@
 Defines which model providers and API backends APAS actively supports, how retired providers are blocked, and how existing projects remain recoverable when provider support is removed.
 ## Requirements
 ### Requirement: The supported launch catalog is terminal-only
-APAS SHALL advertise exactly the supported Claude, Codex, OpenCode, Pi, and OMP terminal profiles plus the supported DeepSeek 4.1 Flash terminal profile. Structured `agent:*` profiles, Cursor Agent, Fable, MiniMax, GLM, DeepSeek Pro, and unknown profiles SHALL NOT be offered for new work.
+APAS SHALL advertise exactly the supported Claude, Codex, OpenCode, and OMP terminal profiles plus the supported DeepSeek 4.1 Flash terminal profile. Structured `agent:*` profiles, Cursor Agent, Fable, MiniMax, GLM, Pi, DeepSeek Pro, and unknown profiles SHALL NOT be offered for new work.
 
 #### Scenario: User opens a launch surface
 - **WHEN** a user opens a new-pane, shared-member default, or policy launch surface
-- **THEN** only Claude Terminal, Codex Terminal, OpenCode Terminal, Pi Terminal, OMP Terminal, and DeepSeek 4.1 Flash Terminal are presented when allowed by effective project policy
+- **THEN** only Claude Terminal, Codex Terminal, OpenCode Terminal, OMP Terminal, and DeepSeek 4.1 Flash Terminal are presented when allowed by effective project policy
 - **AND** no structured agent profile is presented
 
 #### Scenario: Operator reviews supported launch profiles
 - **WHEN** the system administrator or a cluster owner reads the supported-profile catalog or edits launch policy
 - **THEN** every catalog key begins with `terminal:`
-- **AND** the catalog contains exactly the six supported terminal profiles
+- **AND** the catalog contains exactly the five supported terminal profiles
 
 #### Scenario: Persisted structured-agent policy is upgraded
 - **WHEN** stored deployment, cluster, project, member-default, or provisioning policy contains a structured-agent launch profile
 - **THEN** Claude, Codex, OpenCode, and supported DeepSeek profiles are mapped to their terminal equivalents
 - **AND** Fable, Cursor Agent, retired, and unknown profiles are removed
 - **AND** policy ordering, explicit empty allowlists, and version monotonicity are preserved
+
+#### Scenario: A policy the client holds still lists the Pi profile
+- **WHEN** a launch surface reads an effective policy that still lists `terminal:pi:official:default`
+- **THEN** it does not present Pi as a choice
+- **AND** the other allowed profiles are presented as before
 
 ### Requirement: Retired provider launches fail closed at every boundary
 The server and project host SHALL independently reject any pane creation, restart, resume, model switch, or backend switch that identifies MiniMax or GLM through a provider value, backend value, model name, or retired launch-profile key. The system SHALL NOT silently map a retired configuration to another provider.
@@ -162,47 +167,107 @@ APAS SHALL support DeepSeek as one model, `deepseek-flash`, labelled DeepSeek 4.
 - **THEN** the server or project host rejects the launch or switch
 - **AND** APAS does not silently run another model as a fallback
 
-### Requirement: Pi is available as a policy-controlled terminal provider
-APAS SHALL offer Pi as a user-created terminal provider on supported launch surfaces when `terminal:pi:official:default` is permitted by the effective project policy. The project host SHALL run the configured Pi interactive CLI, SHALL deliver a fresh launch instruction through Pi's supported initial-message interface, and SHALL use Pi's exact session identity when launching and restoring the pane.
+### Requirement: Pi is retired as a provider
+APAS SHALL NOT create a Pi tab, switch a tab to Pi, or restart or resume a Pi tab. The server and the project host SHALL each refuse such a request, whether it names Pi by provider value or by the launch-profile key `terminal:pi:official:default`, with the sentence "Pi is no longer supported. Use OMP instead." A refused request SHALL start no Pi process and SHALL start no other provider in its place. The Pi terminal capability `terminal_pi_v1` SHALL NOT be advertised by a project CLI, and no decision SHALL depend on whether a CLI advertises it. `pi_path` SHALL NOT be a CLI setting.
 
-#### Scenario: User creates an allowed Pi terminal
-- **WHEN** the effective project policy permits the Pi terminal profile and a user selects Pi from a terminal launch surface
-- **THEN** APAS creates a terminal pane that hosts the real Pi interactive CLI
-- **AND** the pane receives terminal input, resize, lifecycle, and output through the same terminal transport used by other supported providers
+#### Scenario: A stale web client asks for a new Pi tab
+- **WHEN** a stale or modified web client submits a request to create a Pi terminal tab
+- **THEN** the server refuses it with "Pi is no longer supported. Use OMP instead."
+- **AND** no request is routed to a project host
 
-#### Scenario: Project policy disallows Pi terminal launch
-- **WHEN** a user attempts to create a Pi terminal while its launch profile is absent from the effective project allowlist
-- **THEN** the server and project host reject the launch
-- **AND** no Pi process is spawned
+#### Scenario: An older CLI still advertises the Pi capability
+- **WHEN** a request to create a Pi tab arrives for a project whose connected CLI still advertises `terminal_pi_v1`
+- **THEN** the server refuses it with the same sentence
+- **AND** nothing is routed to that CLI
 
-#### Scenario: Pi binary is unavailable
-- **WHEN** an authorized Pi terminal launch reaches a project host whose configured Pi binary cannot be executed
-- **THEN** the pane reports an actionable spawn error identifying the configured binary
-- **AND** other panes in the project remain available
+#### Scenario: A tab is switched to Pi
+- **WHEN** a client asks to switch an existing Claude, Codex, OpenCode or OMP tab to Pi
+- **THEN** the request is refused with "Pi is no longer supported. Use OMP instead."
+- **AND** the tab keeps its provider and keeps running
 
-### Requirement: Pi launches preserve the host's trust boundary
-APAS SHALL NOT automatically grant Pi trust over project-local resources. A Pi terminal launch SHALL NOT pass an approval flag that ignores the provider's project trust decision, so project-local settings and extensions remain subject to Pi's own trust flow.
+#### Scenario: An older server routes a Pi launch to an upgraded project host
+- **WHEN** an upgraded project host receives a request to create a Pi tab
+- **THEN** it refuses the request before starting any process
+- **AND** it reports "New pane refused. Pi is no longer supported. Use OMP instead."
 
-#### Scenario: Project-local Pi resources are present
-- **WHEN** a Pi terminal launches in a directory containing project-local Pi settings or extensions that the host has not trusted
-- **THEN** APAS does not represent those resources as trusted on the host's behalf
-- **AND** Pi's own trust behavior determines whether they load
+#### Scenario: A person asks the CLI for the retired setting
+- **WHEN** a person runs the CLI's configuration command to set or read `pi_path`
+- **THEN** the command fails with "pi_path is no longer a setting. Pi is no longer supported. Use OMP instead (omp_path)."
+- **AND** `pi_path` is not listed among the settings
 
-### Requirement: Pi terminal launches use the provider's exact session identity
-A fresh Pi terminal launch SHALL pin the pane's conversation identity as the provider session identity, and a restored pane SHALL open the exact retained session rather than selecting a session by directory recency. APAS SHALL NOT associate a Pi pane with a session belonging to another pane or working directory.
+### Requirement: Stored Pi data still parses
+The provider value `pi` SHALL remain valid for reading. A `.apas` file, a stored pane roster, a stored policy, and a frame from an older client that carry it SHALL load without an error and without converting the tab to another provider. Writing such a tab back SHALL keep the value `pi`. A CLI configuration file that still holds `pi_path` SHALL load, and the key SHALL be dropped the next time the file is saved.
 
-#### Scenario: Fresh Pi terminal launch
-- **WHEN** APAS starts a new Pi terminal pane
-- **THEN** the launched Pi process receives the pane's conversation identity as its exact session identity
-- **AND** subsequent recovery reads the session file carrying that identity
+#### Scenario: A project file holds a saved Pi tab
+- **WHEN** the CLI loads a `.apas` file that holds a Pi terminal tab beside an OMP tab
+- **THEN** loading completes and both tabs are listed with their own providers
+- **AND** saving the file again keeps the Pi tab with the value `pi`
 
-#### Scenario: Pi session file is retained
-- **WHEN** APAS restores a persisted Pi terminal pane whose exact session file exists
-- **THEN** it opens that exact session file
-- **AND** it does not choose a session by directory modification time
+#### Scenario: An older client sends a frame that names Pi
+- **WHEN** an upgraded server or client receives a compatible frame whose provider value is `pi`
+- **THEN** the frame parses
+- **AND** the receiver does not treat Pi as a supported provider
 
-#### Scenario: Pi session file is absent
-- **WHEN** APAS restores a persisted Pi terminal pane whose exact session file no longer exists
-- **THEN** it starts Pi with the same pinned session identity, creating a new session under that identity
-- **AND** it does not adopt an unrelated session in the same directory
+#### Scenario: A configuration file still holds the Pi path
+- **WHEN** the CLI loads a configuration file that holds `pi_path` beside `omp_path`
+- **THEN** the file loads and `omp_path` is read as before
+- **AND** the next save writes the file without `pi_path`
+
+### Requirement: A stored policy entry for the Pi profile is dropped
+On upgrade, the server SHALL remove `terminal:pi:official:default` from every stored launch-profile allowlist and SHALL keep the order and meaning of every other entry. A changed policy SHALL receive a newer version. Running the upgrade again SHALL change nothing. A policy write that lists the Pi profile SHALL be rejected as naming a retired profile. A stored or cached allowlist that still lists the Pi profile SHALL NOT make Pi launchable.
+
+#### Scenario: A stored default policy lists Pi
+- **WHEN** the server starts with a stored deployment policy that allows Claude, Pi and OMP terminal profiles
+- **THEN** the policy it keeps allows the Claude and OMP profiles, in that order
+- **AND** its version is newer than the stored one
+
+#### Scenario: The upgrade runs a second time
+- **WHEN** the server starts again with the policy the upgrade already wrote
+- **THEN** the policy and its version are unchanged
+
+#### Scenario: A project override lists only Pi
+- **WHEN** a stored project override allowlist holds only the Pi profile
+- **THEN** the upgrade produces an explicit empty allowlist, not inheritance and not allow-all
+
+#### Scenario: Someone writes the Pi profile back
+- **WHEN** an administrator or cluster owner saves a policy that lists `terminal:pi:official:default`
+- **THEN** the write is rejected as naming a retired launch profile
+- **AND** the stored policy is unchanged
+
+### Requirement: A tab of a retired provider takes no input
+The server SHALL refuse a typed message addressed to a tab whose provider is retired, SHALL store nothing for it and SHALL send nothing to a project CLI. For a saved Pi tab the refusal SHALL read "Pi is no longer supported. Use OMP instead. This tab is read-only." For a tab of another retired provider it SHALL read "This pane uses a retired provider and is read-only." Raw terminal keystrokes for such a tab SHALL be dropped without an error for each key. A request to switch the provider or model of a saved Pi tab SHALL be refused with "Tab N uses Pi, which is no longer supported. Close it and open an OMP tab.", where N is the tab's number, and SHALL leave the pane roster unchanged.
+
+#### Scenario: A message is typed to a saved Pi tab
+- **WHEN** a client sends a conversation message to a saved Pi tab
+- **THEN** the server answers "Pi is no longer supported. Use OMP instead. This tab is read-only."
+- **AND** nothing is added to the tab's history and nothing reaches a CLI
+
+#### Scenario: Keys are pressed in a saved Pi tab's terminal
+- **WHEN** a client sends raw terminal input for a saved Pi tab
+- **THEN** the server drops it and sends no error
+
+#### Scenario: A saved Pi tab is switched to OMP
+- **WHEN** a client asks to switch saved Pi tab 9 to OMP
+- **THEN** the server answers "Tab 9 uses Pi, which is no longer supported. Close it and open an OMP tab."
+- **AND** the roster still lists tab 9 as a Pi tab, no roster is broadcast, and nothing reaches a CLI
+
+#### Scenario: A message is typed to a saved MiniMax or GLM tab
+- **WHEN** a client sends a typed message to a tab whose provider is MiniMax or GLM
+- **THEN** the server answers "This pane uses a retired provider and is read-only."
+- **AND** nothing is stored or sent to a CLI
+
+### Requirement: Retiring Pi leaves OMP unchanged
+The retirement of Pi SHALL NOT change OMP. The OMP terminal profile `terminal:omp:official:default` SHALL remain in the supported catalog and in the default policy. An OMP tab SHALL be created, launched, restored and switched to as before, and SHALL still require a project CLI that advertises the OMP terminal capability.
+
+#### Scenario: A user creates an OMP tab after the retirement
+- **WHEN** the effective project policy permits the OMP terminal profile and the connected CLI advertises the OMP terminal capability
+- **THEN** a request to create an OMP tab is authorized and routed to that CLI
+
+#### Scenario: An older CLI cannot host OMP
+- **WHEN** a request to create an OMP tab arrives for a CLI that does not advertise the OMP terminal capability
+- **THEN** the server refuses it with an update-and-reconnect error, as before
+
+#### Scenario: An existing tab is switched to OMP
+- **WHEN** a client asks to switch a Codex tab to OMP on a capable CLI
+- **THEN** the switch is sent to that tab's CLI and the roster shows the tab as OMP
 

@@ -108,23 +108,24 @@ The mobile task-launch catalog SHALL include `terminal:opencode:official:default
 - **THEN** the server rejects the launch as no longer allowed
 - **AND** no OpenCode pane is created
 
-### Requirement: Mobile task launch supports capable Pi project hosts
-The mobile task-launch catalog SHALL include `terminal:pi:official:default` when effective project policy permits it. A mobile Pi task SHALL be routed only to a connected project CLI that advertises both the current mobile task-launch capability and explicit Pi terminal capability.
+### Requirement: Mobile task launch never offers or accepts Pi
+The mobile task-launch catalog SHALL NOT include `terminal:pi:official:default`, also when a stored or cached effective policy still lists that profile. A mobile task launch that names the Pi profile, or that resolves to Pi, SHALL be refused with "Pi is no longer supported. Use OMP instead.", whatever capabilities the connected project CLI advertises, and SHALL create no pane. Routing a mobile task SHALL NOT require or read a Pi terminal capability. An OMP mobile task SHALL still require a project CLI that advertises the current mobile task-launch capability and the OMP terminal capability.
 
-#### Scenario: Capable project host launches a Pi mobile task
-- **WHEN** an authorized mobile user selects an allowed Pi terminal profile and the connected project CLI advertises Pi terminal capability
-- **THEN** the server creates a Pi terminal pane for the exact project
-- **AND** passes the submitted instruction as the pane's initial Pi message
-- **AND** acknowledges the retained mobile launch operation only after the pane is reported
+#### Scenario: A policy still lists the Pi profile
+- **WHEN** the server builds the mobile task-launch catalog from an effective policy that lists `terminal:pi:official:default`
+- **THEN** the catalog contains no Pi profile
+- **AND** the other allowed profiles are listed as before
 
-#### Scenario: Older project host lacks Pi terminal capability
-- **WHEN** an authorized mobile user selects Pi but the connected project CLI does not advertise Pi terminal capability
-- **THEN** the server rejects the launch with an update-and-reconnect error
-- **AND** does not route a Pi pane request or report the operation as successful
-- **AND** compatible Claude, Codex, and OpenCode launches on that host are unaffected
+#### Scenario: An older mobile build submits the Pi profile
+- **WHEN** a mobile build that holds a profile list from before the retirement submits a launch with `terminal:pi:official:default`
+- **THEN** the server rejects the launch with "Pi is no longer supported. Use OMP instead."
+- **AND** no pane request is routed and the operation is not reported as successful
 
-#### Scenario: Effective policy removes Pi before submission
-- **WHEN** a stale mobile catalog still shows Pi but the effective project policy no longer permits its profile at submission time
-- **THEN** the server rejects the launch as no longer allowed
-- **AND** no Pi pane is created
+#### Scenario: A stale submission names another profile that is no longer allowed
+- **WHEN** a mobile build submits a profile that is not retired and that the effective policy no longer permits
+- **THEN** the server rejects the launch as no longer allowed, asking the user to choose another profile
+
+#### Scenario: OMP mobile launch on an older project host
+- **WHEN** an authorized mobile user selects OMP but the connected project CLI does not advertise OMP terminal capability
+- **THEN** the server rejects the launch with an update-and-reconnect error, as before
 

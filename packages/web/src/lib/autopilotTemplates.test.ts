@@ -23,24 +23,56 @@ describe("the built-in autopilot templates", () => {
     expect(AUTOPILOT_TEMPLATES.map((template) => template.id)).not.toContain(AUTOPILOT_OWN_TEXT);
   });
 
-  it("start with the design-document template, which is the default", () => {
+  it("start with the APAS worker, which is the default", () => {
     expect(DEFAULT_AUTOPILOT_TEMPLATE).toBe(AUTOPILOT_TEMPLATES[0]);
-    expect(DEFAULT_AUTOPILOT_TEMPLATE.id).toBe("design_document");
+    expect(DEFAULT_AUTOPILOT_TEMPLATE.id).toBe("apas_worker");
+    expect(DEFAULT_AUTOPILOT_TEMPLATE.name).toBe("APAS worker");
+    expect(DEFAULT_AUTOPILOT_TEMPLATE.endsWithoutToolCall).toBe(true);
     const { prompt } = DEFAULT_AUTOPILOT_TEMPLATE;
-    // A named default path and a fallback, one step per turn, a note the
-    // next turn finds, and the old bot's rule about deciding alone.
-    expect(prompt).toContain("Use docs/design.md if it exists.");
-    expect(prompt).toContain("use the project's main design document");
-    expect(prompt).toContain("Do one step of that work in this turn, then stop");
-    expect(prompt).toContain("Pick the single most valuable gap or defect.");
-    expect(prompt).toContain("docs/autopilot-progress.md");
-    expect(prompt).toContain("Do not ask me anything.");
+    expect(prompt).toContain("do one step of that work in this turn, then stop");
+    expect(prompt).toContain("Pick the single most valuable step.");
     expect(prompt).toContain("Never disable, skip, delete or weaken a test or a check");
-    expect(prompt).toContain("Commit the change and the notes together");
+    expect(prompt).toContain("Do not push.");
   });
 
-  it("does not let the default guess a design document, or work without one", () => {
-    const { prompt } = DEFAULT_AUTOPILOT_TEMPLATE;
+  it("gives the APAS worker three layers, and the whitepaper to the person alone", () => {
+    const prompt = autopilotTemplateById("apas_worker")!.prompt;
+    // Layer one: read only. Where it lives, and that nothing in it changes.
+    expect(prompt).toContain("docs/whitepaper.md, or the files under docs/whitepaper/ or docs/book/");
+    expect(prompt).toContain("You may read it and nothing else: never create, edit, move, reformat or delete anything in it.");
+    expect(prompt).toContain("never write a whitepaper yourself");
+    // Undoing an edit there must not throw away the person's own edits.
+    expect(prompt).toContain("Check with git status that you added, changed, moved or removed nothing under the whitepaper in this turn.");
+    expect(prompt).toContain("undo only your own edit, by hand, never with git checkout or restore");
+    // What the agent would change in it goes to the report, with answers.
+    expect(prompt).toContain("write that in docs/apas-worker/report.md instead");
+    expect(prompt).toContain('a line starting "Answer:"');
+    expect(prompt).toContain("An answer never lets you edit the whitepaper");
+    expect(prompt).toContain("never delete one the person has not resolved");
+    // Layer two: the specs may decide what the whitepaper leaves open.
+    expect(prompt).toContain("as long as no requirement contradicts the whitepaper. Details it leaves open are yours to decide.");
+    expect(prompt).toContain('"openspec validate <name> --strict --no-interactive"');
+    expect(prompt).toContain('"openspec archive <name> --yes", never with --skip-specs');
+    // Layer three: the code, bound by the specs.
+    expect(prompt).toContain("as long as it does what the specs require and nothing they forbid");
+    // Nothing is deleted because a layer above does not mention it.
+    expect(prompt).toContain("Nothing is removed only because the layer above does not mention it");
+    // A question only the author can answer may hold the turn, once.
+    expect(prompt).toContain("ask it with your tool for asking the person questions if you have one, then wait for the answer, never twice for one entry");
+    expect(prompt).toContain("never take a default or recommended option");
+    // Nothing outside the checkout, and nothing installed.
+    expect(prompt).toContain("Never do a task outside this checkout");
+    expect(prompt).toContain("do not install it");
+    expect(prompt).not.toContain("Do not ask me anything.");
+  });
+
+  it("keep the design-document template, which does not guess a document or work without one", () => {
+    const prompt = autopilotTemplateById("design_document")!.prompt;
+    expect(prompt).toContain("Use docs/design.md if it exists.");
+    expect(prompt).toContain("Do one step of that work in this turn, then stop");
+    expect(prompt).toContain("docs/autopilot-progress.md");
+    expect(prompt).toContain("Do not ask me anything.");
+    expect(prompt).toContain("Commit the change and the notes together");
     // A project can hold old plans and proposals for removed features: a file
     // that merely looks like a design is not built toward, unattended.
     expect(prompt).toContain("the one document that the README or AGENTS.md names as the project's current design, architecture or specification");
@@ -65,8 +97,9 @@ describe("the built-in autopilot templates", () => {
       const checked = autopilotStartSpec({ ...autopilotStartForm(), prompt: template.prompt });
       expect(checked.error).toBeUndefined();
       expect(checked.spec?.prompt).toBe(template.prompt);
-      // Well under the limit, so there is room to add to it.
-      expect(bytes(template.prompt)).toBeLessThan(AUTOPILOT_PROMPT_MAX_BYTES / 4);
+      // Well under the limit, so there is room to add to it. The APAS
+      // worker, which states three layers and a report, is the longest.
+      expect(bytes(template.prompt)).toBeLessThan(AUTOPILOT_PROMPT_MAX_BYTES / 2);
     },
   );
 
@@ -98,7 +131,7 @@ describe("the built-in autopilot templates", () => {
       // The turn that finds nothing left says the sentence the next turn looks for.
       expect(template.prompt.includes("\"Nothing is left to do.\"")).toBe(template.endsWithoutToolCall);
     }
-    expect(AUTOPILOT_TEMPLATES.map((template) => template.endsWithoutToolCall)).toEqual([true, true, false]);
+    expect(AUTOPILOT_TEMPLATES.map((template) => template.endsWithoutToolCall)).toEqual([true, true, true, false]);
   });
 
   it("skip the check only once after each real one, so a later run or a timed repeat looks again", () => {
@@ -123,7 +156,12 @@ describe("the built-in autopilot templates", () => {
   });
 
   it("say what to do with a step that cannot be done, so the next turn does not take it again", () => {
-    const design = DEFAULT_AUTOPILOT_TEMPLATE.prompt;
+    const worker = autopilotTemplateById("apas_worker")!.prompt;
+    expect(worker).toContain("Pass over a step the notes mark blocked, unless you have a new way to try it.");
+    expect(worker).toContain("mark that step blocked, and commit the notes alone");
+    expect(worker).toContain("If step 3 finds the three layers in line, or only blocked steps are left,");
+
+    const design = autopilotTemplateById("design_document")!.prompt;
     expect(design).toContain("Pass over a gap the notes mark blocked, unless you have a new way to try it.");
     expect(design).toContain("mark that gap blocked, and commit the notes alone");
     expect(design).toContain("If step 2 finds nothing left, or only blocked gaps,");
@@ -152,7 +190,8 @@ describe("the built-in autopilot templates", () => {
       expect(prompt).toContain("A failure that comes from uncommitted changes you did not make is not yours to fix: leave those changes alone, say so,");
     }
     // An earlier failure is the turn's step only when it is in committed code.
-    expect(DEFAULT_AUTOPILOT_TEMPLATE.prompt).toContain(
+    expect(autopilotTemplateById("apas_worker")!.prompt).toContain("A failing check in committed code comes first");
+    expect(autopilotTemplateById("design_document")!.prompt).toContain(
       "If a check already failed before your change and the failure is in committed code, fix that first",
     );
   });
