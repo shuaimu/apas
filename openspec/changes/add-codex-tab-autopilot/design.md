@@ -27,7 +27,7 @@ APAS acts as a second JSON-RPC client of the app-server that hosts the tab's con
 Alternatives:
 - **Stop hook** (proven to continue a session): rejected. The continuation stays inside one turn, so there is no `turn/completed` per iteration and no compaction between text-only iterations; it cannot start an iteration from idle (the first one, a resume, an interval); prompts over about 10 KB are cut to a preview and written to `$TMPDIR/hook_outputs` with mode 0644; any `-c hooks` setting forces the tab off the shared daemon; and `--dangerously-bypass-hook-trust` would also trust repository hooks, so it must never be used.
 - **`codex queue` / `thread/queue/*`**: rejected. A queued item is not dispatched after an Escape and stays in the queue for later; dispatch was about 15 s late; the API is experimental.
-- **Typing into the PTY**: rejected for the same reasons as on OMP (blind to the TUI's state).
+- **Typing into the PTY** and reading the rollout to observe turns: rejected by the owner on 2026-11-14 after a side-by-side comparison. It would work today for Codex, Claude and OpenCode with no protocol dependency, and Codex tabs have no approval prompts to land on, but it is blind to menus and to a person's half-typed text, cannot mark iterations, learns of idleness with a 3-second lag and cannot tell a failed turn apart. The control socket was chosen as the more informative and reliable route.
 
 ### 2. The loop runs in the project instance, with a private state file
 Unlike OMP, Codex has no place inside the tab to run code. The loop runs in the APAS project instance that hosts the tab, one task per Codex tab on autopilot, and keeps its state (spec, iteration count, failures, condition, the conversation id) in a private file in the pane's runtime directory, written by temp-and-rename. The state report and journal fields are the same `PaneAutopilotState` the OMP extension reports, so the server and web need no new frame shape.
@@ -71,4 +71,4 @@ Deploy server → web → CLI. Existing Codex tabs: under option A they gain aut
 ## Open Questions
 
 1. Option A or B (decision 5). Gated on task 1.
-2. Where task 1 may run against a real shared daemon without touching the owner's: a separate Unix account, a host where the owner's daemon is not running, or, with the owner's consent, a test daemon with its own `CODEX_HOME` on zoo-005, whose socket file would sit in the owner's `/tmp/codex-daemon-<uid>/` directory beside the real one.
+2. Where task 1 may run against a real shared daemon without touching the owner's: a separate Unix account, or, with the owner's consent, a test daemon with its own `CODEX_HOME` on zoo-005, whose socket file would sit in the owner's `/tmp/codex-daemon-<uid>/` directory beside the real one. The socket's name is a hash of the `CODEX_HOME` path, so it cannot collide with the owner's. zoo-006 is not an alternative: on 2026-11-14 the owner's daemons (0.160 and 0.165) were running there too.
