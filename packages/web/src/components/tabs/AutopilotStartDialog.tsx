@@ -1,10 +1,11 @@
 "use client";
 
 import { useEffect, useId, useRef, useState } from "react";
-import type { AutopilotPromptChange, AutopilotSpec, SavedAutopilotPrompt } from "@apas/protocol";
+import type { AutopilotPromptChange, AutopilotSpec } from "@apas/protocol";
 import { useStore } from "@/lib/store";
 import {
   autopilotLimitsStatement,
+  autopilotStartForm,
   autopilotStartSpec,
   autopilotStatement,
   AUTOPILOT_NO_LIMIT_TEXT,
@@ -12,61 +13,19 @@ import {
   type AutopilotStartForm,
 } from "@/lib/autopilot";
 import {
-  autopilotTemplateById,
   autopilotTemplateEndingNote,
-  autopilotTemplateStartForm,
-  AUTOPILOT_OWN_TEXT,
   AUTOPILOT_OWN_TEXT_DESCRIPTION,
   AUTOPILOT_OWN_TEXT_KEPT_TEXT,
-  AUTOPILOT_OWN_TEXT_LABEL,
-  AUTOPILOT_TEMPLATES,
-  DEFAULT_AUTOPILOT_TEMPLATE,
-  type AutopilotTemplate,
 } from "@/lib/autopilotTemplates";
 import {
   autopilotPromptChangeError,
   autopilotPromptsRequestText,
   AUTOPILOT_PROMPT_NAME_MAX_CHARS,
   AUTOPILOT_PROMPTS_UNREADABLE_TEXT,
-  defaultSavedAutopilotPrompt,
   findSavedAutopilotPrompt,
   foldAutopilotPromptName,
-  NO_PROJECT_AUTOPILOT_PROMPTS,
-  PROJECT_AUTOPILOT_PROMPTS_CAPABILITY,
 } from "@/lib/autopilotPrompts";
-
-/** An entry of the Template control: a prompt saved to the project, or a
- *  built-in template. */
-type PromptEntry =
-  | { key: string; kind: "saved"; saved: SavedAutopilotPrompt; prompt: string }
-  | { key: string; kind: "template"; template: AutopilotTemplate; prompt: string };
-
-const SAVED_KEY_PREFIX = "saved:";
-
-function savedEntryKey(name: string): string {
-  return `${SAVED_KEY_PREFIX}${foldAutopilotPromptName(name)}`;
-}
-
-const TEMPLATE_ENTRIES: PromptEntry[] = AUTOPILOT_TEMPLATES.map((template) => ({
-  key: template.id,
-  kind: "template",
-  template,
-  prompt: template.prompt,
-}));
-
-/**
- * The entry a prompt is, unchanged. The entry the person last chose wins
- * when several hold the same text; otherwise the project's prompts come
- * before the built-in ones, as the control lists them.
- */
-function entryForPrompt(entries: readonly PromptEntry[], prompt: string, preferred?: string): PromptEntry | undefined {
-  const chosen = preferred ? entries.find((entry) => entry.key === preferred) : undefined;
-  if (chosen && chosen.prompt === prompt) return chosen;
-  return entries.find((entry) => entry.prompt === prompt);
-}
-
-const FIELD_BASE =
-  "rounded border border-zinc-600 bg-zinc-800 px-2 py-1 text-zinc-100 focus:outline-none focus:ring-2 focus:ring-indigo-500 disabled:opacity-50";
+import { PromptTemplateSelect, PROMPT_FIELD_BASE as FIELD_BASE, savedEntryKey, usePromptChoice } from "./PromptTemplateChoice";
 
 /**
  * The start dialog for one tab's autopilot. It states what the mode is and is
@@ -115,52 +74,17 @@ export function AutopilotStartDialog({
   const FIELD = `${FIELD_BASE} ${sheet ? "text-[16px]" : "text-sm"}`;
   const ACTION = `rounded border border-zinc-600 bg-zinc-800 px-2 text-zinc-100 hover:bg-zinc-700 disabled:cursor-not-allowed disabled:opacity-50 ${sheet ? "py-1.5 text-sm" : "py-0.5 text-xs"}`;
 
-  // The project's saved prompts, only where the server can carry them. A
-  // viewer whose server cannot is offered exactly the built-in templates.
-  const promptsAvailable = useStore((state) =>
-    sessionId !== undefined && state.negotiatedCapabilities.has(PROJECT_AUTOPILOT_PROMPTS_CAPABILITY));
-  const reportedList = useStore((state) => (sessionId ? state.projectAutopilotPrompts[sessionId] : undefined));
   const promptRequests = useStore((state) => state.autopilotPromptRequests);
   const updateAutopilotPrompts = useStore((state) => state.updateAutopilotPrompts);
-  const list = promptsAvailable ? reportedList ?? NO_PROJECT_AUTOPILOT_PROMPTS : NO_PROJECT_AUTOPILOT_PROMPTS;
-  const savedPrompts = list.received && !list.unreadable ? list.prompts : [];
-  const projectDefault = defaultSavedAutopilotPrompt(list);
-  const entries: PromptEntry[] = [
-    ...savedPrompts.map((saved): PromptEntry => ({ key: savedEntryKey(saved.name), kind: "saved", saved, prompt: saved.prompt })),
-    ...TEMPLATE_ENTRIES,
-  ];
+  // The prompt, its Template control and the project's saved prompts, by the
+  // rules the loop prompt dialog shares: a tab with no earlier autopilot is
+  // offered the project's default saved prompt, else the default template.
+  const choice = usePromptChoice({ sessionId, initialPrompt: last?.prompt });
+  const { list, savedPrompts, projectDefault, promptsAvailable, template, selectedSaved, originSaved, ownTextSetAside } = choice;
 
-  const [form, setForm] = useState<AutopilotStartForm>(() => autopilotTemplateStartForm(last, projectDefault?.prompt));
-  // The entry the person last chose, or the one the dialog opened on. It
-  // only breaks ties between entries with the same text, and says which
-  // saved prompt an edited text came from.
-  const [chosenKey, setChosenKey] = useState<string | undefined>(() =>
-    !last && projectDefault ? savedEntryKey(projectDefault.name) : undefined);
-  // The Template control is not state of its own: it names the entry the
-  // prompt field holds unchanged, else the person's own text. So it cannot
-  // disagree with what will be sent.
-  const current = entryForPrompt(entries, form.prompt, chosenKey);
-  const template = current?.kind === "template" ? current.template : undefined;
-  // What the person last wrote or changed in the field, which is also the
-  // last autopilot's prompt until then. Choosing an entry leaves it alone,
-  // so the own-text entry brings it back. It never holds an entry's exact
-  // text: the own-text entry would then put that entry back and seem to
-  // do nothing.
-  const [ownText, setOwnText] = useState(() => (current ? "" : form.prompt));
-  // Nothing of the person's is set aside while the field shows it.
-  const ownTextSetAside = current !== undefined && ownText.trim() !== "" && ownText !== form.prompt;
-
-  // The project's list can arrive after the dialog opened, as right after a
-  // reconnect. A tab with no earlier autopilot then gets the project's
-  // default, unless the person has already chosen or written something.
-  const touched = useRef(false);
-  useEffect(() => {
-    if (last || touched.current || !projectDefault) return;
-    setForm((value) => value.prompt === DEFAULT_AUTOPILOT_TEMPLATE.prompt
-      ? { ...value, prompt: projectDefault.prompt }
-      : value);
-    setChosenKey(savedEntryKey(projectDefault.name));
-  }, [last, projectDefault]);
+  // Timing, limits and the no-tool-call option. The prompt is the choice's.
+  const [fields, setFields] = useState<AutopilotStartForm>(() => autopilotStartForm(last));
+  const form: AutopilotStartForm = { ...fields, prompt: choice.prompt };
 
   // Saving to the project. The outcome line answers the last change asked
   // for here; a new one replaces it. Nothing is sent again by itself.
@@ -182,11 +106,8 @@ export function AutopilotStartDialog({
   const promptsPending = promptsRequest?.status === "pending";
   const saveFormShown = saveOpen
     && !(promptsRequest?.change.kind === "save" && promptsRequest.status === "saved");
-  const selectedSaved = current?.kind === "saved" ? current.saved : undefined;
-  // The saved prompt the field's text came from, also once it is edited:
-  // saving it again under that name is how a saved prompt is changed.
-  const originSaved = selectedSaved
-    ?? (chosenKey ? savedPrompts.find((saved) => savedEntryKey(saved.name) === chosenKey) : undefined);
+  // `originSaved` is the saved prompt the field's text came from, also once
+  // it is edited: saving it again under that name is how one is changed.
   const replacing = findSavedAutopilotPrompt(savedPrompts, saveName);
   const isDefault = selectedSaved !== undefined && projectDefault !== undefined
     && foldAutopilotPromptName(projectDefault.name) === foldAutopilotPromptName(selectedSaved.name);
@@ -199,25 +120,17 @@ export function AutopilotStartDialog({
   const templateId = useId();
   const templateNoteId = useId();
   const saveNameId = useId();
-  const update = (patch: Partial<AutopilotStartForm>) => {
+  const update = (patch: Partial<Omit<AutopilotStartForm, "prompt">>) => {
     setError(null);
-    setForm((current) => ({ ...current, ...patch }));
+    setFields((current) => ({ ...current, ...patch }));
   };
   const chooseTemplate = (value: string) => {
-    touched.current = true;
     setConfirmingDelete(false);
-    const entry = entries.find((candidate) => candidate.key === value);
-    // Text that is no entry's is the person's own, also when the saved
-    // prompt it was has since been deleted: keep it for the own-text entry.
-    if (!current && entry) setOwnText(form.prompt);
-    // The own-text entry is no saved prompt: nothing chosen is then a saved
-    // prompt to pre-fill a save with, or to replace by accident. An edit of
-    // a saved prompt's text keeps naming it, since that is how one is changed.
-    setChosenKey(entry?.key);
+    setError(null);
     // The prompt only: timing, limits and the no-tool-call option stay as
     // the person left them, and the note under the control says what the
     // template's ending needs.
-    update({ prompt: entry?.prompt ?? autopilotTemplateById(value)?.prompt ?? (current ? ownText : form.prompt) });
+    choice.choose(value);
   };
 
   const sendPromptsChange = (change: AutopilotPromptChange) => {
@@ -251,7 +164,7 @@ export function AutopilotStartDialog({
     const sent = sendPromptsChange({ kind: "save", name, prompt: form.prompt, replace: replacing !== undefined });
     // Once the list has it, the control names it.
     if (!sent) return;
-    setChosenKey(savedEntryKey(name));
+    choice.setChosenKey(savedEntryKey(name));
     // The Save button is disabled while the change is pending, which would
     // drop its focus: the name field stays, read-only, beside "Saving…".
     saveNameRef.current?.focus();
@@ -333,36 +246,13 @@ export function AutopilotStartDialog({
             the sheet's whole width for the longest name. */}
         <div className={`mb-1 flex shrink-0 ${sheet ? "flex-col gap-1" : "items-center gap-2"}`}>
           <label htmlFor={templateId} className="text-xs text-zinc-300">Template</label>
-          <select
-            ref={templateRef}
+          <PromptTemplateSelect
+            choice={{ ...choice, choose: chooseTemplate }}
+            selectRef={templateRef}
             id={templateId}
-            value={current?.key ?? AUTOPILOT_OWN_TEXT}
-            aria-describedby={templateNoteId}
-            onChange={(event) => chooseTemplate(event.target.value)}
+            describedBy={templateNoteId}
             className={`${FIELD} min-w-0 ${sheet ? "w-full" : "flex-1"}`}
-          >
-            {promptsAvailable ? (
-              <>
-                {savedPrompts.length > 0 && (
-                  <optgroup label="This project">
-                    {savedPrompts.map((saved) => (
-                      <option key={savedEntryKey(saved.name)} value={savedEntryKey(saved.name)}>
-                        {projectDefault && savedEntryKey(projectDefault.name) === savedEntryKey(saved.name)
-                          ? `${saved.name} (default)`
-                          : saved.name}
-                      </option>
-                    ))}
-                  </optgroup>
-                )}
-                <optgroup label="Built in">
-                  {AUTOPILOT_TEMPLATES.map((entry) => <option key={entry.id} value={entry.id}>{entry.name}</option>)}
-                </optgroup>
-              </>
-            ) : (
-              AUTOPILOT_TEMPLATES.map((entry) => <option key={entry.id} value={entry.id}>{entry.name}</option>)
-            )}
-            <option value={AUTOPILOT_OWN_TEXT}>{AUTOPILOT_OWN_TEXT_LABEL}</option>
-          </select>
+          />
         </div>
         <div id={templateNoteId} data-testid="autopilot-template-note" className="mb-2 space-y-1 text-xs text-zinc-400">
           {template ? (
@@ -525,12 +415,8 @@ export function AutopilotStartDialog({
           id={promptId}
           value={form.prompt}
           onChange={(event) => {
-            // An edited template is the person's own text from here on. An
-            // edit taken back, so that the field holds a template's exact
-            // text again, leaves nothing of the person's to keep.
-            touched.current = true;
-            setOwnText(entryForPrompt(entries, event.target.value) ? "" : event.target.value);
-            update({ prompt: event.target.value });
+            setError(null);
+            choice.edit(event.target.value);
           }}
           rows={5}
           // On a phone the keyboard would cover the statement above, which is

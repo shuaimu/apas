@@ -941,8 +941,9 @@ describe("refused input", () => {
   it("settles a terminal delivery with the server's reason instead of leaving it unconfirmed", async () => {
     const ws = await openSocket();
     negotiate();
-    expect(useStore.getState().sendTerminalConversationMessage(PANE, "Run the suite.")).toEqual({ success: true });
+    const result = useStore.getState().sendTerminalConversationMessage(PANE, "Run the suite.");
     const [input] = sentFrames(ws, "terminal_conversation_input");
+    expect(result).toEqual({ success: true, sendId: input.client_msg_id });
     deliver(ws, refusalFor(input.client_msg_id));
 
     const [delivery] = useStore.getState().pendingTerminalDeliveries;

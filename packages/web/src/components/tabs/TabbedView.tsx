@@ -44,6 +44,8 @@ import {
 } from "@/lib/autopilot";
 import { useAutopilotNegotiated, useSessionAutopilotStatuses } from "@/lib/useAutopilot";
 import { AutopilotControl } from "./AutopilotControl";
+import { LoopPromptControl } from "./LoopPromptControl";
+import { LOOP_PROMPT_OFFLINE_TEXT, paneCanHaveLoopPrompt } from "@/lib/loopPrompt";
 import { AutopilotRequestNotices, AutopilotStatusLine } from "./AutopilotStatus";
 
 // xterm.js touches `document` at import time, so it can't be part of the
@@ -1146,6 +1148,14 @@ export function TabbedView({
     && paneCanHaveAutopilot(activeConfig)
     ? activeConfig
     : undefined;
+  // The selected tab, when it offers the loop prompt instead: a Codex, Claude
+  // (or DeepSeek) or OpenCode terminal tab. It needs no server capability:
+  // it is an ordinary message.
+  const activeLoopPromptTab = activeConfig
+    && activeTabId != null
+    && paneCanHaveLoopPrompt(activeConfig)
+    ? activeConfig
+    : undefined;
   // Merging or discarding a tab's branch closes the tab too.
   const withAutopilotNote = (question: string, paneId: number) => {
     const note = closeTabAutopilotNote(autopilotStatuses.get(paneId) ?? null);
@@ -1356,6 +1366,25 @@ export function TabbedView({
             // project that is not running has no instance to ask either.
             tabRefusal={activeRefusal ?? (isAttached ? undefined : AUTOPILOT_PROJECT_NOT_RUNNING_TEXT)}
             sharedCheckout={!activeAutopilotTab.worktree_path}
+          />
+        )}
+        {/* In the autopilot control's place on the tabs that cannot have
+            autopilot. It only sends a message, so it shows no state. */}
+        {activeLoopPromptTab && sessionId && (
+          <LoopPromptControl
+            key={`${sessionId}:${activeLoopPromptTab.pane_id}`}
+            sessionId={sessionId}
+            paneId={activeLoopPromptTab.pane_id}
+            tabLabel={tabDisplayLabel(activeLoopPromptTab.pane_id) ?? `Tab ${activeLoopPromptTab.pane_id}`}
+            hostname={activeTabHost?.hostname
+              ?? activeLoopPromptTab.hostname
+              ?? primaryInstance(instances)?.hostname
+              ?? currentSession?.hostname}
+            // The composer's conditions: a tab's own reason first, then a
+            // project that is not running, then no connection.
+            disabledReason={activeRefusal
+              ?? (isAttached ? undefined : AUTOPILOT_PROJECT_NOT_RUNNING_TEXT)
+              ?? (connected ? undefined : LOOP_PROMPT_OFFLINE_TEXT)}
           />
         )}
 

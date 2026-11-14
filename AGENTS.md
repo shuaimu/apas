@@ -1919,6 +1919,19 @@ otherwise have had to volunteer.
   This reads client-maintained metadata; it neither invokes an MCP tool nor
   asks the model to report itself, and it sends no prompt to the provider.
 
+  **The locator must not change the user's Codex daemon.** It initializes as
+  `codex_app_server_daemon` with no capabilities (`initialize_params()` in
+  `transcript/codex_daemon.rs`, whose doc comment cites the Codex source).
+  Codex treats every other client name as a new originating client and then
+  rewrites daemon-wide state: the User-Agent suffix of every later model
+  request, including the person's own typed turns, the originator if none is
+  set yet, and the automatic-login decision; the `explicitGatewayOauth`
+  capability changes login handling whatever the name. Until 2026-11-14 the
+  locator used `apas_transcript`, and a private 0.166.0 daemon showed the
+  person's next typed turn going out as `(apas_transcript; 0.0.1)`. Re-check
+  `NON_ORIGINATING_CLIENT_NAMES` in Codex's `initialize_processor.rs` on
+  every Codex upgrade.
+
   The last verified path survives brief descriptor/control-socket gaps; an
   unambiguous newly owned rollout replaces it on resume/fork. Its
   `session_meta.id` replaces the provisional pane UUID in `.apas`, so future
@@ -2570,6 +2583,40 @@ reconnect disguised as reboot. Rollback disables new host creation; already
 running compatible hosts should be allowed to close normally or stopped by a
 new daemon. Forcing an old CLI/daemon to clean them up interrupts active
 terminal turns.
+
+## Loop prompt on Codex, Claude and OpenCode tabs
+
+Codex, Claude (DeepSeek included) and OpenCode terminal tabs have no
+autopilot: APAS cannot run a loop inside them or watch their turns the way it
+does in OMP. In the toolbar spot where OMP tabs show Autopilot, and as "Send a
+loop prompt" in the phone's Pane actions, they offer **Loop prompt**: a
+shortcut that sends **one** message asking the agent to keep working in a loop
+by itself. The owner chose this on 2026-11-14 over a full Codex autopilot
+driven through Codex's control socket, which was researched and checked and
+then withdrawn (findings in `~/.cache/apas-codex-check/NOTES.md`; the plan is
+in git history as `openspec/changes/add-codex-tab-autopilot`). Design record:
+`openspec/changes/add-loop-prompt-for-terminal-tabs/`.
+
+- **The dialog says what it is before anything is sent:** APAS does not run or
+  watch the loop and cannot count rounds, enforce a limit, pause, resume or
+  stop it, or tell whether it is still looping; the agent keeps the tab's
+  permissions and spends that machine's login, whoever sent it; it is stopped
+  with Esc in the terminal.
+- **What is sent** (`lib/loopPrompt.ts`): a fixed loop instruction, shown in
+  the dialog, then "Round instructions:" and the prompt. The instruction tells
+  the agent to repeat the instructions round after round without waiting or
+  asking, to read an instruction to stop after one step as the end of a round,
+  to read the files again each round, and to stop only when a round ends with
+  "Nothing is left to do." or it is interrupted. "Keep the tests green" has no
+  such ending and loops until interrupted; the dialog says so.
+- **Prompts:** the same templates and the project's saved prompts as the
+  autopilot dialog, starting on the project's default (shared code in
+  `components/tabs/PromptTemplateChoice.tsx`). Saving prompts is done in the
+  autopilot dialog.
+- **Sending:** once per click, through the Conversation view's terminal input,
+  confirmed only when the provider records it ("Sent."), otherwise "Not
+  confirmed", and never resent. It creates no autopilot state, marker, status
+  or list entry. It needs no server or CLI capability.
 
 ## Autopilot on OMP terminal tabs
 

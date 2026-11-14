@@ -16,6 +16,7 @@ import {
   Plus,
   Repeat,
   RotateCcw,
+  RotateCw,
   Settings2,
   Trash2,
   Send,
@@ -27,6 +28,8 @@ import {
 import type { AutopilotSpec } from "@apas/protocol";
 import { AutopilotIterationMarker } from "@/components/chat/AutopilotIterationMarker";
 import { AutopilotStartDialog } from "@/components/tabs/AutopilotStartDialog";
+import { LoopPromptDialog } from "@/components/tabs/LoopPromptDialog";
+import { LOOP_PROMPT_ACTION_LABEL, LOOP_PROMPT_OFFLINE_TEXT, paneCanHaveLoopPrompt } from "@/lib/loopPrompt";
 import { AutopilotRequestNotices } from "@/components/tabs/AutopilotStatus";
 import { AskUserQuestionCard } from "@/components/tools/AskUserQuestionCard";
 import { ProjectWorkersWorkspace } from "@/components/workers/ProjectWorkersWorkspace";
@@ -489,6 +492,8 @@ export function MobileSessionActivity({ connected, onBack, onReconnect }: Mobile
   const [forgetTarget, setForgetTarget] = useState<{ machineId: string; hostname: string; copy: ConfirmationCopy } | null>(null);
   // The autopilot sheet that is open, and the tab it was opened for.
   const [autopilotSheet, setAutopilotSheet] = useState<{ kind: "start" | "stop" | "details"; paneId: number } | null>(null);
+  // The tab the loop prompt sheet was opened for.
+  const [loopPromptSheetPaneId, setLoopPromptSheetPaneId] = useState<number | null>(null);
   // Messages written into the pty that the provider has not recorded back.
   const pendingDeliveries = useStore((state) => state.pendingTerminalDeliveries);
   const dismissTerminalDelivery = useStore((state) => state.dismissTerminalDelivery);
@@ -596,6 +601,20 @@ export function MobileSessionActivity({ connected, onBack, onReconnect }: Mobile
   useEffect(() => {
     if (autopilotSheet && !autopilotSheetKind) setAutopilotSheet(null);
   }, [autopilotSheet, autopilotSheetKind]);
+
+  // The selected tab, when it offers the loop prompt instead of autopilot: a
+  // Codex, Claude (or DeepSeek) or OpenCode terminal tab. Disabled for the
+  // composer's reasons, in the same order as the desktop toolbar.
+  const loopPromptPane = selectedPane && paneCanHaveLoopPrompt(selectedPane) ? selectedPane : undefined;
+  const loopPromptDisabledReason = selectedRefusal
+    ?? (sessionIsRunning ? undefined : AUTOPILOT_PROJECT_NOT_RUNNING_TEXT)
+    ?? (connected ? undefined : LOOP_PROMPT_OFFLINE_TEXT);
+  const loopPromptHost = selectedHost?.hostname
+    ?? loopPromptPane?.hostname
+    ?? primaryInstance(instances)?.hostname
+    ?? session?.hostname;
+  // The sheet belongs to the tab it was opened for: selecting another closes it.
+  const loopPromptSheetOpen = loopPromptPane !== undefined && loopPromptSheetPaneId === loopPromptPane.pane_id;
 
   useEffect(() => {
     if (sessionId) loadSessionActivity(sessionId);
@@ -1469,6 +1488,27 @@ export function MobileSessionActivity({ connected, onBack, onReconnect }: Mobile
               {/* Starting autopilot is an occasional action; so are Stop and
                   Stop now while the tab's state is not reported. A tab with a
                   current autopilot has its actions in the state notice. */}
+              {loopPromptPane && (
+                <button
+                  type="button"
+                  disabled={Boolean(loopPromptDisabledReason)}
+                  title={loopPromptDisabledReason}
+                  onClick={() => {
+                    setMoreOpen(false);
+                    setLoopPromptSheetPaneId(loopPromptPane.pane_id);
+                  }}
+                  className="flex w-full items-start gap-3 rounded-2xl border border-[#dedee7] bg-white p-3.5 text-left dark:border-[#383842] dark:bg-[#1b1b21]"
+                >
+                  <RotateCw aria-hidden="true" className={`mt-0.5 h-5 w-5 shrink-0 text-[#686873] dark:text-[#aaaab6] ${loopPromptDisabledReason ? "opacity-40" : ""}`} />
+                  <span className="min-w-0">
+                    <span className={`block font-bold ${loopPromptDisabledReason ? "opacity-40" : ""}`}>{LOOP_PROMPT_ACTION_LABEL}</span>
+                    {/* A phone has this line in place of a tooltip. */}
+                    <span className="mt-0.5 block text-xs font-normal text-[#686873] dark:text-[#aaaab6]">
+                      {loopPromptDisabledReason ?? "APAS sends the prompt once and does not watch the loop."}
+                    </span>
+                  </span>
+                </button>
+              )}
               {autopilot && autopilotPane && (
                 <MobileAutopilotActions
                   model={autopilot}
@@ -1620,6 +1660,19 @@ export function MobileSessionActivity({ connected, onBack, onReconnect }: Mobile
       {/* The same prompt, timing and limit choices and the same statement as
           the desktop dialog. Nothing is sent until Start autopilot is
           pressed, and only once. */}
+      {/* One message, sent once; the sheet says first that APAS does not
+          watch the loop it asks for. */}
+      {loopPromptSheetOpen && loopPromptPane && (
+        <LoopPromptDialog
+          variant="sheet"
+          sessionId={sessionId ?? undefined}
+          paneId={loopPromptPane.pane_id}
+          tabLabel={paneLabel(loopPromptPane)}
+          hostname={loopPromptHost}
+          disabledReason={loopPromptDisabledReason}
+          onClose={() => setLoopPromptSheetPaneId(null)}
+        />
+      )}
       {autopilot && autopilotPane && autopilotSheetKind === "start" && (
         <AutopilotStartDialog
           variant="sheet"

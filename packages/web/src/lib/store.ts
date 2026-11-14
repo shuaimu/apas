@@ -1185,8 +1185,10 @@ interface AppState {
   attachTerminal: (paneId: number) => void;
   sendTerminalInput: (paneId: number, data: string) => void;
   /** Submit a loggable chat message to a terminal-hosted agent. Raw terminal
-   *  keystrokes stay on sendTerminalInput and are never added to history. */
-  sendTerminalConversationMessage: (paneId: number, text: string) => { success: boolean; error?: string };
+   *  keystrokes stay on sendTerminalInput and are never added to history.
+   *  A sent message's `sendId` is its `client_msg_id`: its entry in
+   *  `pendingTerminalDeliveries` until the transcript records it. */
+  sendTerminalConversationMessage: (paneId: number, text: string) => { success: boolean; error?: string; sendId?: string };
   sendTerminalResize: (paneId: number, cols: number, rows: number) => void;
 
 }
@@ -3960,7 +3962,7 @@ export const useStore = create<AppState>((set, get) => ({
       text: body,
       client_msg_id: sendId,
     }));
-    return { success: true };
+    return { success: true, sendId };
   },
 
   dismissTerminalDelivery: (id) => {
