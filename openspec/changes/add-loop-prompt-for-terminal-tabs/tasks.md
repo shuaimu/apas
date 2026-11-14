@@ -17,4 +17,4 @@
 ## 4. Documentation and verification
 
 - [x] 4.1 `AGENTS.md`: the loop prompt and its limits; the locator's client name and why
-- [ ] 4.2 The complete gates; a browser look at the dialog on a Claude and a Codex tab at desktop and phone width
+- [x] 4.2 The complete gates; a browser look at the dialog on a Claude and a Codex tab at desktop and phone width

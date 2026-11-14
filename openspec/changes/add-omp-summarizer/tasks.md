@@ -12,4 +12,4 @@
 
 ## 3. Rollout
 
-- [ ] 3.1 Push the CLI; each machine gains it at its daemon reboot; the owner sets `summary_adapter omp` and `summary_allow_cross_provider true`
+- [ ] 3.1 Push the CLI (done 2026-11-14 with release 20261114T174439Z); each machine gains it at its daemon reboot; the owner sets `summary_adapter omp` and `summary_allow_cross_provider true`

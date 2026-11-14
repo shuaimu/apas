@@ -2661,6 +2661,14 @@ in git history as `openspec/changes/add-codex-tab-autopilot`). Design record:
   confirmed only when the provider records it ("Sent."), otherwise "Not
   confirmed", and never resent. It creates no autopilot state, marker, status
   or list entry. It needs no server or CLI capability.
+- **Rolled out on 2026-11-14** with web-only release `20261114T174439Z`
+  (version 26.11.48, built at d4ba3db), live since 17:45 UTC; backups under
+  `/opt/apas/backups/deploy-20261114T174439Z`. The same release removed the
+  Workers and Attention buttons from the project list. `master` was pushed
+  at the same time with the Codex locator fix and the OMP summarizer, which
+  each machine gains at its next daemon reboot. Ten public routes and 18
+  static assets answered `200`, and the web logged no error. Not yet seen: a
+  loop prompt sent to a real tab.
 
 ## Autopilot on OMP terminal tabs
 
