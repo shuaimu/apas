@@ -179,6 +179,55 @@ impl Rpc<'_> {
     }
 }
 
+/// The daemon belongs to the person: their own Codex tabs run their turns in
+/// it. `initialize` is not a private handshake there. Codex 0.160.0
+/// (`codex-rs/app-server/src/request_processors/initialize_processor.rs`)
+/// treats every client whose `clientInfo.name` is not in
+/// `NON_ORIGINATING_CLIENT_NAMES` (`codex_app_server_daemon`, `codex-backend`)
+/// as an originating client and changes three process-wide things for it:
+///
+/// - `USER_AGENT_SUFFIX` becomes `"<name>; <version>"`, so the User-Agent of
+///   every later model request from the daemon, the person's own typed turns
+///   included, names this client. Under the old name `apas_transcript` the
+///   isolated harness saw a tab's next turn sent as `… (apas_transcript;
+///   0.0.1)` instead of `… (codex-tui; 0.160.0)`, until another client
+///   initialized.
+/// - `set_default_originator(name)`, the `originator` header and User-Agent
+///   prefix of those requests, taken by the first originating client: after a
+///   daemon restart a locator poll can be the first client to arrive.
+/// - gateway login: the first originating client decides whether automatic
+///   login is allowed.
+///
+/// `codex_app_server_daemon` is the name Codex's own daemon tooling uses for
+/// its read-only probe of this socket (`app-server-daemon/src/client.rs`,
+/// `CLIENT_NAME`), and the one Codex keeps out of all three. Codex still
+/// records each connection's `clientInfo` for its own analytics and tracing,
+/// per connection, so the title and version say honestly that this is APAS.
+/// The version never reaches a User-Agent under this name, and Codex parses
+/// versions only from the server's own `userAgent`, not from a client's.
+///
+/// No `capabilities`, because the name alone is not enough: an
+/// `explicitGatewayOauth` capability changes the daemon's login handling from
+/// any client, whatever its name. Locating needs none of them:
+/// `thread/loaded/list`, `thread/read` and `mcpServerStatus/list` are not
+/// experimental (no `#[experimental]` in
+/// `app-server-protocol/src/protocol/common.rs`, and all three are in the
+/// non-experimental 0.166.0 schema), and the fields read here (`cwd`, `path`,
+/// `name`, `runtimeStatus`, `httpOrigin`) are not experimental fields.
+///
+/// The allowlist is an internal Codex constant, not a documented contract.
+/// Checked against the 0.160.0 source and a 0.166.0 daemon on 2026-11-14;
+/// re-check both files whenever the Codex version changes.
+fn initialize_params() -> Value {
+    json!({
+        "clientInfo": {
+            "name": "codex_app_server_daemon",
+            "title": "APAS transcript locator",
+            "version": env!("APAS_VERSION")
+        }
+    })
+}
+
 fn query_rollouts(
     home: &Path,
     panes: &HashMap<i32, PathBuf>,
@@ -191,13 +240,7 @@ fn query_rollouts(
         deadline,
         id: 0,
     };
-    rpc.call(
-        "initialize",
-        json!({
-            "clientInfo": {"name": "apas_transcript", "version": env!("CARGO_PKG_VERSION")},
-            "capabilities": {"experimentalApi": true}
-        }),
-    )?;
+    rpc.call("initialize", initialize_params())?;
     rpc.socket
         .send(Message::Text(json!({"method": "initialized"}).to_string()))?;
     let sessions_root = home.join(".codex/sessions");
@@ -329,14 +372,26 @@ mod tests {
         panes: &HashMap<i32, PathBuf>,
         ports: &HashMap<u16, i32>,
     ) -> HashMap<i32, PathBuf> {
+        discover_recording(home, threads, panes, ports).0
+    }
+
+    /// Also returns every frame the locator sent, in order.
+    fn discover_recording(
+        home: &Path,
+        threads: Vec<Value>,
+        panes: &HashMap<i32, PathBuf>,
+        ports: &HashMap<u16, i32>,
+    ) -> (HashMap<i32, PathBuf>, Vec<Value>) {
         let (server, client_stream) = UnixStream::pair().unwrap();
         server
             .set_read_timeout(Some(Duration::from_secs(5)))
             .unwrap();
         let server = std::thread::spawn(move || {
+            let mut sent = Vec::new();
             let mut socket = tokio_tungstenite::tungstenite::accept(server).unwrap();
             while let Ok(Message::Text(text)) = socket.read() {
                 let request: Value = serde_json::from_str(&text).unwrap();
+                sent.push(request.clone());
                 let method = request["method"].as_str().unwrap();
                 if method == "initialized" {
                     continue;
@@ -369,6 +424,7 @@ mod tests {
                     ))
                     .unwrap();
             }
+            sent
         });
         let (mut socket, _) = client("ws://localhost/", client_stream).unwrap();
         let result = query_rollouts(
@@ -381,8 +437,87 @@ mod tests {
         .unwrap();
         socket.close(None).unwrap();
         drop(socket);
-        server.join().unwrap();
-        result
+        (result, server.join().unwrap())
+    }
+
+    /// Any other name changes the person's own Codex daemon (see
+    /// `initialize_params`), and so can a capability (`explicitGatewayOauth`
+    /// is daemon-wide and sticky); locating needs none. Re-check Codex's
+    /// `NON_ORIGINATING_CLIENT_NAMES` before changing this.
+    #[test]
+    fn initializes_as_codex_own_non_originating_daemon_client() {
+        let home = tempfile::tempdir().unwrap();
+        let owned = thread(home.path(), "/repo", 3000, false);
+        let (found, sent) = discover_recording(
+            home.path(),
+            vec![owned],
+            &HashMap::from([(100, PathBuf::from("/repo"))]),
+            &HashMap::from([(3000, 100)]),
+        );
+        assert_eq!(found.len(), 1);
+        assert_eq!(
+            sent[0],
+            json!({
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "clientInfo": {
+                        "name": "codex_app_server_daemon",
+                        "title": "APAS transcript locator",
+                        "version": env!("APAS_VERSION")
+                    }
+                }
+            })
+        );
+        assert_eq!(sent[1], json!({"method": "initialized"}));
+        let methods: Vec<&str> = sent[2..]
+            .iter()
+            .map(|frame| frame["method"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            methods,
+            ["thread/loaded/list", "thread/read", "mcpServerStatus/list"]
+        );
+    }
+
+    /// Runs the real locator against an isolated Codex daemon, never the
+    /// person's own: `APAS_CODEX_DAEMON_CHECK_HOME` is a private home whose
+    /// `.codex/app-server-control/app-server-control.sock` must resolve to
+    /// exactly `APAS_CODEX_DAEMON_CHECK_SOCKET`, checked before connecting.
+    /// `APAS_CODEX_DAEMON_CHECK_PANE` is `<provider pgid>=<cwd>` and
+    /// `APAS_CODEX_DAEMON_CHECK_THREAD` the conversation it must be bound to.
+    /// Used by `~/.cache/apas-codex-check/bin/daemon-11-locator-identity.sh`.
+    #[test]
+    #[ignore = "needs an isolated Codex daemon; see the doc comment"]
+    fn locates_a_tab_through_an_isolated_daemon() {
+        let var = |name: &str| std::env::var(name).unwrap_or_else(|_| panic!("{name} is not set"));
+        let home = PathBuf::from(var("APAS_CODEX_DAEMON_CHECK_HOME"));
+        let expected_socket = PathBuf::from(var("APAS_CODEX_DAEMON_CHECK_SOCKET"));
+        let real_home = std::env::var_os("HOME").map(PathBuf::from);
+        assert!(
+            real_home
+                .is_none_or(|real| fs::canonicalize(&real).ok() != fs::canonicalize(&home).ok()),
+            "refusing the person's own home"
+        );
+        let socket =
+            fs::canonicalize(home.join(".codex/app-server-control/app-server-control.sock"))
+                .expect("the private daemon's socket does not resolve");
+        assert_eq!(
+            socket, expected_socket,
+            "refusing a socket other than the private one"
+        );
+        let (group, cwd) = var("APAS_CODEX_DAEMON_CHECK_PANE")
+            .split_once('=')
+            .map(|(group, cwd)| (group.parse::<i32>().unwrap(), PathBuf::from(cwd)))
+            .unwrap();
+        let found = find_rollouts(&home, &HashMap::from([(group, cwd)])).unwrap();
+        println!("found: {found:?}");
+        let path = found.get(&group).expect("the tab was not bound");
+        let meta = read_codex_rollout_meta(path).unwrap();
+        assert_eq!(
+            meta.session_id.map(|id| id.to_string()),
+            Some(var("APAS_CODEX_DAEMON_CHECK_THREAD"))
+        );
     }
 
     #[test]
