@@ -542,19 +542,24 @@ impl Sandbox {
             .env("LANG", "C.UTF-8")
             .stdin(Stdio::null())
             .kill_on_drop(true);
-        // An orphaned create/start client must not launch work after its trusted
-        // host dies. The detached conmon still owns the container's hard timeout.
-        let parent = unsafe { libc::getpid() };
-        unsafe {
-            command.pre_exec(move || {
-                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                if libc::getppid() != parent {
-                    return Err(std::io::Error::from_raw_os_error(libc::ECHILD));
-                }
-                Ok(())
-            });
+        // Sandbox::open rejects non-Linux hosts, but its runtime check cannot
+        // keep the compiler from resolving Linux-only libc symbols on macOS.
+        #[cfg(target_os = "linux")]
+        {
+            // An orphaned create/start client must not launch work after its trusted
+            // host dies. The detached conmon still owns the container's hard timeout.
+            let parent = unsafe { libc::getpid() };
+            unsafe {
+                command.pre_exec(move || {
+                    if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    if libc::getppid() != parent {
+                        return Err(std::io::Error::from_raw_os_error(libc::ECHILD));
+                    }
+                    Ok(())
+                });
+            }
         }
         command
     }
@@ -1585,6 +1590,22 @@ print('APAS_INSPECTION_OK')
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn non_linux_hosts_refuse_execution_and_recovery() {
+        let mut config = AutonomousJobConfig::default();
+        config.enabled = true;
+        assert!(Sandbox::new(&config)
+            .unwrap_err()
+            .to_string()
+            .contains("autonomous jobs require Linux rootless Podman"));
+        config.enabled = false;
+        assert!(Sandbox::for_recovery(&config)
+            .unwrap_err()
+            .to_string()
+            .contains("autonomous jobs require Linux rootless Podman"));
+    }
 
     #[test]
     fn qualification_requires_real_result_contract_for_exact_bootstrap() {

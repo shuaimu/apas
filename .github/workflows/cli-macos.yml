@@ -1,0 +1,33 @@
+name: macOS CLI
+
+on:
+  pull_request:
+    paths:
+      - "crates/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".cargo/**"
+      - ".github/workflows/cli-macos.yml"
+  push:
+    branches: [master, main]
+    paths:
+      - "crates/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".cargo/**"
+      - ".github/workflows/cli-macos.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build the CLI on macOS
+        run: cargo build --locked -p apas
+      - name: Keep autonomous jobs unavailable on macOS
+        run: cargo test --locked -p apas jobs::sandbox::tests::non_linux_hosts_refuse_execution_and_recovery -- --exact
