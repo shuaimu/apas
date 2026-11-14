@@ -405,23 +405,44 @@ both. Exact check counts and the still-open host/device qualification gates are
 recorded in `openspec/changes/unify-autonomous-workers/tasks.md`. This local work
 did not deploy, enable a policy, approve a real worker or satisfy those gates.
 
-**Not yet deployed, as of 2026-11-13.** Four changes are in the tree and not in
-production: `+` creating an interactive agent directly, the retirement of Pi,
-the rebuilt Overview tab, and the prompt templates in the Start autopilot
-dialog. Production still shows the chooser, offers Pi and has the older
-Overview. The Pi retirement touches server, web and CLI and goes out in that
-order (see "Pi is retired; OMP stays"); the other three are web only. The
-smaller fixes made with them are undeployed too: the last `team_available`
-reads in server, web and CLI, and the one-machine reboot confirmation. The
-CLI's part reaches each machine only at its next daemon reboot from the
-Machines page. The design record for all of it is
+**Rolled out on 2026-11-14.** Four changes reached production together:
+`+` creating an interactive agent directly, the retirement of Pi, the rebuilt
+Overview tab, and the prompt templates in the Start autopilot dialog, with the
+smaller fixes made beside them (the last `team_available` reads in server, web
+and CLI, and the one-machine reboot confirmation). The design record is
 `openspec/changes/refine-interactive-workspace/`.
 
-**What was checked for these four, as of 2026-11-13.** Each work stream ran
-only its own tests. The complete gates were not run on the combined tree: not
-the whole web test suite, `npm run build`, the static musl CLI build, the
-native checks or a two-host smoke (task 10.1 of the change). The templates'
-own record is under "Prompt templates" in the autopilot section.
+- **Server** has run the new binary since 00:25 UTC, and **web** release
+  `20261114T002349Z` (version 26.11.36, built at 58a548d) since 00:25 UTC.
+  Backups are under `/opt/apas/backups/deploy-20261114T002349Z`. The
+  dependency graphs had not changed since the previous release and audited
+  clean again on the host. nginx did not change: no route was added.
+- The first start of the new server rewrote the stored launch policies
+  without `terminal:pi:official:default`: the deployment default, one
+  cluster default and nine project overrides. None is left empty; the
+  smallest allows one profile. All nine project instances and three daemons
+  registered again by themselves, and the server logged no error and no frame
+  it could not parse.
+- Ten public routes answered `200` with no redirect, the 18 static assets the
+  pages reference answered `200`, and `/projects/by-remote` and
+  `/projects/workers` answered JSON from `apas-server` with and without a
+  credential. Viewers still negotiate `tab_autopilot_v1`. No job policy row
+  exists, so recurring execution stays disabled. The live Overview shows the
+  new layout with the owner's data.
+- **CLI:** `master` was pushed at 58a548d. No daemon was restarted. Until a
+  machine's daemon is rebooted from the Machines page, it runs the previous
+  CLI: that CLI would still start a saved Pi tab when its project starts,
+  although the server already refuses to create or relaunch one. Nothing
+  else depends on the reboot. No tab of the owner's projects uses Pi.
+
+**What was checked before the rollout.** At 58a548d the complete gates pass:
+`cargo test` for shared (92 + 3 + 1), server (457) and CLI (596, 1 ignored),
+the static musl CLI build, the protocol's 68 tests and typecheck, the
+extension's 137 node tests, the whole web suite (1,242 tests) with lint,
+typecheck and the production build, native (136 tests and typecheck),
+`openspec validate --all --strict` and the runbook check. No two-host smoke
+was run for these changes. While each work stream was still open, its own
+checks were:
 
 - Pi retirement: `cargo test` for shared (92 + 3 + 1), server (456) and CLI
   (595, 1 ignored as before); the protocol's 68 tests, the extension's 137

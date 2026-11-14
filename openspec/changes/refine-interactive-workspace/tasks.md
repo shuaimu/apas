@@ -84,8 +84,8 @@
 
 ## 10. Not done
 
-- [ ] 10.1 Run the complete gates at the final commit: the Rust workspace, the static musl CLI build, the protocol tests, the whole web suite with lint, typecheck and the production build, and the native checks. During the work only each stream's own test files were run
-- [ ] 10.2 Deploy the server, then the web and protocol pair, then push the CLI. Check that the first server start drops `terminal:pi:official:default` from the stored policies and that no project is left with an empty allowlist by it
+- [x] 10.1 Run the complete gates at the final commit: the Rust workspace, the static musl CLI build, the protocol tests, the whole web suite with lint, typecheck and the production build, and the native checks. During the work only each stream's own test files were run (done 2026-11-14 at 58a548d: shared 92 + 3 + 1, server 457, CLI 596 with 1 ignored, musl build, protocol 68 and 137 extension tests, web 1,242 with lint, typecheck and production build, native 136; no two-host smoke)
+- [x] 10.2 Deploy the server, then the web and protocol pair, then push the CLI. Check that the first server start drops `terminal:pi:official:default` from the stored policies and that no project is left with an empty allowlist by it (done 2026-11-14: release 20261114T002349Z; the first start rewrote the deployment default, one cluster default and nine project overrides; none is empty, the smallest allows one profile)
 - [ ] 10.3 Run a template on a real OMP tab: the default template through a step and a commit, the two-turn ending with "End when an iteration makes no tool call" ticked, a blocked step, and a checkout with someone else's uncommitted changes
 - [ ] 10.4 Look at a saved Pi tab on a real CLI: listed and stopped at project start, the exited state and its sentence on the desktop and the phone, the Reboot CLI refusal, and closing it. A Pi pane host left by an older CLI is ended when the updated CLI starts the project
 - [ ] 10.5 Look at the work on a real phone: "Add agent", the Overview, the Start autopilot sheet with the on-screen keyboard open, and iOS
