@@ -1857,6 +1857,15 @@ or using the arrow keys. Its width is a browser-local preference under
 the available workspace when the window or project sidebar changes size;
 the phone's summary sheet keeps its existing layout.
 
+The resizable drawer was deployed on **2026-11-14 at 18:29 UTC**, web release
+`20261114T182726Z`, version **26.11.50**, built at `8dbba50`. Backups are under
+`/opt/apas/backups/deploy-20261114T182726Z`. Both dependency graphs audited
+clean, and the staged production build passed. Ten public routes, 23 referenced
+assets and authenticated worker JSON passed smoke checks. On the live
+chiral-network OMP 2 tab, dragging, arrow-key resizing and reopening at the saved
+width worked. Its original terminal process stayed running. This was a web-only
+release; the server, daemons and job policy were unchanged.
+
 A tab's work summaries are written by a separate, headless run of a
 summarizer on the tab's machine, configured in the CLI's `[summaries]`
 section (`apas config set summary_enabled|summary_adapter|summary_model|
