@@ -173,3 +173,12 @@ operational environment.
 ### Production state — 2026-11-13
 
 The persistent-worker cutover reached production with server and web release `20261113T013925Z`, built at e02c0f7, at 01:48 UTC on 2026-11-13. Web release `20261113T193707Z` followed at 19:39 UTC. No job policy row exists and there is no worker, so recurring execution stays disabled. No policy was enabled, no real worker was approved and no execution profile was qualified. The four open tasks above remain open. Task 8.6 of `add-omp-tab-autopilot` was applied here on the same day: the proposal gained the section "Applicability after `add-omp-tab-autopilot`" and one requirement in `autonomous-worker-surfaces` was retitled "The worker flow replaces legacy creation paths".
+
+## 13. Amendments after `refine-interactive-workspace` (2026-11-13)
+
+- [x] 13.1 Correct "Worker navigation preserves terminal and project identity" in the `web-project-workspace` delta: `+` creates an interactive agent only, and a worker is created from the Overview or the Workers page. Add the scenario "A person opens the new-tab control".
+- [x] 13.2 Correct "Project Overview presents persistent workers independently of panes" in the same delta: the interactive sections come before the worker inventory.
+- [x] 13.3 Correct section 10 of `design.md`: `+` no longer offers Interactive agent / Autonomous worker, and the Overview shows the interactive sections first.
+- [x] 13.4 Add "Applicability after `refine-interactive-workspace`" to `proposal.md`.
+
+These are text corrections only. The code they describe is recorded in `refine-interactive-workspace`. Tasks 11.4, 11.5, 11.6 and 11.8 stay open and unchanged. Nothing in this change named Pi.

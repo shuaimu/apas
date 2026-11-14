@@ -18,10 +18,10 @@ Responsive web and native mobile SHALL each expose the persistent worker workflo
 - **AND** creation and control actions accurately explain their missing authority without exposing unauthorized machine inventory
 
 ### Requirement: Responsive web integrates autonomous work into each project
-The responsive-web project's add control SHALL offer an interactive agent or autonomous worker. Interactive creation SHALL retain existing provider/worktree behavior. Worker creation SHALL keep the selected project fixed, prefer its current machine only when eligible and no saved or explicit choice exists, and require reviewed mandate/recurring approval. Missing authority, policy, worker readiness or connectivity SHALL be explained without silently changing target or substituting an interactive pane.
+The responsive-web project's add control SHALL create an interactive agent only and SHALL retain existing provider/worktree behavior. Worker creation SHALL be offered from the project's Overview and from the cross-project Workers page. From a project it SHALL keep the selected project fixed, prefer its current machine only when eligible and no saved or explicit choice exists, and require reviewed mandate/recurring approval. Missing authority, policy, worker readiness or connectivity SHALL be explained without silently changing target or substituting an interactive pane.
 
 #### Scenario: User creates autonomous work from a project
-- **WHEN** the user selects Autonomous worker from the project's add control
+- **WHEN** the user chooses New autonomous worker in the project's Overview
 - **THEN** mandate composition and approval review remain in that project with its identity fixed
 - **AND** an accepted or recovered receipt opens that exact worker without changing the selected session or creating a pane
 

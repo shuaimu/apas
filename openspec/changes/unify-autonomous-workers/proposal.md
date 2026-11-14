@@ -38,4 +38,13 @@ This change's "one unattended product" position covers contained, approved, recu
 
 Autopilot is not a worker and not the bot restored. It shares no job, policy, ledger, verifier, publisher or wire type with this change and satisfies none of its gates. The binding statements here still hold: Start bot stays removed, no legacy path starts a loop, a bot pane cannot be put on autopilot, and no terminal is adopted as a worker.
 
-The requirement formerly titled "One unattended product replaces legacy creation paths" in `autonomous-worker-surfaces` is now titled "The worker flow replaces legacy creation paths". Its text is unchanged. The owner agreed to both edits on 2026-11-13.
+The requirement formerly titled "One unattended product replaces legacy creation paths" in `autonomous-worker-surfaces` is now titled "The worker flow replaces legacy creation paths". Its text is unchanged. The owner asked on 2026-11-13 for the outdated changes to be updated.
+
+## Applicability after `refine-interactive-workspace`
+
+On 2026-11-13 `refine-interactive-workspace` removed the step in the project's `+` control that chose between an interactive agent and an autonomous worker, and rebuilt the project Overview. This change's worker flow is unchanged. What changed is where it starts and where it is listed:
+
+- `+` creates an interactive agent only, on the desktop and in the mobile browser. An autonomous worker is created from **New autonomous worker** in the Overview's Autonomous workers section, or from `/code/workers`.
+- The Overview shows the project's interactive sections first and the worker inventory with earlier results after them. On the desktop the interactive sections are tabs, usage, resource use and allowed launch profiles. In the mobile browser it is the tabs.
+
+The requirements "Worker navigation preserves terminal and project identity" and "Project Overview presents persistent workers independently of panes" in this change's `web-project-workspace` delta, and section 10 of `design.md`, were corrected in place, to follow the changes the owner asked for on 2026-11-13. No gate task changed.

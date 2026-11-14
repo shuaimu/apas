@@ -259,3 +259,7 @@ performed. The seven earlier operational qualification gates remain open.
 ### Production state — 2026-11-13
 
 Server and web release `20261113T013925Z`, built at e02c0f7, has run in production since 2026-11-13 01:48 UTC. It carries this change together with the persistent-worker cutover of `unify-autonomous-workers`. Web release `20261113T193707Z` followed at 19:39 UTC. No job policy row exists and there is no worker, so admission and recurring execution stay disabled. No worker, verifier or publisher profile has been qualified, and no real job has run. The seven operational qualification gates above remain open.
+
+### Amended on 2026-11-13
+
+`refine-interactive-workspace` removed the chooser that task 15.2 added: the project `+` creates an interactive agent only, and autonomous work is created from **New autonomous worker** in the project's Overview or from `/code/workers`. It also put the Overview's interactive panels before autonomous work. `proposal.md`, section 9 of `design.md` and the requirement "Responsive web integrates autonomous work into each project" in `mobile-autonomous-jobs` were corrected in place. Task 15.2, its smoke and its rollout record stand as history of what was built and deployed then. No gate task changed.
