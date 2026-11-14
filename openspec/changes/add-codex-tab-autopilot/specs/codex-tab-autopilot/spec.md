@@ -15,9 +15,9 @@ A person who may send input to a Codex terminal tab SHALL be able to start, paus
 - **WHEN** a start request for a Codex tab is not confirmed in time
 - **THEN** the person is told it was not confirmed, and the request is not sent again
 
-### Requirement: Codex autopilot submits an iteration only while the conversation is idle
+### Requirement: Codex autopilot submits an iteration only while the conversation is at rest
 
-Autopilot SHALL submit an iteration only when it is due, the tab's conversation is idle, no question or approval request is waiting in it, and Codex's own goal mode is not active in it. "As soon as each turn ends" SHALL mean five seconds after the conversation became idle; "every N minutes" SHALL be measured from one submission to the next and SHALL wait for the conversation to be idle. Each submission SHALL carry an identifier that marks it as an autopilot iteration. When a person's turn starts at the same moment and the submission is added to that turn instead of starting a new one, that submission SHALL NOT count as an iteration, and autopilot SHALL wait for that turn to end before submitting again.
+Autopilot SHALL submit an iteration only when it is due, the tab's conversation is not running a turn (it is idle, or at rest after a failed turn), no question or approval request is waiting in it, and Codex's own goal mode is not active in it. "As soon as each turn ends" SHALL mean five seconds after the conversation became idle; "every N minutes" SHALL be measured from one submission to the next and SHALL wait for the conversation to be idle. Each submission SHALL carry an identifier that marks it as an autopilot iteration. When a person's turn starts at the same moment and the submission is added to that turn instead of starting a new one, that submission SHALL NOT count as an iteration, and autopilot SHALL wait for that turn to end before submitting again.
 
 #### Scenario: A turn ends
 - **WHEN** an iteration's turn completes and the repeat timing is "as soon as each turn ends"
@@ -33,7 +33,7 @@ Autopilot SHALL submit an iteration only when it is due, the tab's conversation 
 
 ### Requirement: How a Codex iteration ended decides what autopilot does next
 
-Autopilot SHALL treat an iteration whose turn completed as done, SHALL count one whose turn failed as failed, and SHALL pause after three failed iterations in a row, waiting 60 seconds after each failure first. A turn that ended interrupted, when autopilot did not request the interrupt, SHALL pause autopilot with the reason that the turn was interrupted, whether the person pressed Escape in the terminal or interrupted the turn another way. Stop now SHALL interrupt the turn in progress and end the autopilot; it SHALL NOT be reported as a person's interrupt. An interrupt request that receives no answer SHALL be given up after a bounded wait and reported as not confirmed.
+Autopilot SHALL treat an iteration whose turn completed as done, SHALL count one whose turn failed as failed, and SHALL pause after three failed iterations in a row, waiting 60 seconds after each failure first. A turn reported as interrupted while autopilot was connected to the conversation, when autopilot did not request the interrupt, SHALL pause autopilot with the reason that the turn was interrupted, whether the person pressed Escape in the terminal or interrupted the turn another way. A turn found interrupted only after autopilot had lost its connection while that turn ran, as happens when the app-server stops abruptly, SHALL NOT be treated as a person's interrupt: autopilot SHALL hold until it is connected again and then continue. Stop now SHALL interrupt the turn in progress and end the autopilot; it SHALL NOT be reported as a person's interrupt. An interrupt request that receives no answer SHALL be given up after a bounded wait and reported as not confirmed.
 
 #### Scenario: Escape during an iteration
 - **WHEN** a person presses Escape in a Codex tab while an iteration's turn is running
@@ -57,7 +57,12 @@ The loop of a Codex tab's autopilot SHALL run in the APAS project instance on th
 
 #### Scenario: The Codex app-server restarts
 - **WHEN** the app-server that hosts a tab's conversation restarts while the tab is on autopilot
-- **THEN** autopilot holds, and continues once the conversation is reachable again
+- **THEN** autopilot holds while the app-server is unreachable or shutting down, and continues once the conversation is reachable again
+- **AND** if the app-server does not come back, or the tab's Codex has stopped reconnecting and must be rebooted, autopilot keeps holding and pauses after four hours like any other hold
+
+#### Scenario: A failed turn followed by a resume
+- **WHEN** an iteration's turn fails and the conversation is left at rest in an error state
+- **THEN** the next iteration is submitted when it is due, without waiting for an idle state that does not come
 
 ### Requirement: Codex's own goal mode is shown and respected
 
@@ -69,7 +74,7 @@ APAS SHALL show when Codex's goal mode is active or paused in a tab and SHALL NO
 
 ### Requirement: Leaving the conversation ends a Codex autopilot
 
-When the tab's Codex conversation is replaced, for example by starting a new one or resuming another one in the terminal, the autopilot SHALL end with the reason that the conversation changed and SHALL NOT submit to the new conversation.
+When the tab's Codex conversation is replaced, for example by starting a new one or resuming another one in the terminal, the autopilot SHALL end with the reason that the conversation changed and SHALL NOT submit to the new conversation. The change SHALL be detected when the tab starts another user conversation, even though the previous conversation stays reachable through the same tab for a while; autopilot SHALL NOT submit to the previous conversation after that.
 
 #### Scenario: A new conversation in the tab
 - **WHEN** a person starts a new conversation in a Codex tab that is on autopilot
@@ -85,7 +90,7 @@ In the Conversation view of a Codex tab, each iteration that autopilot submitted
 
 ### Requirement: Codex autopilot is offered only where every part supports it
 
-The control SHALL be offered on a Codex terminal tab only when the server, the instance that runs the tab's machine, and the tab's Codex conversation and Codex version all support it; otherwise it SHALL be shown disabled with the reason, as for OMP tabs. A Codex version that APAS has not been checked against SHALL be reported as unsupported with "This tab's Codex version cannot run autopilot." A viewer, instance or server that does not support Codex autopilot SHALL receive nothing it cannot interpret and SHALL behave as before. APAS SHALL NOT change the user's shared Codex configuration or hooks to provide autopilot.
+The control SHALL be offered on a Codex terminal tab only when the server, the instance that runs the tab's machine, the tab's Codex conversation, the tab's Codex version and the version of the Codex app-server hosting that conversation all support it; otherwise it SHALL be shown disabled with the reason, as for OMP tabs. A Codex version, of the tab or of the app-server, that APAS has not been checked against SHALL be reported as unsupported with "This tab's Codex version cannot run autopilot." A viewer, instance or server that does not support Codex autopilot SHALL receive nothing it cannot interpret and SHALL behave as before. APAS SHALL NOT change the user's shared Codex configuration or hooks to provide autopilot, SHALL NOT start, stop or restart the shared Codex app-server, and SHALL NOT answer a question or approval request that Codex sends to it.
 
 #### Scenario: An older machine
 - **WHEN** a Codex tab runs on a machine whose APAS does not support Codex autopilot
