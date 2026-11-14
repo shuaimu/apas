@@ -178,7 +178,6 @@ fn mobile_launch_capability_error(
     provider: shared::Provider,
     supports_mobile_launch: bool,
     supports_opencode_terminal: bool,
-    supports_pi_terminal: bool,
     supports_omp_terminal: bool,
 ) -> Option<&'static str> {
     if !supports_mobile_launch {
@@ -189,8 +188,10 @@ fn mobile_launch_capability_error(
             "The project CLI must be updated and reconnected before launching an OpenCode task",
         );
     }
-    if provider == shared::Provider::Pi && !supports_pi_terminal {
-        return Some("The project CLI must be updated and reconnected before launching a Pi task");
+    if shared::is_retired_provider(provider) {
+        // Unreachable through the catalog, which no longer lists a retired
+        // provider; kept so this function alone cannot let one through.
+        return Some(shared::retired_launch_message(provider));
     }
     if provider == shared::Provider::Omp && !supports_omp_terminal {
         return Some(
@@ -480,8 +481,13 @@ pub async fn launch_task(
         .find(|profile| profile.key == request.profile_key)
         .cloned()
         .ok_or_else(|| {
+            // A build that still holds a profile list from before a
+            // retirement sends the retired key: say what to use instead.
             AppError::Conflict(
-                "The selected coding profile is no longer allowed; choose another profile"
+                shared::retired_launch_profile_message(&request.profile_key)
+                    .unwrap_or(
+                        "The selected coding profile is no longer allowed; choose another profile",
+                    )
                     .to_string(),
             )
         })?;
@@ -628,7 +634,6 @@ pub async fn launch_task(
         profile.provider,
         supports(shared::MOBILE_TASK_LAUNCH_CAPABILITY),
         supports(shared::OPENCODE_TERMINAL_CAPABILITY),
-        supports(shared::PI_TERMINAL_CAPABILITY),
         supports(shared::OMP_TERMINAL_CAPABILITY),
     ) {
         return Err(fail_task_launch(&state, &request, &user.id, message).await);
@@ -867,7 +872,6 @@ mod tests {
                 "terminal:claude:official:default",
                 "terminal:codex:official:default",
                 "terminal:opencode:official:default",
-                "terminal:pi:official:default",
                 "terminal:omp:official:default",
                 "terminal:claude:deepseek:deepseek-flash",
             ]
@@ -879,45 +883,51 @@ mod tests {
 
     #[test]
     fn mobile_opencode_launch_requires_its_provider_capability() {
-        let error =
-            mobile_launch_capability_error(shared::Provider::Opencode, true, false, true, true)
-                .expect("older CLI must be rejected");
+        let error = mobile_launch_capability_error(shared::Provider::Opencode, true, false, true)
+            .expect("older CLI must be rejected");
         assert!(error.contains("OpenCode"));
         assert!(error.contains("updated and reconnected"));
 
         assert!(
-            mobile_launch_capability_error(shared::Provider::Opencode, true, true, true, true)
-                .is_none()
+            mobile_launch_capability_error(shared::Provider::Opencode, true, true, true).is_none()
         );
         assert!(
-            mobile_launch_capability_error(shared::Provider::Claude, true, false, false, true)
-                .is_none()
+            mobile_launch_capability_error(shared::Provider::Claude, true, false, true).is_none()
         );
         assert!(
-            mobile_launch_capability_error(shared::Provider::Codex, true, false, false, true)
-                .is_none()
+            mobile_launch_capability_error(shared::Provider::Codex, true, false, true).is_none()
         );
     }
 
+    /// Pi was retired. No profile offers it, a stored policy that still lists
+    /// its profile does not bring it back, and a launch that names it is
+    /// refused whatever the CLI can host.
     #[test]
-    fn mobile_pi_launch_requires_its_provider_capability() {
-        let error = mobile_launch_capability_error(shared::Provider::Pi, true, true, false, true)
-            .expect("older CLI must be rejected");
-        assert!(error.contains("Pi"));
-        assert!(error.contains("updated and reconnected"));
+    #[allow(deprecated)]
+    fn mobile_launch_never_offers_or_accepts_pi() {
+        let mut policy = shared::EffectiveProjectPolicy::default();
+        policy
+            .allowed_launch_profiles
+            .push("terminal:pi:official:default".to_string());
+        assert!(mobile_launch_profiles(&policy)
+            .iter()
+            .all(|profile| profile.provider != shared::Provider::Pi));
 
-        assert!(
-            mobile_launch_capability_error(shared::Provider::Pi, true, false, true, true).is_none()
+        assert_eq!(
+            mobile_launch_capability_error(shared::Provider::Pi, true, true, true),
+            Some("Pi is no longer supported. Use OMP instead.")
         );
-        // An OpenCode-capable CLI that predates Pi must still accept OpenCode.
-        assert!(mobile_launch_capability_error(
-            shared::Provider::Opencode,
-            true,
-            true,
-            false,
-            true
-        )
-        .is_none());
+        assert_eq!(
+            shared::retired_launch_profile_message("terminal:pi:official:default"),
+            Some(shared::PI_RETIRED_MESSAGE)
+        );
+        // OMP is untouched: it needs only its own capability.
+        assert!(mobile_launch_capability_error(shared::Provider::Omp, true, false, true).is_none());
+        assert!(
+            mobile_launch_capability_error(shared::Provider::Omp, true, true, false)
+                .expect("an older CLI cannot host OMP")
+                .contains("OMP")
+        );
     }
 
     /// A native build that never receives the instance-set frame still learns

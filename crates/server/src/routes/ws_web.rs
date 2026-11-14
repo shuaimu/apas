@@ -1663,6 +1663,68 @@ async fn send_policy_error(state: &AppState, connection_id: &Uuid, message: impl
 
 const RETIRED_BOT_MESSAGE: &str = "upgrade_required: Legacy bot history is read-only; create and explicitly approve a new independent worker.";
 
+/// Why typed input cannot go to `pane`, when the tab is history only: a
+/// legacy bot, or a tab whose provider is retired (a saved Pi tab). Such a
+/// tab has no process on any CLI, so input sent on would be stored and shown
+/// as a message no agent ever answers.
+#[allow(deprecated)]
+fn read_only_pane_message(pane: &shared::PaneConfig) -> Option<String> {
+    if pane.mode == shared::PaneMode::Deadloop {
+        return Some(RETIRED_BOT_MESSAGE.to_owned());
+    }
+    if !shared::is_retired_launch(pane.provider, pane.model.as_deref()) {
+        return None;
+    }
+    Some(if pane.provider == shared::Provider::Pi {
+        format!("{} This tab is read-only.", shared::PI_RETIRED_MESSAGE)
+    } else {
+        "This pane uses a retired provider and is read-only.".to_owned()
+    })
+}
+
+/// Whether raw keystrokes for `pane_id` are sent on to its CLI. A retired
+/// provider's tab has no terminal, and its terminal state already says why,
+/// so its keystrokes are dropped without an error for every key pressed.
+fn terminal_accepts_keystrokes(state: &AppState, session_id: &Uuid, pane_id: u32) -> bool {
+    !state
+        .sessions
+        .get_session_panes(session_id)
+        .iter()
+        .any(|pane| {
+            pane.pane_id == pane_id
+                && shared::is_retired_launch(pane.provider, pane.model.as_deref())
+        })
+}
+
+/// [`read_only_pane_message`] for the tab `pane_id` of a session's roster.
+fn read_only_pane_refusal(state: &AppState, session_id: &Uuid, pane_id: u32) -> Option<String> {
+    state
+        .sessions
+        .get_session_panes(session_id)
+        .iter()
+        .find(|pane| pane.pane_id == pane_id)
+        .and_then(read_only_pane_message)
+}
+
+/// Why the provider or model of `pane` cannot be switched: its own provider
+/// is retired, and the CLI never switches such a tab. Refusing here keeps the
+/// roster true. Accepting a switch of a saved Pi tab to OMP used to store and
+/// show it as an OMP tab while its CLI kept it as Pi and refused.
+#[allow(deprecated)]
+fn retired_pane_switch_refusal(pane: &shared::PaneConfig) -> Option<String> {
+    if !shared::is_retired_launch(pane.provider, pane.model.as_deref()) {
+        return None;
+    }
+    Some(if pane.provider == shared::Provider::Pi {
+        format!(
+            "Tab {} uses Pi, which is no longer supported. Close it and open an OMP tab.",
+            pane.pane_id
+        )
+    } else {
+        shared::retired_launch_message(pane.provider).to_owned()
+    })
+}
+
 /// Refuse typed input for `pane_id` with `message`, for a refusal that
 /// resending the same input cannot fix. Every client is sent the `Error`, as
 /// before. A connection that negotiated project instances and tagged the
@@ -2415,7 +2477,8 @@ async fn profile_launch_refusal(
     target: Option<InstanceTarget>,
 ) -> Result<(), String> {
     if shared::is_retired_launch(provider, model) {
-        return Err("Unsupported provider: this backend has been retired".to_string());
+        // Pi included: "Pi is no longer supported. Use OMP instead."
+        return Err(shared::retired_launch_message(provider).to_string());
     }
     let policy = launch_policy(state, session_id, web_policy_capable, target).await?;
     if policy.allows(kind, provider, model) {
@@ -2478,10 +2541,6 @@ fn required_terminal_capability(
         shared::Provider::Opencode => Some((
             shared::OPENCODE_TERMINAL_CAPABILITY,
             "The project CLI must be updated and reconnected before creating an OpenCode terminal pane.",
-        )),
-        shared::Provider::Pi => Some((
-            shared::PI_TERMINAL_CAPABILITY,
-            "The project CLI must be updated and reconnected before creating a Pi terminal pane.",
         )),
         shared::Provider::Omp => Some((
             shared::OMP_TERMINAL_CAPABILITY,
@@ -2607,10 +2666,11 @@ async fn authorize_new_pane_launch(
 /// it only made that pane impossible to bring back, which bites hardest exactly
 /// when someone needs it back.
 ///
-/// What still refuses: a retired backend, which genuinely cannot run, and a
-/// managed pane while team mode is unavailable, which is the switch that stops
-/// a running team rather than a catalogue entry. Without the latter a disabled
-/// team could be resurrected one pane at a time.
+/// What still refuses: a legacy bot and a retired backend, which genuinely
+/// cannot run. A pane an older `.apas` marked `managed` is an ordinary pane:
+/// team mode is removed, and neither that marker nor the policy's retained
+/// `team_available` decides anything here. Such a pane used to need a policy
+/// lookup an ordinary pane was spared, so it alone could be refused.
 async fn authorize_existing_pane_launch(
     state: &AppState,
     connection_id: &Uuid,
@@ -2634,25 +2694,11 @@ async fn authorize_existing_pane_launch(
         send_policy_error(
             state,
             connection_id,
-            "Unsupported provider: this backend has been retired",
+            shared::retired_launch_message(pane.provider),
         )
         .await;
         return false;
     }
-    if !pane.managed {
-        return true;
-    }
-    let Some(policy) = effective_policy_for_launch(
-        state,
-        connection_id,
-        session_id,
-        InstanceTarget::Pane(pane_id),
-    )
-    .await
-    else {
-        return false;
-    };
-    let _ = policy;
     true
 }
 
@@ -3749,13 +3795,57 @@ mod retired_launch_authorization_tests {
         assert!(web_rx.try_recv().is_err());
     }
 
+    /// Pi was retired. A request to create a Pi tab is refused with the
+    /// sentence that says what to use instead, whatever the CLI advertises:
+    /// `terminal_pi_v1` from an older CLI no longer routes anything.
     #[tokio::test]
-    async fn pi_terminal_requires_a_capable_cli() {
+    #[allow(deprecated)]
+    async fn a_new_pi_tab_is_refused_whatever_the_cli_advertises() {
+        for capabilities in [
+            vec![shared::PROJECT_POLICY_CAPABILITY.to_string()],
+            vec![
+                shared::PROJECT_POLICY_CAPABILITY.to_string(),
+                "terminal_pi_v1".to_string(),
+                shared::OMP_TERMINAL_CAPABILITY.to_string(),
+            ],
+        ] {
+            let (state, connection_id, session_id, mut web_rx, mut cli_rx, cli_id) =
+                policy_state().await;
+            state.sessions.set_cli_capabilities(cli_id, capabilities);
+
+            assert!(
+                !authorize_new_pane_launch(
+                    &state,
+                    &connection_id,
+                    &session_id,
+                    shared::PaneKind::Terminal,
+                    shared::Provider::Pi,
+                    None,
+                    false,
+                    InstanceTarget::Primary,
+                )
+                .await
+            );
+
+            let ServerToWeb::Error { message } = web_rx.try_recv().expect("explicit web error")
+            else {
+                panic!("expected a refusal")
+            };
+            assert_eq!(message, "Pi is no longer supported. Use OMP instead.");
+            assert!(cli_rx.try_recv().is_err(), "nothing reaches the CLI");
+        }
+    }
+
+    /// Switching an existing tab to Pi is refused the same way, and so is
+    /// bringing a saved Pi tab back.
+    #[tokio::test]
+    #[allow(deprecated)]
+    async fn switching_to_pi_and_relaunching_a_saved_pi_tab_are_refused() {
         let (state, connection_id, session_id, mut web_rx, mut cli_rx, _cli_id) =
             policy_state().await;
 
         assert!(
-            !authorize_new_pane_launch(
+            !authorize_profile_launch(
                 &state,
                 &connection_id,
                 &session_id,
@@ -3767,32 +3857,232 @@ mod retired_launch_authorization_tests {
             )
             .await
         );
-
         let ServerToWeb::Error { message } = web_rx.try_recv().expect("explicit web error") else {
-            panic!("expected compatibility error")
+            panic!("expected a refusal")
         };
-        assert!(message.contains("updated and reconnected"));
-        assert!(cli_rx.try_recv().is_err());
+        assert_eq!(message, shared::PI_RETIRED_MESSAGE);
+
+        state
+            .sessions
+            .set_session_panes(&session_id, vec![pane(9, shared::Provider::Pi, false)]);
+        assert!(!authorize_existing_pane_launch(&state, &connection_id, &session_id, 9).await);
+        let ServerToWeb::Error { message } = web_rx.try_recv().expect("explicit web error") else {
+            panic!("expected a refusal")
+        };
+        assert_eq!(message, shared::PI_RETIRED_MESSAGE);
+        assert!(cli_rx.try_recv().is_err(), "nothing reaches the CLI");
+
+        assert_eq!(
+            retired_pi_reboot_refusal(&pane(9, shared::Provider::Pi, false)).as_deref(),
+            Some(
+                "Tab 9 uses Pi, which is no longer supported. Close that tab, then reboot the CLI."
+            )
+        );
+        assert_eq!(
+            retired_pi_reboot_refusal(&pane(9, shared::Provider::Omp, false)),
+            None
+        );
     }
 
+    /// Retiring Pi must not catch OMP: an OMP tab is still authorized for a
+    /// CLI that can host it, and still needs that capability.
+    /// A saved Pi tab cannot be switched to another provider: its CLI keeps
+    /// it as Pi and refuses. Accepting the frame first stored and broadcast
+    /// the tab as OMP, so viewers saw a usable OMP tab that did not exist.
+    /// An older bundle or the native app can still send the frame.
     #[tokio::test]
-    async fn pi_terminal_is_authorized_for_a_capable_cli() {
-        let (state, connection_id, session_id, mut web_rx, _cli_rx, cli_id) = policy_state().await;
+    #[allow(deprecated)]
+    async fn switching_a_saved_pi_tab_to_omp_changes_nothing_and_reaches_no_cli() {
+        let (state, connection, session, mut web_rx, mut cli_rx, cli_id) = policy_state().await;
+        let user = state.sessions.get_session(&session).unwrap().user_id;
+        state.sessions.set_web_user(connection, user);
         state.sessions.set_cli_capabilities(
             cli_id,
             vec![
                 shared::PROJECT_POLICY_CAPABILITY.to_string(),
-                shared::PI_TERMINAL_CAPABILITY.to_string(),
+                shared::OMP_TERMINAL_CAPABILITY.to_string(),
             ],
         );
+        state.sessions.set_session_panes(
+            &session,
+            vec![
+                pane(9, shared::Provider::Pi, false),
+                pane(10, shared::Provider::Codex, false),
+            ],
+        );
+        let providers = |state: &AppState| {
+            state
+                .sessions
+                .get_session_panes(&session)
+                .into_iter()
+                .map(|pane| (pane.pane_id, pane.provider))
+                .collect::<Vec<_>>()
+        };
 
+        handle_update_pane_model(
+            &state,
+            &connection,
+            Some(session),
+            Some(session),
+            9,
+            Some(shared::Provider::Omp),
+            None,
+        )
+        .await;
+
+        let ServerToWeb::Error { message } = web_rx.try_recv().expect("explicit web error") else {
+            panic!("expected a refusal")
+        };
+        assert_eq!(
+            message,
+            "Tab 9 uses Pi, which is no longer supported. Close it and open an OMP tab."
+        );
+        assert!(web_rx.try_recv().is_err(), "no roster is broadcast");
+        assert!(cli_rx.try_recv().is_err(), "nothing reaches the CLI");
+        assert_eq!(
+            providers(&state),
+            vec![(9, shared::Provider::Pi), (10, shared::Provider::Codex)]
+        );
+
+        // The same frame for a tab that can be switched goes through, so the
+        // refusal above is the Pi tab's and not the test's setup.
+        handle_update_pane_model(
+            &state,
+            &connection,
+            Some(session),
+            Some(session),
+            10,
+            Some(shared::Provider::Omp),
+            None,
+        )
+        .await;
+        assert!(matches!(
+            cli_rx.try_recv(),
+            Ok(ServerToCli::UpdatePaneModel {
+                pane_id: 10,
+                provider: Some(shared::Provider::Omp),
+                ..
+            })
+        ));
+        assert_eq!(
+            providers(&state),
+            vec![(9, shared::Provider::Pi), (10, shared::Provider::Omp)]
+        );
+    }
+
+    /// A saved Pi tab has no process on any CLI. A message typed to it, from
+    /// the phone layout or an older bundle, used to be sent on, stored in the
+    /// tab's history and shown as a message no agent would ever answer.
+    #[tokio::test]
+    #[allow(deprecated)]
+    async fn a_saved_pi_tab_takes_no_typed_input_and_no_keystrokes() {
+        let (state, connection, session, mut web_rx, mut cli_rx, _) = policy_state().await;
+        let user = state.sessions.get_session(&session).unwrap().user_id;
+        state.sessions.set_web_user(connection, user);
+        state.sessions.set_session_panes(
+            &session,
+            vec![
+                pane(9, shared::Provider::Pi, false),
+                pane(10, shared::Provider::Omp, false),
+            ],
+        );
+        let refusal = "Pi is no longer supported. Use OMP instead. This tab is read-only.";
+
+        handle_terminal_conversation_input(
+            &state,
+            &connection,
+            Some(session),
+            session,
+            9,
+            "hello pi".into(),
+            Some("send-1".into()),
+        )
+        .await;
+        assert!(
+            matches!(web_rx.try_recv(), Ok(ServerToWeb::Error { message }) if message == refusal)
+        );
+
+        handle_web_input(
+            &state,
+            &connection,
+            Some(session),
+            Some(session),
+            "hello pi".into(),
+            None,
+            Some(9),
+            Some("send-2".into()),
+        )
+        .await;
+        assert!(
+            matches!(web_rx.try_recv(), Ok(ServerToWeb::Error { message }) if message == refusal)
+        );
+
+        assert!(web_rx.try_recv().is_err(), "nothing is echoed as sent");
+        assert!(cli_rx.try_recv().is_err(), "nothing reaches the CLI");
+        assert!(
+            state
+                .storage
+                .get_messages(&session)
+                .await
+                .unwrap_or_default()
+                .is_empty(),
+            "nothing is added to the tab's history"
+        );
+        assert_eq!(state.sessions.seen_input_id(&session, "send-1"), None);
+        assert_eq!(state.sessions.seen_input_id(&session, "send-2"), None);
+
+        // Raw keystrokes are dropped without an error for every key.
+        assert!(!terminal_accepts_keystrokes(&state, &session, 9));
+        assert!(terminal_accepts_keystrokes(&state, &session, 10));
+        // A tab the roster does not list is left to routing, as before.
+        assert!(terminal_accepts_keystrokes(&state, &session, 11));
+
+        assert_eq!(
+            read_only_pane_message(&pane(10, shared::Provider::Omp, false)),
+            None
+        );
+        assert_eq!(
+            retired_pane_switch_refusal(&pane(10, shared::Provider::Omp, false)),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn omp_terminal_is_still_authorized_for_a_capable_cli() {
+        let (state, connection_id, session_id, mut web_rx, _cli_rx, cli_id) = policy_state().await;
+
+        assert!(
+            !authorize_new_pane_launch(
+                &state,
+                &connection_id,
+                &session_id,
+                shared::PaneKind::Terminal,
+                shared::Provider::Omp,
+                None,
+                false,
+                InstanceTarget::Primary,
+            )
+            .await
+        );
+        let ServerToWeb::Error { message } = web_rx.try_recv().expect("explicit web error") else {
+            panic!("expected compatibility error")
+        };
+        assert!(message.contains("OMP terminal"));
+
+        state.sessions.set_cli_capabilities(
+            cli_id,
+            vec![
+                shared::PROJECT_POLICY_CAPABILITY.to_string(),
+                shared::OMP_TERMINAL_CAPABILITY.to_string(),
+            ],
+        );
         assert!(
             authorize_new_pane_launch(
                 &state,
                 &connection_id,
                 &session_id,
                 shared::PaneKind::Terminal,
-                shared::Provider::Pi,
+                shared::Provider::Omp,
                 None,
                 false,
                 InstanceTarget::Primary,
@@ -3800,37 +4090,6 @@ mod retired_launch_authorization_tests {
             .await
         );
         assert!(web_rx.try_recv().is_err());
-    }
-
-    #[tokio::test]
-    async fn opencode_capability_does_not_authorize_pi() {
-        // A CLI that predates Pi but can host OpenCode must not receive Pi.
-        let (state, connection_id, session_id, mut web_rx, _cli_rx, cli_id) = policy_state().await;
-        state.sessions.set_cli_capabilities(
-            cli_id,
-            vec![
-                shared::PROJECT_POLICY_CAPABILITY.to_string(),
-                shared::OPENCODE_TERMINAL_CAPABILITY.to_string(),
-            ],
-        );
-
-        assert!(
-            !authorize_new_pane_launch(
-                &state,
-                &connection_id,
-                &session_id,
-                shared::PaneKind::Terminal,
-                shared::Provider::Pi,
-                None,
-                false,
-                InstanceTarget::Primary,
-            )
-            .await
-        );
-        let ServerToWeb::Error { message } = web_rx.try_recv().expect("explicit web error") else {
-            panic!("expected compatibility error")
-        };
-        assert!(message.contains("Pi terminal"));
     }
 
     #[tokio::test]
@@ -4759,6 +5018,21 @@ fn retired_instance_pane(
         .find(|pane| shared::is_retired_launch(pane.provider, pane.model.as_deref()))
 }
 
+/// The reboot refusal for a saved Pi tab, which says what to do about it.
+/// A Pi tab blocks a project's CLI reboot like any other retired pane. The
+/// Machines page reboot is not blocked, and neither path leaves a Pi process
+/// an older CLI was hosting running for long: the updated CLI keeps no pane
+/// host for a retired tab and ends it when it starts the project.
+#[allow(deprecated)]
+fn retired_pi_reboot_refusal(pane: &shared::PaneConfig) -> Option<String> {
+    (pane.provider == shared::Provider::Pi).then(|| {
+        format!(
+            "Tab {} uses Pi, which is no longer supported. Close that tab, then reboot the CLI.",
+            pane.pane_id
+        )
+    })
+}
+
 /// `RebootCli` for a session this connection may use: reboot the instance on
 /// `machine_id`, else the primary. Projects run inside their machine's
 /// daemon, so this replaces that host's daemon and every project in it and
@@ -4797,15 +5071,13 @@ async fn handle_reboot_cli(
         return;
     }
     if let Some(pane) = retired_instance_pane(state, &session_id, target.as_ref()) {
-        send_policy_error(
-            state,
-            connection_id,
+        let message = retired_pi_reboot_refusal(&pane).unwrap_or_else(|| {
             format!(
                 "Pane {} uses an unsupported retired provider and blocks CLI reboot",
                 pane.pane_id
-            ),
-        )
-        .await;
+            )
+        });
+        send_policy_error(state, connection_id, message).await;
         return;
     }
     tracing::info!(%session_id, ?machine_id, "Rebooting CLI");
@@ -4918,15 +5190,13 @@ async fn handle_cli_lifecycle_request(
             return;
         }
         if let Some(pane) = retired_instance_pane(state, &session_id, target.as_ref()) {
-            send_policy_error(
-                state,
-                connection_id,
+            let message = retired_pi_reboot_refusal(&pane).unwrap_or_else(|| {
                 format!(
                     "Pane {} uses a retired backend and blocks CLI reboot",
                     pane.pane_id
-                ),
-            )
-            .await;
+                )
+            });
+            send_policy_error(state, connection_id, message).await;
             return;
         }
     }
@@ -5073,19 +5343,14 @@ async fn handle_web_input(
             .map(|pane_type| shared::PaneConfig::pane_id_from_legacy(&pane_type))
             .unwrap_or(shared::PANE_ID_INTERACTIVE)
     });
-    if state
-        .sessions
-        .get_session_panes(&sid)
-        .iter()
-        .any(|pane| pane.pane_id == target_pane && pane.mode == shared::PaneMode::Deadloop)
-    {
+    if let Some(refusal) = read_only_pane_refusal(state, &sid, target_pane) {
         refuse_input(
             state,
             connection_id,
             sid,
             target_pane,
             client_msg_id.as_deref(),
-            RETIRED_BOT_MESSAGE.to_owned(),
+            refusal,
         )
         .await;
         return;
@@ -5346,6 +5611,112 @@ async fn handle_reorder_panes(
         .await;
 }
 
+/// `UpdatePaneModel`: switch one tab's provider or model. The roster is
+/// edited and sent to viewers only for a switch the tab's CLI will carry
+/// out, so every refusal comes before the edit.
+async fn handle_update_pane_model(
+    state: &AppState,
+    connection_id: &Uuid,
+    msg_session_id: Option<Uuid>,
+    fallback_session_id: Option<Uuid>,
+    pane_id: u32,
+    provider: Option<shared::Provider>,
+    model: Option<String>,
+) {
+    let Some(sid) = resolve_pane_session(
+        state,
+        connection_id,
+        msg_session_id,
+        fallback_session_id,
+        pane_id,
+    )
+    .await
+    else {
+        return;
+    };
+    let Ok((_project_id, _project_guard)) = state.active_session_operation(&sid.to_string()).await
+    else {
+        return;
+    };
+    let trimmed = model
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let existing = state
+        .sessions
+        .get_session_panes(&sid)
+        .into_iter()
+        .find(|pane| pane.pane_id == pane_id);
+    let Some(existing) = existing else {
+        send_policy_error(state, connection_id, "Pane not found").await;
+        return;
+    };
+    if existing.mode == shared::PaneMode::Deadloop {
+        send_policy_error(state, connection_id, RETIRED_BOT_MESSAGE).await;
+        return;
+    }
+    if let Some(refusal) = retired_pane_switch_refusal(&existing) {
+        send_policy_error(state, connection_id, refusal).await;
+        return;
+    }
+    let desired_provider = provider.unwrap_or(existing.provider);
+    if provider.is_some()
+        && existing.kind == shared::PaneKind::Terminal
+        && !requires_capable_terminal_cli(
+            state,
+            connection_id,
+            &sid,
+            desired_provider,
+            InstanceTarget::Pane(pane_id),
+        )
+        .await
+    {
+        return;
+    }
+    if !authorize_profile_launch(
+        state,
+        connection_id,
+        &sid,
+        existing.kind,
+        desired_provider,
+        trimmed.as_deref(),
+        existing.managed,
+        InstanceTarget::Pane(pane_id),
+    )
+    .await
+    {
+        return;
+    }
+    tracing::info!(
+        "Switching pane {} agent in session {} to provider={:?} model={:?}",
+        pane_id,
+        sid,
+        provider,
+        trimmed
+    );
+    let new_model = trimmed.clone();
+    edit_roster_pane(state, sid, pane_id, |pane| {
+        if let Some(p) = provider {
+            pane.provider = p;
+        }
+        pane.model = new_model;
+    })
+    .await;
+    state
+        .sessions
+        .route_to_cli(
+            &sid,
+            ServerToCli::UpdatePaneModel {
+                session_id: sid,
+                pane_id,
+                provider,
+                model: trimmed,
+            },
+        )
+        .await;
+}
+
 /// Apply a web edit of one tab (its label, effort, model or bot settings),
 /// save the roster and send it to the session's viewers. Returns false, and
 /// changes nothing, when the roster does not list the tab.
@@ -5592,19 +5963,14 @@ async fn handle_terminal_conversation_input(
         }
     }
 
-    if state
-        .sessions
-        .get_session_panes(&sid)
-        .iter()
-        .any(|pane| pane.pane_id == pane_id && pane.mode == shared::PaneMode::Deadloop)
-    {
+    if let Some(refusal) = read_only_pane_refusal(state, &sid, pane_id) {
         refuse_input(
             state,
             connection_id,
             sid,
             pane_id,
             client_msg_id.as_deref(),
-            RETIRED_BOT_MESSAGE.to_owned(),
+            refusal,
         )
         .await;
         return;
@@ -7879,6 +8245,9 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     else {
                         continue;
                     };
+                    if !terminal_accepts_keystrokes(&state, &sid, pane_id) {
+                        continue;
+                    }
                     state
                         .sessions
                         .route_to_cli(
@@ -8303,89 +8672,16 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     provider,
                     model,
                 }) => {
-                    if let Some(sid) =
-                        resolve_pane_session(&state, &connection_id, msg_sid, session_id, pane_id)
-                            .await
-                    {
-                        let Ok((_project_id, _project_guard)) =
-                            state.active_session_operation(&sid.to_string()).await
-                        else {
-                            continue;
-                        };
-                        let trimmed = model
-                            .as_deref()
-                            .map(str::trim)
-                            .filter(|s| !s.is_empty())
-                            .map(str::to_string);
-                        let existing = state
-                            .sessions
-                            .get_session_panes(&sid)
-                            .into_iter()
-                            .find(|pane| pane.pane_id == pane_id);
-                        let Some(existing) = existing else {
-                            send_policy_error(&state, &connection_id, "Pane not found").await;
-                            continue;
-                        };
-                        if existing.mode == shared::PaneMode::Deadloop {
-                            send_policy_error(&state, &connection_id, RETIRED_BOT_MESSAGE).await;
-                            continue;
-                        }
-                        let desired_provider = provider.unwrap_or(existing.provider);
-                        if provider.is_some()
-                            && existing.kind == shared::PaneKind::Terminal
-                            && !requires_capable_terminal_cli(
-                                &state,
-                                &connection_id,
-                                &sid,
-                                desired_provider,
-                                InstanceTarget::Pane(pane_id),
-                            )
-                            .await
-                        {
-                            continue;
-                        }
-                        if !authorize_profile_launch(
-                            &state,
-                            &connection_id,
-                            &sid,
-                            existing.kind,
-                            desired_provider,
-                            trimmed.as_deref(),
-                            existing.managed,
-                            InstanceTarget::Pane(pane_id),
-                        )
-                        .await
-                        {
-                            continue;
-                        }
-                        tracing::info!(
-                            "Switching pane {} agent in session {} to provider={:?} model={:?}",
-                            pane_id,
-                            sid,
-                            provider,
-                            trimmed
-                        );
-                        let new_model = trimmed.clone();
-                        edit_roster_pane(&state, sid, pane_id, |pane| {
-                            if let Some(p) = provider {
-                                pane.provider = p;
-                            }
-                            pane.model = new_model;
-                        })
-                        .await;
-                        state
-                            .sessions
-                            .route_to_cli(
-                                &sid,
-                                ServerToCli::UpdatePaneModel {
-                                    session_id: sid,
-                                    pane_id,
-                                    provider,
-                                    model: trimmed,
-                                },
-                            )
-                            .await;
-                    }
+                    handle_update_pane_model(
+                        &state,
+                        &connection_id,
+                        msg_sid,
+                        session_id,
+                        pane_id,
+                        provider,
+                        model,
+                    )
+                    .await;
                 }
                 Ok(WebToServer::ReorderPanes {
                     session_id: msg_sid,

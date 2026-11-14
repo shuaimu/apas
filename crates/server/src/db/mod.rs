@@ -7276,6 +7276,64 @@ mod cluster_administration_tests {
             .contains("unsupported"));
     }
 
+    /// Pi was a supported profile, so the deployment default written before
+    /// its retirement lists it. That stored policy must load, lose only the
+    /// Pi entry, and keep OMP; and nobody can write Pi back.
+    #[tokio::test]
+    async fn a_stored_policy_that_lists_pi_loads_and_loses_only_pi() {
+        let db = database("pi-retired-policy").await;
+        db.run_migrations().await.unwrap();
+        db.create_user(&user("admin", "admin@test", "admin"))
+            .await
+            .unwrap();
+
+        let fresh = db.get_deployment_default_policy().await.unwrap();
+        assert!(!fresh
+            .allowed_launch_profiles
+            .iter()
+            .any(|key| key.starts_with("terminal:pi:")));
+        assert!(fresh
+            .allowed_launch_profiles
+            .contains(&"terminal:omp:official:default".to_string()));
+
+        let before_retirement = vec![
+            "terminal:claude:official:default".to_string(),
+            "terminal:pi:official:default".to_string(),
+            "terminal:omp:official:default".to_string(),
+        ];
+        sqlx::query(
+            "UPDATE cluster_settings SET allowed_launch_profiles = ?, version = 9 WHERE id = 1",
+        )
+        .bind(serde_json::to_string(&before_retirement).unwrap())
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+        db.run_migrations().await.unwrap();
+        let persisted = db.get_deployment_default_policy().await.unwrap();
+        assert_eq!(
+            persisted.allowed_launch_profiles,
+            vec![
+                "terminal:claude:official:default".to_string(),
+                "terminal:omp:official:default".to_string(),
+            ]
+        );
+        let settled = persisted.version;
+        db.run_migrations().await.unwrap();
+        assert_eq!(
+            db.get_deployment_default_policy().await.unwrap().version,
+            settled,
+            "migration must be idempotent"
+        );
+
+        assert!(db
+            .set_deployment_default_policy("admin", true, before_retirement)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("retired"));
+    }
+
     #[tokio::test]
     async fn deepseek_seeds_only_flash_and_carries_a_legacy_allowlist_forward() {
         let db = database("deepseek-flash-policy-defaults").await;

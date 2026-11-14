@@ -57,6 +57,21 @@ describe("Rust protocol golden fixtures", () => {
     expect(validateServerMessage({ ...receipt, outcome: "probably" }).valid).toBe(false);
   });
 
+  it("still parses the retired Pi provider, in a frame from an older client and in a stored roster", () => {
+    // Pi can no longer be created, and the server refuses a request for it.
+    // The value stays in the schema so the frame is refused with a sentence
+    // instead of dropping the socket, and so an old roster still loads.
+    const add = JSON.parse(readFileSync(`${fixturesDirectory}/web-add-pane-targeted.json`, "utf8"));
+    expect(validateClientMessage({ ...add, provider: "pi" }).valid).toBe(true);
+    expect(validateClientMessage({ ...add, provider: "omp" }).valid).toBe(true);
+    expect(validateClientMessage({ ...add, provider: "invented" }).valid).toBe(false);
+
+    const roster = JSON.parse(readFileSync(`${fixturesDirectory}/server-pane-list-instances.json`, "utf8"));
+    expect(roster.panes.length).toBeGreaterThan(0);
+    const withPi = { ...roster, panes: roster.panes.map((pane: object) => ({ ...pane, provider: "pi" })) };
+    expect(validateServerMessage(withPi).errors).toEqual([]);
+  });
+
   it("rejects an unknown client mutation", () => {
     expect(validateClientMessage({ type: "invented_mutation" }).valid).toBe(false);
   });

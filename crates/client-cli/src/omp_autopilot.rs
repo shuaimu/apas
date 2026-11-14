@@ -6,7 +6,8 @@
 //! reports there, and writes a heartbeat that says a controller is present.
 //! The directory and every file are private to the OS account (0700/0600),
 //! as for the question bridge. The design record is
-//! `openspec/changes/add-omp-tab-autopilot/design.md`, decisions 5 to 8.
+//! `openspec/changes/archive/2026-11-13-add-omp-tab-autopilot/design.md`,
+//! decisions 5 to 8.
 //!
 //! These files are not an authority boundary. The checks show which launch a
 //! file belongs to, not who wrote it.

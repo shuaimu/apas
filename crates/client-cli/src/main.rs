@@ -1100,7 +1100,12 @@ fn is_apas_daemon_process(pid: u32) -> bool {
     has_apas_binary && has_daemon_arg
 }
 
-const CONFIG_KEYS: &str = "server, token, claude_path, codex_path, opencode_path, pi_path, omp_path, cursor_agent_path, deepseek_api_base_url, deepseek_api_key, pane_host_adoption_grace_seconds, pane_host_reboot_grace_seconds, daemon_machine_id, daemon_roots, summary_enabled, summary_adapter, summary_model, summary_timeout_seconds, summary_max_input_bytes, summary_allow_cross_provider";
+const CONFIG_KEYS: &str = "server, token, claude_path, codex_path, opencode_path, omp_path, cursor_agent_path, deepseek_api_base_url, deepseek_api_key, pane_host_adoption_grace_seconds, pane_host_reboot_grace_seconds, daemon_machine_id, daemon_roots, summary_enabled, summary_adapter, summary_model, summary_timeout_seconds, summary_max_input_bytes, summary_allow_cross_provider";
+
+/// What `apas config set/get pi_path` answers. A config file that still holds
+/// the key loads without complaint; only asking for it by name says this.
+const PI_PATH_RETIRED: &str =
+    "pi_path is no longer a setting. Pi is no longer supported. Use OMP instead (omp_path).";
 
 fn set_config_value(config: &mut config::Config, key: &str, value: String) -> Result<()> {
     match key {
@@ -1109,7 +1114,7 @@ fn set_config_value(config: &mut config::Config, key: &str, value: String) -> Re
         "claude_path" => config.local.claude_path = value,
         "codex_path" => config.local.codex_path = value,
         "opencode_path" => config.local.opencode_path = value,
-        "pi_path" => config.local.pi_path = value,
+        "pi_path" => anyhow::bail!(PI_PATH_RETIRED),
         "omp_path" => config.local.omp_path = value,
         "cursor_agent_path" => config.local.cursor_agent_path = value,
         "deepseek_api_base_url" => {
@@ -1232,6 +1237,26 @@ mod tests {
         assert_eq!(
             get_config_value(&config, "deepseek_api_base_url").unwrap(),
             "https://api.deepseek.com/anthropic"
+        );
+    }
+
+    #[test]
+    fn pi_path_is_no_longer_a_setting_and_omp_path_still_is() {
+        let mut config = config::Config::default();
+        for error in [
+            set_config_value(&mut config, "pi_path", "/opt/pi/bin/pi".to_string()).unwrap_err(),
+            get_config_value(&config, "pi_path").unwrap_err(),
+        ] {
+            let text = error.to_string();
+            assert!(text.contains("Pi is no longer supported"), "{text}");
+            assert!(text.contains("omp_path"), "{text}");
+        }
+        assert!(!super::CONFIG_KEYS.contains("pi_path"));
+
+        set_config_value(&mut config, "omp_path", "/opt/omp/bin/omp".to_string()).unwrap();
+        assert_eq!(
+            get_config_value(&config, "omp_path").unwrap(),
+            "/opt/omp/bin/omp"
         );
     }
 
@@ -2157,7 +2182,7 @@ fn get_config_value(config: &config::Config, key: &str) -> Result<String> {
         "claude_path" => config.local.claude_path.clone(),
         "codex_path" => config.local.codex_path.clone(),
         "opencode_path" => config.local.opencode_path.clone(),
-        "pi_path" => config.local.pi_path.clone(),
+        "pi_path" => anyhow::bail!(PI_PATH_RETIRED),
         "omp_path" => config.local.omp_path.clone(),
         "cursor_agent_path" => config.local.cursor_agent_path.clone(),
         "deepseek_api_base_url" => config
@@ -2219,7 +2244,6 @@ async fn handle_config_command(action: ConfigAction) -> Result<()> {
             println!("claude_path: {}", config.local.claude_path);
             println!("codex_path: {}", config.local.codex_path);
             println!("opencode_path: {}", config.local.opencode_path);
-            println!("pi_path: {}", config.local.pi_path);
             println!("omp_path: {}", config.local.omp_path);
             println!("cursor_agent_path: {}", config.local.cursor_agent_path);
             println!(

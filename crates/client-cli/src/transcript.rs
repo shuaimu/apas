@@ -34,12 +34,12 @@
 //!   its UUID at creation. The newest session whose exported `directory`
 //!   exactly matches the pane cwd is selected, then exported by ID. This has
 //!   the same shared-cwd ambiguity as Codex but never crosses directories.
-//! * **pi** — `--session-id <uuid>` pins the id at spawn, and the file name
-//!   carries it: `~/.pi/agent/sessions/--<cwd slug>--/<timestamp>_<uuid>.jsonl`.
-//!   The file is found by the exact id anywhere under the sessions root, so
-//!   sibling panes and provider subprocesses sharing a directory can never be
-//!   mistaken for this pane. The file appears only once the session's first
-//!   assistant message exists; before that the pane simply has no history.
+//! * **omp** — the pane owns a private `--session-dir`, so the newest flat
+//!   `.jsonl` in it is this pane's and nobody else's; new Linux panes also
+//!   report their exact transcript through the activity extension. OMP is
+//!   derived from Pi and writes Pi's session record format, which is why the
+//!   reader below is named for Pi. Pi itself was retired as a provider: its
+//!   sessions under `~/.pi` are no longer located or read.
 
 use anyhow::{Context, Result};
 use serde_json::Value;
@@ -570,52 +570,6 @@ pub fn read_opencode_turns(
     Ok(turns)
 }
 
-/// Root holding Pi's per-directory session buckets.
-///
-/// Pi's own environment overrides are honored so a host that relocates its
-/// agent directory does not leave every Pi pane with no recoverable history.
-fn pi_sessions_root(home: &Path) -> PathBuf {
-    if let Some(dir) = std::env::var_os("PI_CODING_AGENT_SESSION_DIR") {
-        return PathBuf::from(dir);
-    }
-    std::env::var_os("PI_CODING_AGENT_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| home.join(".pi").join("agent"))
-        .join("sessions")
-}
-
-/// The exact Pi session file carrying this pane's pinned identity.
-///
-/// The id names the file (`<timestamp>_<uuid>.jsonl`) wherever Pi wrote it, so
-/// the lookup is by suffix under the sessions root rather than by directory
-/// slug: a pane whose provider moved into a worktree keeps its own history, and
-/// a sibling pane or provider subprocess sharing a directory is never adopted.
-/// Returns `None` until Pi writes its first assistant message.
-pub fn find_pi_session_file(home: &Path, session_id: Uuid) -> Option<PathBuf> {
-    let suffix = format!("_{session_id}.jsonl");
-    let mut stack = vec![pi_sessions_root(home)];
-    while let Some(dir) = stack.pop() {
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            continue;
-        };
-        for entry in entries.filter_map(|entry| entry.ok()) {
-            let path = entry.path();
-            if path.is_dir() {
-                stack.push(path);
-                continue;
-            }
-            if path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| name.ends_with(&suffix))
-            {
-                return Some(path);
-            }
-        }
-    }
-    None
-}
-
 /// Root holding OMP's session buckets.
 ///
 /// OMP is Pi-derived and reads the same `PI_CODING_AGENT_*` overrides, but its
@@ -633,8 +587,8 @@ fn omp_sessions_root(home: &Path) -> PathBuf {
 
 /// The private session directory a pane's OMP process writes into.
 ///
-/// OMP has no `--session-id`, so a pane cannot pin an exact identity the way a
-/// Pi pane does. `--session-dir` is stronger in practice: the pane owns the
+/// OMP has no `--session-id`, so a pane cannot pin an exact identity by id.
+/// `--session-dir` is stronger in practice: the pane owns the
 /// directory outright, so a sibling pane or a provider subprocess sharing a
 /// working directory can never select this pane's session, and `--continue`
 /// inside it is unambiguous without consulting recency across panes.
@@ -648,9 +602,8 @@ pub fn omp_session_dir(home: &Path, conversation_id: Uuid) -> PathBuf {
 
 /// The session file OMP wrote for this pane, if it has written one yet.
 ///
-/// The pane owns its directory, so the newest `.jsonl` in it is unambiguous —
-/// unlike Pi, where directory recency could pick up a sibling and the lookup
-/// has to go by pinned id. OMP names files `<timestamp>_<uuid>.jsonl`, and a
+/// The pane owns its directory, so the newest `.jsonl` in it is unambiguous:
+/// no sibling pane writes there. OMP names files `<timestamp>_<uuid>.jsonl`, and a
 /// resumed session keeps appending to the file it started, so there is
 /// normally exactly one.
 pub fn find_omp_session_file(home: &Path, conversation_id: Uuid) -> Option<PathBuf> {
@@ -731,6 +684,10 @@ pub struct PiTranscriptReader {
 }
 
 impl PiTranscriptReader {
+    /// The record format without OMP's additions (native questions, tool
+    /// rounds, the APAS extension's entries). No pane reads this way since Pi
+    /// was retired; the tests of the shared cache and branch logic still do.
+    #[cfg(test)]
     pub fn read(&mut self, path: &Path, pane_id: u32) -> Result<&PiSnapshot> {
         self.read_provider(path, pane_id, false)
     }
@@ -3066,7 +3023,10 @@ mod tests {
         assert!(find_claude_switch_candidate(&pinned, last_growth, &excluded,).is_none());
     }
 
-    // --- pi ---------------------------------------------------------------
+    // --- the Pi session record format, which OMP writes ---------------------
+    //
+    // Pi itself was retired as a provider. These stay because the reader and
+    // its branch, completion and cache rules are the ones OMP panes use.
 
     /// A real omp 18.1.20 session, trimmed. Two turns written across a
     /// `--continue` boundary, so the parent chain crosses the resume and the
@@ -3534,25 +3494,6 @@ mod tests {
         assert!(reader.read(&replacement, 2).unwrap().turns.is_empty());
         std::fs::write(&replacement, original).unwrap();
         assert_eq!(reader.read(&replacement, 2).unwrap().turns[0].text, "old");
-    }
-
-    #[test]
-    fn pi_session_file_is_found_by_exact_id_in_any_bucket() {
-        let home = tempfile::tempdir().unwrap();
-        let wanted = Uuid::parse_str("11111111-2222-4333-8444-555555555555").unwrap();
-        let other = Uuid::new_v4();
-        let dir = home.path().join(".pi/agent/sessions/--wanted--");
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(
-            dir.join(format!("2024-12-03T14-00-00-000Z_{other}.jsonl")),
-            "{}\n",
-        )
-        .unwrap();
-        let expected = dir.join(format!("2024-12-03T14-00-00-000Z_{wanted}.jsonl"));
-        std::fs::write(&expected, "{}\n").unwrap();
-
-        assert_eq!(find_pi_session_file(home.path(), wanted), Some(expected));
-        assert_eq!(find_pi_session_file(home.path(), Uuid::new_v4()), None);
     }
 
     #[test]

@@ -1189,7 +1189,6 @@ fn resolve_pane_binary_path(
     claude_path: &str,
     codex_path: &str,
     opencode_path: &str,
-    pi_path: &str,
     omp_path: &str,
     cursor_agent_path: &str,
 ) -> String {
@@ -1200,15 +1199,20 @@ fn resolve_pane_binary_path(
         Provider::Claude | Provider::Deepseek => claude_path.to_string(),
         Provider::Codex => codex_path.to_string(),
         Provider::Opencode => opencode_path.to_string(),
-        Provider::Pi => pi_path.to_string(),
         Provider::Omp => omp_path.to_string(),
         Provider::CursorAgent => cursor_agent_path.to_string(),
         #[allow(deprecated)]
-        Provider::Minimax | Provider::Glm => String::new(),
+        Provider::Minimax | Provider::Glm | Provider::Pi => String::new(),
     }
 }
 
 fn provider_display_name(provider: &Provider, model: Option<&str>) -> &'static str {
+    #[allow(deprecated)]
+    if matches!(provider, Provider::Pi) {
+        // Retired, and still named: a message about a saved Pi tab should say
+        // which provider it means.
+        return "Pi";
+    }
     if shared::is_retired_launch(*provider, model) {
         return "Unsupported provider";
     }
@@ -1218,9 +1222,10 @@ fn provider_display_name(provider: &Provider, model: Option<&str>) -> &'static s
         Provider::Codex => "Codex",
         #[allow(deprecated)]
         Provider::Minimax | Provider::Glm => "Unsupported provider",
+        #[allow(deprecated)]
+        Provider::Pi => "Pi",
         Provider::Deepseek => "DeepSeek",
         Provider::Opencode => "OpenCode",
-        Provider::Pi => "Pi",
         Provider::Omp => "OMP",
         Provider::CursorAgent => "Cursor",
     }
@@ -1235,12 +1240,90 @@ fn provider_config_key(provider: &Provider, model: Option<&str>) -> &'static str
         Provider::Codex => "codex_path",
         Provider::Deepseek => "claude_path",
         Provider::Opencode => "opencode_path",
-        Provider::Pi => "pi_path",
         Provider::Omp => "omp_path",
         Provider::CursorAgent => "cursor_agent_path",
         #[allow(deprecated)]
-        Provider::Minimax | Provider::Glm => "unsupported_provider",
+        Provider::Minimax | Provider::Glm | Provider::Pi => "unsupported_provider",
     }
+}
+
+/// The status line for refusing `action` on a retired launch. Pi says what to
+/// use instead; the older tombstones keep the wording stale clients match on.
+#[allow(deprecated)]
+fn retired_refusal_text(action: &str, provider: Provider) -> String {
+    if provider == Provider::Pi {
+        format!("[{action} refused. {}]", shared::PI_RETIRED_MESSAGE)
+    } else {
+        format!("[{action} refused — unsupported provider has been retired]")
+    }
+}
+
+/// Why a switch of tab `pane_id` from `own` to `desired` (each a provider and
+/// its model) is refused for a retired side: the tab's own provider, else the
+/// one asked for. A saved Pi tab cannot become an OMP tab, so its refusal
+/// must not say "Use OMP instead": that is what was just tried.
+#[allow(deprecated)]
+fn retired_model_switch_refusal(
+    pane_id: u32,
+    own: (Provider, Option<&str>),
+    desired: (Provider, Option<&str>),
+) -> Option<String> {
+    if shared::is_retired_launch(own.0, own.1) {
+        return Some(if own.0 == Provider::Pi {
+            format!(
+                "[Model switch refused. Tab {pane_id} uses Pi, which is no longer supported. Close it and open an OMP tab.]"
+            )
+        } else {
+            retired_refusal_text("Model switch", own.0)
+        });
+    }
+    shared::is_retired_launch(desired.0, desired.1)
+        .then(|| retired_refusal_text("Model switch", desired.0))
+}
+
+/// The line a local `apas --attach` view gets for a saved tab that is not
+/// started at restore. It goes to the local output channel only: it is not
+/// sent to the server and so never appears in the web conversation. The web
+/// learns the reason from the tab's exited terminal state
+/// (`unavailable_terminal_status`) and words it itself.
+#[allow(deprecated)]
+fn retired_pane_restore_text(provider: Provider) -> String {
+    if provider == Provider::Pi {
+        format!("[{} This tab stays stopped.]", shared::PI_RETIRED_MESSAGE)
+    } else {
+        "[Unsupported provider — this historical pane remains stopped]".to_string()
+    }
+}
+
+/// The status of a configured terminal tab that has no process. A retired
+/// provider's tab never gets one, and says why: its terminal view shows this
+/// as the reason it exited.
+fn unavailable_terminal_status(provider: Provider, model: Option<&str>) -> String {
+    if shared::is_retired_launch(provider, model) {
+        shared::retired_launch_message(provider).to_string()
+    } else {
+        "terminal process unavailable".to_string()
+    }
+}
+
+/// Why a project CLI reboot is refused while `panes` holds a retired one.
+#[allow(deprecated)]
+fn retired_pane_cli_reboot_refusal<'a>(
+    panes: impl IntoIterator<Item = (u32, Provider, Option<&'a str>)>,
+) -> Option<String> {
+    let mut retired = panes
+        .into_iter()
+        .filter(|(_, provider, model)| shared::is_retired_launch(*provider, *model))
+        .collect::<Vec<_>>();
+    retired.sort_by_key(|(pane_id, ..)| *pane_id);
+    let (pane_id, provider, _) = retired.first()?;
+    Some(if *provider == Provider::Pi {
+        format!(
+            "[CLI reboot refused. Tab {pane_id} uses Pi, which is no longer supported. Close that tab first.]"
+        )
+    } else {
+        "[CLI reboot refused while a historical retired-provider pane is present]".to_string()
+    })
 }
 
 const DEEPSEEK_API_BASE_URL: &str = "https://api.deepseek.com/anthropic";
@@ -1649,7 +1732,7 @@ fn build_pane_env_overrides_from_keys(
     deepseek_api_key: Option<String>,
 ) -> Result<Vec<(String, String)>, String> {
     if shared::is_retired_launch(*provider, model) {
-        return Err("Unsupported provider: this backend has been retired".to_string());
+        return Err(shared::retired_launch_message(*provider).to_string());
     }
     if !matches!(provider, Provider::Claude | Provider::Deepseek) {
         return Ok(Vec::new());
@@ -1803,6 +1886,11 @@ fn spawn_terminal_pane(
     resume: bool,
     initial_input: Option<&str>,
 ) -> Result<(), String> {
+    // A saved tab of a retired provider (Pi) is never launched, whichever
+    // path asks: restore, reboot, or a provider switch.
+    if shared::is_retired_launch(*provider, model) {
+        return Err(format!("[{}]", shared::retired_launch_message(*provider)));
+    }
     terminal_binary_for(provider).ok_or_else(|| {
         format!(
             "[{} cannot host a terminal pane]",
@@ -1911,20 +1999,24 @@ fn terminal_state_reports(
     pane_metas: &PaneMetas,
     terminal_panes: &TerminalPanes,
 ) -> Vec<CliToServer> {
-    let mut terminal_ids = pane_metas
+    let mut terminals = pane_metas
         .lock()
         .map(|metas| {
             metas
                 .iter()
-                .filter_map(|(pane_id, meta)| meta.kind.is_terminal().then_some(*pane_id))
+                .filter_map(|(pane_id, meta)| {
+                    meta.kind
+                        .is_terminal()
+                        .then(|| (*pane_id, meta.provider, meta.model.clone()))
+                })
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
-    terminal_ids.sort_unstable();
+    terminals.sort_unstable_by_key(|(pane_id, ..)| *pane_id);
 
-    terminal_ids
+    terminals
         .into_iter()
-        .map(|pane_id| {
+        .map(|(pane_id, provider, model)| {
             let handle = terminal_panes
                 .lock()
                 .ok()
@@ -1936,7 +2028,7 @@ fn terminal_state_reports(
                     pane_id,
                     instance_id: None,
                     lifecycle: shared::TerminalLifecycle::Exited,
-                    status: Some("terminal process unavailable".to_string()),
+                    status: Some(unavailable_terminal_status(provider, model.as_deref())),
                     runtime: None,
                 },
             }
@@ -2228,7 +2320,8 @@ struct RuntimeStart {
     metadata: ProjectMetadata,
     /// The panes this runtime restores, which are only the ones it owns.
     tabs: Vec<RestoredTab>,
-    /// Which of those are terminal panes, for pane-host reconciliation.
+    /// Which of those are terminal panes this runtime can host, for pane-host
+    /// reconciliation. A retired provider's tab is not among them.
     terminal_panes: HashSet<u32>,
 }
 
@@ -2248,10 +2341,19 @@ fn open_runtime(working_dir: &Path, owner: &PaneOwner) -> Result<RuntimeStart> {
         others = start.metadata.panes.len().saturating_sub(start.panes.len()),
         "opened project panes for this machine"
     );
+    // A retired provider's terminal tab is listed but never started or
+    // adopted, so it is left out here: a pane host still running it from
+    // before the upgrade (a saved Pi tab) would otherwise keep its agent
+    // alive, unseen and unstoppable, until its reboot lease ran out.
+    // Reconciliation ends such a host at project start instead.
     let terminal_panes = start
         .panes
         .iter()
-        .filter_map(|pane| pane.kind.is_terminal().then_some(pane.pane_id))
+        .filter(|pane| {
+            pane.kind.is_terminal()
+                && !shared::is_retired_launch(pane.provider, pane.model.as_deref())
+        })
+        .map(|pane| pane.pane_id)
         .collect();
     let tabs = restored_tabs(&start.panes, start.metadata.is_paused);
     Ok(RuntimeStart {
@@ -2855,7 +2957,6 @@ async fn run_inner(
     let claude_path = resolve_binary_path(&config.local.claude_path);
     let codex_path = resolve_binary_path(&config.local.codex_path);
     let opencode_path = resolve_binary_path(&config.local.opencode_path);
-    let pi_path = resolve_binary_path(&config.local.pi_path);
     let omp_path = resolve_binary_path(&config.local.omp_path);
     let cursor_agent_path = resolve_binary_path(&config.local.cursor_agent_path);
 
@@ -2880,9 +2981,10 @@ async fn run_inner(
     // nearly all of it through this handle.
     let store = ProjectStore::new(working_dir, owner, metadata);
 
-    // Against the terminal panes this runtime restores, which are this
-    // machine's only: a pane host left on this host for any other pane has
-    // nothing here that would ever adopt it.
+    // Against the terminal panes this runtime restores and can host, which
+    // are this machine's only: a pane host left on this host for any other
+    // pane, or for a retired provider's tab, has nothing here that would ever
+    // adopt it.
     match crate::pane_host::reconcile_project_hosts(session_id, &configured_terminal_panes) {
         Ok(removed) if removed > 0 => {
             tracing::info!(removed, "removed unrostered pane-host runtimes")
@@ -3024,9 +3126,12 @@ async fn run_inner(
                 continue;
             }
             if shared::is_retired_launch(*provider, tab_model.as_deref()) {
+                // Listed, never started. A terminal tab among them (a saved
+                // Pi tab) is reported to the server as an exited terminal
+                // with the reason: see `terminal_state_reports`. The line
+                // below reaches only a local `apas --attach` view.
                 let _ = output_tx.send(PaneOutput {
-                    text: "[Unsupported provider — this historical pane remains stopped]"
-                        .to_string(),
+                    text: retired_pane_restore_text(*provider),
                     pane_id: *pane_id,
                 });
                 continue;
@@ -3072,7 +3177,6 @@ async fn run_inner(
             &claude_path,
             &codex_path,
             &opencode_path,
-            &pi_path,
             &omp_path,
             &cursor_agent_path,
         );
@@ -3235,7 +3339,6 @@ async fn run_inner(
             &claude_path,
             &codex_path,
             &opencode_path,
-            &pi_path,
             &omp_path,
             &cursor_agent_path,
         );
@@ -3319,7 +3422,6 @@ async fn run_inner(
         let claude_path_event = claude_path.clone();
         let codex_path_event = codex_path.clone();
         let opencode_path_event = opencode_path.clone();
-        let pi_path_event = pi_path.clone();
         let omp_path_event = omp_path.clone();
         let cursor_agent_path_event = cursor_agent_path.clone();
         let pane_sessions_event = pane_sessions.clone();
@@ -3342,7 +3444,6 @@ async fn run_inner(
                 &claude_path_event,
                 &codex_path_event,
                 &opencode_path_event,
-                &pi_path_event,
                 &omp_path_event,
                 &cursor_agent_path_event,
                 &working_dir_event,
@@ -3881,30 +3982,6 @@ async fn run_inner(
                             (
                                 format!("claude:{}", path.display()),
                                 Cow::Owned(turns),
-                                None,
-                            )
-                        }
-                        Provider::Pi => {
-                            let Some(home) = home.as_deref() else {
-                                continue;
-                            };
-                            // Exact pinned identity: the id names the session
-                            // file wherever Pi wrote it. No directory-recency
-                            // fallback, because a sibling pane or an oh-my-pi
-                            // subprocess can share the working directory.
-                            let Some(path) = crate::transcript::find_pi_session_file(home, conv_id)
-                            else {
-                                continue;
-                            };
-                            let Ok(snapshot) =
-                                pi_readers.entry(pane_id).or_default().read(&path, pane_id)
-                            else {
-                                continue;
-                            };
-                            provider_activity = snapshot.activity;
-                            (
-                                format!("pi:{}", path.display()),
-                                Cow::Borrowed(&snapshot.turns),
                                 None,
                             )
                         }
@@ -4517,7 +4594,6 @@ fn handle_tui_events(
     claude_path: &str,
     codex_path: &str,
     opencode_path: &str,
-    pi_path: &str,
     omp_path: &str,
     cursor_agent_path: &str,
     working_dir: &str,
@@ -4692,28 +4768,23 @@ fn handle_tui_events(
                 if shared::is_retired_launch(provider, model.as_deref()) {
                     tracing::warn!(pane_id, "AddPane refused for retired provider");
                     let _ = output_tx.send(PaneOutput {
-                        text: "[New tab refused — unsupported provider has been retired]"
-                            .to_string(),
+                        text: retired_refusal_text("New tab", provider),
                         pane_id,
                     });
                     continue;
                 }
                 // Last-line launch enforcement. This applies equally to
-                // managed panes and direct TUI events, and fails closed until
-                // the server's effective policy has arrived.
-                if (managed
-                    && !project_policy
-                        .lock()
-                        .ok()
-                        .and_then(|policy| policy.clone())
-                        .is_some_and(|policy| policy.team_available))
-                    || !launch_allowed_by_server_policy(
-                        &project_policy,
-                        kind,
-                        provider,
-                        model.as_deref(),
-                    )
-                {
+                // server requests and direct TUI events, and fails closed
+                // until the server's effective policy has arrived. Only the
+                // launch profile decides: `managed` and the policy's
+                // `team_available` are leftovers of the removed team mode and
+                // refuse nothing.
+                if !launch_allowed_by_server_policy(
+                    &project_policy,
+                    kind,
+                    provider,
+                    model.as_deref(),
+                ) {
                     let denied = shared::launch_profile_key(kind, provider, model.as_deref());
                     tracing::warn!(pane_id, %denied, "AddPane refused by cluster policy");
                     let _ = output_tx.send(PaneOutput {
@@ -4777,7 +4848,6 @@ fn handle_tui_events(
                     claude_path,
                     codex_path,
                     opencode_path,
-                    pi_path,
                     omp_path,
                     cursor_agent_path,
                 );
@@ -5353,8 +5423,8 @@ fn build_agent_args(
             }
         }
         #[allow(deprecated)]
-        Provider::Minimax | Provider::Glm => (Vec::new(), false),
-        Provider::Pi | Provider::Omp => (Vec::new(), false),
+        Provider::Minimax | Provider::Glm | Provider::Pi => (Vec::new(), false),
+        Provider::Omp => (Vec::new(), false),
         Provider::Opencode => {
             // OpenCode generates its own `ses_*` identifiers, so the APAS
             // UUID cannot be passed to --session. Resume the newest session
@@ -5738,13 +5808,13 @@ fn parse_agent_output(
             Err(_) => None,
         },
         Provider::Opencode => convert_opencode_to_claude(line, session_id_str),
-        Provider::Pi | Provider::Omp => None,
+        Provider::Omp => None,
         Provider::CursorAgent => {
             // cursor-agent --output-format stream-json emits Claude-compatible events
             serde_json::from_str::<ClaudeStreamMessage>(line).ok()
         }
         #[allow(deprecated)]
-        Provider::Minimax | Provider::Glm => None,
+        Provider::Minimax | Provider::Glm | Provider::Pi => None,
     }
 }
 
@@ -6172,6 +6242,53 @@ mod tests {
     #[test]
     fn any_existing_pane_relaunches() {
         assert!(super::existing_pane_relaunch_allowed());
+    }
+
+    /// A new pane is admitted or refused by its launch profile alone. The
+    /// AddPane check used to refuse a pane flagged `managed` whenever the
+    /// policy's retained `team_available` was false, which is its default.
+    /// The field stays on the wire for older builds and decides nothing: a
+    /// policy that carries it either way gives the same answers.
+    #[test]
+    fn the_retained_team_field_does_not_decide_a_new_pane() {
+        for team_available in [false, true] {
+            let policy: super::ProjectPolicyState =
+                Arc::new(Mutex::new(Some(shared::EffectiveProjectPolicy {
+                    team_available,
+                    allowed_launch_profiles: vec!["terminal:codex:official:default".to_string()],
+                    version: 1,
+                    project_suspended: false,
+                })));
+            assert!(super::launch_allowed_by_server_policy(
+                &policy,
+                shared::PaneKind::Terminal,
+                Provider::Codex,
+                None
+            ));
+            assert!(!super::launch_allowed_by_server_policy(
+                &policy,
+                shared::PaneKind::Terminal,
+                Provider::Claude,
+                None
+            ));
+        }
+        // Still fails closed until the server's policy has arrived.
+        let unknown: super::ProjectPolicyState = Arc::new(Mutex::new(None));
+        assert!(!super::launch_allowed_by_server_policy(
+            &unknown,
+            shared::PaneKind::Terminal,
+            Provider::Codex,
+            None
+        ));
+
+        // And nothing in the pane runtime reads the field. The needle is
+        // assembled so that this test does not find itself.
+        let read = concat!(".team", "_available");
+        let source = include_str!("dual_pane.rs");
+        assert!(
+            !source.contains(read),
+            "the CLI must not decide anything from the retained team field"
+        );
     }
 
     fn extract_ts_string_const<'a>(source: &'a str, name: &str) -> Option<&'a str> {
@@ -7368,6 +7485,206 @@ mod tests {
         }
     }
 
+    /// Pi was retired as a provider. A tab saved while it was supported is
+    /// still in `.apas`: the CLI keeps it listed, never launches Pi for it on
+    /// any path, and reports its terminal as exited with the sentence that
+    /// says what to use instead. An OMP tab beside it is treated as before.
+    #[test]
+    #[allow(deprecated)]
+    fn a_saved_pi_tab_is_never_launched_and_its_terminal_says_why() {
+        let session_id = Uuid::new_v4();
+        let root = tempfile::tempdir().unwrap();
+        // A "pi" that would prove it ran. Nothing may execute it.
+        let marker = root.path().join("pi-ran");
+        let fake_pi = root.path().join("pi");
+        std::fs::write(
+            &fake_pi,
+            format!("#!/bin/sh\ntouch '{}'\nsleep 30\n", marker.display()),
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&fake_pi, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        let handles = crate::terminal_pane::TerminalPanes::default();
+        let (server_tx, mut server_rx) = tokio_mpsc::channel(4);
+        for resume in [true, false] {
+            let error = super::spawn_terminal_pane(
+                &handles,
+                77,
+                session_id,
+                Uuid::new_v4(),
+                &Provider::Pi,
+                None,
+                &fake_pi.to_string_lossy(),
+                &root.path().to_string_lossy(),
+                None,
+                &server_tx,
+                resume,
+                None,
+            )
+            .expect_err("a Pi tab must not start");
+            assert_eq!(error, "[Pi is no longer supported. Use OMP instead.]");
+        }
+        assert!(
+            handles.lock().unwrap().is_empty(),
+            "no terminal was registered"
+        );
+        assert!(!marker.exists(), "the pi binary must never be executed");
+        assert!(server_rx.try_recv().is_err(), "nothing was sent for it");
+        assert!(crate::terminal_pane::terminal_binary_for(&Provider::Pi).is_none());
+        assert!(
+            super::build_pane_env_overrides_from_keys(&Provider::Pi, None, None)
+                .unwrap_err()
+                .contains("Pi is no longer supported")
+        );
+
+        // What the server and the tab's terminal view are told at every
+        // registration: the Pi tab exited, and why. The OMP tab without a
+        // process keeps the ordinary status.
+        let terminal_meta = |provider| {
+            let mut meta = test_pane_meta(provider, false, None, Arc::new(Mutex::new(None)));
+            meta.kind = shared::PaneKind::Terminal;
+            meta.mode = shared::PaneMode::Interactive;
+            meta
+        };
+        let panes: PaneMetas = Arc::new(Mutex::new(HashMap::from([
+            (77, terminal_meta(Provider::Pi)),
+            (78, terminal_meta(Provider::Omp)),
+        ])));
+        let statuses = terminal_state_reports(session_id, &panes, &handles)
+            .into_iter()
+            .map(|report| match report {
+                CliToServer::TerminalState {
+                    pane_id,
+                    lifecycle,
+                    status,
+                    instance_id,
+                    ..
+                } => {
+                    assert_eq!(lifecycle, shared::TerminalLifecycle::Exited);
+                    assert!(instance_id.is_none());
+                    (pane_id, status.unwrap_or_default())
+                }
+                other => panic!("unexpected report: {other:?}"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            statuses,
+            vec![
+                (77, shared::PI_RETIRED_MESSAGE.to_string()),
+                (78, "terminal process unavailable".to_string()),
+            ]
+        );
+
+        // The sentences a person sees on the other paths.
+        assert_eq!(
+            super::retired_pane_restore_text(Provider::Pi),
+            "[Pi is no longer supported. Use OMP instead. This tab stays stopped.]"
+        );
+        assert_eq!(
+            super::retired_refusal_text("New tab", Provider::Pi),
+            "[New tab refused. Pi is no longer supported. Use OMP instead.]"
+        );
+        // A switch of the Pi tab itself says what can be done about it; a
+        // switch of another tab to Pi says what to use instead.
+        assert_eq!(
+            super::retired_model_switch_refusal(
+                77,
+                (Provider::Pi, None),
+                (Provider::Omp, None)
+            )
+            .as_deref(),
+            Some(
+                "[Model switch refused. Tab 77 uses Pi, which is no longer supported. Close it and open an OMP tab.]"
+            )
+        );
+        assert_eq!(
+            super::retired_model_switch_refusal(78, (Provider::Omp, None), (Provider::Pi, None))
+                .as_deref(),
+            Some("[Model switch refused. Pi is no longer supported. Use OMP instead.]")
+        );
+        assert_eq!(
+            super::retired_model_switch_refusal(78, (Provider::Omp, None), (Provider::Codex, None)),
+            None
+        );
+        assert_eq!(
+            super::retired_refusal_text("New tab", Provider::Minimax),
+            "[New tab refused — unsupported provider has been retired]"
+        );
+        assert_eq!(
+            super::retired_pane_cli_reboot_refusal([
+                (78, Provider::Omp, None),
+                (77, Provider::Pi, None),
+            ])
+            .as_deref(),
+            Some("[CLI reboot refused. Tab 77 uses Pi, which is no longer supported. Close that tab first.]")
+        );
+        assert_eq!(
+            super::retired_pane_cli_reboot_refusal([(78, Provider::Omp, None)]),
+            None
+        );
+        // Stopping retired panes keeps the Pi tab's metadata, for history and
+        // for closing it, like any other retired pane's.
+        let stopped = stop_retired_panes(
+            &panes,
+            &Arc::new(Mutex::new(HashMap::new())),
+            &Arc::new(Mutex::new(HashMap::new())),
+            &handles,
+        );
+        assert_eq!(stopped, vec![77]);
+        assert!(panes.lock().unwrap().contains_key(&77));
+    }
+
+    /// A `.apas` saved while Pi was supported still loads, with its Pi tab,
+    /// and saving it again keeps the tab as it was.
+    #[test]
+    #[allow(deprecated)]
+    fn an_apas_file_with_a_saved_pi_tab_still_loads() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(".apas"),
+            serde_json::json!({
+                "id": Uuid::new_v4(),
+                "name": "old-project",
+                "created_at": "2026-10-01T00:00:00Z",
+                "panes": [
+                    {
+                        "pane_id": 77,
+                        "provider": "pi",
+                        "mode": "interactive",
+                        "kind": "terminal",
+                        "session_id": Uuid::new_v4(),
+                        "label": "Pi 1"
+                    },
+                    {
+                        "pane_id": 78,
+                        "provider": "omp",
+                        "mode": "interactive",
+                        "kind": "terminal",
+                        "session_id": Uuid::new_v4(),
+                        "label": "OMP 2"
+                    }
+                ]
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let metadata = read_project_metadata(dir.path()).expect("the old file still parses");
+        let providers = metadata
+            .panes
+            .iter()
+            .map(|pane| (pane.pane_id, pane.provider, pane.kind.is_terminal()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            providers,
+            vec![(77, Provider::Pi, true), (78, Provider::Omp, true)]
+        );
+        let saved = serde_json::to_value(&metadata.panes).unwrap();
+        assert_eq!(saved[0]["provider"], "pi");
+        assert_eq!(saved[1]["provider"], "omp");
+    }
+
     #[tokio::test]
     async fn a_dropped_transport_preserves_terminal_and_structured_turn_state() {
         let root = tempfile::tempdir().unwrap();
@@ -8098,7 +8415,6 @@ mod tests {
             "claude",
             "codex",
             "opencode",
-            "pi",
             "omp",
             "cursor-agent",
         );
@@ -8106,18 +8422,20 @@ mod tests {
     }
 
     #[test]
-    fn resolve_pane_binary_path_uses_configured_pi_binary() {
-        let path = resolve_pane_binary_path(
-            Provider::Pi,
-            None,
-            "claude",
-            "codex",
-            "opencode",
-            "/opt/pi/bin/pi",
-            "omp",
-            "cursor-agent",
-        );
-        assert_eq!(path, "/opt/pi/bin/pi");
+    fn resolve_pane_binary_path_has_no_binary_for_retired_pi_and_keeps_omp() {
+        let resolve = |provider| {
+            resolve_pane_binary_path(
+                provider,
+                None,
+                "claude",
+                "codex",
+                "opencode",
+                "/opt/omp/bin/omp",
+                "cursor-agent",
+            )
+        };
+        assert_eq!(resolve(Provider::Pi), "");
+        assert_eq!(resolve(Provider::Omp), "/opt/omp/bin/omp");
     }
 
     #[test]
@@ -10237,6 +10555,87 @@ mod tests {
             let restored: Vec<u32> = start.tabs.iter().map(|(pane_id, ..)| *pane_id).collect();
             assert_eq!(restored, vec![3, 4]);
             assert_eq!(start.terminal_panes, HashSet::from([3, 4]));
+        });
+    }
+
+    /// A Pi tab that was live under a pane host when its machine was updated
+    /// must not keep running where APAS can neither see nor stop it: Pi has no
+    /// permission prompts. The tab stays listed, but its host is not among
+    /// the ones this runtime keeps, so reconciliation at project start ends
+    /// it. The OMP tab's host is kept for adoption.
+    #[test]
+    fn a_retired_terminal_tab_keeps_no_pane_host_while_an_omp_tab_keeps_its_own() {
+        crate::project::test_support::with_isolated_config(|| {
+            // Pane-host runtime files resolve from the environment. The
+            // isolated-config helper already holds the lock that serialises
+            // every test that changes it.
+            struct RestoreRuntimeDir(Option<std::ffi::OsString>);
+            impl Drop for RestoreRuntimeDir {
+                fn drop(&mut self) {
+                    match self.0.take() {
+                        Some(value) => std::env::set_var("XDG_RUNTIME_DIR", value),
+                        None => std::env::remove_var("XDG_RUNTIME_DIR"),
+                    }
+                }
+            }
+            let runtime_root = tempfile::tempdir().unwrap();
+            let _restore = RestoreRuntimeDir(std::env::var_os("XDG_RUNTIME_DIR"));
+            std::env::set_var("XDG_RUNTIME_DIR", runtime_root.path());
+
+            let dir = tempfile::tempdir().unwrap();
+            #[allow(deprecated)]
+            let pi = shared::PaneConfig {
+                provider: Provider::Pi,
+                ..recorded_pane(77, shared::PaneKind::Terminal, None)
+            };
+            let omp = shared::PaneConfig {
+                provider: Provider::Omp,
+                ..recorded_pane(78, shared::PaneKind::Terminal, None)
+            };
+            let project = write_project(dir.path(), vec![pi, omp]).id;
+
+            let start = super::open_runtime(dir.path(), &PaneOwner::Sole).unwrap();
+
+            let listed: Vec<u32> = start.tabs.iter().map(|(pane_id, ..)| *pane_id).collect();
+            assert_eq!(listed, vec![77, 78], "the Pi tab stays in the roster");
+            assert_eq!(start.terminal_panes, HashSet::from([78]));
+
+            // Both tabs had a host before the upgrade. The session names
+            // belong to no tmux server, so nothing real is signalled.
+            let host = |pane_id: u32| {
+                let runtime_id = Uuid::new_v4();
+                let paths = crate::pane_host::runtime_paths(project, pane_id, runtime_id).unwrap();
+                let descriptor = crate::pane_host::RuntimeDescriptor {
+                    protocol_version: crate::pane_host::HOST_PROTOCOL_VERSION,
+                    project_id: project,
+                    pane_id,
+                    runtime_id,
+                    instance_id: Uuid::new_v4(),
+                    owner_uid: unsafe { libc::getuid() },
+                    controller_generation: 1,
+                    controller_id: None,
+                    session_name: format!("ph_{pane_id}_retired_test"),
+                    socket_path: paths.socket.clone(),
+                    credential_path: paths.credential.clone(),
+                    created_at_unix_ms: 0,
+                };
+                crate::pane_host::write_descriptor(&paths.descriptor, &descriptor).unwrap();
+                paths.dir
+            };
+            let (pi_host, omp_host) = (host(77), host(78));
+
+            let removed =
+                crate::pane_host::reconcile_project_hosts(project, &start.terminal_panes).unwrap();
+
+            assert_eq!(removed, 1);
+            assert!(!pi_host.exists(), "the Pi tab's host must be ended");
+            assert!(omp_host.exists(), "the OMP tab's host must be kept");
+            let kept: Vec<u32> = crate::pane_host::list_project_descriptors(project)
+                .unwrap()
+                .into_iter()
+                .map(|(_, descriptor)| descriptor.pane_id)
+                .collect();
+            assert_eq!(kept, vec![78]);
         });
     }
 
@@ -12712,7 +13111,6 @@ fn cli_capabilities(
         shared::PROJECT_POLICY_CAPABILITY.to_string(),
         shared::MOBILE_TASK_LAUNCH_CAPABILITY.to_string(),
         shared::OPENCODE_TERMINAL_CAPABILITY.to_string(),
-        shared::PI_TERMINAL_CAPABILITY.to_string(),
         shared::OMP_TERMINAL_CAPABILITY.to_string(),
         shared::OMP_QUESTION_CAPABILITY.to_string(),
         // The build speaks the autopilot protocol. Whether one tab can run
@@ -13626,7 +14024,7 @@ async fn run_server_connection(
                                                         &mut ws_sender,
                                                         session_id,
                                                         pane_config.pane_id,
-                                                        "[New pane refused — unsupported provider has been retired]",
+                                                        &retired_refusal_text("New pane", pane_config.provider),
                                                     )
                                                     .await;
                                                     continue;
@@ -13803,7 +14201,7 @@ async fn run_server_connection(
                                                         &mut ws_sender,
                                                         session_id,
                                                         target,
-                                                        "[Reboot refused — unsupported provider has been retired]",
+                                                        &retired_refusal_text("Reboot", meta.provider),
                                                     )
                                                     .await;
                                                     continue;
@@ -13957,20 +14355,19 @@ async fn run_server_connection(
                                             ServerToCli::RebootCli { .. } => {
                                                 let retired = pane_metas
                                                     .lock()
-                                                    .map(|panes| panes.values().any(|pane| {
-                                                        shared::is_retired_launch(
-                                                            pane.provider,
-                                                            pane.model.as_deref(),
-                                                        )
-                                                    }))
-                                                    .unwrap_or(false);
-                                                if retired {
+                                                    .ok()
+                                                    .and_then(|panes| retired_pane_cli_reboot_refusal(
+                                                        panes.iter().map(|(pane_id, pane)| {
+                                                            (*pane_id, pane.provider, pane.model.as_deref())
+                                                        }),
+                                                    ));
+                                                if let Some(refusal) = retired {
                                                     report_retired_launch_rejection(
                                                         &status_tx,
                                                         &mut ws_sender,
                                                         session_id,
                                                         0,
-                                                        "[CLI reboot refused while a historical retired-provider pane is present]",
+                                                        &refusal,
                                                     )
                                                     .await;
                                                     continue;
@@ -14283,22 +14680,23 @@ async fn run_server_connection(
                                                     .lock()
                                                     .ok()
                                                     .and_then(|panes| panes.get(&target_pane).cloned())
-                                                    .is_some_and(|pane| {
-                                                        shared::is_retired_launch(
-                                                            pane.provider,
-                                                            pane.model.as_deref(),
-                                                        ) || shared::is_retired_launch(
-                                                            provider.unwrap_or(pane.provider),
-                                                            trimmed.as_deref(),
+                                                    .and_then(|pane| {
+                                                        retired_model_switch_refusal(
+                                                            target_pane,
+                                                            (pane.provider, pane.model.as_deref()),
+                                                            (
+                                                                provider.unwrap_or(pane.provider),
+                                                                trimmed.as_deref(),
+                                                            ),
                                                         )
                                                     });
-                                                if retired {
+                                                if let Some(refusal) = retired {
                                                     report_retired_launch_rejection(
                                                         &status_tx,
                                                         &mut ws_sender,
                                                         session_id,
                                                         target_pane,
-                                                        "[Model switch refused — unsupported provider has been retired]",
+                                                        &refusal,
                                                     )
                                                     .await;
                                                     continue;

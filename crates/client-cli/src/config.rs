@@ -80,8 +80,6 @@ pub struct LocalConfig {
     pub codex_path: String,
     #[serde(default = "default_opencode_path")]
     pub opencode_path: String,
-    #[serde(default = "default_pi_path")]
-    pub pi_path: String,
     #[serde(default = "default_omp_path")]
     pub omp_path: String,
     #[serde(default = "default_cursor_agent_path")]
@@ -145,10 +143,6 @@ fn default_omp_path() -> String {
     "omp".to_string()
 }
 
-fn default_pi_path() -> String {
-    "pi".to_string()
-}
-
 fn default_cursor_agent_path() -> String {
     "cursor-agent".to_string()
 }
@@ -167,7 +161,6 @@ impl Default for LocalConfig {
             claude_path: "claude".to_string(),
             codex_path: default_codex_path(),
             opencode_path: default_opencode_path(),
-            pi_path: default_pi_path(),
             omp_path: default_omp_path(),
             cursor_agent_path: default_cursor_agent_path(),
             deepseek_api_base_url: None,
@@ -421,5 +414,29 @@ mod tests {
         assert!(!saved.contains("minimax"));
         assert!(!saved.contains("glm_api"));
         assert!(!saved.contains("must-not-survive"));
+    }
+
+    /// Pi was retired and `pi_path` with it. Every config file written while
+    /// Pi was supported still has the key, so it must keep loading, and the
+    /// OMP setting beside it must be read as before.
+    #[test]
+    fn a_config_that_still_has_pi_path_loads_and_drops_it() {
+        let config: Config = toml::from_str(
+            r#"
+            [local]
+            claude_path = "claude"
+            codex_path = "codex"
+            opencode_path = "opencode"
+            pi_path = "/opt/pi/bin/pi"
+            omp_path = "/opt/omp/bin/omp"
+            cursor_agent_path = "cursor-agent"
+            "#,
+        )
+        .expect("a retired key must not fail the load");
+
+        assert_eq!(config.local.omp_path, "/opt/omp/bin/omp");
+        let saved = toml::to_string(&config).unwrap();
+        assert!(!saved.contains("pi_path"));
+        assert!(saved.contains("omp_path"));
     }
 }

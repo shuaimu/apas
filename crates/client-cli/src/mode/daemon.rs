@@ -374,8 +374,10 @@ fn take_resume_manifest_at(path: &std::path::Path) -> Vec<ResumeProject> {
 ///    a duplicate CLI against the same `.apas` and worktrees — the exact race
 ///    the claim system exists to prevent.
 ///
-/// Headless project CLIs live in their own tmux sessions and are unaffected;
-/// the replacement adopts them via `is_headless_running_for` + `tmux_has_session`.
+/// Projects run inside this process, so the `exec` takes them with it: the
+/// resume manifest written here is how the replacement starts them again. Pane
+/// hosts are separate processes and are unaffected; the resumed projects adopt
+/// them.
 ///
 /// Returns only on failure — on success the process image is gone.
 #[cfg(unix)]
@@ -2366,8 +2368,12 @@ pub async fn run(
     // and kills its agents' subtrees; dropping the process instead would lose
     // both.
     //
-    // Pane hosts are untouched and keep their PTYs, so a replacement instance
-    // that starts within their adoption grace picks the terminals back up.
+    // This also ends each project's terminal agents. A stop that is not a
+    // reboot owns terminal cleanup: the project's teardown shuts every pane
+    // host down (`TerminalHandle::shutdown`, which kills the host's tmux
+    // session and removes its runtime files). Pane hosts are left for a
+    // replacement to adopt only by a requested reboot, which re-execs and
+    // never reaches this point.
     let running = state.running_project_ids();
     if !running.is_empty() {
         tracing::info!(count = running.len(), "stopping projects before shutdown");
@@ -2779,9 +2785,11 @@ async fn run_connection(
                                     .await?;
                             }
                             ServerToDaemon::RebootDaemon => {
-                                // The projects on this host are owned by their
-                                // own tmux sessions, not by this process, so
-                                // replacing it disturbs nothing that is running.
+                                // Projects run inside this process, so the
+                                // `exec` takes them with it and the resume
+                                // manifest starts them again. Pane hosts are
+                                // separate processes it does not touch, so
+                                // terminal agents are adopted, not restarted.
                                 #[cfg(unix)]
                                 {
                                     let err = perform_requested_restart(

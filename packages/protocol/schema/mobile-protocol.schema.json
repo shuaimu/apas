@@ -4818,12 +4818,13 @@
           "deprecated": true
         },
         {
-          "description": "Pi coding agent (`pi`): terminal-only in APAS. See\n`terminal_pane::terminal_binary_for`.",
+          "description": "Decode-only compatibility tombstone. The Pi coding agent (`pi`) is not\nlaunchable; OMP replaced it. The value stays so an older `.apas`, a\nstored session or policy, and a frame from an older client still parse.",
           "type": "string",
-          "const": "pi"
+          "const": "pi",
+          "deprecated": true
         },
         {
-          "description": "Oh My Pi (`omp`): a standalone Pi-derived agent, terminal-only in APAS.\nUnlike Pi it has no `--session-id`, so a pane is pinned by giving it a\nprivate `--session-dir` instead; see `terminal_pane::omp_session_args`.",
+          "description": "Oh My Pi (`omp`): a standalone Pi-derived agent, terminal-only in APAS.\nIt has no `--session-id`, so a pane is pinned by giving it a private\n`--session-dir` instead; see `terminal_pane::omp_session_args`.",
           "type": "string",
           "const": "omp"
         }

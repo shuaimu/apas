@@ -16,13 +16,6 @@ pub const MOBILE_TASK_LAUNCH_CAPABILITY: &str = "mobile_task_launch_v2";
 /// server/web deployment cannot route an OpenCode pane to an older CLI that
 /// would persist the pane but fail to launch it.
 pub const OPENCODE_TERMINAL_CAPABILITY: &str = "terminal_opencode_v1";
-/// The connected CLI can host Pi's interactive TUI, pin each pane to an exact
-/// Pi session identity, and mirror its session transcript.
-///
-/// Kept separate from the generic mobile-launch capability so a rolling
-/// server/web deployment cannot route a Pi pane to an older CLI that would
-/// persist the pane but fail to launch it.
-pub const PI_TERMINAL_CAPABILITY: &str = "terminal_pi_v1";
 /// The connected CLI can host OMP's interactive TUI, give each pane its own
 /// session directory, and mirror the session transcript written there.
 ///
@@ -3255,12 +3248,14 @@ pub enum Provider {
     Glm,
     Deepseek,
     Opencode,
-    /// Pi coding agent (`pi`): terminal-only in APAS. See
-    /// `terminal_pane::terminal_binary_for`.
+    /// Decode-only compatibility tombstone. The Pi coding agent (`pi`) is not
+    /// launchable; OMP replaced it. The value stays so an older `.apas`, a
+    /// stored session or policy, and a frame from an older client still parse.
+    #[deprecated(note = "Pi support has been retired; use OMP")]
     Pi,
     /// Oh My Pi (`omp`): a standalone Pi-derived agent, terminal-only in APAS.
-    /// Unlike Pi it has no `--session-id`, so a pane is pinned by giving it a
-    /// private `--session-dir` instead; see `terminal_pane::omp_session_args`.
+    /// It has no `--session-id`, so a pane is pinned by giving it a private
+    /// `--session-dir` instead; see `terminal_pane::omp_session_args`.
     Omp,
     #[serde(rename = "cursor-agent")]
     CursorAgent,
@@ -3338,14 +3333,13 @@ pub fn tab_type_key(kind: PaneKind, provider: Provider) -> String {
 /// are never advertised, and DeepSeek is offered as a Claude model because it
 /// uses the Anthropic-compatible bridge.
 ///
-/// Terminal panes exist only for claude, codex, opencode, and pi — see
+/// Terminal panes exist only for claude, codex, opencode, and omp — see
 /// `terminal_pane::terminal_binary_for`, which this must stay in step with.
 pub fn all_tab_types() -> Vec<String> {
     vec![
         tab_type_key(PaneKind::Terminal, Provider::Claude),
         tab_type_key(PaneKind::Terminal, Provider::Codex),
         tab_type_key(PaneKind::Terminal, Provider::Opencode),
-        tab_type_key(PaneKind::Terminal, Provider::Pi),
         tab_type_key(PaneKind::Terminal, Provider::Omp),
     ]
 }
@@ -3478,14 +3472,6 @@ pub fn supported_launch_profiles() -> Vec<LaunchProfile> {
             None,
         ),
         launch_profile(
-            "terminal:pi:official:default",
-            "Pi Terminal",
-            PaneKind::Terminal,
-            Provider::Pi,
-            "official",
-            None,
-        ),
-        launch_profile(
             "terminal:omp:official:default",
             "OMP Terminal",
             PaneKind::Terminal,
@@ -3532,7 +3518,41 @@ fn normalized_model(model: Option<&str>) -> String {
 /// Whether an explicit provider value is a decode-only retirement tombstone.
 #[allow(deprecated)]
 pub fn is_retired_provider(provider: Provider) -> bool {
-    matches!(provider, Provider::Minimax | Provider::Glm)
+    matches!(provider, Provider::Minimax | Provider::Glm | Provider::Pi)
+}
+
+/// What a person is told when a request names Pi. Pi was retired as a
+/// provider while OMP, which is derived from it, stayed.
+pub const PI_RETIRED_MESSAGE: &str = "Pi is no longer supported. Use OMP instead.";
+
+/// What a person is told when a request names any other retired backend.
+pub const RETIRED_BACKEND_MESSAGE: &str = "Unsupported provider: this backend has been retired";
+
+/// The sentence for refusing a retired launch (see [`is_retired_launch`]).
+/// Pi gets its own, because there is something to do about it: use OMP.
+#[allow(deprecated)]
+pub fn retired_launch_message(provider: Provider) -> &'static str {
+    match provider {
+        Provider::Pi => PI_RETIRED_MESSAGE,
+        _ => RETIRED_BACKEND_MESSAGE,
+    }
+}
+
+/// The same sentence for a launch-profile key, when the key names a retired
+/// capability. A client that still holds a profile list from before a
+/// retirement sends the key, not a provider.
+pub fn retired_launch_profile_message(key: &str) -> Option<&'static str> {
+    if !is_retired_launch_profile_key(key) {
+        return None;
+    }
+    let provider = key.trim().split(':').nth(1).map(str::trim);
+    Some(
+        if provider.is_some_and(|name| name.eq_ignore_ascii_case("pi")) {
+            PI_RETIRED_MESSAGE
+        } else {
+            RETIRED_BACKEND_MESSAGE
+        },
+    )
 }
 
 /// Whether a historical model name selects a retired backend.
@@ -3563,7 +3583,7 @@ pub fn is_retired_launch_profile_key(key: &str) -> bool {
 
     segments
         .get(1)
-        .is_some_and(|provider| is_retired_backend(provider))
+        .is_some_and(|provider| is_retired_backend(provider) || provider.eq_ignore_ascii_case("pi"))
         || segments
             .get(2)
             .is_some_and(|backend| is_retired_backend(backend))
@@ -3595,10 +3615,9 @@ pub fn launch_profile_key(kind: PaneKind, provider: Provider, model: Option<&str
         Provider::Claude | Provider::Deepseek => "claude",
         Provider::Codex => "codex",
         Provider::Opencode => "opencode",
-        Provider::Pi => "pi",
         Provider::Omp => "omp",
         Provider::CursorAgent => "cursor-agent",
-        Provider::Minimax | Provider::Glm => "unsupported",
+        Provider::Minimax | Provider::Glm | Provider::Pi => "unsupported",
     };
     let mut normalized = normalized_model(model);
     if provider == Provider::Deepseek && normalized == "default" {
@@ -5504,7 +5523,6 @@ mod tests {
                 "terminal:claude".to_string(),
                 "terminal:codex".to_string(),
                 "terminal:opencode".to_string(),
-                "terminal:pi".to_string(),
                 "terminal:omp".to_string(),
             ]
         );
@@ -5553,11 +5571,93 @@ mod tests {
         for (json, provider) in [
             ("\"minimax\"", Provider::Minimax),
             ("\"glm\"", Provider::Glm),
+            ("\"pi\"", Provider::Pi),
         ] {
             assert_eq!(serde_json::from_str::<Provider>(json).unwrap(), provider);
             assert!(is_retired_provider(provider));
             assert!(!EffectiveProjectPolicy::default().allows(PaneKind::Agent, provider, None));
+            assert!(!EffectiveProjectPolicy::default().allows(PaneKind::Terminal, provider, None));
         }
+    }
+
+    /// Pi was a supported terminal provider, so its value is in `.apas`
+    /// files, stored sessions and stored policy. All of it must keep parsing,
+    /// none of it may launch, and the refusal must say what to use instead.
+    #[test]
+    #[allow(deprecated)]
+    fn pi_is_retired_but_its_stored_forms_still_parse() {
+        let pane: PaneConfig = serde_json::from_value(serde_json::json!({
+            "pane_id": 7,
+            "provider": "pi",
+            "mode": "interactive",
+            "kind": "terminal",
+            "session_id": "00000000-0000-0000-0000-000000000007"
+        }))
+        .expect("a saved Pi tab still parses");
+        assert_eq!(pane.provider, Provider::Pi);
+        assert!(pane.kind.is_terminal());
+        // The value round-trips, so re-saving `.apas` keeps the tab as it was.
+        assert_eq!(serde_json::to_value(pane.provider).unwrap(), "pi");
+        assert_eq!(
+            tab_type_key(PaneKind::Terminal, Provider::Pi),
+            "terminal:pi"
+        );
+
+        assert!(is_retired_launch(Provider::Pi, None));
+        assert_eq!(
+            launch_profile_key(PaneKind::Terminal, Provider::Pi, None),
+            "unsupported:retired"
+        );
+        assert!(!all_tab_types().contains(&"terminal:pi".to_string()));
+        assert!(supported_launch_profiles()
+            .iter()
+            .all(|profile| profile.provider != Provider::Pi));
+        // A policy stored while Pi was offered may still list its profile.
+        // The key is recognized as retired, and an allowlist naming it does
+        // not make Pi launchable again.
+        assert!(is_retired_launch_profile_key(
+            "terminal:pi:official:default"
+        ));
+        let stored = EffectiveProjectPolicy {
+            allowed_launch_profiles: vec!["terminal:pi:official:default".to_string()],
+            ..EffectiveProjectPolicy::default()
+        };
+        assert!(!stored.allows(PaneKind::Terminal, Provider::Pi, None));
+
+        assert_eq!(retired_launch_message(Provider::Pi), PI_RETIRED_MESSAGE);
+        assert_eq!(
+            retired_launch_profile_message("terminal:pi:official:default"),
+            Some(PI_RETIRED_MESSAGE)
+        );
+        assert_eq!(
+            retired_launch_message(Provider::Minimax),
+            RETIRED_BACKEND_MESSAGE
+        );
+        assert_eq!(
+            retired_launch_profile_message("agent:glm:official:default"),
+            Some(RETIRED_BACKEND_MESSAGE)
+        );
+    }
+
+    /// OMP is derived from Pi and shares letters with it. Retiring Pi must
+    /// not catch it.
+    #[test]
+    fn omp_is_untouched_by_the_pi_retirement() {
+        assert!(!is_retired_provider(Provider::Omp));
+        assert!(!is_retired_launch(Provider::Omp, None));
+        assert!(!is_retired_launch_profile_key(
+            "terminal:omp:official:default"
+        ));
+        assert_eq!(
+            retired_launch_profile_message("terminal:omp:official:default"),
+            None
+        );
+        assert_eq!(
+            launch_profile_key(PaneKind::Terminal, Provider::Omp, None),
+            "terminal:omp:official:default"
+        );
+        assert!(EffectiveProjectPolicy::default().allows(PaneKind::Terminal, Provider::Omp, None));
+        assert!(all_tab_types().contains(&"terminal:omp".to_string()));
     }
 
     #[test]
@@ -5592,7 +5692,7 @@ mod tests {
     #[test]
     fn supported_profiles_and_default_policy_offer_only_terminal_backends() {
         let profiles = supported_launch_profiles();
-        assert_eq!(profiles.len(), 6);
+        assert_eq!(profiles.len(), 5);
         assert!(profiles
             .iter()
             .all(|profile| profile.kind == PaneKind::Terminal));
@@ -5605,7 +5705,6 @@ mod tests {
                 ("terminal:claude:official:default", "Claude Terminal"),
                 ("terminal:codex:official:default", "Codex Terminal"),
                 ("terminal:opencode:official:default", "OpenCode Terminal"),
-                ("terminal:pi:official:default", "Pi Terminal"),
                 ("terminal:omp:official:default", "OMP Terminal"),
                 (
                     "terminal:claude:deepseek:deepseek-flash",
@@ -5628,7 +5727,6 @@ mod tests {
             "terminal:claude:official:default",
             "terminal:codex:official:default",
             "terminal:opencode:official:default",
-            "terminal:pi:official:default",
             "terminal:omp:official:default",
             "terminal:claude:deepseek:deepseek-flash",
         ] {

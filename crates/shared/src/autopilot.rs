@@ -4,7 +4,7 @@
 //! and the tab has settled. The loop, its limits and its state live in the
 //! APAS extension inside the tab's OMP process. This module is what the
 //! viewer, the server and the CLI say to each other about it. The design
-//! record is `openspec/changes/add-omp-tab-autopilot/`.
+//! record is `openspec/changes/archive/2026-11-13-add-omp-tab-autopilot/`.
 //!
 //! Autopilot is not a worker and shares none of the worker's types. It is not
 //! contained, verified or budgeted.

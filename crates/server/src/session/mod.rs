@@ -2066,9 +2066,11 @@ impl SessionManager {
                     session
                         .panes
                         .iter()
+                        // Only the launch profile counts. `team_available`
+                        // and a pane's `managed` marker are leftovers of the
+                        // removed team mode and decide nothing.
                         .filter(|pane| {
-                            (!policy.team_available && pane.managed)
-                                || !policy.allows(pane.kind, pane.provider, pane.model.as_deref())
+                            !policy.allows(pane.kind, pane.provider, pane.model.as_deref())
                         })
                         .map(|pane| pane.pane_id)
                         .collect::<Vec<_>>()
@@ -4012,6 +4014,58 @@ mod tests {
                 && got_policy == policy
                 && noncompliant_pane_ids.is_empty()
         ));
+    }
+
+    /// `team_available` and a pane's `managed` marker survive only so older
+    /// clients and older `.apas` files keep parsing. A stored managed pane
+    /// whose launch profile is allowed used to be reported as outside policy
+    /// whenever the field was false, which is its default.
+    #[tokio::test]
+    async fn the_retained_team_field_marks_no_pane_noncompliant() {
+        for team_available in [false, true] {
+            let mgr = SessionManager::new();
+            let session_id = Uuid::new_v4();
+            let cli_id = Uuid::new_v4();
+            let web_id = Uuid::new_v4();
+            let (cli_tx, _cli_rx) = mpsc::channel(2);
+            let (web_tx, mut web_rx) = mpsc::channel(2);
+            mgr.register_cli(cli_id, Uuid::new_v4(), cli_tx, None);
+            mgr.create_cli_session(session_id, cli_id, None, None);
+            mgr.set_session_project(session_id, "project-a".to_string());
+            mgr.register_web(web_id, web_tx);
+            assert!(mgr.attach_web_to_session(&session_id, web_id, Some(cli_id)));
+
+            let mut managed = test_pane_config(7);
+            managed.kind = shared::PaneKind::Terminal;
+            managed.provider = shared::Provider::Codex;
+            managed.managed = true;
+            let mut outside = test_pane_config(8);
+            outside.kind = shared::PaneKind::Terminal;
+            outside.provider = shared::Provider::Claude;
+            mgr.set_session_panes(&session_id, vec![managed, outside]);
+
+            mgr.broadcast_project_policy(
+                "project-a",
+                shared::EffectiveProjectPolicy {
+                    team_available,
+                    allowed_launch_profiles: vec!["terminal:codex:official:default".to_string()],
+                    version: 42,
+                    project_suspended: false,
+                },
+            )
+            .await;
+
+            assert!(
+                matches!(
+                    web_rx.try_recv(),
+                    Ok(ServerToWeb::ProjectPolicyChanged {
+                        noncompliant_pane_ids,
+                        ..
+                    }) if noncompliant_pane_ids == vec![8]
+                ),
+                "team_available = {team_available}: only the launch profile decides"
+            );
+        }
     }
 
     #[test]
