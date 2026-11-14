@@ -28,6 +28,12 @@ pub enum SummaryAdapterKind {
     /// Explicit opt-in: uses ephemeral, read-only headless execution but
     /// retains Codex's command tool and therefore has residual host-read risk.
     Codex,
+    /// OMP in print mode with its own default model and backend (or
+    /// `summaries.model`). Built-in tools, MCP servers and discovered custom
+    /// tools are off and tool calls that need approval are refused, but tools
+    /// of installed OMP plugins still load, and one the user allowed in
+    /// `tools.approval` would run.
+    Omp,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -438,5 +444,28 @@ mod tests {
         let saved = toml::to_string(&config).unwrap();
         assert!(!saved.contains("pi_path"));
         assert!(saved.contains("omp_path"));
+    }
+
+    #[test]
+    fn the_omp_summary_adapter_parses_and_round_trips() {
+        let config: Config = toml::from_str(
+            r#"
+            [summaries]
+            enabled = true
+            adapter = "omp"
+            allow_cross_provider = true
+            "#,
+        )
+        .expect("omp is a summary adapter");
+        assert!(config.summaries.enabled);
+        assert_eq!(config.summaries.adapter, super::SummaryAdapterKind::Omp);
+        assert!(config.summaries.allow_cross_provider);
+        assert_eq!(config.summaries.model, None);
+        let saved = toml::to_string(&config).unwrap();
+        assert!(saved.contains("adapter = \"omp\""));
+        let reloaded: Config = toml::from_str(&saved).unwrap();
+        assert_eq!(reloaded.summaries.adapter, super::SummaryAdapterKind::Omp);
+
+        assert!(toml::from_str::<Config>("[summaries]\nadapter = \"pi\"\n").is_err());
     }
 }

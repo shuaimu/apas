@@ -1849,6 +1849,47 @@ and is in the October CLI too. The cause is not confirmed and nothing is
 fixed. Until it is, wait for a rebooted machine to show as online before
 acting on its projects.
 
+## Pane work summaries: which summarizer
+
+A tab's work summaries are written by a separate, headless run of a
+summarizer on the tab's machine, configured in the CLI's `[summaries]`
+section (`apas config set summary_enabled|summary_adapter|summary_model|
+summary_allow_cross_provider ...`; the settings are read when a project
+starts, so a change needs a project restart or a daemon reboot). Adapters:
+`claude`, `codex` and, since 2026-11-14, `omp` (`crates/client-cli/src/
+summary_runner.rs`). A job for a tab whose provider differs from the
+summarizer's is refused with "Cross-provider summarization is disabled on
+this CLI host" unless `summary_allow_cross_provider` is true. The check
+compares APAS tab types, not backends: an OMP tab running on the OpenAI/Codex
+login is still "cross-provider" to the Codex summarizer.
+
+The owner's choice (2026-11-14) is `adapter = "omp"` with cross-provider
+allowed, so every tab is summarized by OMP with OMP's own default model and
+backend. The OMP adapter runs `omp --print` with the prompt on stdin, in a
+fresh temporary directory, with `--no-session --no-tools --no-extensions
+--no-skills --no-rules --no-context-files --no-lsp --no-pty --no-title
+--approval-mode always-ask-cached`, a fixed system prompt, and a settings file
+passed with `--config` that turns off MCP and custom-tool discovery
+(`disabledProviders`), magic keywords, memory, the advisor, stream rules,
+model fallback and telemetry. `@` and `^` in the summarized records are
+escaped, because OMP would otherwise read a mentioned file into the prompt.
+The run gets its own process group, which is killed on timeout or when it
+ends. At startup the CLI checks `omp --help` for every flag it needs and
+leaves the summarizer off, with a log line, if one is missing.
+
+What remains, and what the warning printed by `apas config set summary_adapter
+omp` says: tools of OMP plugins installed under `~/.omp/plugins` still load,
+and one allowed in OMP's `tools.approval` would run; a model served by OMP's
+`opencode` or `cursor` provider is not used, because those names are in the
+disabled list; and OMP's detached daemon broker may outlive a job until its
+idle grace ends. Checked on OMP 18.20.0 with DeepSeek V4 Flash in the isolated
+harness (`~/.cache/apas-autopilot-check/NOTES.md`): a parsable summary in 4 to
+8 s, no session file, no context file or extension loaded, no built-in tool
+offered, mention escaping effective, and failures (no key, wrong key, unknown
+model, timeout) returned as failures. Not tried: credentials stored in
+`agent.db` (the owner's OAuth login) with the final settings file, and
+`~/.claude.json` MCP servers. Re-check when OMP's minor version changes.
+
 ## Terminal-pane history: read the provider's transcript
 
 An agent pane is *observed* — the CLI parses its stream-json and knows every

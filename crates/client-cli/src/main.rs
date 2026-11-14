@@ -1162,7 +1162,8 @@ fn set_config_value(config: &mut config::Config, key: &str, value: String) -> Re
                 "disabled" | "off" | "none" => config::SummaryAdapterKind::Disabled,
                 "claude" => config::SummaryAdapterKind::Claude,
                 "codex" => config::SummaryAdapterKind::Codex,
-                _ => anyhow::bail!("summary_adapter must be disabled, claude, or codex"),
+                "omp" => config::SummaryAdapterKind::Omp,
+                _ => anyhow::bail!("summary_adapter must be disabled, claude, codex, or omp"),
             }
         }
         "summary_model" => config.summaries.model = (!value.trim().is_empty()).then_some(value),
@@ -1174,6 +1175,25 @@ fn set_config_value(config: &mut config::Config, key: &str, value: String) -> Re
         _ => anyhow::bail!("Unknown config key: {}. Valid keys: {}", key, CONFIG_KEYS),
     }
     Ok(())
+}
+
+/// What `apas config set summary_adapter` prints for an adapter whose
+/// confinement is incomplete.
+fn summary_adapter_warning(adapter: config::SummaryAdapterKind) -> Option<&'static str> {
+    match adapter {
+        config::SummaryAdapterKind::Codex => Some(
+            "WARNING: the Codex summary adapter retains a read-only command tool. \
+             Prompt and sandbox controls reduce but do not eliminate host-file read risk.",
+        ),
+        config::SummaryAdapterKind::Omp => Some(
+            "WARNING: the OMP summary adapter runs with no built-in tools, MCP servers or \
+             discovered custom tools, and refuses tool calls that need approval. Tools of OMP \
+             plugins you installed still load, and one you allowed in tools.approval would run. \
+             Summaries use OMP's default model unless summary_model is set; a model served by \
+             the opencode or cursor provider is not used.",
+        ),
+        config::SummaryAdapterKind::Disabled | config::SummaryAdapterKind::Claude => None,
+    }
 }
 
 fn parse_bool_config(key: &str, value: &str) -> Result<bool> {
@@ -1189,10 +1209,46 @@ mod tests {
     use super::{
         detect_running_daemon_with_process_check, get_config_value, plan_launch_daemon,
         read_daemon_state, read_legacy_daemon_pid, set_config_value, should_restart_for_version,
-        write_daemon_state, DaemonStateFile, DaemonStateGuard,
+        summary_adapter_warning, write_daemon_state, DaemonStateFile, DaemonStateGuard,
     };
     use crate::config;
     use std::fs;
+
+    #[test]
+    fn summary_adapter_can_be_set_to_omp_and_read_back() {
+        let mut config = config::Config::default();
+        set_config_value(&mut config, "summary_adapter", "OMP".to_string()).unwrap();
+        assert_eq!(config.summaries.adapter, config::SummaryAdapterKind::Omp);
+        assert_eq!(get_config_value(&config, "summary_adapter").unwrap(), "omp");
+        set_config_value(
+            &mut config,
+            "summary_allow_cross_provider",
+            "true".to_string(),
+        )
+        .unwrap();
+        assert!(config.summaries.allow_cross_provider);
+        // No model is chosen for OMP unless one is set; an empty value clears it.
+        set_config_value(&mut config, "summary_model", "deepseek/x".to_string()).unwrap();
+        set_config_value(&mut config, "summary_model", " ".to_string()).unwrap();
+        assert_eq!(config.summaries.model, None);
+
+        let error = set_config_value(&mut config, "summary_adapter", "pi".to_string())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("omp"), "{error}");
+        assert_eq!(config.summaries.adapter, config::SummaryAdapterKind::Omp);
+    }
+
+    #[test]
+    fn only_adapters_with_incomplete_confinement_warn() {
+        let omp = summary_adapter_warning(config::SummaryAdapterKind::Omp).unwrap();
+        // What stays reachable, and how the model is chosen.
+        assert!(omp.contains("plugins"), "{omp}");
+        assert!(omp.contains("summary_model"), "{omp}");
+        assert!(summary_adapter_warning(config::SummaryAdapterKind::Codex).is_some());
+        assert!(summary_adapter_warning(config::SummaryAdapterKind::Claude).is_none());
+        assert!(summary_adapter_warning(config::SummaryAdapterKind::Disabled).is_none());
+    }
 
     #[test]
     fn deepseek_config_get_masks_api_key() {
@@ -2221,13 +2277,10 @@ async fn handle_config_command(action: ConfigAction) -> Result<()> {
             set_config_value(&mut config, &key, value)?;
             config.save()?;
             println!("Configuration saved");
-            if key == "summary_adapter"
-                && config.summaries.adapter == config::SummaryAdapterKind::Codex
-            {
-                eprintln!(
-                    "WARNING: the Codex summary adapter retains a read-only command tool. \
-                     Prompt and sandbox controls reduce but do not eliminate host-file read risk."
-                );
+            if key == "summary_adapter" {
+                if let Some(warning) = summary_adapter_warning(config.summaries.adapter) {
+                    eprintln!("{warning}");
+                }
             }
         }
         ConfigAction::Get { key } => {
