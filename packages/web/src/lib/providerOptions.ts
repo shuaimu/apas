@@ -66,13 +66,6 @@ export const PROVIDER_MODEL_GROUPS: ProviderModelGroup[] = [
     ],
   },
   {
-    id: "pi",
-    label: "Pi",
-    iconProvider: "pi",
-    toneClass: "text-purple-500",
-    options: [{ value: "pi/official", label: "Pi", provider: "pi" }],
-  },
-  {
     id: "omp",
     label: "OMP",
     iconProvider: "omp",
@@ -113,12 +106,28 @@ export const UNSUPPORTED_PROVIDER_MODEL_OPTION: ProviderModelOption = {
   supported: false,
 };
 
+/**
+ * What a person is told when a request names Pi. Pi was retired as a provider
+ * while OMP, which is derived from it, stayed. Same sentence as
+ * `shared::PI_RETIRED_MESSAGE`.
+ */
+export const PI_RETIRED_MESSAGE = "Pi is no longer supported. Use OMP instead.";
+
+/**
+ * Whether a tab's provider is the retired Pi. The value still arrives in old
+ * rosters and stored sessions, so it must keep parsing; it can no longer be
+ * created, switched to, resumed or typed into.
+ */
+export function isRetiredPiProvider(provider?: string | null): boolean {
+  return provider?.trim().toLowerCase() === "pi";
+}
+
 export function isRetiredProviderModel(
   provider?: string | null,
   model?: string | null,
 ): boolean {
   const normalizedProvider = provider?.trim().toLowerCase();
-  if (["minimax", "mini_max", "glm", "zai", "z.ai", "zhipu"].includes(normalizedProvider ?? "")) {
+  if (["minimax", "mini_max", "glm", "zai", "z.ai", "zhipu", "pi"].includes(normalizedProvider ?? "")) {
     return true;
   }
   if (typeof model !== "string") return false;
@@ -180,7 +189,6 @@ export function providerModelValue(
   }
   if (provider === "codex") return "codex/official";
   if (provider === "opencode") return "opencode/official";
-  if (provider === "pi") return "pi/official";
   if (provider === "omp") return "omp/official";
   if (provider === "cursor-agent") return "cursor-agent/official";
   if (provider === "deepseek") {

@@ -8,6 +8,8 @@ export interface LaunchProfile {
 }
 
 export interface EffectivePolicy {
+  /** Retained on the wire for older builds. Team mode is removed: the value
+   *  decides nothing and is not a setting. */
   team_available: boolean;
   allowed_launch_profiles: string[];
   version: number;
@@ -21,8 +23,12 @@ export interface EffectivePolicy {
  * `bound` is the policy one level up. Launch profiles narrow monotonically —
  * a level may only restrict what the level above allows — so anything outside
  * the bound is shown disabled with the reason, rather than offered and then
- * rejected by the server. Team availability is a default rather than a
- * ceiling, so it is never disabled here.
+ * rejected by the server.
+ *
+ * `team_available` is not offered. Team mode is removed and the field decides
+ * nothing; it stays in stored policy and on the wire only so older builds keep
+ * parsing. A save sends back the value the editor was given, so saving the
+ * launch profiles cannot change it.
  */
 export function PolicyEditor({
   title,
@@ -45,10 +51,8 @@ export function PolicyEditor({
   onInherit?: () => void;
   saveLabel?: string;
 }) {
-  const [team, setTeam] = useState(policy.team_available);
   const [allowed, setAllowed] = useState<string[]>(policy.allowed_launch_profiles);
   useEffect(() => {
-    setTeam(policy.team_available);
     setAllowed(policy.allowed_launch_profiles);
   }, [policy]);
 
@@ -60,10 +64,6 @@ export function PolicyEditor({
         {policy.version != null && <span className="text-xs text-gray-500">v{policy.version}</span>}
       </div>
       {description && <p className="mb-3 text-xs text-gray-500">{description}</p>}
-      <label className="mb-3 flex items-center gap-2 text-sm">
-        <input type="checkbox" checked={team} onChange={(event) => setTeam(event.target.checked)} />
-        Team launch available
-      </label>
       <div className="grid gap-2 sm:grid-cols-2">
         {profiles.map((profile) => {
           const blocked = permitted != null && !permitted.includes(profile.key);
@@ -95,7 +95,7 @@ export function PolicyEditor({
       </div>
       <div className="mt-4 flex flex-wrap gap-2">
         <button
-          onClick={() => onSave({ team_available: team, allowed_launch_profiles: allowed })}
+          onClick={() => onSave({ team_available: policy.team_available, allowed_launch_profiles: allowed })}
           className="rounded-lg bg-blue-600 px-4 py-2 text-sm text-white"
         >
           {saveLabel}

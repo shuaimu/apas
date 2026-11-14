@@ -8,6 +8,7 @@ import {
   TAB_AUTOPILOT_CAPABILITY,
   type PaneAutopilotEntry,
 } from "@/lib/autopilot";
+import { AUTOPILOT_OWN_TEXT, DEFAULT_AUTOPILOT_TEMPLATE } from "@/lib/autopilotTemplates";
 import { noRuntimeAccessReason } from "@/lib/tabHosts";
 import { AutopilotControl } from "./AutopilotControl";
 
@@ -132,19 +133,43 @@ describe("a tab that is not on autopilot", () => {
   });
 
   it("keeps the prompt field's height when the dialog has to scroll", () => {
-    // The dialog is a scrolling column and the textarea is the one child
-    // that can shrink: in a browser it collapsed to a sliver on a phone and
-    // on a short window, hiding what was typed.
+    // The dialog's body is a scrolling column and the textarea is the one
+    // child that can shrink: in a browser it collapsed to a sliver on a phone
+    // and on a short window, hiding what was typed.
     seed({ support: "supported" });
     renderControl();
     fireEvent.click(controlButton());
 
     const dialog = screen.getByRole("dialog", { name: "Start autopilot — OMP 1" });
-    expect(dialog.className.split(" ")).toEqual(expect.arrayContaining(["flex-col", "overflow-y-auto"]));
+    const body = within(dialog).getByTestId("autopilot-start-body");
+    expect(body.className.split(" ")).toEqual(expect.arrayContaining(["flex-col", "min-h-0", "overflow-y-auto"]));
     const prompt = screen.getByLabelText("Prompt") as HTMLTextAreaElement;
+    expect(body.contains(prompt)).toBe(true);
     expect(prompt.rows).toBe(5);
     expect(prompt.className.split(" ")).toContain("shrink-0");
     expect(prompt.className.split(" ")).toContain("text-sm");
+  });
+
+  it("keeps Cancel and Start autopilot in a footer outside the scrolling body", () => {
+    // Only the body scrolls. With the buttons inside it they were below the
+    // fold of a 1440x900 window.
+    seed({ support: "supported" });
+    renderControl();
+    fireEvent.click(controlButton());
+
+    const dialog = screen.getByRole("dialog", { name: "Start autopilot — OMP 1" });
+    expect(dialog.className.split(" ")).toEqual(expect.arrayContaining(["flex", "flex-col", "overflow-hidden"]));
+    const body = within(dialog).getByTestId("autopilot-start-body");
+    const footer = within(dialog).getByTestId("autopilot-start-footer");
+    expect(body.parentElement).toBe(dialog);
+    expect(footer.parentElement).toBe(dialog);
+    expect(body.nextElementSibling).toBe(footer);
+    expect(footer.className.split(" ")).toContain("shrink-0");
+    for (const name of ["Cancel", "Start autopilot"]) {
+      const button = within(dialog).getByRole("button", { name });
+      expect(footer.contains(button)).toBe(true);
+      expect(body.contains(button)).toBe(false);
+    }
   });
 
   it("states what the mode is and is not before a start is sent", () => {
@@ -171,8 +196,10 @@ describe("a tab that is not on autopilot", () => {
     fireEvent.click(controlButton());
     const dialog = screen.getByRole("dialog");
 
-    // No prompt of APAS's own.
-    expect((within(dialog).getByLabelText("Prompt") as HTMLTextAreaElement).value).toBe("");
+    // The default template, in full and ready to change: a tab with no
+    // earlier autopilot is not left with an empty field.
+    expect((within(dialog).getByLabelText("Prompt") as HTMLTextAreaElement).value).toBe(DEFAULT_AUTOPILOT_TEMPLATE.prompt);
+    expect((within(dialog).getByLabelText("Template") as HTMLSelectElement).value).toBe(DEFAULT_AUTOPILOT_TEMPLATE.id);
     const noLimits = within(dialog).getAllByRole("radio", { name: "No limit" }) as HTMLInputElement[];
     expect(noLimits).toHaveLength(2);
     expect(noLimits.every((radio) => radio.checked)).toBe(true);
@@ -182,6 +209,9 @@ describe("a tab that is not on autopilot", () => {
     expect((within(dialog).getByRole("radio", { name: "As soon as each turn ends" }) as HTMLInputElement).checked).toBe(true);
     expect((within(dialog).getByRole("checkbox", { name: /End when an iteration makes no tool call/ }) as HTMLInputElement).checked).toBe(true);
 
+    // The person's own text starts empty, and an empty prompt is refused.
+    fireEvent.change(within(dialog).getByLabelText("Template"), { target: { value: AUTOPILOT_OWN_TEXT } });
+    expect((within(dialog).getByLabelText("Prompt") as HTMLTextAreaElement).value).toBe("");
     fireEvent.click(within(dialog).getByRole("button", { name: "Start autopilot" }));
     expect(within(dialog).getByRole("alert").textContent).toBe("Autopilot needs a prompt.");
     expect(send).not.toHaveBeenCalled();

@@ -196,6 +196,27 @@ describe("ResourceUseRollup", () => {
     expect(screen.queryByText("cursor-agent")).toBeNull();
   });
 
+  it("adds no card for a retired Pi tab, like the other retired providers", () => {
+    // Pi can no longer be launched. An old tab of it stays in the roster as
+    // read-only history, but it cannot run, so it has no limits to show, not
+    // even from a payload cached before it was retired.
+    seedRollup({
+      cliClientId: "cli-a",
+      paneConfigs: [pane(1, "pi"), pane(2, "codex")],
+      usageLimits: usageByClient([["cli-a", {
+        pi: { sevenDay: { utilization: 0.31 } },
+        codex: { sevenDay: { utilization: 0.12 } },
+      } as UsageLimitsByProvider]]),
+    });
+
+    render(<ResourceUseRollup />);
+
+    expect(within(providerCard("Codex")).getByText("12%")).toBeTruthy();
+    expect(screen.queryByText("Pi")).toBeNull();
+    expect(screen.queryByText("pi")).toBeNull();
+    expect(screen.queryByText("31%")).toBeNull();
+  });
+
   it("stays scoped to the active cli client when usage data exists for another project", () => {
     seedRollup({
       cliClientId: "cli-a",

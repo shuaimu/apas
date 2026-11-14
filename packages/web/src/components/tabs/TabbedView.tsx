@@ -10,14 +10,15 @@ import { AssistantMessage } from "../chat/AssistantMessage";
 import { ToolGroupCard, groupMessagesForRender, isToolLikeMessage } from "../chat/ToolGroupCard";
 import { TabBar } from "./TabBar";
 import { ProjectWorkersWorkspace } from "../workers/ProjectWorkersWorkspace";
-import { WorkerTaskBar } from "./WorkerTaskBar";
 import { UsageLimitsDisplay } from "../UsageLimits";
 import { CodeBlock } from "../code/CodeBlock";
 import { useIsLaunchProfileAllowed } from "@/lib/tabTypes";
 import {
   canonicalDeepseekModel,
   DEEPSEEK_FLASH_MODEL,
+  isRetiredPiProvider,
   isRetiredProviderModel,
+  PI_RETIRED_MESSAGE,
 } from "@/lib/providerOptions";
 import { resolveMachineProjectTarget } from "@/lib/machineProjectTarget";
 import { paneIsAwaitingAnswerStatus } from "@/lib/paneStatus";
@@ -331,7 +332,6 @@ const PROVIDER_OPTIONS = [
   { value: "codex", label: "Codex" },
   { value: "cursor-agent", label: "Cursor" },
   { value: "opencode", label: "OpenCode" },
-  { value: "pi", label: "Pi" },
   { value: "omp", label: "OMP" },
   { value: "deepseek", label: "DeepSeek" },
 ] as const;
@@ -836,8 +836,8 @@ export function TabbedView({
         ? "Cursor"
         : provider === "opencode"
           ? "OpenCode"
-          : provider === "pi"
-            ? "Pi"
+          : provider === "omp"
+            ? "OMP"
             : isDeepseek || deepseekModel === DEEPSEEK_FLASH_MODEL
               ? "DeepSeek"
               : "Claude";
@@ -999,13 +999,11 @@ export function TabbedView({
     || !activeProvider
     || activeProvider === "minimax"
     || activeProvider === "glm"
+    || activeProvider === "pi"
     ? null
     : activeIsDeepseek
       ? "deepseek"
       : activeProvider;
-  const diffModalPaneConfig = diffModalPaneId !== null
-    ? effectiveTabs.find((t) => t.pane_id === diffModalPaneId)
-    : undefined;
 
   // Use a targeted selector to avoid re-renders when unrelated usage limits change
   const currentUsageLimits = useStore(
@@ -1181,8 +1179,6 @@ export function TabbedView({
         onSelectTab={(paneId) => { workspace.selectInteractive(); handleSelectTab(paneId); }}
         onCloseTab={handleCloseTab}
         onAddTab={(...args) => { workspace.selectInteractive(); handleAddTab(...args); }}
-        onAddAutonomous={workspace.addAutonomous}
-        autonomousUnavailableReason={workspace.unavailableReason}
         jobTabs={workspace.tabs}
         overviewTab={workspace.overviewTab}
         onRenameTab={handleRenameTab}
@@ -1250,7 +1246,9 @@ export function TabbedView({
             className="rounded border border-red-300 bg-red-50 px-2.5 py-1 text-xs font-medium text-red-700 dark:border-red-800 dark:bg-red-950/40 dark:text-red-300"
             role="status"
           >
-            Unsupported provider — history is read-only
+            {isRetiredPiProvider(activeProvider)
+              ? "Pi is no longer supported. History is read-only."
+              : "Unsupported provider — history is read-only"}
           </div>
         ) : isAttached && activeTabId != null && activeTabId !== PANE_ID_MAIN && !activeIsBot && (
             <>
@@ -1511,7 +1509,9 @@ export function TabbedView({
               {tabIsUnsupported ? (
                 <>
                   <div className="border-b border-red-200 bg-red-50 px-4 py-2 text-sm text-red-700 dark:border-red-900 dark:bg-red-950/30 dark:text-red-300">
-                    This historical pane uses a retired provider. Its history is available, but it cannot receive input or be restarted.
+                    {isRetiredPiProvider(tab.provider)
+                      ? `${PI_RETIRED_MESSAGE} This tab's history is available, but it cannot receive input or be restarted.`
+                      : "This historical pane uses a retired provider. Its history is available, but it cannot receive input or be restarted."}
                   </div>
                   <MessagePane
                     key={`${sessionId}-${tab.pane_id}-unsupported`}
@@ -1521,7 +1521,6 @@ export function TabbedView({
                     isLoading={loadingMorePane === tab.pane_id}
                     hasMore={paneHasMore[paneKey(tab.pane_id)] || false}
                     isActive={isActive}
-                    role={tab.role}
                   />
                 </>
               ) : tab.kind === "terminal" ? (
@@ -1547,20 +1546,16 @@ export function TabbedView({
                   disabledReason={tab.mode === "deadloop" ? "Legacy bot history is read-only." : tabHosts.tabs.get(tab.pane_id)?.refusal}
                 />
               ) : (
-                <>
-                  <WorkerTaskBar paneId={tab.pane_id} role={tab.role} managed={tab.managed} />
-                  <MessagePane
-                    key={`${sessionId}-${tab.pane_id}`}
-                    paneId={tab.pane_id}
-                    messages={msgs}
-                    onLoadMore={() => loadMoreMessages(tab.pane_id)}
-                    isLoading={loadingMorePane === tab.pane_id}
-                    hasMore={paneHasMore[paneKey(tab.pane_id)] || false}
-                    isActive={isActive}
-                    role={tab.role}
-                    disabledReason={tab.mode === "deadloop" ? "Legacy bot history is read-only." : tabHosts.tabs.get(tab.pane_id)?.refusal}
-                  />
-                </>
+                <MessagePane
+                  key={`${sessionId}-${tab.pane_id}`}
+                  paneId={tab.pane_id}
+                  messages={msgs}
+                  onLoadMore={() => loadMoreMessages(tab.pane_id)}
+                  isLoading={loadingMorePane === tab.pane_id}
+                  hasMore={paneHasMore[paneKey(tab.pane_id)] || false}
+                  isActive={isActive}
+                  disabledReason={tab.mode === "deadloop" ? "Legacy bot history is read-only." : tabHosts.tabs.get(tab.pane_id)?.refusal}
+                />
               )}
             </div>
           );
@@ -1589,7 +1584,7 @@ export function TabbedView({
         <div className="p-3 border-t border-gray-200 dark:border-gray-700 flex-shrink-0">
           {activeIsBot ? (
             <div className="text-center text-sm text-gray-400 dark:text-gray-500 py-2">
-              Legacy bot history is read-only. Use Autonomous worker to review a new responsibility and recurring allowance.
+              Legacy bot history is read-only. To set up recurring work, use New autonomous worker on the Overview tab.
             </div>
           ) : (
             <InteractiveInput
@@ -1626,7 +1621,6 @@ export function TabbedView({
       <PaneDiffModal
         open={diffModalPaneId !== null}
         diff={diffModalPaneId !== null ? paneDiffs[diffModalPaneId] : undefined}
-        manualPrCreationDisabled={diffModalPaneConfig?.managed === true}
         onClose={() => setDiffModalPaneId(null)}
         onRefresh={() => {
           if (diffModalPaneId !== null) requestPaneDiff(diffModalPaneId);
@@ -1877,7 +1871,6 @@ interface PaneDiffModalProps {
   onMerge: () => void;
   onDiscard: () => void;
   onCreatePr: () => void;
-  manualPrCreationDisabled?: boolean;
 }
 
 // Split a unified `git diff` output into per-file sections. Each `diff
@@ -1946,7 +1939,6 @@ export function PaneDiffModal({
   onMerge,
   onDiscard,
   onCreatePr,
-  manualPrCreationDisabled = false,
 }: PaneDiffModalProps) {
   if (!open) return null;
   let body: React.ReactNode;
@@ -1982,20 +1974,17 @@ export function PaneDiffModal({
             >
               Refresh
             </button>
-            {manualPrCreationDisabled ? (
-              <p className="max-w-[13rem] text-xs leading-5 text-zinc-400">
-                Managed team panes open PRs after Reviewer approval.
-              </p>
-            ) : (
-              <button
-                type="button"
-                onClick={onCreatePr}
-                className="rounded border border-sky-600 bg-sky-900/40 px-3 py-1 text-xs text-sky-200 hover:bg-sky-900/60"
-                title="Push this branch to origin and open a GitHub PR via `gh pr create --fill`. Requires `gh` on the CLI host."
-              >
-                Create PR
-              </button>
-            )}
+            {/* Every pane with a worktree gets this, also one an older
+                `.apas` marked managed: the team review that used to open
+                its PR is gone. */}
+            <button
+              type="button"
+              onClick={onCreatePr}
+              className="rounded border border-sky-600 bg-sky-900/40 px-3 py-1 text-xs text-sky-200 hover:bg-sky-900/60"
+              title="Push this branch to origin and open a GitHub PR via `gh pr create --fill`. Requires `gh` on the CLI host."
+            >
+              Create PR
+            </button>
             <button
               type="button"
               onClick={onMerge}
@@ -2125,10 +2114,6 @@ export interface MessagePaneProps {
    * false, the pane is mounted but `display: none`. Phase: hide-not-
    * unmount switching. */
   isActive: boolean;
-  /** Pane role string used to tailor the first-run empty state. The
-   * Manager pane gets a chat-first prompt; everyone else falls back to
-   * the generic placeholder. */
-  role?: string;
   /** Why the pane cannot take answers now: its machine is not running the
    *  project, or this viewer may not use it. Locks its questions and
    *  approvals with the reason; the history still reads. */
@@ -2203,7 +2188,7 @@ function HistoryLoadingPlaceholder({ paneId }: { paneId: number }) {
   );
 }
 
-export function MessagePane({ paneId, messages, onLoadMore, isLoading, hasMore, isActive, role, disabledReason }: MessagePaneProps) {
+export function MessagePane({ paneId, messages, onLoadMore, isLoading, hasMore, isActive, disabledReason }: MessagePaneProps) {
   const sessionId = useStore((s) => s.sessionId);
   // How many newest messages to mount. Grows when the user reveals older
   // ones. `expanded` latches once they page all the way back so server-
@@ -2466,29 +2451,6 @@ export function MessagePane({ paneId, messages, onLoadMore, isLoading, hasMore, 
   );
 
   if (messages.length === 0) {
-    const lowerRole = (role ?? "").toLowerCase();
-    const isManager =
-      lowerRole.includes("manager") && !lowerRole.includes("tech lead");
-    if (isManager) {
-      return (
-        <div className="flex-1 flex items-center justify-center text-gray-500 dark:text-gray-400 px-4">
-          <div className="max-w-md text-center">
-            <p className="text-base font-medium text-gray-700 dark:text-gray-200">
-              Talk to your Manager
-            </p>
-            <p className="mt-2 text-xs leading-relaxed">
-              State the project goal in one or two sentences below — the
-              Manager keeps <span className="font-mono">project_goal.md</span> in
-              sync and hands work to the Tech Lead, who delegates to workers.
-            </p>
-            <p className="mt-2 text-[11px] opacity-75">
-              Tip: try <em>&ldquo;Scan the repo and draft a starter goal&rdquo;</em> or
-              describe the next milestone yourself.
-            </p>
-          </div>
-        </div>
-      );
-    }
     return (
       <div className="flex-1 flex items-center justify-center text-gray-400 px-4">
         <div className="text-center">

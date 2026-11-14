@@ -28,24 +28,40 @@ afterEach(() => {
 });
 
 describe("AllowedTabTypesCard", () => {
-  it("renders the exact server-authoritative launch profiles", () => {
+  it("names each server-authoritative launch profile and keeps its key as the tooltip", () => {
     seed([
       "agent:claude:official:default",
       "terminal:codex:official:default",
+      "terminal:claude:deepseek:deepseek-flash",
     ]);
     render(<AllowedTabTypesCard />);
 
-    expect(screen.getByText("agent:claude:official:default")).toBeTruthy();
-    expect(screen.getByText("terminal:codex:official:default")).toBeTruthy();
+    expect(screen.getByTitle("agent:claude:official:default").textContent).toBe("Claude / Official (structured agent)");
+    expect(screen.getByTitle("terminal:codex:official:default").textContent).toBe("Codex / Official");
+    expect(screen.getByTitle("terminal:claude:deepseek:deepseek-flash").textContent).toBe("Claude / DeepSeek 4.1 Flash");
     expect(screen.getByText("Read-only cluster policy")).toBeTruthy();
     expect(screen.queryByRole("checkbox")).toBeNull();
     expect(screen.queryByRole("button")).toBeNull();
   });
 
-  it("reports that no panes may launch for an empty allowlist", () => {
+  it("shows a profile the catalog cannot name by its key, and leaves out a retired one", () => {
+    seed([
+      "terminal:nova:official:default",
+      "terminal:claude:minimax:m2",
+      "terminal:omp:official:default",
+    ]);
+    render(<AllowedTabTypesCard />);
+
+    expect(screen.getByText("terminal:nova:official:default")).toBeTruthy();
+    expect(screen.getByTitle("terminal:omp:official:default").textContent).toBe("OMP");
+    expect(screen.queryByText(/minimax/)).toBeNull();
+    expect(screen.queryByTitle(/minimax/)).toBeNull();
+  });
+
+  it("reports that no tabs may launch for an empty allowlist", () => {
     seed([]);
     render(<AllowedTabTypesCard />);
-    expect(screen.getByText(/No new panes may be launched/)).toBeTruthy();
+    expect(screen.getByText(/No new tabs may be launched/)).toBeTruthy();
   });
 
   it("names panes outside the policy without claiming they are stuck", () => {
@@ -54,7 +70,7 @@ describe("AllowedTabTypesCard", () => {
     // something new.
     seed(["agent:codex:official:default"], [2, 9]);
     render(<AllowedTabTypesCard />);
-    expect(screen.getByText(/Panes 2, 9 use a combination this policy no longer allows/)).toBeTruthy();
+    expect(screen.getByText(/Tabs 2, 9 use a combination this policy no longer allows/)).toBeTruthy();
     expect(screen.getByText(/can be relaunched/)).toBeTruthy();
     expect(screen.queryByText(/cannot be relaunched/)).toBeNull();
   });

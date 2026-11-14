@@ -1,4 +1,4 @@
-import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import MachinesPage from "./page";
 import { useStore, type MachineWithProjects } from "@/lib/store";
@@ -247,6 +247,9 @@ describe("MachinesPage daemon restart", () => {
 
     const dialog = screen.getByRole("dialog", { name: "Reboot and update the daemon on zoo-006" });
     expect(dialog).toBeTruthy();
+    // Projects run inside the daemon: the dialog must not promise they keep running.
+    expect(within(dialog).getByText(/Every project running on zoo-006 restarts with it\. Terminal agents normally keep running/)).toBeTruthy();
+    expect(within(dialog).queryByText(/does not own/)).toBeNull();
     fireEvent.click(screen.getByRole("button", { name: "Reboot to update" }));
 
     expect(actions.rebootDaemon).toHaveBeenCalledWith("machine-b");

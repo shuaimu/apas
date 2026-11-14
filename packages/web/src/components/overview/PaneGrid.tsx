@@ -1,11 +1,12 @@
 "use client";
 
 /**
- * Phase 5.1b — pane grid for the Overview tab. One card per pane,
- * showing the at-a-glance roll-up the user described:
- *   label + role chip · status pill · mode · worktree · last-activity
- * Quick-action row: Diff / Role (modal opens) and a click-anywhere
- * "Open" affordance that switches the active tab.
+ * The Overview's "Tabs" section: one card per tab of the project.
+ *
+ * Every card has the same parts in the same order: a status dot, the tab's
+ * name and what it runs; one status line; the autopilot line, the goal and the
+ * worktree when the tab has them; then an activity strip and the card's
+ * actions. The name opens the tab, and so does a click anywhere on the card.
  */
 import { useMemo } from "react";
 import {
@@ -27,6 +28,9 @@ import { paneIsAwaitingAnswerStatus } from "@/lib/paneStatus";
 import { useIsLaunchProfileAllowed } from "@/lib/tabTypes";
 import { useSessionAutopilotStatuses } from "@/lib/useAutopilot";
 import type { AutopilotListStatus } from "@/lib/autopilot";
+import { providerModelDisplayName } from "@/lib/launchProfileLabels";
+import { formatRelativeTime } from "@/lib/formatRelativeTime";
+import { OverviewEmpty, overviewCard, overviewChip, overviewQuietButton, overviewQuietDangerButton } from "./OverviewElements";
 
 interface PaneGridProps {
   onOpenPane: (paneId: number) => void;
@@ -60,26 +64,33 @@ export function PaneGrid({
   const paneMessages = useStore((s) => s.paneMessages);
   const paneDiffs = useStore((s) => s.paneDiffs);
   const sessionId = useStore((s) => s.sessionId);
+  const usageStats = useStore((s) => s.usageStats);
   const autopilotStatuses = useSessionAutopilotStatuses(sessionId, paneConfigs);
-  // One grid: the managed/unmanaged split existed for team mode, and a pane
-  // still marked managed is now just a pane.
-  const sorted = useMemo(() => {
-    const arr = [...paneConfigs];
-    arr.sort((a, b) => a.pane_id - b.pane_id);
-    return arr;
-  }, [paneConfigs]);
+  // The server's record of when each tab last did something. The messages in
+  // this browser cover only the tabs that were opened here, so a card that
+  // read them alone said "no activity yet" for a tab that had just worked.
+  const reportedActivity = useMemo(() => {
+    const byPane = new Map<number, Date>();
+    for (const pane of (sessionId ? usageStats[sessionId]?.panes : undefined) ?? []) {
+      const at = pane.last_active ? Date.parse(pane.last_active) : Number.NaN;
+      if (!Number.isNaN(at)) byPane.set(pane.pane_id, new Date(at));
+    }
+    return byPane;
+  }, [sessionId, usageStats]);
 
-  if (sorted.length === 0) {
-    return (
-      <div className="rounded border border-dashed border-gray-300 dark:border-gray-700 bg-gray-50 dark:bg-gray-800/30 p-3 text-xs italic text-gray-500 dark:text-gray-400">
-        No panes. Click <strong>+</strong> in the tab bar to start one.
-      </div>
-    );
+  if (paneConfigs.length === 0) {
+    return <OverviewEmpty>No tabs yet. Use + in the tab bar to open one.</OverviewEmpty>;
   }
 
   return (
     <div className="grid grid-cols-1 gap-3 md:grid-cols-2 xl:grid-cols-3">
-      {sorted.map((pane) => {
+      {/* One grid, in the tab bar's order: these are the same tabs, and a tab
+          must not sit in a different place here than in the bar above. Pane
+          ids are not creation order (they are reused, and assigned per
+          machine), so sorting by id shuffled the cards. A card also keeps its
+          place when its tab starts or stops working, so it never moves from
+          under a pointer. */}
+      {paneConfigs.map((pane) => {
         const status = paneStatuses[paneKey(pane.pane_id)];
         const isPaused = pausedPanes.includes(pane.pane_id);
         const messages = paneMessages[paneKey(pane.pane_id)] ?? [];
@@ -93,7 +104,7 @@ export function PaneGrid({
             isPaused={isPaused}
             autopilot={autopilotStatuses.get(pane.pane_id)}
             messages={messages}
-            lastActivity={lastMsg?.timestamp}
+            lastActivity={latest(lastMsg?.timestamp, reportedActivity.get(pane.pane_id))}
             diffStats={diff?.diff ? summarizeDiffStats(diff.diff) : undefined}
             onOpen={() => onOpenPane(pane.pane_id)}
             onOpenDiff={() => onOpenDiff(pane.pane_id)}
@@ -104,6 +115,12 @@ export function PaneGrid({
       })}
     </div>
   );
+}
+
+function latest(a?: Date, b?: Date): Date | undefined {
+  if (!a) return b;
+  if (!b) return a;
+  return a.getTime() >= b.getTime() ? a : b;
 }
 
 interface PaneCardProps {
@@ -147,22 +164,23 @@ function PaneCard({
     || currentAgentValue === "unsupported";
   const isAwaitingAnswer = paneIsAwaitingAnswerStatus(status) && !isPaused;
   const isThinking = !!status && !isPaused && !isAwaitingAnswer;
+  // The dot's label is the tab's state in a word; the status line beside it
+  // carries what the tab itself reports.
   const modeIndicator = readOnlyHistory
-    ? { icon: "", label: "earlier bot history" }
+    ? { label: "earlier bot history", dot: "bg-gray-300 dark:bg-gray-600" }
     : isUnsupported
-    ? { icon: "!", label: "unsupported provider" }
+    ? { label: "unsupported provider", dot: "bg-red-500" }
     : isAwaitingAnswer
-    ? { icon: "?", label: "pending answer" }
+    ? { label: "pending answer", dot: "bg-amber-500" }
     : isThinking
-      ? { icon: "●", label: "thinking" }
-      : { icon: "•", label: "idle" };
-  const modeColor = readOnlyHistory ? "text-gray-400" : isUnsupported
-    ? "text-red-500"
-    : isAwaitingAnswer
-    ? "text-amber-500"
+      ? { label: "thinking", dot: "bg-blue-500 animate-pulse" }
+      : { label: "idle", dot: "bg-gray-300 dark:bg-gray-600" };
+  const statusText = status || (isPaused ? "Paused" : "Idle");
+  const statusColor = isAwaitingAnswer
+    ? "text-amber-700 dark:text-amber-300"
     : isThinking
-      ? "text-blue-500 animate-pulse"
-      : "text-gray-400";
+      ? "text-blue-700 dark:text-blue-300"
+      : "text-gray-700 dark:text-gray-300";
   const updatePaneModel = useStore((s) => s.updatePaneModel);
   const isLaunchProfileAllowed = useIsLaunchProfileAllowed();
   // Inline agent switcher. Mirrors the "+" new-tab menu's
@@ -178,32 +196,52 @@ function PaneCard({
       || isLaunchProfileAllowed("agent", option.provider, option.model ?? undefined),
   );
   const label = pane.label || `Tab ${pane.pane_id}`;
+  const runs = providerModelDisplayName(pane.provider, pane.model);
+  const builtIn = pane.pane_id === PANE_ID_INTERACTIVE || pane.pane_id === PANE_ID_DEADLOOP;
+  // The card opens its tab wherever it is clicked. The name is the real
+  // button, so the same thing is reachable from the keyboard; the controls
+  // inside stop their own clicks from also opening the tab.
   return (
-    <button
-      type="button"
+    <div
       onClick={onOpen}
-      className="flex flex-col items-stretch gap-2 rounded border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800/60 p-3 text-left transition-colors hover:border-indigo-400 dark:hover:border-indigo-500"
       title={`Open ${label}`}
+      className={`${overviewCard} flex min-w-0 cursor-pointer flex-col gap-2 p-3 transition-colors hover:border-blue-400 dark:hover:border-blue-500`}
     >
-      <div className="flex flex-wrap items-baseline gap-2">
-        <span className={`flex-shrink-0 text-base ${modeColor}`} aria-label={modeIndicator.label}>
-          {modeIndicator.icon}
-        </span>
-        <span className="font-semibold text-gray-900 dark:text-gray-100 truncate">{label}</span>
+      <div className="flex min-w-0 items-center gap-2">
+        <span
+          role="img"
+          aria-label={modeIndicator.label}
+          className={`h-2 w-2 shrink-0 rounded-full ${modeIndicator.dot}`}
+        />
+        <h4 className="min-w-0 flex-1 text-sm font-semibold text-gray-900 dark:text-gray-100">
+          <button
+            type="button"
+            aria-label={`Open ${label}`}
+            onClick={(e) => {
+              e.stopPropagation();
+              onOpen();
+            }}
+            className="block max-w-full truncate rounded text-left hover:underline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-500"
+          >
+            {label}
+          </button>
+        </h4>
         {pane.role && (
-          <span className="rounded bg-purple-100 dark:bg-purple-900/40 px-1.5 py-0.5 text-[10px] font-medium text-purple-700 dark:text-purple-300">
+          <span className={`${overviewChip} max-w-28 truncate`} title={`Role: ${pane.role}`}>
             {pane.role}
           </span>
         )}
-        {readOnlyHistory ? <span className="ml-auto text-xs">Earlier bot · Read-only</span> : isUnsupported ? (
-          <span className="ml-auto rounded bg-red-100 px-2 py-0.5 text-[10px] font-medium text-red-700 dark:bg-red-900/40 dark:text-red-300">
+        {readOnlyHistory ? (
+          <span className={overviewChip}>Earlier bot · Read-only</span>
+        ) : isUnsupported ? (
+          <span className="shrink-0 rounded bg-red-100 px-1.5 py-0.5 text-[11px] font-medium text-red-700 dark:bg-red-900/40 dark:text-red-300">
             Unsupported provider
           </span>
         ) : isTerminal ? (
-          <span className="ml-auto rounded bg-gray-100 px-2 py-0.5 text-[10px] font-medium text-gray-600 dark:bg-gray-700 dark:text-gray-300">
-            Terminal
+          <span className={`${overviewChip} max-w-40 truncate`} title={`${runs ?? pane.provider} terminal tab`}>
+            {runs ?? pane.provider}
           </span>
-        ) : <span className="ml-auto flex items-center gap-1" onClick={(e) => e.stopPropagation()}>
+        ) : <span className="flex shrink-0 items-center" onClick={(e) => e.stopPropagation()}>
           <select
             value={currentAgentValue}
             onChange={(e) => {
@@ -236,7 +274,7 @@ function PaneCard({
               }
               updatePaneModel(pane.pane_id, picked.model, picked.provider);
             }}
-            className="rounded border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-800 px-1 py-0 text-[10px] font-mono text-gray-700 dark:text-gray-300 focus:outline-none"
+            className="h-6 max-w-40 rounded border border-gray-300 bg-white px-1 text-[11px] font-medium text-gray-700 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-500 dark:border-gray-600 dark:bg-gray-800 dark:text-gray-300"
             title="Agent frontend / API backend — Claude→Claude with no backend swap is a live swap (next turn takes effect); provider change or backend swap respawns with a fresh session id"
           >
             {visibleAgentOptions.map((o) => (
@@ -252,20 +290,12 @@ function PaneCard({
         </span>}
       </div>
 
-      {pane.goal && (
-        <div
-          className="line-clamp-2 text-xs text-gray-600 dark:text-gray-300"
-          title={pane.goal}
-        >
-          {pane.goal}
-        </div>
-      )}
-
-      {status && (
-        <div className="rounded bg-blue-50 dark:bg-blue-900/30 px-2 py-1 text-xs text-blue-700 dark:text-blue-300">
-          {status}
-        </div>
-      )}
+      <p className="flex flex-wrap items-baseline gap-x-1.5 text-xs">
+        <span className={`font-medium ${statusColor}`}>{statusText}</span>
+        <span className="text-gray-500 dark:text-gray-400" title={lastActivity?.toLocaleString()}>
+          {lastActivity ? `· Last active ${formatRelativeTime(lastActivity)}` : "· No activity yet"}
+        </span>
+      </p>
 
       {autopilot && (
         <div
@@ -282,71 +312,78 @@ function PaneCard({
         </div>
       )}
 
-      {pane.worktree_path && (
-        <div className="flex items-center gap-2 text-[11px] text-gray-500 dark:text-gray-400">
-          <span className="font-mono">apas-pane-{pane.pane_id}</span>
-          {diffStats && (
-            <>
-              <span className="text-emerald-500">+{diffStats.added}</span>
-              <span className="text-red-500">-{diffStats.removed}</span>
-            </>
-          )}
-        </div>
+      {pane.goal && (
+        <p
+          className="line-clamp-2 text-xs text-gray-600 dark:text-gray-300"
+          title={pane.goal}
+        >
+          {pane.goal}
+        </p>
       )}
 
-      <div className="flex items-center gap-2 text-[11px] text-gray-500 dark:text-gray-400">
-        <span>{lastActivity ? `last: ${formatRelative(lastActivity)}` : "no activity yet"}</span>
-        <ActivitySparkline messages={messages} />
-        <span className="ml-auto flex gap-1.5">
-          {pane.worktree_path && (
-            <span
-              className="rounded border border-emerald-400 dark:border-emerald-700 bg-emerald-50 dark:bg-emerald-900/30 px-1.5 py-0.5 text-emerald-700 dark:text-emerald-300 hover:bg-emerald-100 dark:hover:bg-emerald-900/50"
-              role="button"
-              onClick={(e) => {
-                e.stopPropagation();
-                onOpenDiff();
-              }}
-            >
-              Diff
-            </span>
+      {pane.worktree_path && (
+        <p className="flex items-center gap-2 text-xs text-gray-500 dark:text-gray-400">
+          <span className="truncate font-mono text-[11px]">apas-pane-{pane.pane_id}</span>
+          {diffStats && (
+            <>
+              <span className="text-emerald-600 dark:text-emerald-400">+{diffStats.added}</span>
+              <span className="text-red-600 dark:text-red-400">-{diffStats.removed}</span>
+            </>
           )}
-          {!readOnlyHistory && !isUnsupported && !isTerminal && (
-            <span
-              className="rounded border border-purple-400 dark:border-purple-700 bg-purple-50 dark:bg-purple-900/30 px-1.5 py-0.5 text-purple-700 dark:text-purple-300 hover:bg-purple-100 dark:hover:bg-purple-900/50"
-              role="button"
-              onClick={(e) => {
-                e.stopPropagation();
-                onOpenRole();
-              }}
-              title="Edit role / goal / backstory"
-            >
-              Role
-            </span>
-          )}
-          {pane.pane_id !== PANE_ID_INTERACTIVE && pane.pane_id !== PANE_ID_DEADLOOP && (
-              <span
-                className="rounded border border-red-400 dark:border-red-700 bg-red-50 dark:bg-red-900/30 px-1.5 py-0.5 text-red-700 dark:text-red-300 hover:bg-red-100 dark:hover:bg-red-900/50"
-                role="button"
-                onClick={(e) => {
-                  e.stopPropagation();
-                  onRemove();
-                }}
-                title="Close this pane (worktree-cleanup prompt opens if applicable)"
-              >
-                Remove
-              </span>
-            )}
-          {(pane.pane_id === PANE_ID_INTERACTIVE || pane.pane_id === PANE_ID_DEADLOOP) && (
-            <span
-              className="rounded bg-gray-100 dark:bg-gray-700 px-1.5 py-0.5 text-[10px] text-gray-500 dark:text-gray-400"
-              title="Built-in default pane (can't be removed)"
-            >
-              default
-            </span>
-          )}
+        </p>
+      )}
+
+      <div className="mt-auto flex items-center gap-1 pt-1">
+        <span className="mr-auto flex min-w-0 items-center">
+          <ActivitySparkline messages={messages} />
         </span>
+        {pane.worktree_path && (
+          <button
+            type="button"
+            className={overviewQuietButton}
+            onClick={(e) => {
+              e.stopPropagation();
+              onOpenDiff();
+            }}
+            title="Show this tab's changes in its worktree"
+          >
+            Diff
+          </button>
+        )}
+        {!readOnlyHistory && !isUnsupported && !isTerminal && (
+          <button
+            type="button"
+            className={overviewQuietButton}
+            onClick={(e) => {
+              e.stopPropagation();
+              onOpenRole();
+            }}
+            title="Edit role / goal / backstory"
+          >
+            Role
+          </button>
+        )}
+        {!builtIn && (
+          <button
+            type="button"
+            aria-label={`Close tab ${label}`}
+            className={overviewQuietDangerButton}
+            onClick={(e) => {
+              e.stopPropagation();
+              onRemove();
+            }}
+            title="Close this pane (worktree-cleanup prompt opens if applicable)"
+          >
+            Close tab
+          </button>
+        )}
+        {builtIn && (
+          <span className={overviewChip} title="Built-in default pane (can't be removed)">
+            default
+          </span>
+        )}
       </div>
-    </button>
+    </div>
   );
 }
 
@@ -358,14 +395,4 @@ function summarizeDiffStats(diff: string): { added: number; removed: number } {
     else if (line.startsWith("-") && !line.startsWith("---")) removed++;
   }
   return { added, removed };
-}
-
-function formatRelative(when: Date): string {
-  const seconds = Math.floor((Date.now() - when.getTime()) / 1000);
-  if (seconds < 60) return `${seconds}s ago`;
-  const minutes = Math.floor(seconds / 60);
-  if (minutes < 60) return `${minutes}m ago`;
-  const hours = Math.floor(minutes / 60);
-  if (hours < 24) return `${hours}h ago`;
-  return `${Math.floor(hours / 24)}d ago`;
 }

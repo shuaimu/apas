@@ -1,4 +1,4 @@
-import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterAll, afterEach, beforeAll, beforeEach, expect, it, vi } from "vitest";
 import { IDBFactory } from "fake-indexeddb";
 import type { WorkerConversionSource, WorkerSummary } from "@apas/protocol";
@@ -9,8 +9,10 @@ import { ProjectWorkersWorkspace } from "./ProjectWorkersWorkspace";
 
 const inventory = vi.hoisted(() => ({ workers: [] as WorkerSummary[], ready: true, loading: false, error: "", hasMore: true, refresh: vi.fn(), loadMore: vi.fn() }));
 const useInventory = vi.hoisted(() => vi.fn());
+const earlier = vi.hoisted(() => ({ jobs: [] as { id: string; title: string; state: string }[], ready: true, loading: false, error: "", hasMore: false, refresh: vi.fn(), loadMore: vi.fn() }));
+const useEarlier = vi.hoisted(() => vi.fn());
 vi.mock("@/lib/useProjectWorkers", () => ({ useProjectWorkers: (project: string | null) => { useInventory(project); return inventory; } }));
-vi.mock("@/lib/useProjectJobs", () => ({ useProjectJobs: () => ({ jobs: [], ready: true, loading: false, error: "", hasMore: false, refresh: vi.fn(), loadMore: vi.fn() }) }));
+vi.mock("@/lib/useProjectJobs", () => ({ useProjectJobs: (project: string | null | undefined) => { useEarlier(project); return earlier; } }));
 vi.mock("./WorkerComposer", () => ({ WorkerComposer: ({ source, onApproved }: { source?: WorkerConversionSource; onApproved: (id: string, project: string) => void }) => <><output data-testid="conversion-source">{JSON.stringify(source)}</output><button onClick={() => onApproved("worker", "project")}>Acknowledge approval receipt</button></> }));
 vi.mock("./WorkerDetail", () => ({ WorkerDetailScreen: ({ id, runId, questionId, review, onNavigate }: { id: string; runId?: string; questionId?: string; review?: boolean; onNavigate: (destination: { runId: string; questionId?: string; review?: boolean }) => void }) => <div>
   <output data-testid="worker-destination">{JSON.stringify({ id, runId, questionId, review })}</output>
@@ -29,10 +31,11 @@ const worker: WorkerSummary = {
 };
 const project = { id: "project", name: "Project" };
 const scope = ["account", "project", ""] as const;
-function Workspace({ initialOverview = false }: { initialOverview?: boolean }) {
-  return <ProjectWorkersWorkspace project={project} paneSelectionRequested={false} initialOverview={initialOverview}>
-    {({ active, tabs, overviewTab, content, selectInteractive, addAutonomous }) => <>
-      {overviewTab}{tabs}<button onClick={selectInteractive}>Interactive pane</button><button disabled={!addAutonomous} onClick={() => addAutonomous?.()}>Add worker</button>
+function Workspace({ initialOverview = false, summary }: { initialOverview?: boolean; summary?: string }) {
+  return <ProjectWorkersWorkspace project={project} paneSelectionRequested={false} initialOverview={initialOverview} overviewSummary={summary}
+    renderOverviewPanels={(selectInteractive) => <section aria-label="Interactive project"><button onClick={selectInteractive}>Open a tab</button></section>}>
+    {({ active, tabs, overviewTab, content, selectInteractive }) => <>
+      {overviewTab}{tabs}<button onClick={selectInteractive}>Interactive pane</button>
       <div hidden={active}><input aria-label="Terminal draft" defaultValue="retained input" /></div>{content}
     </>}
   </ProjectWorkersWorkspace>;
@@ -42,7 +45,8 @@ beforeAll(() => { vi.stubGlobal("indexedDB", new IDBFactory()); Element.prototyp
 beforeEach(async () => {
   await cache.purgeWorkerCache();
   useStore.setState({ userId: "account", sessionId: "selected-project" });
-  inventory.workers = [worker]; inventory.ready = true; inventory.hasMore = true;
+  inventory.workers = [worker]; inventory.ready = true; inventory.hasMore = true; inventory.loading = false; inventory.error = "";
+  earlier.jobs = []; earlier.ready = true; earlier.hasMore = false;
   vi.clearAllMocks();
 });
 afterEach(() => { cleanup(); vi.restoreAllMocks(); useStore.setState(initialStore, true); });
@@ -142,9 +146,9 @@ it("fences delayed preference and label restores after project purge", async () 
 });
 
 it("opens a fresh independent worker only as an unapproved draft", async () => {
-  render(<Workspace />);
+  render(<Workspace initialOverview />);
   await screen.findByRole("button", { name: `Autonomous worker: ${worker.title}` });
-  fireEvent.click(screen.getByRole("button", { name: "Add worker" }));
+  fireEvent.click(screen.getByRole("button", { name: "New autonomous worker" }));
   expect(screen.getByTestId("conversion-source").textContent).toBe("");
   expect(screen.queryByTestId("worker-destination")).toBeNull();
   expect(useStore.getState().sessionId).toBe("selected-project");
@@ -169,4 +173,134 @@ it("drops retired bot conversion provenance from saved composer preferences", as
   expect((await screen.findByTestId("conversion-source")).textContent).toBe("");
   expect(screen.queryByTestId("worker-destination")).toBeNull();
   expect(useStore.getState().sessionId).toBe("selected-project");
+});
+
+// The Overview on desktop and on the phone: the caller's panels come first and
+// the workers section last, in the page's own small parts.
+it("lays the Overview out as one page: the project's name, the caller's panels, then autonomous workers", async () => {
+  render(<Workspace initialOverview />);
+  const page = await screen.findByRole("region", { name: "Project overview" });
+  // Not the Jobs page: its stylesheet's large buttons and titles do not apply.
+  expect(page.classList.contains("jobs-app")).toBe(false);
+  expect(within(page).getByRole("heading", { level: 1 }).textContent).toBe("Project");
+  const panels = within(page).getByRole("region", { name: "Interactive project" });
+  const workers = await within(page).findByRole("heading", { level: 2, name: "Autonomous workers" });
+  expect(panels.compareDocumentPosition(workers) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+  expect(within(page).getByRole("heading", { level: 3, name: "Earlier results" })).toBeTruthy();
+  expect(within(page).queryByRole("heading", { name: "Project overview" })).toBeNull();
+});
+
+it("keeps every worker function on the Overview", async () => {
+  await cache.writeWorkerRecord(scope, "draft", { hidden: [worker.id], opened: [], results: [], hiddenResults: [], view: { kind: "overview" } }, "project-workspace");
+  render(<Workspace />);
+  expect(await screen.findByText(worker.description)).toBeTruthy();
+  expect(useInventory).toHaveBeenCalledWith("project");
+  expect(screen.getByText("idle")).toBeTruthy();
+  expect(screen.getByText(/View hidden/)).toBeTruthy();
+  expect(screen.getByText("approved-host")).toBeTruthy();
+  expect(screen.getByText("Next check")).toBeTruthy();
+  expect(screen.getByText("Last confirmed update")).toBeTruthy();
+  fireEvent.click(screen.getByRole("button", { name: "Show full description" }));
+  expect(screen.getByRole("button", { name: "Collapse description" }).getAttribute("aria-expanded")).toBe("true");
+  expect(screen.getByText(/loaded subset/)).toBeTruthy();
+  fireEvent.click(screen.getByRole("button", { name: "Load more project workers" }));
+  expect(inventory.loadMore).toHaveBeenCalledOnce();
+  fireEvent.click(screen.getByRole("button", { name: "Refresh project workers" }));
+  expect(inventory.refresh).toHaveBeenCalled();
+  // Opening a hidden worker shows its view and its tab again.
+  fireEvent.click(screen.getByRole("button", { name: `Open ${worker.title}` }));
+  expect(JSON.parse(screen.getByTestId("worker-destination").textContent!)).toEqual({ id: "worker" });
+  expect(screen.getByRole("button", { name: `Autonomous worker: ${worker.title}` }).getAttribute("aria-pressed")).toBe("true");
+  // A worker's own screens keep the Jobs style and their way back.
+  expect(screen.getByRole("region", { name: "Project autonomous work" }).classList.contains("jobs-app")).toBe(true);
+  fireEvent.click(screen.getByRole("button", { name: "Project overview" , pressed: false }));
+  expect(await screen.findByRole("heading", { level: 2, name: "Autonomous workers" })).toBeTruthy();
+});
+
+it("is where a worker is created, now that the tab bar's + no longer offers one", async () => {
+  inventory.workers = []; inventory.hasMore = false;
+  render(<Workspace initialOverview />);
+  expect(await screen.findByText(/No autonomous workers in this project yet/)).toBeTruthy();
+  fireEvent.click(screen.getByRole("button", { name: "New autonomous worker" }));
+  expect(screen.getByTestId("conversion-source").textContent).toBe("");
+  expect(screen.getByRole("button", { name: "Back to interactive agents" })).toBeTruthy();
+  fireEvent.click(screen.getByRole("button", { name: "Acknowledge approval receipt" }));
+  expect(JSON.parse(screen.getByTestId("worker-destination").textContent!)).toEqual({ id: "worker" });
+});
+
+it("loads, lists, pages and opens earlier results from the Overview", async () => {
+  earlier.jobs = [{ id: "old-job", title: "Retained result", state: "candidate_ready" }]; earlier.hasMore = true;
+  render(<Workspace initialOverview />);
+  const load = await screen.findByRole("button", { name: "Load earlier project results" });
+  // Nothing is fetched or shown until it is asked for.
+  expect(useEarlier).toHaveBeenLastCalledWith(null);
+  expect(screen.queryByText("Retained result")).toBeNull();
+  fireEvent.click(load);
+  expect(useEarlier).toHaveBeenLastCalledWith("project");
+  expect(earlier.refresh).toHaveBeenCalledOnce();
+  expect(screen.getByText("Retained result")).toBeTruthy();
+  expect(screen.getByText("candidate ready · Read-only")).toBeTruthy();
+  fireEvent.click(screen.getByRole("button", { name: "Load more earlier results" }));
+  expect(earlier.loadMore).toHaveBeenCalledOnce();
+  fireEvent.click(screen.getByRole("button", { name: "Open earlier result: Retained result" }));
+  expect(JSON.parse(screen.getByTestId("earlier-destination").textContent!)).toEqual({ id: "old-job" });
+  expect(screen.getByText(/This job is not a persistent worker/)).toBeTruthy();
+});
+
+it("says so when there are no earlier results or the worker list is stale", async () => {
+  inventory.ready = false;
+  render(<Workspace initialOverview />);
+  expect((await screen.findByText(/Offline or reconnecting/)).getAttribute("role")).toBe("status");
+  fireEvent.click(screen.getByRole("button", { name: "Load earlier project results" }));
+  expect(screen.getByText("No retained earlier results.")).toBeTruthy();
+});
+
+it("has no Back to interactive agents on the Overview: the caller's panels and tab bar lead to the tabs", async () => {
+  render(<Workspace initialOverview />);
+  const page = await screen.findByRole("region", { name: "Project overview" });
+  const terminal = screen.getByLabelText("Terminal draft");
+  expect(terminal.closest("[hidden]")).not.toBeNull();
+  // Not hidden, not kept for the keyboard: it is not on this page at all.
+  expect(screen.queryByRole("button", { name: "Back to interactive agents" })).toBeNull();
+  // The caller's panel opens a tab, and the mounted terminal is the same one.
+  fireEvent.click(within(page).getByRole("button", { name: "Open a tab" }));
+  expect(screen.queryByRole("region", { name: "Project overview" })).toBeNull();
+  expect(screen.getByRole("button", { name: "Project overview" }).getAttribute("aria-pressed")).toBe("false");
+  expect(screen.getByRole("textbox", { name: "Terminal draft" })).toBe(terminal);
+  expect(terminal.closest("[hidden]")).toBeNull();
+  // So does the caller's own tab bar.
+  fireEvent.click(screen.getByRole("button", { name: "Project overview" }));
+  fireEvent.click(screen.getByRole("button", { name: "Interactive pane" }));
+  expect(screen.queryByRole("region", { name: "Project overview" })).toBeNull();
+});
+
+it("keeps both ways out on a worker's own screens, which are pages of their own", async () => {
+  render(<Workspace />);
+  fireEvent.click(await screen.findByRole("button", { name: `Autonomous worker: ${worker.title}` }));
+  const screenOfWorker = screen.getByRole("region", { name: "Project autonomous work" });
+  expect(within(screenOfWorker).getByRole("button", { name: "Project overview" })).toBeTruthy();
+  fireEvent.click(within(screenOfWorker).getByRole("button", { name: "Back to interactive agents" }));
+  expect(screen.queryByRole("region", { name: "Project autonomous work" })).toBeNull();
+  expect(screen.getByLabelText("Terminal draft").closest("[hidden]")).toBeNull();
+});
+
+it("shows the caller's own summary line under the project's name", async () => {
+  render(<Workspace initialOverview summary="This project's tabs and its autonomous workers." />);
+  const page = await screen.findByRole("region", { name: "Project overview" });
+  expect(within(page).getByText("This project's tabs and its autonomous workers.")).toBeTruthy();
+  expect(within(page).queryByText(/what they have used/)).toBeNull();
+});
+
+it("removes the workers and the caller's panels from the Overview when access changes, and rechecks on request", async () => {
+  render(<Workspace initialOverview />);
+  expect(await screen.findByText(worker.description)).toBeTruthy();
+  await act(async () => { await cache.purgeWorkerCache("account", "project"); });
+  expect(screen.getByRole("alert").textContent).toMatch(/Worker access changed/);
+  expect(screen.queryByText(worker.description)).toBeNull();
+  expect(screen.queryByRole("region", { name: "Interactive project" })).toBeNull();
+  expect(screen.queryByRole("button", { name: "New autonomous worker" })).toBeNull();
+  expect(useInventory).toHaveBeenLastCalledWith(null);
+  await act(async () => { fireEvent.click(screen.getByRole("button", { name: "Check current access" })); });
+  expect(await screen.findByText(worker.description)).toBeTruthy();
+  expect(screen.getByRole("region", { name: "Interactive project" })).toBeTruthy();
 });

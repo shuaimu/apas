@@ -4,10 +4,13 @@ import { PaneGrid } from "./PaneGrid";
 import { ResourceUseRollup } from "./ResourceUseRollup";
 import { UsageStatsRollup } from "./UsageStatsRollup";
 import { AllowedTabTypesCard } from "./AllowedTabTypesCard";
+import { OverviewSection } from "./OverviewElements";
 
 /**
- * Interactive project panels embedded below the autonomous agent overview:
- * launch policy, panes, usage and resource costs.
+ * The interactive half of a project's Overview, in the order the project is
+ * used: its tabs, what they have used, how close each provider is to its
+ * limits, and what a new tab may launch. The workspace puts the project's
+ * name above these sections and its autonomous workers below them.
  */
 interface OverviewViewProps {
   onOpenPane: (paneId: number) => void;
@@ -23,48 +26,32 @@ export function OverviewView({
   onRemovePane,
 }: OverviewViewProps) {
   return (
-    <section aria-label="Interactive project" className="mt-6 rounded-lg bg-gray-50 p-6 dark:bg-gray-950">
-      <div className="mx-auto max-w-7xl">
-        <div className="mb-1 flex flex-wrap items-center justify-between gap-2">
-          <h2 className="text-xl font-semibold text-gray-900 dark:text-gray-100">
-            Interactive project
-          </h2>
-        </div>
-        <p className="mb-6 text-sm text-gray-500 dark:text-gray-400">
-          What this project may launch, the panes it is running, and what they
-          are using.
-        </p>
+    <section aria-label="Interactive project" className="flex min-w-0 flex-col gap-8">
+      {/* Names the group for a screen reader's outline. On screen its four
+          sections stand beside "Autonomous workers" as equals, so the page
+          has one level of section heading. */}
+      <h2 className="sr-only">Interactive project</h2>
 
-        <AllowedTabTypesCard />
+      <OverviewSection title="Tabs" level={3}>
+        <PaneGrid
+          onOpenPane={onOpenPane}
+          onOpenDiff={onOpenDiff}
+          onOpenRole={onOpenRole}
+          onRemovePane={onRemovePane}
+        />
+      </OverviewSection>
 
-        <OverviewSection title="Panes">
-          <PaneGrid
-            onOpenPane={onOpenPane}
-            onOpenDiff={onOpenDiff}
-            onOpenRole={onOpenRole}
-            onRemovePane={onRemovePane}
-          />
-        </OverviewSection>
+      <UsageStatsRollup />
 
-        <OverviewSection title="Usage stats">
-          <UsageStatsRollup />
-        </OverviewSection>
+      <OverviewSection
+        title="Resource use"
+        level={3}
+        description="How much of each provider's usage limit is used, and when it resets."
+      >
+        <ResourceUseRollup />
+      </OverviewSection>
 
-        <OverviewSection title="Resource use">
-          <ResourceUseRollup />
-        </OverviewSection>
-      </div>
-    </section>
-  );
-}
-
-function OverviewSection({ title, children }: { title: string; children: React.ReactNode }) {
-  return (
-    <section className="mb-6">
-      <h3 className="mb-2 text-sm font-semibold uppercase tracking-wide text-gray-500 dark:text-gray-400">
-        {title}
-      </h3>
-      {children}
+      <AllowedTabTypesCard />
     </section>
   );
 }

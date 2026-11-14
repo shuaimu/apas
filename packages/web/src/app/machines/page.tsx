@@ -25,6 +25,7 @@ import {
   isMachineBehind,
   latestSeenVersion,
   rebootActionLabelFor,
+  rebootEffectNote,
   rebootLabelFor,
 } from "@/lib/daemonVersion";
 
@@ -570,8 +571,7 @@ export default function MachinesPage() {
                   ? "This machine is behind, so the reboot updates it first."
                   : "It updates to the latest version if one is available."}
                 {" "}
-                Projects, panes, and agents on this machine keep running — the daemon does not own
-                them.
+                {rebootEffectNote(rebootTarget.hostname)}
               </p>
               <div className="mt-4 flex justify-end gap-2">
                 <button

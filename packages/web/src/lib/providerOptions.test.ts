@@ -8,7 +8,9 @@ import {
   findProviderModelOption,
   isFableModel,
   isRetiredLaunchProfileKey,
+  isRetiredPiProvider,
   isRetiredProviderModel,
+  PI_RETIRED_MESSAGE,
   providerModelValue,
   PROVIDER_MODEL_OPTIONS,
   UNSUPPORTED_PROVIDER_MODEL_OPTION,
@@ -73,23 +75,29 @@ describe("providerOptions", () => {
     expect(providerModelValue("deepseek", "deepseek-chat")).toBe("unsupported");
   });
 
-  it("exposes Pi as its own official terminal backend", () => {
-    expect(findProviderModelOption("pi/official")).toEqual(
-      expect.objectContaining({ label: "Pi", provider: "pi" }),
-    );
-    expect(providerModelValue("pi", null)).toBe("pi/official");
-    expect(providerModelValue("pi", "default")).toBe("pi/official");
+  it("no longer offers Pi, and reads a saved Pi tab as unsupported", () => {
+    expect(PROVIDER_MODEL_OPTIONS.some((option) => option.provider === "pi")).toBe(false);
+    expect(findProviderModelOption("pi/official")).toBe(UNSUPPORTED_PROVIDER_MODEL_OPTION);
+    expect(providerModelValue("pi", null)).toBe("unsupported");
+    expect(providerModelValue("pi", "default")).toBe("unsupported");
+    expect(isRetiredProviderModel("pi", null)).toBe(true);
+    expect(isRetiredPiProvider("pi")).toBe(true);
+    expect(isRetiredPiProvider(" Pi ")).toBe(true);
+    expect(isRetiredLaunchProfileKey("terminal:pi:official:default")).toBe(true);
+    expect(PI_RETIRED_MESSAGE).toBe("Pi is no longer supported. Use OMP instead.");
   });
 
-  it("exposes OMP as a backend of its own, separate from Pi", () => {
+  it("keeps OMP as a backend of its own, untouched by the Pi retirement", () => {
     // OMP is Pi-derived but a different binary with its own store, so it must
-    // never collapse into the Pi option.
+    // never be caught by a rule written for Pi.
     expect(findProviderModelOption("omp/official")).toEqual(
       expect.objectContaining({ label: "OMP", provider: "omp" }),
     );
     expect(providerModelValue("omp", null)).toBe("omp/official");
     expect(providerModelValue("omp", "default")).toBe("omp/official");
-    expect(providerModelValue("omp", null)).not.toBe(providerModelValue("pi", null));
+    expect(isRetiredProviderModel("omp", null)).toBe(false);
+    expect(isRetiredPiProvider("omp")).toBe(false);
+    expect(isRetiredLaunchProfileKey("terminal:omp:official:default")).toBe(false);
   });
 
   it("excludes retired providers and classifies historical values as unsupported", () => {

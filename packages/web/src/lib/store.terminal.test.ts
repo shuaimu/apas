@@ -226,36 +226,145 @@ describe("terminal outbound controls", () => {
     expect(sent[0]).toMatchObject({ type: "add_pane", kind: "terminal", managed: false });
   });
 
-  it("addPane defaults to an agent pane and preserves managed", () => {
+  // The server refuses a new conversation-only pane whether or not the request
+  // carries the legacy `managed` marker, so the browser says so first. That
+  // marker used to exempt the pane while team mode was available.
+  it.each([
+    ["without the managed marker", false, false],
+    ["with the managed marker", true, false],
+    ["with the managed marker and the retained team field set", true, true],
+  ])("rejects a new conversation-only pane %s", (_name, managed, teamAvailable) => {
     const { ws, sent } = fakeSocket();
     useStore.setState({
       ws,
       sessionId: SID,
       isAttached: true,
-      projectPolicies: { [SID]: permissivePolicy },
-    });
-
-    useStore.getState().addPane("claude", "interactive", "Claude 2", undefined, undefined, undefined, undefined, true);
-
-    expect(sent[0]).toMatchObject({ kind: "agent", managed: true });
-  });
-
-  it("rejects new unmanaged conversation-only panes", () => {
-    const { ws, sent } = fakeSocket();
-    useStore.setState({
-      ws,
-      sessionId: SID,
-      isAttached: true,
-      projectPolicies: { [SID]: permissivePolicy },
+      projectPolicies: { [SID]: { ...permissivePolicy, teamAvailable } },
     });
 
     const result = useStore
       .getState()
-      .addPane("claude", "interactive", "Legacy", undefined, undefined, undefined, undefined, false, "agent");
+      .addPane("claude", "interactive", "Legacy", undefined, undefined, undefined, undefined, managed, "agent");
 
     expect(result.success).toBe(false);
     expect(result.error).toMatch(/Conversation-only panes are retired/);
     expect(sent).toHaveLength(0);
+  });
+
+  // `team_available` survives on the wire for older builds and decides
+  // nothing: the same requests get the same answers whatever it says.
+  it.each([false, true])("treats a tab marked managed like any other when teamAvailable is %s", (teamAvailable) => {
+    const { ws, sent } = fakeSocket();
+    const showToast = vi.fn();
+    useStore.setState({
+      ws,
+      sessionId: SID,
+      isAttached: true,
+      showToast,
+      projectPolicies: { [SID]: { ...permissivePolicy, teamAvailable } },
+      paneConfigs: [
+        {
+          pane_id: PANE,
+          provider: "codex",
+          mode: "interactive",
+          kind: "terminal",
+          session_id: "conversation",
+          is_paused: false,
+          stop_requested: false,
+          managed: true,
+        },
+      ],
+    });
+
+    useStore.getState().resumePane(PANE);
+    useStore.getState().rebootPane(PANE);
+    const added = useStore
+      .getState()
+      .addPane("codex", "interactive", "Codex 2", undefined, undefined, undefined, undefined, true, "terminal");
+
+    expect(showToast).not.toHaveBeenCalled();
+    expect(added.success).toBe(true);
+    expect(sent.map((frame) => frame.type)).toEqual(["resume_pane", "reboot_pane", "add_pane"]);
+  });
+
+  it("refuses a Pi tab with the sentence that says what to use, and still adds an OMP tab", () => {
+    const { ws, sent } = fakeSocket();
+    useStore.setState({
+      ws,
+      sessionId: SID,
+      isAttached: true,
+      projectPolicies: {
+        [SID]: {
+          ...permissivePolicy,
+          // A policy stored before the retirement can still list Pi.
+          allowedLaunchProfiles: [
+            "terminal:pi:official:default",
+            "terminal:omp:official:default",
+          ],
+        },
+      },
+    });
+
+    const refused = useStore
+      .getState()
+      .addPane("pi", "interactive", "Pi 1", undefined, undefined, undefined, undefined, false, "terminal");
+    expect(refused).toEqual({ success: false, error: "Pi is no longer supported. Use OMP instead." });
+    expect(sent).toHaveLength(0);
+
+    const added = useStore
+      .getState()
+      .addPane("omp", "interactive", "OMP 1", undefined, undefined, undefined, undefined, false, "terminal");
+    expect(added.success).toBe(true);
+    expect(sent[0]).toMatchObject({ type: "add_pane", kind: "terminal", provider: "omp" });
+  });
+
+  it("sends nothing to a saved Pi tab, and still sends to an OMP tab", () => {
+    const { ws, sent } = fakeSocket();
+    const toasts: string[] = [];
+    const tab = (pane_id: number, provider: "pi" | "omp") => ({
+      pane_id,
+      provider,
+      mode: "interactive" as const,
+      kind: "terminal" as const,
+      session_id: `${provider}-${pane_id}`,
+      is_paused: false,
+      label: `${provider} ${pane_id}`,
+    });
+    useStore.setState({
+      ws,
+      sessionId: SID,
+      isAttached: true,
+      paneConfigs: [tab(77, "pi"), tab(78, "omp")],
+      pendingTerminalDeliveries: [],
+      projectPolicies: {
+        [SID]: { ...permissivePolicy, allowedLaunchProfiles: ["terminal:omp:official:default"] },
+      },
+      showToast: (message: string) => { toasts.push(message); },
+    });
+
+    // The phone's composer and the conversation view both send this way. A
+    // message to a tab with no agent would stay unconfirmed forever.
+    expect(useStore.getState().sendTerminalConversationMessage(77, "hello pi")).toEqual({
+      success: false,
+      error: "Pi is no longer supported. Use OMP instead. This tab is read-only.",
+    });
+    useStore.getState().sendTerminalInput(77, "x");
+    expect(sent).toHaveLength(0);
+    expect(useStore.getState().pendingTerminalDeliveries).toHaveLength(0);
+
+    // A Pi tab cannot become an OMP tab: the server and its CLI refuse too.
+    useStore.getState().updatePaneModel(77, null, "omp");
+    expect(sent).toHaveLength(0);
+    expect(toasts).toEqual([
+      "Tab 77 uses Pi, which is no longer supported. Close it and open an OMP tab.",
+    ]);
+
+    expect(useStore.getState().sendTerminalConversationMessage(78, "hello omp").success).toBe(true);
+    useStore.getState().sendTerminalInput(78, "x");
+    expect(sent.map((frame) => [frame.type, frame.pane_id])).toEqual([
+      ["terminal_conversation_input", 78],
+      ["terminal_input", 78],
+    ]);
   });
 
   it("fails closed before policy arrives and rejects disallowed profiles", () => {

@@ -30,8 +30,9 @@ describe("tab type keys", () => {
       "terminal:claude",
       "terminal:codex",
       "terminal:opencode",
-      "terminal:pi",
       "terminal:omp",
     ]);
+    // Pi was retired. A stored deny list may still name it; nothing offers it.
+    expect(ALL_TAB_TYPES.some((type) => type.provider === "pi")).toBe(false);
   });
 });

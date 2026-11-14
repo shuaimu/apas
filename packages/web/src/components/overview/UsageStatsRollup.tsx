@@ -1,14 +1,23 @@
 "use client";
 
 /**
- * Per-project / per-pane usage stats for the Overview: prompt + token counts,
- * cache usage, completed responses, and real cost (Claude only). Fed by the
- * server's ServerToWeb::ProjectUsageStats push (keyed by session_id), which is
- * also replayed on attach. A small window toggle switches between cumulative
- * lifetime totals and the rolling 7-day / today windows.
+ * The Overview's "Usage" section: prompt and token counts, cache usage,
+ * completed responses and reported cost, for the project and for each tab.
+ * Fed by the server's ServerToWeb::ProjectUsageStats push (keyed by
+ * session_id), which is also replayed on attach. A small switch chooses
+ * between lifetime totals and the rolling 7-day and today windows.
+ *
+ * The table lists the project's open tabs first. Tabs that were closed, which
+ * after a few months are most of the rows, are folded into one line with
+ * their sum; the totals above always count every tab.
  */
 import { useMemo, useState } from "react";
-import { useStore, type UsageCounters, type PaneConfig } from "@/lib/store";
+import { ChevronDown, ChevronRight } from "lucide-react";
+import { useStore, type PaneConfig, type PaneUsageStats, type UsageCounters } from "@/lib/store";
+import { formatCompactCount, formatUsd } from "@/lib/formatCount";
+import { formatRelativeTime } from "@/lib/formatRelativeTime";
+import { providerDisplayName } from "@/lib/launchProfileLabels";
+import { OverviewEmpty, OverviewSection, overviewCard, overviewMuted } from "./OverviewElements";
 
 type Window = "lifetime" | "last_7d" | "today";
 
@@ -22,61 +31,72 @@ function formatInt(n: number): string {
   return n.toLocaleString();
 }
 
-// Compact token formatting: 1.2k / 3.4M so wide token columns stay readable.
-// The M threshold is 999_950 (not 1_000_000) so values that would round up to
-// "1000.0k" roll into "1.0M" instead.
-function formatTokens(n: number): string {
-  if (n >= 999_950) return `${(n / 1_000_000).toFixed(n % 1_000_000 === 0 ? 0 : 1)}M`;
-  if (n >= 1_000) return `${(n / 1_000).toFixed(n % 1_000 === 0 ? 0 : 1)}k`;
-  return String(n);
-}
-
-// Short relative time for the per-pane "Last active" column. last_active is
-// RFC3339 UTC from the server; unparseable/absent values render as a dash.
-function formatRelative(iso?: string): string {
-  if (!iso) return "—";
-  const t = Date.parse(iso);
-  if (Number.isNaN(t)) return "—";
-  const diffMs = Date.now() - t;
-  if (diffMs < 60_000) return "just now";
-  const mins = Math.floor(diffMs / 60_000);
-  if (mins < 60) return `${mins}m ago`;
-  const hours = Math.floor(mins / 60);
-  if (hours < 24) return `${hours}h ago`;
-  return `${Math.floor(hours / 24)}d ago`;
-}
-
-// Cost is real only for Claude transport; render a dash (not "$0.0000") when
-// a pane/provider reports no cost so empty cells aren't mistaken for $0 spend.
-function formatCost(n: number): string {
-  if (!(n > 0)) return "—";
-  return `$${n < 1 ? n.toFixed(4) : n.toFixed(2)}`;
+// The "Last active" column. last_active is RFC3339 UTC from the server; an
+// absent or unparseable value is a dash. Same wording as the tab's card.
+function formatLastActive(iso?: string): string {
+  return iso ? formatRelativeTime(Date.parse(iso)) : "—";
 }
 
 function totalTokens(c: UsageCounters): number {
   return c.input_tokens + c.output_tokens + c.cache_read_tokens + c.cache_creation_tokens;
 }
 
-function paneLabelFor(
-  paneId: number,
-  configs: Map<number, PaneConfig>,
-): { name: string; provider?: string } {
-  if (paneId === 0) return { name: "Unattributed" };
-  const cfg = configs.get(paneId);
-  if (!cfg) return { name: `Pane ${paneId}` };
-  return { name: cfg.label || cfg.role || `Pane ${paneId}`, provider: cfg.provider };
+function sumCounters(rows: UsageCounters[]): UsageCounters {
+  const sum: UsageCounters = {
+    prompts: 0,
+    responses: 0,
+    input_tokens: 0,
+    output_tokens: 0,
+    cache_read_tokens: 0,
+    cache_creation_tokens: 0,
+    cost_usd: 0,
+  };
+  for (const row of rows) {
+    sum.prompts += row.prompts;
+    sum.responses += row.responses;
+    sum.input_tokens += row.input_tokens;
+    sum.output_tokens += row.output_tokens;
+    sum.cache_read_tokens += row.cache_read_tokens;
+    sum.cache_creation_tokens += row.cache_creation_tokens;
+    sum.cost_usd += row.cost_usd;
+  }
+  return sum;
+}
+
+function lastActiveMs(pane: PaneUsageStats): number {
+  const t = pane.last_active ? Date.parse(pane.last_active) : Number.NaN;
+  return Number.isNaN(t) ? Number.NEGATIVE_INFINITY : t;
 }
 
 function StatCard({ label, value }: { label: string; value: string }) {
   return (
-    <div className="rounded border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800/40 px-3 py-2">
-      <div className="text-[10px] uppercase tracking-wide text-gray-500 dark:text-gray-400">
-        {label}
-      </div>
-      <div className="mt-0.5 text-base font-semibold tabular-nums text-gray-900 dark:text-gray-100">
+    <div className={`${overviewCard} px-3 py-2`}>
+      <dt className={overviewMuted}>{label}</dt>
+      <dd className="mt-0.5 text-lg font-semibold tabular-nums text-gray-900 dark:text-gray-100">
         {value}
-      </div>
+      </dd>
     </div>
+  );
+}
+
+const NUMBER_CELL = "px-2 py-2 text-right tabular-nums";
+
+/** The eight figures of one row, in the table's column order. */
+function CounterCells({ counters, lastActive }: { counters: UsageCounters; lastActive?: string }) {
+  const cache = counters.cache_read_tokens + counters.cache_creation_tokens;
+  return (
+    <>
+      <td className={NUMBER_CELL}>{formatInt(counters.prompts)}</td>
+      <td className={NUMBER_CELL}>{formatInt(counters.responses)}</td>
+      <td className={NUMBER_CELL}>{formatCompactCount(counters.input_tokens)}</td>
+      <td className={NUMBER_CELL}>{formatCompactCount(counters.output_tokens)}</td>
+      <td className={NUMBER_CELL}>{formatCompactCount(cache)}</td>
+      <td className={`${NUMBER_CELL} font-medium`}>{formatCompactCount(totalTokens(counters))}</td>
+      <td className={NUMBER_CELL}>{formatUsd(counters.cost_usd)}</td>
+      <td className={`whitespace-nowrap px-3 py-2 text-right ${overviewMuted}`} title={lastActive}>
+        {formatLastActive(lastActive)}
+      </td>
+    </>
   );
 }
 
@@ -85,6 +105,7 @@ export function UsageStatsRollup() {
   const usageStats = useStore((s) => s.usageStats);
   const paneConfigs = useStore((s) => s.paneConfigs);
   const [window, setWindow] = useState<Window>("lifetime");
+  const [showClosed, setShowClosed] = useState(false);
 
   const stats = sessionId ? usageStats[sessionId] : undefined;
 
@@ -94,115 +115,150 @@ export function UsageStatsRollup() {
     return m;
   }, [paneConfigs]);
 
-  const rows = useMemo(() => {
-    if (!stats) return [];
-    // Sort by total tokens in the selected window (busiest pane first), then
-    // by pane id for stable ordering.
-    return [...stats.panes].sort(
-      (a, b) => totalTokens(b[window]) - totalTokens(a[window]) || a.pane_id - b.pane_id,
-    );
-  }, [stats, window]);
+  // Open tabs, then the usage no tab accounts for, then closed tabs. Within
+  // each, the most recently active first; a tie goes to the heavier user of
+  // the selected window, then to the lower id so the order is stable.
+  const { listed, closed } = useMemo(() => {
+    const byActivity = (a: PaneUsageStats, b: PaneUsageStats) =>
+      lastActiveMs(b) - lastActiveMs(a)
+      || totalTokens(b[window]) - totalTokens(a[window])
+      || a.pane_id - b.pane_id;
+    const panes = stats?.panes ?? [];
+    return {
+      listed: [
+        ...panes.filter((pane) => paneConfigById.has(pane.pane_id)).sort(byActivity),
+        ...panes.filter((pane) => pane.pane_id === 0),
+      ],
+      closed: panes.filter((pane) => pane.pane_id !== 0 && !paneConfigById.has(pane.pane_id)).sort(byActivity),
+    };
+  }, [stats, window, paneConfigById]);
 
   if (!stats || stats.panes.length === 0) {
     return (
-      <div className="rounded border border-dashed border-gray-300 dark:border-gray-700 bg-gray-50 dark:bg-gray-800/30 p-4 text-sm italic text-gray-500 dark:text-gray-400">
-        No usage recorded yet. Stats accumulate as panes send prompts and complete turns.
-      </div>
+      <OverviewSection title="Usage" level={3}>
+        <OverviewEmpty>
+          No usage recorded yet. Stats accumulate as tabs send prompts and complete turns.
+        </OverviewEmpty>
+      </OverviewSection>
     );
   }
 
   const totals = stats[window];
+  // With nothing else to list, the closed tabs are the table.
+  const closedShown = showClosed || listed.length === 0;
+  const closedLabel = `${closed.length} closed ${closed.length === 1 ? "tab" : "tabs"}`;
+  const closedLastActive = closed[0]?.last_active;
 
   return (
-    <div>
-      {/* Window toggle */}
-      <div className="mb-3 flex flex-wrap items-center gap-2">
-        <div className="inline-flex rounded-md border border-gray-200 dark:border-gray-700 p-0.5">
-          {(Object.keys(WINDOW_LABELS) as Window[]).map((w) => (
-            <button
-              key={w}
-              type="button"
-              onClick={() => setWindow(w)}
-              className={`rounded px-2.5 py-1 text-xs font-medium transition-colors ${
-                window === w
-                  ? "bg-blue-100 text-blue-700 dark:bg-blue-900/40 dark:text-blue-300"
-                  : "text-gray-500 hover:text-gray-700 dark:text-gray-400 dark:hover:text-gray-200"
-              }`}
-            >
-              {WINDOW_LABELS[w]}
-            </button>
-          ))}
-        </div>
-        {window !== "lifetime" && (
-          <span className="text-[10px] uppercase tracking-wide text-gray-400">UTC days</span>
-        )}
-      </div>
-
-      {/* Project totals */}
-      <div className="mb-3 grid grid-cols-2 gap-2 sm:grid-cols-3 lg:grid-cols-6">
+    <OverviewSection
+      title="Usage"
+      level={3}
+      aside={
+        <>
+          {window !== "lifetime" && <span className={overviewMuted}>UTC days</span>}
+          <div
+            role="group"
+            aria-label="Usage period"
+            className="inline-flex h-8 items-center rounded border border-gray-300 bg-white p-0.5 dark:border-gray-600 dark:bg-gray-800"
+          >
+            {(Object.keys(WINDOW_LABELS) as Window[]).map((w) => (
+              <button
+                key={w}
+                type="button"
+                aria-pressed={window === w}
+                onClick={() => setWindow(w)}
+                className={`h-full rounded-sm px-2.5 text-xs font-medium transition-colors focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-500 ${
+                  window === w
+                    ? "bg-blue-100 text-blue-700 dark:bg-blue-900/50 dark:text-blue-200"
+                    : "text-gray-600 hover:text-gray-900 dark:text-gray-300 dark:hover:text-gray-100"
+                }`}
+              >
+                {WINDOW_LABELS[w]}
+              </button>
+            ))}
+          </div>
+        </>
+      }
+    >
+      {/* Project totals: every tab, open or closed. */}
+      <dl className="mb-3 grid grid-cols-2 gap-2 sm:grid-cols-3 lg:grid-cols-6">
         <StatCard label="Prompts" value={formatInt(totals.prompts)} />
         <StatCard label="Responses" value={formatInt(totals.responses)} />
-        <StatCard label="Input tokens" value={formatTokens(totals.input_tokens)} />
-        <StatCard label="Output tokens" value={formatTokens(totals.output_tokens)} />
-        <StatCard label="Total tokens" value={formatTokens(totalTokens(totals))} />
-        <StatCard label="Cost" value={formatCost(totals.cost_usd)} />
-      </div>
+        <StatCard label="Input tokens" value={formatCompactCount(totals.input_tokens)} />
+        <StatCard label="Output tokens" value={formatCompactCount(totals.output_tokens)} />
+        <StatCard label="Total tokens" value={formatCompactCount(totalTokens(totals))} />
+        <StatCard label="Cost" value={formatUsd(totals.cost_usd)} />
+      </dl>
 
-      {/* Per-pane breakdown */}
-      <div className="overflow-x-auto rounded border border-gray-200 dark:border-gray-700">
-        <table className="w-full text-sm">
+      {/* Per-tab breakdown */}
+      <div className={`${overviewCard} overflow-x-auto`}>
+        <table className="w-full whitespace-nowrap text-sm text-gray-900 dark:text-gray-100">
           <thead>
-            <tr className="border-b border-gray-200 bg-gray-50 text-left text-[11px] uppercase tracking-wide text-gray-500 dark:border-gray-700 dark:bg-gray-800/50 dark:text-gray-400">
-              <th className="px-3 py-2 font-medium">Pane</th>
-              <th className="px-2 py-2 text-right font-medium">Prompts</th>
-              <th className="px-2 py-2 text-right font-medium">Responses</th>
-              <th className="px-2 py-2 text-right font-medium">Input</th>
-              <th className="px-2 py-2 text-right font-medium">Output</th>
-              <th className="px-2 py-2 text-right font-medium">Cache</th>
-              <th className="px-2 py-2 text-right font-medium">Total</th>
-              <th className="px-2 py-2 text-right font-medium">Cost</th>
-              <th className="px-3 py-2 text-right font-medium">Active</th>
+            <tr className="border-b border-gray-200 text-left text-xs text-gray-500 dark:border-gray-700 dark:text-gray-400">
+              <th scope="col" className="px-3 py-2 font-medium">Tab</th>
+              <th scope="col" className="px-2 py-2 text-right font-medium">Prompts</th>
+              <th scope="col" className="px-2 py-2 text-right font-medium">Responses</th>
+              <th scope="col" className="px-2 py-2 text-right font-medium">Input</th>
+              <th scope="col" className="px-2 py-2 text-right font-medium">Output</th>
+              <th scope="col" className="px-2 py-2 text-right font-medium">Cache</th>
+              <th scope="col" className="px-2 py-2 text-right font-medium">Total</th>
+              <th scope="col" className="px-2 py-2 text-right font-medium">Cost</th>
+              <th scope="col" className="px-3 py-2 text-right font-medium">Last active</th>
             </tr>
           </thead>
-          <tbody>
-            {rows.map((pane) => {
-              const c = pane[window];
-              const { name, provider } = paneLabelFor(pane.pane_id, paneConfigById);
-              const cache = c.cache_read_tokens + c.cache_creation_tokens;
+          <tbody className="divide-y divide-gray-100 dark:divide-gray-800">
+            {listed.map((pane) => {
+              const config = paneConfigById.get(pane.pane_id);
               return (
-                <tr
-                  key={pane.pane_id}
-                  className="border-b border-gray-100 last:border-0 dark:border-gray-800"
-                >
-                  <td className="px-3 py-2">
-                    <span className="font-medium text-gray-900 dark:text-gray-100">{name}</span>
-                    {provider && (
-                      <span className="ml-1.5 text-[10px] uppercase tracking-wide text-gray-400">
-                        {provider}
+                <tr key={pane.pane_id}>
+                  <th scope="row" className="max-w-56 px-3 py-2 text-left font-medium">
+                    <span className="flex items-baseline gap-1.5">
+                      <span className="truncate">
+                        {config ? config.label || config.role || `Tab ${pane.pane_id}` : "Unattributed"}
                       </span>
-                    )}
-                  </td>
-                  <td className="px-2 py-2 text-right tabular-nums">{formatInt(c.prompts)}</td>
-                  <td className="px-2 py-2 text-right tabular-nums">{formatInt(c.responses)}</td>
-                  <td className="px-2 py-2 text-right tabular-nums">{formatTokens(c.input_tokens)}</td>
-                  <td className="px-2 py-2 text-right tabular-nums">{formatTokens(c.output_tokens)}</td>
-                  <td className="px-2 py-2 text-right tabular-nums">{formatTokens(cache)}</td>
-                  <td className="px-2 py-2 text-right font-medium tabular-nums">
-                    {formatTokens(totalTokens(c))}
-                  </td>
-                  <td className="px-2 py-2 text-right tabular-nums">{formatCost(c.cost_usd)}</td>
-                  <td
-                    className="px-3 py-2 text-right text-xs text-gray-500 dark:text-gray-400"
-                    title={pane.last_active ?? undefined}
-                  >
-                    {formatRelative(pane.last_active)}
-                  </td>
+                      {config && (
+                        <span className={`shrink-0 font-normal ${overviewMuted}`}>
+                          {providerDisplayName(config.provider)}
+                        </span>
+                      )}
+                    </span>
+                  </th>
+                  <CounterCells counters={pane[window]} lastActive={pane.last_active} />
                 </tr>
               );
             })}
+            {closed.length > 0 && (
+              <tr className="bg-gray-50 text-gray-600 dark:bg-gray-800/60 dark:text-gray-300">
+                <th scope="row" className="px-3 py-1 text-left font-normal">
+                  {listed.length === 0 ? closedLabel : (
+                    <button
+                      type="button"
+                      aria-expanded={closedShown}
+                      onClick={() => setShowClosed((shown) => !shown)}
+                      className="-ml-1.5 inline-flex h-7 items-center gap-1 rounded px-1.5 text-sm font-medium text-gray-700 hover:bg-gray-200/70 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-500 dark:text-gray-200 dark:hover:bg-gray-700"
+                    >
+                      {closedShown
+                        ? <ChevronDown className="h-3.5 w-3.5" aria-hidden="true" />
+                        : <ChevronRight className="h-3.5 w-3.5" aria-hidden="true" />}
+                      {closedShown ? "Hide" : "Show"} {closedLabel}
+                    </button>
+                  )}
+                </th>
+                <CounterCells
+                  counters={sumCounters(closed.map((pane) => pane[window]))}
+                  lastActive={closedLastActive}
+                />
+              </tr>
+            )}
+            {closedShown && closed.map((pane) => (
+              <tr key={pane.pane_id} className="text-gray-600 dark:text-gray-300">
+                <th scope="row" className="px-3 py-2 pl-8 text-left font-normal">Tab {pane.pane_id}</th>
+                <CounterCells counters={pane[window]} lastActive={pane.last_active} />
+              </tr>
+            ))}
           </tbody>
         </table>
       </div>
-    </div>
+    </OverviewSection>
   );
 }

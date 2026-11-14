@@ -1,24 +1,16 @@
 "use client";
 
 /**
- * Phase 5.1e — collapsed view of per-provider usage limits for the
- * current project. Reuses the existing UsageLimitsDisplay component
- * so the rendering matches what each per-pane header shows. Lists
- * one row per provider that actually has limits cached.
+ * The Overview's "Resource use" section: each provider's usage limits for the
+ * current project. Reuses the existing UsageLimitsDisplay component so the
+ * rendering matches what each tab's header shows. Lists one card per provider
+ * that actually has limits cached.
  */
 import { useMemo } from "react";
 import { useStore, SupportedProvider, UsageLimits } from "@/lib/store";
+import { providerDisplayName } from "@/lib/launchProfileLabels";
 import { UsageLimitsDisplay } from "../UsageLimits";
-
-const PROVIDER_LABELS: Record<SupportedProvider, string> = {
-  claude: "Claude",
-  codex: "Codex",
-  deepseek: "DeepSeek",
-  opencode: "OpenCode",
-  pi: "Pi",
-  omp: "OMP",
-  "cursor-agent": "Cursor",
-};
+import { OverviewEmpty, overviewCard, overviewMuted } from "./OverviewElements";
 
 export function ResourceUseRollup() {
   const cliClientId = useStore((s) => s.cliClientId);
@@ -30,7 +22,9 @@ export function ResourceUseRollup() {
   const providers = useMemo(() => {
     const set = new Set<SupportedProvider>();
     for (const p of paneConfigs) {
-      if (p.provider !== "minimax" && p.provider !== "glm") {
+      // Retired providers cannot run, so they have no limits to show. A
+      // saved Pi tab stays listed among the tabs and adds no card here.
+      if (p.provider !== "minimax" && p.provider !== "glm" && p.provider !== "pi") {
         set.add(p.provider);
       }
     }
@@ -53,22 +47,17 @@ export function ResourceUseRollup() {
 
   if (rows.length === 0) {
     return (
-      <div className="rounded border border-dashed border-gray-300 dark:border-gray-700 bg-gray-50 dark:bg-gray-800/30 p-4 text-sm italic text-gray-500 dark:text-gray-400">
+      <OverviewEmpty>
         No usage telemetry yet. Limits populate after each provider runs its first turn.
-      </div>
+      </OverviewEmpty>
     );
   }
 
   return (
-    <div className="grid grid-cols-1 gap-2 sm:grid-cols-2 lg:grid-cols-3">
+    <div className="grid grid-cols-2 gap-2 sm:grid-cols-3 lg:grid-cols-6">
       {rows.map(({ provider, limits }) => (
-        <div
-          key={provider}
-          className="rounded border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800/40 px-3 py-2"
-        >
-          <div className="mb-1 text-[10px] uppercase tracking-wide text-gray-500 dark:text-gray-400">
-            {PROVIDER_LABELS[provider] ?? provider}
-          </div>
+        <div key={provider} className={`${overviewCard} px-3 py-2`}>
+          <div className={`mb-1 ${overviewMuted}`}>{providerDisplayName(provider)}</div>
           <UsageLimitsDisplay limits={limits} compact />
         </div>
       ))}

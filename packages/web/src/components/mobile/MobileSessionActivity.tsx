@@ -6,6 +6,7 @@ import {
   AlertTriangle,
   ArrowLeft,
   ChevronDown,
+  ChevronRight,
   ChevronUp,
   FolderOpen,
   History,
@@ -29,6 +30,7 @@ import { AutopilotStartDialog } from "@/components/tabs/AutopilotStartDialog";
 import { AutopilotRequestNotices } from "@/components/tabs/AutopilotStatus";
 import { AskUserQuestionCard } from "@/components/tools/AskUserQuestionCard";
 import { ProjectWorkersWorkspace } from "@/components/workers/ProjectWorkersWorkspace";
+import { OverviewEmpty, OverviewSection, overviewCard, overviewMuted } from "@/components/overview/OverviewElements";
 import { readSelectedPane, writeSelectedPane } from "@/lib/mobileSelectedPane";
 import { isOmpQuestionInput, ompQuestionKey, parseOmpQuestionResult } from "@/lib/ompQuestions";
 import {
@@ -54,6 +56,7 @@ import {
   sessionIsOwned,
   tabHostStateLabel,
   type ConfirmationCopy,
+  type TabHost,
 } from "@/lib/tabHosts";
 import { AddPaneLaunches } from "@/components/tabs/AddPaneLaunches";
 import {
@@ -69,6 +72,7 @@ import {
   paneCanHaveAutopilot,
   parseAutopilotIterationMarker,
   rebootAgentAutopilotNote,
+  type AutopilotListStatus,
   type AutopilotRequestKind,
 } from "@/lib/autopilot";
 import { useAutopilotNegotiated, useSessionAutopilotStatuses } from "@/lib/useAutopilot";
@@ -85,6 +89,9 @@ import { MobileTerminalKeyBar } from "./MobileTerminalKeyBar";
 import {
   canonicalDeepseekModel,
   DEEPSEEK_FLASH_MODEL,
+  isRetiredPiProvider,
+  isRetiredProviderModel,
+  PI_RETIRED_MESSAGE,
 } from "@/lib/providerOptions";
 import {
   paneKey,
@@ -95,7 +102,7 @@ import {
   type PaneKind,
   type Provider,
 } from "@/lib/store";
-import { paneIsAwaitingAnswerStatus } from "@/lib/paneStatus";
+import { PANE_STATUS_PENDING_ANSWER, paneIsAwaitingAnswerStatus } from "@/lib/paneStatus";
 
 const TerminalPane = dynamic(
   () => import("@/components/tabs/TerminalPane").then((module) => module.TerminalPane),
@@ -170,8 +177,59 @@ function displayProjectName(workingDir?: string, gitRemote?: string): string {
     || "Coding session";
 }
 
+/**
+ * Why a tab is history only: a legacy bot, or a tab whose provider is retired
+ * (a saved Pi tab). Such a tab has no agent, so nothing may be sent to it and
+ * its cards cannot be answered.
+ */
+function readOnlyTabReason(pane?: PaneConfig | null): string | undefined {
+  if (!pane) return undefined;
+  if (pane.mode === "deadloop") return "Legacy bot history is read-only.";
+  if (isRetiredPiProvider(pane.provider)) return `${PI_RETIRED_MESSAGE} This tab is read-only.`;
+  if (isRetiredProviderModel(pane.provider, pane.model)) {
+    return "This pane uses a retired provider and is read-only.";
+  }
+  return undefined;
+}
+
 function paneLabel(pane: PaneConfig): string {
   return pane.label?.trim() || `${pane.kind === "terminal" ? "Terminal" : "Pane"} ${pane.pane_id}`;
+}
+
+/**
+ * One tab's row on the phone's Overview: the colour of its dot and the quiet
+ * line under its name. The line says what the tab is doing, or that its
+ * machine is not running the project; then its machine where the project
+ * spans machines; then its autopilot. The colours are the desktop Overview
+ * card's: blue Working, amber Pending answer, gray otherwise.
+ */
+function overviewTabRow(
+  pane: PaneConfig,
+  status: string | null | undefined,
+  host: TabHost | undefined,
+  autopilot: AutopilotListStatus["kind"] | undefined,
+): { dot: string; detail: string } {
+  const gray = "bg-gray-300 dark:bg-gray-600";
+  if (pane.mode === "deadloop") return { dot: gray, detail: "Earlier bot · Read-only" };
+  const where = host?.hostname;
+  const state = host && host.state !== "running"
+    ? {
+        dot: gray,
+        text: host.state === "no_access"
+          ? `No access${where ? ` to ${where}` : ""}`
+          : `Not running${where ? ` on ${where}` : ""}`,
+      }
+    : paneIsAwaitingAnswerStatus(status)
+      ? { dot: "bg-amber-500", text: PANE_STATUS_PENDING_ANSWER }
+      : status
+        ? { dot: "bg-blue-500 animate-pulse", text: "Working" }
+        : { dot: gray, text: "Idle" };
+  const machine = host?.badge && host.state === "running" ? host.hostname : undefined;
+  const mark = autopilot ? autopilotMarkerLabel(autopilot) : null;
+  return {
+    dot: state.dot,
+    detail: [state.text, machine, mark ? `${mark[0].toUpperCase()}${mark.slice(1)}` : undefined].filter(Boolean).join(" · "),
+  };
 }
 
 function eventLabel(message: Message): string | null {
@@ -252,7 +310,9 @@ function parseLaunchProfile(key: string): LaunchOption | null {
   const provider = (
     backend === "deepseek" && rawKind !== "terminal" ? "deepseek" : frontend
   ) as Provider;
-  if (!["claude", "codex", "deepseek", "opencode", "pi", "omp", "cursor-agent"].includes(provider)) return null;
+  // Pi was retired: a policy stored while it was offered may still list its
+  // profile, and it must not come back as a launch option.
+  if (!["claude", "codex", "deepseek", "opencode", "omp", "cursor-agent"].includes(provider)) return null;
   const rawModel = modelParts.join(":");
   const model = rawModel && rawModel !== "default" ? rawModel : undefined;
   const deepseekModel = canonicalDeepseekModel(model);
@@ -262,8 +322,6 @@ function parseLaunchProfile(key: string): LaunchOption | null {
         ? "Cursor"
         : provider === "opencode"
           ? "OpenCode"
-          : provider === "pi"
-            ? "Pi"
           : provider === "omp"
             ? "OMP"
             : provider.charAt(0).toUpperCase() + provider.slice(1);
@@ -416,7 +474,6 @@ export function MobileSessionActivity({ connected, onBack, onReconnect }: Mobile
   const [terminalPaneId, setTerminalPaneId] = useState<number | null>(null);
   const [mountedTerminal, setMountedTerminal] = useState<{ sessionId: string; paneId: number } | null>(null);
   const [newPaneOpen, setNewPaneOpen] = useState(false);
-  const [interactiveCreation, setInteractiveCreation] = useState(false);
   const [summaryOpen, setSummaryOpen] = useState(false);
   const [manageOpen, setManageOpen] = useState(false);
   const [moreOpen, setMoreOpen] = useState(false);
@@ -719,6 +776,11 @@ export function MobileSessionActivity({ connected, onBack, onReconnect }: Mobile
       setActionError(selectedRefusal);
       return;
     }
+    const readOnly = readOnlyTabReason(selectedPane);
+    if (readOnly) {
+      setActionError(readOnly);
+      return;
+    }
     if (selectedPane?.kind === "terminal") {
       const result = sendTerminalConversationMessage(selectedPaneId, followUp);
       if (!result.success) {
@@ -878,11 +940,13 @@ export function MobileSessionActivity({ connected, onBack, onReconnect }: Mobile
   const projectName = displayProjectName(session.workingDir, session.gitRemote);
   const selectedIsTerminal = selectedPane?.kind === "terminal";
   const selectedIsBot = selectedPane?.mode === "deadloop";
+  // A saved Pi tab, or any other retired provider's: listed, never running.
+  const selectedIsRetired = isRetiredProviderModel(selectedPane?.provider, selectedPane?.model);
   const canOpenProject = connected
     && !sessionIsRunning
     && machineProjectTarget !== null
     && !machineProjectTarget.isRunning;
-  const canCompose = selectedPaneId !== null && !selectedIsBot;
+  const canCompose = selectedPaneId !== null && !selectedIsBot && !selectedIsRetired;
   const canSend = canCompose && connected && sessionIsRunning && !selectedRefusal;
   const hostLabel = projectHostLabel(instances, session.hostname);
   const stoppedActions = selectedHost?.stopped;
@@ -902,9 +966,8 @@ export function MobileSessionActivity({ connected, onBack, onReconnect }: Mobile
   // The retained terminal's own pane, which need not be the selected one.
   // Its screen still reads, but keys and sizes would only be refused.
   const retainedRefusal = retainedTerminal
-    ? paneConfigs.find((pane) => pane.pane_id === retainedTerminal.paneId)?.mode === "deadloop"
-      ? "Legacy bot history is read-only."
-      : tabHosts.tabs.get(retainedTerminal.paneId)?.refusal
+    ? readOnlyTabReason(paneConfigs.find((pane) => pane.pane_id === retainedTerminal.paneId))
+      ?? tabHosts.tabs.get(retainedTerminal.paneId)?.refusal
     : undefined;
   // The machines the Open sheet's request starts; empty means only the one it
   // names, which is all an older server ever starts.
@@ -922,10 +985,43 @@ export function MobileSessionActivity({ connected, onBack, onReconnect }: Mobile
 
   return (
     <ProjectWorkersWorkspace key={`${accountId}:${projectId ?? sessionId}`} project={projectContext} paneSelectionRequested={false}
-      renderOverviewPanels={(selectInteractive) => <section aria-label="Interactive project" className="job-card">
-        <h2>Interactive project</h2>
-        {paneConfigs.length ? paneConfigs.map((pane) => <button key={pane.pane_id} type="button" onClick={() => { selectInteractive(); selectPane(pane.pane_id); }}>{paneLabel(pane)}</button>) : <p>No interactive panes. Add an interactive agent separately; workers do not create panes.</p>}
-      </section>}
+      overviewSummary="This project's tabs and its autonomous workers."
+      renderOverviewPanels={(selectInteractive) => (
+        // The phone's part of the Overview: the project's tabs, each a row
+        // that opens it. Built from the Overview's own parts, like the
+        // desktop panels, so the page reads as one thing.
+        <section aria-label="Interactive project" className="flex min-w-0 flex-col gap-8">
+          <h2 className="sr-only">Interactive project</h2>
+          <OverviewSection title="Tabs" level={3}>
+            {paneConfigs.length ? (
+              <ul className={`${overviewCard} divide-y divide-gray-100 overflow-hidden dark:divide-gray-700/60`}>
+                {paneConfigs.map((pane) => {
+                  const row = overviewTabRow(pane, paneStatuses[paneKey(pane.pane_id)], tabHosts.tabs.get(pane.pane_id), autopilotStatuses.get(pane.pane_id)?.kind);
+                  return (
+                    <li key={pane.pane_id}>
+                      <button
+                        type="button"
+                        title={tabHosts.tabs.get(pane.pane_id)?.refusal}
+                        onClick={() => { selectInteractive(); selectPane(pane.pane_id); }}
+                        className="flex min-h-11 w-full items-center gap-2.5 px-3 py-2 text-left hover:bg-gray-50 focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-blue-500 dark:hover:bg-gray-700/40"
+                      >
+                        <span aria-hidden="true" className={`h-2 w-2 shrink-0 rounded-full ${row.dot}`} />
+                        <span className="min-w-0 flex-1">
+                          <span className="block truncate text-sm font-medium text-gray-900 dark:text-gray-100">{paneLabel(pane)}</span>
+                          <span className={`block truncate ${overviewMuted}`}>{row.detail}</span>
+                        </span>
+                        <ChevronRight aria-hidden="true" className="h-4 w-4 shrink-0 text-gray-400" />
+                      </button>
+                    </li>
+                  );
+                })}
+              </ul>
+            ) : (
+              <OverviewEmpty>No tabs yet. Use + to add an interactive agent. Workers do not create tabs.</OverviewEmpty>
+            )}
+          </OverviewSection>
+        </section>
+      )}
     >
     {(workspace) => (
     <section aria-label="Mobile session activity" className="flex h-full min-h-0 w-full flex-col overflow-hidden bg-[#f7f7fa] text-[#18181b] dark:bg-[#111115] dark:text-[#f7f7fa]">
@@ -1018,8 +1114,13 @@ export function MobileSessionActivity({ connected, onBack, onReconnect }: Mobile
             )}
             {workspace.tabs}
           </div>
-          <button type="button" aria-label="Add agent" onClick={() => { setInteractiveCreation(false); setMachineKey(null); setNewPaneOpen(true); }} className="inline-flex h-11 w-11 shrink-0 items-center justify-center rounded-full bg-[#6d5efc] text-white"><Plus className="h-4 w-4" /></button>
-          {!workspace.active && <button type="button" aria-label="More actions" onClick={() => setMoreOpen(true)} className="-mr-2 flex h-11 w-11 shrink-0 items-center justify-center rounded-lg text-[#686873] hover:bg-[#efeff5] dark:text-[#aaaab6] dark:hover:bg-[#25252d]"><MoreVertical className="h-5 w-5" /></button>}
+          <button type="button" aria-label="Add agent" onClick={() => { setMachineKey(null); setNewPaneOpen(true); }} className="inline-flex h-11 w-11 shrink-0 items-center justify-center rounded-full bg-[#6d5efc] text-white"><Plus className="h-4 w-4" /></button>
+          {/* Hidden on the Overview, whose actions are its own, while a tab
+              chip leads back. A project with no tabs has no chip, and the
+              Overview is remembered per project, so there this is the only
+              way to Open project or Manage project. Its pane items are
+              disabled without a selected pane. */}
+          {(!workspace.active || paneConfigs.length === 0) && <button type="button" aria-label="More actions" onClick={() => setMoreOpen(true)} className="-mr-2 flex h-11 w-11 shrink-0 items-center justify-center rounded-lg text-[#686873] hover:bg-[#efeff5] dark:text-[#aaaab6] dark:hover:bg-[#25252d]"><MoreVertical className="h-5 w-5" /></button>}
         </div>
 
         <div className="mt-1.5 flex items-center gap-2">
@@ -1040,6 +1141,19 @@ export function MobileSessionActivity({ connected, onBack, onReconnect }: Mobile
       </div>
 
       {actionError && <div className="mx-4 mt-3 flex shrink-0 items-center gap-2 rounded-xl border border-red-300 bg-red-50 px-3 py-2 text-xs text-red-700 dark:border-red-900 dark:bg-red-950/40 dark:text-red-300"><AlertTriangle className="h-4 w-4 shrink-0" /> {actionError}</div>}
+
+      {/* The selected tab's provider is retired (a saved Pi tab). Its history
+          still reads; say why nothing else can be done with it. */}
+      {selectedIsRetired && !workspace.active && !terminalIsOpen && (
+        <p role="status" className="mx-4 mt-3 flex shrink-0 items-start gap-2 rounded-xl border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-700 dark:border-red-900 dark:bg-red-950/30 dark:text-red-300">
+          <AlertTriangle aria-hidden="true" className="mt-px h-4 w-4 shrink-0" />
+          <span>
+            {isRetiredPiProvider(selectedPane?.provider)
+              ? `${PI_RETIRED_MESSAGE} This tab's history is available, but it cannot receive input or be restarted.`
+              : "This historical pane uses a retired provider. Its history is available, but it cannot receive input or be restarted."}
+          </span>
+        </p>
+      )}
 
       {/* The selected pane belongs to a machine that is not running the
           project, or that this viewer may not use. Its history still reads;
@@ -1135,7 +1249,7 @@ export function MobileSessionActivity({ connected, onBack, onReconnect }: Mobile
             {selectedPlanReviews.map((plan) => {
               // Answering optimistically drops the review, while the server
               // refuses it for a machine that is not running the project.
-              const planRefusal = selectedPane?.mode === "deadloop" ? "Legacy bot history is read-only." : tabHosts.tabs.get(plan.paneId)?.refusal;
+              const planRefusal = readOnlyTabReason(selectedPane) ?? tabHosts.tabs.get(plan.paneId)?.refusal;
               return (
                 <div key={plan.toolUseId} className="rounded-2xl border border-amber-400 bg-white p-3.5 dark:border-amber-700 dark:bg-[#1b1b21]">
                   <span className="rounded-full bg-amber-100 px-2.5 py-1 text-[0.68rem] font-extrabold uppercase text-amber-800 dark:bg-amber-950/60 dark:text-amber-200">plan review</span>
@@ -1161,12 +1275,12 @@ export function MobileSessionActivity({ connected, onBack, onReconnect }: Mobile
 
         {visibleActivity.length > 0 ? (
           <div className="space-y-2.5">
-            {visibleActivity.map((item) => <MobileEventCard key={item.key} item={item} answeredQuestions={answeredQuestions} onApprove={approve} onReject={reject} disabledReason={paneConfigs.find((pane) => pane.pane_id === item.paneId)?.mode === "deadloop" ? "Legacy bot history is read-only." : tabHosts.tabs.get(item.paneId)?.refusal} />)}
+            {visibleActivity.map((item) => <MobileEventCard key={item.key} item={item} answeredQuestions={answeredQuestions} onApprove={approve} onReject={reject} disabledReason={readOnlyTabReason(paneConfigs.find((pane) => pane.pane_id === item.paneId)) ?? tabHosts.tabs.get(item.paneId)?.refusal} />)}
           </div>
         ) : (
           <div className="flex min-h-60 flex-col items-center justify-center px-5 text-center">
             <div className="rounded-2xl bg-[#efeff5] p-3 dark:bg-[#25252d]">{connected ? <Wifi className="h-6 w-6 text-[#686873]" /> : <WifiOff className="h-6 w-6 text-[#686873]" />}</div>
-            {connected && selectedIsTerminal ? (
+            {connected && selectedIsTerminal && !selectedIsRetired ? (
               <>
                 {/* A terminal pane records every turn, so none at all means no
                     conversation has started — it is very likely still at a
@@ -1264,7 +1378,7 @@ export function MobileSessionActivity({ connected, onBack, onReconnect }: Mobile
           <p className="whitespace-pre-wrap break-words">{selectedPane?.prompt || "No saved bot prompt is available."}</p>
         </details>}
         <div className="flex items-end gap-2">
-          <textarea value={followUp} onChange={(event) => setFollowUp(event.target.value)} rows={2} placeholder={selectedIsBot ? "Legacy bot history is read-only" : selectedIsTerminal ? "Message this terminal conversation" : "Steer this session and pane"} disabled={!canCompose} className="min-h-[2.75rem] flex-1 resize-none rounded-xl border border-[#dedee7] bg-white px-3 py-2 text-sm outline-none focus:border-[#6d5efc] disabled:opacity-50 dark:border-[#383842] dark:bg-[#1b1b21]" />
+          <textarea value={followUp} onChange={(event) => setFollowUp(event.target.value)} rows={2} placeholder={selectedIsBot ? "Legacy bot history is read-only" : selectedIsRetired ? "This tab is read-only" : selectedIsTerminal ? "Message this terminal conversation" : "Steer this session and pane"} disabled={!canCompose} className="min-h-[2.75rem] flex-1 resize-none rounded-xl border border-[#dedee7] bg-white px-3 py-2 text-sm outline-none focus:border-[#6d5efc] disabled:opacity-50 dark:border-[#383842] dark:bg-[#1b1b21]" />
           <button type="button" aria-label={selectedIsTerminal ? "Send conversation message" : "Send follow-up"} disabled={!canSend || !followUp.trim()} onClick={sendFollowUp} className="flex h-11 w-11 shrink-0 items-center justify-center rounded-xl bg-[#6d5efc] text-white disabled:opacity-40"><Send className="h-5 w-5" /></button>
         </div>
       </div>
@@ -1273,12 +1387,9 @@ export function MobileSessionActivity({ connected, onBack, onReconnect }: Mobile
       {newPaneOpen && (
         <div className="fixed inset-0 z-[95] flex items-end bg-black/45" onClick={() => setNewPaneOpen(false)}>
           <div role="dialog" aria-modal="true" aria-label="Add agent" onClick={(event) => event.stopPropagation()} className="max-h-[82dvh] w-full overflow-y-auto rounded-t-[1.4rem] border-t border-[#dedee7] bg-[#f7f7fa] p-4 pb-[max(1rem,env(safe-area-inset-bottom))] shadow-2xl dark:border-[#383842] dark:bg-[#111115]">
-            <div className="flex items-center justify-between"><div><h2 className="text-xl font-extrabold">{interactiveCreation ? "Interactive agent" : "Add agent"}</h2><p className="mt-1 text-sm text-[#686873] dark:text-[#aaaab6]">{interactiveCreation ? "Choose a profile allowed by this project's cluster policy." : "Choose interactive work or an autonomous responsibility."}</p></div><button type="button" aria-label="Close add agent" onClick={() => setNewPaneOpen(false)} className="flex h-11 w-11 shrink-0 items-center justify-center rounded-lg hover:bg-[#efeff5] dark:hover:bg-[#25252d]"><X className="h-5 w-5" /></button></div>
-            {!interactiveCreation ? <div className="mt-4 space-y-2">
-              <button type="button" onClick={() => setInteractiveCreation(true)} className="min-h-11 w-full rounded-2xl border border-[#dedee7] bg-white p-3.5 text-left dark:border-[#383842] dark:bg-[#1b1b21]"><span className="block font-bold">Interactive agent</span><span className="mt-1 block text-sm">Work directly with a provider in a terminal.</span></button>
-              <button type="button" disabled={!workspace.addAutonomous} onClick={() => { persistActivityScroll(); setNewPaneOpen(false); workspace.addAutonomous?.(); }} className="min-h-11 w-full rounded-2xl border border-[#dedee7] bg-white p-3.5 text-left disabled:opacity-50 dark:border-[#383842] dark:bg-[#1b1b21]"><span className="block font-bold">Autonomous worker</span><span className="mt-1 block text-sm">{workspace.unavailableReason || "Review a responsibility, standing checklist and recurring allowance."}</span></button>
-            </div> : <>
-            <button type="button" onClick={() => setInteractiveCreation(false)} className="mt-2 min-h-11 text-sm font-bold text-[#6d5efc]">Back to agent types</button>
+            <div className="flex items-center justify-between"><div><h2 className="text-xl font-extrabold">Add agent</h2><p className="mt-1 text-sm text-[#686873] dark:text-[#aaaab6]">Choose a profile allowed by this project's cluster policy.</p></div><button type="button" aria-label="Close add agent" onClick={() => setNewPaneOpen(false)} className="flex h-11 w-11 shrink-0 items-center justify-center rounded-lg hover:bg-[#efeff5] dark:hover:bg-[#25252d]"><X className="h-5 w-5" /></button></div>
+            {/* "+" creates an interactive agent and nothing else. An
+                autonomous worker is created from Overview. */}
             {/* Where the agent runs, when there is a real choice: the same
                 choices, groups and reasons as the desktop new-tab menu. */}
             {machineChoices.showChoice && (
@@ -1313,7 +1424,6 @@ export function MobileSessionActivity({ connected, onBack, onReconnect }: Mobile
               {launchOptions.map((option) => <button key={option.key} type="button" disabled={needsMachine} onClick={() => { workspace.selectInteractive(); createPane(option); }} className="flex w-full items-center justify-between rounded-2xl border border-[#dedee7] bg-white p-3.5 text-left disabled:opacity-40 dark:border-[#383842] dark:bg-[#1b1b21]"><span><span className="block font-bold">{option.label}</span><span className="mt-0.5 block text-xs text-[#686873] dark:text-[#aaaab6]">{option.kind === "terminal" ? "Interactive TUI" : "Coding activity pane"}</span></span><Plus className="h-5 w-5 text-[#6d5efc]" /></button>)}
               {launchOptions.length === 0 && <div className="rounded-2xl border border-[#dedee7] bg-white p-4 text-sm text-[#686873] dark:border-[#383842] dark:bg-[#1b1b21] dark:text-[#aaaab6]">Waiting for the project's launch policy, or no profiles are currently allowed.</div>}
             </div>
-            </>}
           </div>
         </div>
       )}
@@ -1348,7 +1458,7 @@ export function MobileSessionActivity({ connected, onBack, onReconnect }: Mobile
                   <FolderOpen className="h-5 w-5 shrink-0 text-[#6d5efc]" /> Open project
                 </button>
               )}
-              <button type="button" aria-label="Open raw terminal" disabled={!selectedIsTerminal} onClick={() => {
+              <button type="button" aria-label="Open raw terminal" disabled={!selectedIsTerminal || selectedIsRetired} onClick={() => {
                 if (selectedPaneId === null) return;
                 setMoreOpen(false);
                 openRawTerminal();
@@ -1394,7 +1504,7 @@ export function MobileSessionActivity({ connected, onBack, onReconnect }: Mobile
               >
                 <Pencil className="h-5 w-5 shrink-0 text-[#686873] dark:text-[#aaaab6]" /> Rename conversation
               </button>
-              {!selectedIsBot && <button type="button" aria-label="Reboot this pane" disabled={!selectedPane || Boolean(selectedRefusal)} title={selectedRefusal} onClick={() => { setMoreOpen(false); setRebootTarget(selectedPane ?? null); }} className="flex w-full items-center gap-3 rounded-2xl border border-[#dedee7] bg-white p-3.5 text-left font-bold disabled:opacity-40 dark:border-[#383842] dark:bg-[#1b1b21]"><RotateCcw className="h-5 w-5 shrink-0 text-[#686873] dark:text-[#aaaab6]" /> Reboot this pane</button>}
+              {!selectedIsBot && !selectedIsRetired && <button type="button" aria-label="Reboot this pane" disabled={!selectedPane || Boolean(selectedRefusal)} title={selectedRefusal} onClick={() => { setMoreOpen(false); setRebootTarget(selectedPane ?? null); }} className="flex w-full items-center gap-3 rounded-2xl border border-[#dedee7] bg-white p-3.5 text-left font-bold disabled:opacity-40 dark:border-[#383842] dark:bg-[#1b1b21]"><RotateCcw className="h-5 w-5 shrink-0 text-[#686873] dark:text-[#aaaab6]" /> Reboot this pane</button>}
               <button type="button" aria-label="Close this pane" disabled={!selectedPane || Boolean(selectedRefusal)} title={selectedRefusal} onClick={() => { setMoreOpen(false); setCloseTarget(selectedPane ?? null); }} className="flex w-full items-center gap-3 rounded-2xl border border-red-200 bg-white p-3.5 text-left font-bold text-red-700 disabled:opacity-40 dark:border-red-900 dark:bg-[#1b1b21] dark:text-red-300"><Trash2 className="h-5 w-5 shrink-0" /> Close this pane</button>
               {/* Different scope from the four above, and the only place it can
                   live: project management is per-project, so there is no

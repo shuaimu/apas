@@ -10,6 +10,7 @@ import {
 } from "@/lib/store";
 import { PROJECT_INSTANCES_CAPABILITY, type SessionInstance } from "@/lib/projectInstances";
 import { paneAutopilotKey, TAB_AUTOPILOT_CAPABILITY, type PaneAutopilotEntry } from "@/lib/autopilot";
+import { DEFAULT_AUTOPILOT_TEMPLATE } from "@/lib/autopilotTemplates";
 import { TabbedView } from "./TabbedView";
 
 /**
@@ -287,7 +288,7 @@ describe("one control per tab", () => {
     expect(screen.queryByRole("dialog")).toBeNull();
     fireEvent.click(controlButton());
     expect(screen.getByRole("dialog", { name: "Start autopilot — OMP 1" })).toBeTruthy();
-    expect((screen.getByLabelText("Prompt") as HTMLTextAreaElement).value).toBe("");
+    expect((screen.getByLabelText("Prompt") as HTMLTextAreaElement).value).toBe(DEFAULT_AUTOPILOT_TEMPLATE.prompt);
     expect(sentActions()).toEqual([]);
   });
 });

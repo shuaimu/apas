@@ -384,7 +384,7 @@ export default function SystemAdminPage() {
             {defaultPolicy && (
               <PolicyEditor
                 title="Deployment default policy"
-                description="The outer bound for every virtual cluster. A cluster or project may narrow the allowed launch profiles but never widen them; team availability is a default that a cluster or project may set for itself."
+                description="The outer bound for every virtual cluster. A cluster or project may narrow the allowed launch profiles but never widen them."
                 policy={defaultPolicy}
                 profiles={profiles}
                 onSave={(policy) => mutate("/admin/policy/default", { method: "PATCH", body: JSON.stringify(policy) })}

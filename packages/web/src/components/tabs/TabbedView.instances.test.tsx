@@ -144,7 +144,6 @@ function deliver(message: Record<string, unknown>) {
 
 function openMachineStep() {
   fireEvent.click(screen.getByTitle("New tab"));
-  fireEvent.click(screen.getByRole("button", { name: /^Interactive agent/ }));
   return screen.getByRole("group", { name: "Run on" });
 }
 
@@ -205,7 +204,7 @@ describe("a tab whose machine is not running the project", () => {
     render(<TabbedView />);
     await screen.findByTestId("terminal-pane-10");
 
-    // The overview's Remove reaches the same close path as the tab bar.
+    // The Overview's "Close tab" reaches the same close path as the tab bar.
     fireEvent.click(screen.getByRole("button", { name: "Project overview" }));
     const panels = await screen.findByRole("region", { name: "Interactive project" });
     const removes = within(panels).getAllByTitle("Close this pane (worktree-cleanup prompt opens if applicable)");

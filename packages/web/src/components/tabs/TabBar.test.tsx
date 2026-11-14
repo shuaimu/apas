@@ -130,7 +130,6 @@ function mockRect(element: Element, left: number, width: number) {
 
 function openNewTabMenu() {
   fireEvent.click(screen.getByTitle("New tab"));
-  fireEvent.click(screen.getByRole("button", { name: /^Interactive agent/ }));
 }
 
 function isolatedWorktreeCheckbox(): HTMLInputElement {
@@ -434,6 +433,92 @@ describe("TabBar add-tab worktree controls", () => {
 
     expect(screen.getByText("Claude / DeepSeek 4.1 Flash")).toBeTruthy();
     expect(screen.queryByText("Claude")).toBeNull();
+  });
+
+  it("opens the interactive agent menu at once, with no agent-type step", () => {
+    const onAddTab = vi.fn();
+    renderTabBar({ onAddTab });
+
+    fireEvent.click(screen.getByTitle("New tab"));
+
+    // The provider list is there on the first click. An autonomous worker is
+    // created from Overview, not from "+".
+    expect(screen.queryByRole("button", { name: /^Interactive agent/ })).toBeNull();
+    expect(screen.queryByRole("button", { name: /^Autonomous worker/ })).toBeNull();
+    expect(screen.queryByText("Back to agent types")).toBeNull();
+    expect(screen.getByText("Interactive provider")).toBeTruthy();
+
+    fireEvent.click(screen.getByText("OMP"));
+    expect(onAddTab).toHaveBeenCalledWith("omp", undefined, undefined, "terminal", undefined);
+  });
+
+  it("offers the first tab of a project that has none", () => {
+    const onAddTab = vi.fn();
+    renderTabBar({ onAddTab, tabs: [], activeTabId: undefined });
+
+    fireEvent.click(screen.getByTitle("New tab"));
+    fireEvent.click(screen.getByText("Claude"));
+
+    expect(onAddTab).toHaveBeenCalledWith("claude", undefined, undefined, "terminal", undefined);
+  });
+
+  it("does not offer Pi, even to a policy that still lists its profile", () => {
+    act(() => useStore.setState({
+      sessionId: "tabbar-session",
+      projectPolicies: {
+        "tabbar-session": {
+          teamAvailable: false,
+          // What a policy stored before the retirement can still hold.
+          allowedLaunchProfiles: [
+            "terminal:pi:official:default",
+            "terminal:omp:official:default",
+          ],
+          version: 2,
+          projectSuspended: false,
+          noncompliantPaneIds: [],
+        },
+      },
+    }));
+    renderTabBar({ onAddTab: vi.fn() });
+    openNewTabMenu();
+
+    expect(screen.getByText("OMP")).toBeTruthy();
+    expect(screen.queryByText("Pi")).toBeNull();
+  });
+
+  it("marks a saved Pi tab as no longer supported", () => {
+    const { container } = renderTabBar({
+      tabs: [pane({ pane_id: 82, label: "Old Pi tab", role: "developer", provider: "pi" })],
+      activeTabId: 82,
+    });
+
+    const tab = tabButton(container, 82);
+    expect(tab.querySelector('[title="Pi is no longer supported. Use OMP instead."]')).toBeTruthy();
+    expect(tab.textContent).toContain("!");
+  });
+
+  it("names an OMP tab's icon OMP, in a colour of its own", () => {
+    const { container } = renderTabBar({
+      tabs: [
+        pane({ pane_id: 83, label: "OMP 1", role: "developer", provider: "omp", kind: "terminal" }),
+        pane({ pane_id: 84, label: "Claude 2", role: "developer", provider: "claude", kind: "terminal" }),
+      ],
+      activeTabId: 83,
+    });
+
+    // It used to fall through to Claude's title and colour.
+    const omp = tabButton(container, 83).querySelector('[title="OMP"]');
+    expect(omp).toBeTruthy();
+    expect(omp?.className).toContain("text-violet-500");
+    // The mark is drawn inside the icon's box. As plain text it was wider
+    // than the box and ran into the tab's name.
+    const mark = omp?.querySelector('svg[data-provider-icon="omp"]');
+    expect(mark?.getAttribute("class")).toBe("w-3.5 h-3.5");
+    expect(mark?.querySelector("text")?.getAttribute("textLength")).toBe("23");
+    expect(Array.from(omp?.childNodes ?? []).some((node) => node.nodeType === Node.TEXT_NODE)).toBe(false);
+    expect(tabButton(container, 83).querySelector('[title="Claude"]')).toBeNull();
+    const claude = tabButton(container, 84).querySelector('[title="Claude"]');
+    expect(claude?.className).toContain("text-blue-500");
   });
 
   it("marks a historical retired tab unsupported without branding it", () => {

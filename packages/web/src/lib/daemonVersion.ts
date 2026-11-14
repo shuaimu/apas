@@ -104,6 +104,21 @@ export function rebootActionLabelFor(behind: boolean, hostname: string): string 
     : `Reboot the daemon on ${hostname}`;
 }
 
+/**
+ * What rebooting one machine's daemon does to the work on it, for the
+ * confirmation. Projects run inside the daemon, so every project on the
+ * machine restarts. Terminal agents run in pane hosts, which are separate
+ * processes the new daemon takes back; "normally" because a host whose runtime
+ * files were lost is not found again and its tab gets a fresh agent.
+ *
+ * This used to say that projects, panes and agents keep running because the
+ * daemon does not own them. That stopped being true when projects moved into
+ * the daemon.
+ */
+export function rebootEffectNote(hostname: string): string {
+  return `Every project running on ${hostname} restarts with it. Terminal agents normally keep running during the restart, because their hosts are separate processes.`;
+}
+
 /** How a machine's version reads in its row, including when it reports none. */
 export function daemonVersionLabel(value: string | null | undefined): string {
   const trimmed = typeof value === "string" ? value.trim() : "";

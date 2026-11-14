@@ -24,7 +24,11 @@ it("keeps saved bot instructions as data without offering a new bot or sending o
   expect(screen.queryByPlaceholderText("Enter bot loop prompt...")).toBeNull();
   send.mockClear();
   fireEvent.click(screen.getByRole("button", { name: "Project overview" }));
-  fireEvent.click(screen.getByRole("button", { name: "Back to interactive agents" }));
+  expect(await screen.findByRole("region", { name: "Project overview" })).toBeTruthy();
+  // The Overview has no button back to the tabs: the tab bar selects one.
+  expect(screen.queryByRole("button", { name: "Back to interactive agents" })).toBeNull();
+  fireEvent.click(document.querySelector<HTMLButtonElement>('button[data-tab-id="42"]')!);
+  expect(screen.queryByRole("region", { name: "Project overview" })).toBeNull();
   expect(send).not.toHaveBeenCalled();
   expect(useStore.getState().paneConfigs[0]).toMatchObject({ prompt: "Original instructions", effort: "high", mode: "interactive" });
   expect(useStore.getState().sessionId).toBe("cutover");

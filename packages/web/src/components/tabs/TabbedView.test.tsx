@@ -346,11 +346,54 @@ describe("TabbedView zero-pane projects", () => {
 
     render(<TabbedView />);
     fireEvent.click(screen.getByTitle("New tab"));
-    fireEvent.click(screen.getByRole("button", { name: /^Interactive agent/ }));
 
     expect(screen.queryByText("Claude")).toBeNull();
     expect(screen.getByText("Codex")).toBeTruthy();
     expect(addPane).not.toHaveBeenCalled();
+  });
+
+  it("opens the provider list on the first click of + for a project with no tab", () => {
+    const { addPane } = seedZeroPaneTabbedView([
+      "terminal:claude:official:default",
+      "terminal:omp:official:default",
+    ]);
+
+    render(<TabbedView />);
+    fireEvent.click(screen.getByTitle("New tab"));
+
+    // No agent-type step in between, and no way to a worker from here.
+    expect(screen.queryByRole("button", { name: /^Interactive agent/ })).toBeNull();
+    expect(screen.queryByRole("button", { name: /^Autonomous worker/ })).toBeNull();
+    fireEvent.click(screen.getByText("OMP"));
+    expect(addPane).toHaveBeenCalledTimes(1);
+    expect((addPane.mock.calls[0] as unknown[])[0]).toBe("omp");
+    // Named for its provider, as the other providers' tabs are.
+    expect((addPane.mock.calls[0] as unknown[])[2]).toBe("OMP 1");
+  });
+
+  it("shows a saved Pi tab as read-only history and says what to use instead", async () => {
+    seedZeroPaneTabbedView(["terminal:omp:official:default"], false);
+    act(() => useStore.setState({
+      paneConfigs: [{
+        pane_id: 77,
+        provider: "pi",
+        mode: "interactive",
+        kind: "terminal",
+        session_id: "pi-pane-77",
+        is_paused: false,
+        label: "Pi 1",
+      }],
+    }));
+
+    render(<TabbedView />);
+    fireEvent.click(await screen.findByText("Pi 1"));
+
+    expect(await screen.findByText(
+      "Pi is no longer supported. Use OMP instead. This tab's history is available, but it cannot receive input or be restarted.",
+    )).toBeTruthy();
+    expect(screen.getByText("Pi is no longer supported. History is read-only.")).toBeTruthy();
+    // Nothing offers to bring it back.
+    expect(screen.queryByRole("button", { name: "Reboot" })).toBeNull();
   });
 
   it("explains an empty project and points at the control that fixes it", () => {

@@ -308,8 +308,10 @@ describe("MobileCodeHome", () => {
     expect(props.onRebootDaemon).not.toHaveBeenCalled();
 
     const dialog = screen.getByRole("dialog", { name: /Reboot the daemon on zoo-006/ });
-    // The reassurance is the point: this restarts a process, not the work.
-    expect(within(dialog).getByText(/keep running/)).toBeTruthy();
+    // The dialog must say what the reboot does: projects run inside the
+    // daemon, so they restart; terminal agents are in separate hosts.
+    expect(within(dialog).getByText(/Every project running on zoo-006 restarts with it\. Terminal agents normally keep running/)).toBeTruthy();
+    expect(within(dialog).queryByText(/does not own/)).toBeNull();
     fireEvent.click(within(dialog).getByRole("button", { name: "Reboot" }));
 
     expect(props.onRebootDaemon).toHaveBeenCalledWith("machine-b", "zoo-006");
@@ -622,7 +624,7 @@ describe("MobileCodeHome", () => {
     fireEvent.click(await screen.findByRole("button", { name: "Reboot and update the daemon on zoo-006" }));
     const dialog = screen.getByRole("dialog", { name: /Reboot and update the daemon on zoo-006/ });
     expect(within(dialog).getByText(/behind/)).toBeTruthy();
-    expect(within(dialog).getByText(/keep running/)).toBeTruthy();
+    expect(within(dialog).getByText(/Every project running on zoo-006 restarts with it/)).toBeTruthy();
     fireEvent.click(within(dialog).getByRole("button", { name: "Reboot to update" }));
 
     expect(props.onRebootDaemon).toHaveBeenCalledWith("machine-b", "zoo-006");

@@ -9,8 +9,8 @@ export function normalizeProjectRole(raw: string | undefined | null): ProjectRol
 }
 
 /**
- * Whether the viewer may change project-level *settings* — team mode on/off
- * and the Tech Lead autonomy flags.
+ * Whether the viewer may change project-level *settings*, such as which tab
+ * types the project allows.
  *
  * Mirrors the server's `share::ProjectRole::can_manage_access`, which is what
  * actually enforces this; the UI only decides what to render. Keep the two in
@@ -42,18 +42,4 @@ export function useCanManageCurrentProject(): boolean {
   const session = sessions.find((s) => s.id === sessionId);
   if (!session) return false;
   return canManageProject(session);
-}
-
-/**
- * Whether managed team mode is switched on for the current project.
- *
- * Absent flags read as **off**, which is also what a CLI too old to send the
- * field produces — the UI must not offer a team the CLI will refuse to start.
- */
-export function useTeamEnabled(): boolean {
-  const sessionId = useStore((s) => s.sessionId);
-  const projectPolicies = useStore((s) => s.projectPolicies);
-  if (!sessionId) return false;
-  const policy = projectPolicies?.[sessionId];
-  return policy?.teamAvailable === true && policy.projectSuspended !== true;
 }

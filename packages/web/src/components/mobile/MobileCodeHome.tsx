@@ -33,6 +33,7 @@ import {
   isMachineBehind,
   latestSeenVersion,
   rebootActionLabelFor,
+  rebootEffectNote,
   rebootLabelFor,
 } from "@/lib/daemonVersion";
 import { CreateInstanceModal } from "@/components/CreateInstanceModal";
@@ -945,8 +946,7 @@ export function MobileCodeHome({
                 ? "This machine is behind, so the reboot updates it first."
                 : "It updates to the latest version if one is available."}
               {" "}
-              Projects, panes, and agents on this machine keep running — the daemon does not own
-              them.
+              {rebootEffectNote(machineRebootTarget.hostname)}
             </p>
             <div className="mt-4 flex gap-2.5">
               <button

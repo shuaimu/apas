@@ -1,40 +1,61 @@
 "use client";
 
 import { useStore } from "@/lib/store";
+import { launchProfileLabel } from "@/lib/launchProfileLabels";
+import { isRetiredLaunchProfileKey } from "@/lib/providerOptions";
+import { OverviewSection, overviewCard, overviewChip, overviewMuted } from "./OverviewElements";
 
-/** Read-only launch-profile policy for normal project users and owners. */
+/**
+ * The Overview's "Allowed launch profiles" section: what a new tab of this
+ * project may run. Read-only, for normal project users and owners alike.
+ *
+ * A profile is shown by its name from the provider catalog, with the policy's
+ * own key as the tooltip. A key the catalog cannot name is shown as it is.
+ * A profile of a retired provider is left out, as the Machines and admin
+ * policy lists leave it out: a policy may still carry its key, but no menu
+ * offers it and nothing can launch it.
+ */
 export function AllowedTabTypesCard() {
   const sessionId = useStore((state) => state.sessionId);
   const policy = useStore((state) => sessionId ? state.projectPolicies?.[sessionId] : undefined);
+  const profiles = (policy?.allowedLaunchProfiles ?? []).filter((key) => !isRetiredLaunchProfileKey(key));
 
   return (
-    <div className="mb-4 rounded-lg border border-sky-200 bg-sky-50/60 px-4 py-3 dark:border-sky-700/40 dark:bg-sky-900/10">
-      <div className="mb-1 flex items-center justify-between gap-2">
-        <span className="text-xs font-semibold uppercase tracking-wide text-sky-700 dark:text-sky-400">
-          Allowed launch profiles
-        </span>
-        <span className="text-[11px] text-gray-500">Read-only cluster policy</span>
+    <OverviewSection
+      title="Allowed launch profiles"
+      level={3}
+      aside={<span className={overviewMuted}>Read-only cluster policy</span>}
+      description="What a new tab of this project may run."
+    >
+      <div className={`${overviewCard} px-3 py-3`}>
+        {!policy ? (
+          <p className={overviewMuted}>Waiting for an authoritative policy snapshot…</p>
+        ) : profiles.length === 0 ? (
+          <p className="text-sm text-amber-700 dark:text-amber-400">No new tabs may be launched.</p>
+        ) : (
+          <ul className="flex flex-wrap gap-2">
+            {profiles.map((key) => {
+              const profile = launchProfileLabel(key);
+              return (
+                <li
+                  key={key}
+                  title={key}
+                  className={`${overviewChip} ${profile.known ? "" : "font-mono"}`}
+                >
+                  {profile.label}
+                </li>
+              );
+            })}
+          </ul>
+        )}
+        {policy && policy.noncompliantPaneIds.length > 0 && (
+          <p className={`mt-2 ${overviewMuted}`}>
+            Tabs {policy.noncompliantPaneIds.join(", ")} use a combination this policy no longer
+            allows. They keep running and can be relaunched; the combination just cannot be chosen
+            for a new tab.
+          </p>
+        )}
       </div>
-      {!policy ? (
-        <p className="text-xs text-gray-500">Waiting for an authoritative policy snapshot…</p>
-      ) : policy.allowedLaunchProfiles.length === 0 ? (
-        <p className="text-xs text-amber-700 dark:text-amber-400">No new panes may be launched.</p>
-      ) : (
-        <div className="flex flex-wrap gap-2">
-          {policy.allowedLaunchProfiles.map((key) => (
-            <span key={key} className="rounded bg-white px-2 py-1 font-mono text-[11px] text-gray-700 shadow-sm dark:bg-gray-800 dark:text-gray-300">
-              {key}
-            </span>
-          ))}
-        </div>
-      )}
-      {policy && policy.noncompliantPaneIds.length > 0 && (
-        <p className="mt-2 text-xs text-gray-500 dark:text-gray-400">
-          Panes {policy.noncompliantPaneIds.join(", ")} use a combination this policy no longer
-          allows. They keep running and can be relaunched; the combination just cannot be chosen
-          for a new tab.
-        </p>
-      )}
-    </div>
+    </OverviewSection>
   );
 }

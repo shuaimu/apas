@@ -214,8 +214,14 @@ describe("MobileSessionActivity", () => {
     fireEvent.click(screen.getByRole("button", { name: "Project overview" }));
     expect(screen.getByText("Raw terminal pane 9")).toBe(terminal);
     expect(terminal.closest("[hidden]")).not.toBeNull();
-    expect(screen.getByRole("region", { name: "Interactive project" })).toBeTruthy();
-    fireEvent.click(screen.getByRole("button", { name: "Back to interactive agents" }));
+    // The Overview is the workspace's own page, not the Jobs page, and has no
+    // button back to the tabs: its tab row and the chips above lead there.
+    expect(screen.getByRole("region", { name: "Project overview" }).classList.contains("jobs-app")).toBe(false);
+    expect(screen.queryByRole("button", { name: "Back to interactive agents" })).toBeNull();
+    const panel = screen.getByRole("region", { name: "Interactive project" });
+    expect(within(panel).getByRole("heading", { name: "Tabs" })).toBeTruthy();
+    fireEvent.click(within(panel).getByRole("button", { name: /Retained TTY/ }));
+    expect(screen.queryByRole("region", { name: "Project overview" })).toBeNull();
     expect(screen.getByText("Raw terminal pane 9")).toBe(terminal);
     expect(useStore.getState().sessionId).toBe("session-a");
     expect(actions.addPane).not.toHaveBeenCalled();
@@ -254,10 +260,50 @@ describe("MobileSessionActivity", () => {
     const actions = seedStore({ paneConfigs: [], paneMessages: {}, paneListReceived: true, projectPolicies: {} });
     renderActivity();
     fireEvent.click(screen.getByRole("button", { name: "Project overview" }));
-    expect(screen.getByText(/No interactive panes/)).toBeTruthy();
+    expect(screen.getByText("No tabs yet. Use + to add an interactive agent. Workers do not create tabs.")).toBeTruthy();
     expect(useStore.getState().paneConfigs).toEqual([]);
     expect(actions.addPane).not.toHaveBeenCalled();
     expect(useStore.getState().sessionId).toBe("session-a");
+  });
+
+  it("keeps Open project and Manage project reachable from the Overview of a project with no tabs", () => {
+    const actions = seedStore({
+      paneConfigs: [],
+      paneMessages: {},
+      paneListReceived: true,
+      projectPolicies: {},
+      sessions: [{
+        id: "session-a",
+        projectId: "project-a",
+        workingDir: "/workspace/alpha",
+        hostname: "builder-a",
+        status: "offline",
+        isActive: false,
+      }],
+      isAttached: false,
+      machines: [{
+        machine: { machineId: "machine-a", hostname: "builder-a", os: "linux", arch: "x86_64" },
+        projects: [{ projectId: "project-a", path: "/workspace/alpha", isRunning: false }],
+      }],
+    });
+    renderActivity();
+    const overview = screen.getByRole("button", { name: "Project overview" });
+    fireEvent.click(overview);
+    expect(overview.getAttribute("aria-pressed")).toBe("true");
+
+    // No tab chip leads back, so the actions stay on the Overview.
+    fireEvent.click(screen.getByRole("button", { name: "More actions" }));
+    const sheet = screen.getByRole("dialog", { name: "Pane actions" });
+    expect(within(sheet).getByRole("button", { name: "Close this pane" })).toHaveProperty("disabled", true);
+    expect(within(sheet).getByRole("button", { name: "Reboot this pane" })).toHaveProperty("disabled", true);
+    fireEvent.click(within(sheet).getByRole("button", { name: "Open project" }));
+    expect(screen.getByRole("dialog", { name: "Open alpha" })).toBeTruthy();
+    expect(actions.startMachineProjectCli).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByRole("button", { name: "More actions" }));
+    fireEvent.click(screen.getByRole("button", { name: "Manage project" }));
+    expect(screen.getByRole("dialog", { name: "Manage project" })).toBeTruthy();
+    expect(actions.addPane).not.toHaveBeenCalled();
   });
 
   it("retains legacy bot instructions without offering bot sends or steering", () => {

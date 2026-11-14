@@ -26,26 +26,16 @@ function renderModal(overrides: Partial<ComponentProps<typeof PaneDiffModal>> = 
 }
 
 describe("PaneDiffModal manual PR action", () => {
-  it("keeps Create PR available for unmanaged panes", () => {
+  // A pane an older `.apas` marked managed used to get "Managed team panes
+  // open PRs after Reviewer approval" here instead of the button. Team mode is
+  // removed, so the modal takes no such flag and always offers the action.
+  it("offers Create PR and no team workflow guidance", () => {
     const onCreatePr = vi.fn();
     renderModal({ onCreatePr });
 
     fireEvent.click(screen.getByRole("button", { name: "Create PR" }));
 
     expect(onCreatePr).toHaveBeenCalledTimes(1);
-    expect(
-      screen.queryByText(/Managed team panes open PRs after Reviewer approval/),
-    ).toBeNull();
-  });
-
-  it("replaces Create PR with team workflow guidance for managed panes", () => {
-    const onCreatePr = vi.fn();
-    renderModal({ manualPrCreationDisabled: true, onCreatePr });
-
-    expect(screen.queryByRole("button", { name: "Create PR" })).toBeNull();
-    expect(
-      screen.getByText(/Managed team panes open PRs after Reviewer approval/),
-    ).toBeTruthy();
-    expect(onCreatePr).not.toHaveBeenCalled();
+    expect(screen.queryByText(/Managed team panes/)).toBeNull();
   });
 });

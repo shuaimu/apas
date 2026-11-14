@@ -734,6 +734,10 @@ function splitDuration<U extends AutopilotDurationUnit>(seconds: number, units: 
  * "as soon as each turn ends", no limits, and the no-tool-call ending on,
  * which is proposed only for that timing. With one, that autopilot's prompt,
  * timing and limits, ready to change.
+ *
+ * The start dialog opens on `autopilotTemplateStartForm` in
+ * `autopilotTemplates.ts`, which is this form with the default template's
+ * text as the prompt when there is no earlier autopilot.
  */
 export function autopilotStartForm(last?: AutopilotSpec): AutopilotStartForm {
   const form: AutopilotStartForm = {

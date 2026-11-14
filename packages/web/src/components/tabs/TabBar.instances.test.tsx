@@ -237,7 +237,6 @@ describe("the new-tab machine step", () => {
 
   function openInteractive() {
     fireEvent.click(screen.getByTitle("New tab"));
-    fireEvent.click(screen.getByRole("button", { name: /^Interactive agent/ }));
   }
 
   it("groups the machines, defaults to the selected tab's machine and sends the pick", () => {

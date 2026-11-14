@@ -128,8 +128,10 @@ function renderScreen() {
 
 function openInteractiveSheet() {
   fireEvent.click(screen.getByRole("button", { name: "Add agent" }));
+  // "+" opens the interactive agent sheet directly: no agent-type step.
   const sheet = screen.getByRole("dialog", { name: "Add agent" });
-  fireEvent.click(within(sheet).getByRole("button", { name: /^Interactive agent/ }));
+  expect(within(sheet).queryByRole("button", { name: /^Interactive agent/ })).toBeNull();
+  expect(within(sheet).queryByRole("button", { name: /^Autonomous worker/ })).toBeNull();
   return sheet;
 }
 
@@ -395,6 +397,94 @@ describe("choosing a machine for a new mobile agent", () => {
     const [add] = sent("add_pane");
     expect(add).toMatchObject({ session_id: SID, machine_id: ZOO5, kind: "terminal" });
     expectValid(add);
+  });
+
+  it("opens the agent profiles at once and never offers Pi", () => {
+    seed(10);
+    act(() => useStore.setState({
+      projectPolicies: {
+        [SID]: {
+          teamAvailable: false,
+          // A policy stored before Pi was retired can still list its profile.
+          allowedLaunchProfiles: [
+            "terminal:claude:official:default",
+            "terminal:pi:official:default",
+            "terminal:omp:official:default",
+          ],
+          version: 4,
+          projectSuspended: false,
+          noncompliantPaneIds: [],
+        },
+      },
+    }));
+    renderScreen();
+    fireEvent.click(screen.getByRole("button", { name: "Add agent" }));
+    const sheet = screen.getByRole("dialog", { name: "Add agent" });
+
+    // No agent-type step: the profiles are there on the first tap. An
+    // autonomous worker is created from Overview.
+    expect(within(sheet).queryByText("Back to agent types")).toBeNull();
+    expect(within(sheet).queryByRole("button", { name: /^Autonomous worker/ })).toBeNull();
+    expect(within(sheet).getByRole("button", { name: /^Claude terminal/ })).toBeTruthy();
+    expect(within(sheet).getByRole("button", { name: /^OMP terminal/ })).toBeTruthy();
+    expect(within(sheet).queryByRole("button", { name: /^Pi terminal/ })).toBeNull();
+  });
+
+  it("shows a saved Pi tab as read-only history: no composer, terminal or reboot", () => {
+    seed(77);
+    act(() => useStore.setState({
+      paneConfigs: [
+        { ...terminal(77, "Pi 1", ZOO5, "zoo-005"), provider: "pi" },
+        { ...terminal(78, "OMP 2", ZOO5, "zoo-005"), provider: "omp" },
+      ],
+    }));
+    renderScreen();
+
+    // The screen says why, in the words the desktop tab uses.
+    expect(screen.getByText(
+      "Pi is no longer supported. Use OMP instead. This tab's history is available, but it cannot receive input or be restarted.",
+    )).toBeTruthy();
+    // A tab with no history is not "still starting up".
+    expect(screen.queryByRole("button", { name: "Open raw terminal to finish setting up this agent" })).toBeNull();
+    const composer = screen.getByPlaceholderText("This tab is read-only");
+    expect(composer).toHaveProperty("disabled", true);
+    expect(screen.getByRole("button", { name: "Send conversation message" })).toHaveProperty("disabled", true);
+
+    fireEvent.click(screen.getByRole("button", { name: "More actions" }));
+    expect(screen.queryByRole("button", { name: "Reboot this pane" })).toBeNull();
+    expect(screen.getByRole("button", { name: "Open raw terminal" })).toHaveProperty("disabled", true);
+    // Closing it is what clears it from the project.
+    expect(screen.getByRole("button", { name: "Close this pane" })).toHaveProperty("disabled", false);
+
+    // The real store refuses too, so nothing is sent and nothing is pending.
+    expect(useStore.getState().sendTerminalConversationMessage(77, "hello pi").success).toBe(false);
+    expect(sent("terminal_conversation_input")).toEqual([]);
+    expect(sent("terminal_input")).toEqual([]);
+    expect(useStore.getState().pendingTerminalDeliveries).toEqual([]);
+  });
+
+  it("keeps the composer, terminal and reboot of an OMP tab beside a saved Pi tab", () => {
+    seed(78);
+    act(() => useStore.setState({
+      paneConfigs: [
+        { ...terminal(77, "Pi 1", ZOO5, "zoo-005"), provider: "pi" },
+        { ...terminal(78, "OMP 2", ZOO5, "zoo-005"), provider: "omp" },
+      ],
+    }));
+    renderScreen();
+
+    expect(screen.queryByText(/Pi is no longer supported/)).toBeNull();
+    const composer = screen.getByPlaceholderText("Message this terminal conversation");
+    expect(composer).toHaveProperty("disabled", false);
+    fireEvent.change(composer, { target: { value: "hello omp" } });
+    fireEvent.click(screen.getByRole("button", { name: "Send conversation message" }));
+    const [input] = sent("terminal_conversation_input");
+    expect(input).toMatchObject({ pane_id: 78, text: "hello omp" });
+    expectValid(input);
+
+    fireEvent.click(screen.getByRole("button", { name: "More actions" }));
+    expect(screen.getByRole("button", { name: "Reboot this pane" })).toHaveProperty("disabled", false);
+    expect(screen.getByRole("button", { name: "Open raw terminal" })).toHaveProperty("disabled", false);
   });
 
   it("leaves the sheet unchanged with a single eligible machine", () => {

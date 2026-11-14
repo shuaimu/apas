@@ -250,6 +250,21 @@ describe("starting autopilot from a phone", () => {
     expect(sheet.className).toContain("rounded-t-[1.4rem]");
     expect(sheet.parentElement?.className).toContain("items-end");
     expect(document.activeElement).not.toBe(within(sheet).getByLabelText("Prompt"));
+    // Only the body scrolls; Cancel and Start autopilot stay in a footer
+    // below it, on screen wherever the body is scrolled to.
+    expect(sheet.className.split(" ")).toEqual(expect.arrayContaining(["flex", "flex-col", "overflow-hidden"]));
+    const sheetBody = within(sheet).getByTestId("autopilot-start-body");
+    const sheetFooter = within(sheet).getByTestId("autopilot-start-footer");
+    expect(sheetBody.parentElement).toBe(sheet);
+    expect(sheetFooter.parentElement).toBe(sheet);
+    expect(sheetBody.nextElementSibling).toBe(sheetFooter);
+    expect(sheetBody.className.split(" ")).toEqual(expect.arrayContaining(["min-h-0", "overflow-y-auto"]));
+    expect(sheetFooter.className.split(" ")).toContain("shrink-0");
+    for (const name of ["Cancel", "Start autopilot"]) {
+      const action = within(sheet).getByRole("button", { name });
+      expect(sheetFooter.contains(action)).toBe(true);
+      expect(sheetBody.contains(action)).toBe(false);
+    }
 
     const statement = within(sheet).getByRole("list", { name: "What autopilot is and is not" }).textContent ?? "";
     expect(statement).toContain("This tab keeps running on zoo-006");
@@ -1019,6 +1034,41 @@ describe("the raw terminal view", () => {
     }
     expect(ws.send).not.toHaveBeenCalled();
     expect(useStore.getState().autopilotRequests).toEqual({});
+  });
+});
+
+describe("the Overview's tab rows", () => {
+  it("say what each tab is doing, where, and its autopilot, and open the tab", () => {
+    seed([
+      tab(6, "OMP on 5", { machine_id: ZOO5, hostname: "zoo-005" }),
+      tab(7, "OMP 1"),
+      tab(8, "OMP 2"),
+      tab(9, "OMP 3"),
+    ], 8, {
+      entries: {
+        7: { support: "supported", state: autopilot("running") },
+        9: { support: "supported", state: autopilot("paused", "failures") },
+      },
+      // Only zoo-006 runs the project: zoo-005's tab cannot be used.
+      instances: [{ machineId: ZOO6, hostname: "zoo-006", primary: true, runtimeAccess: true }],
+      paneStatuses: { [paneKey(7)]: "Working", [paneKey(9)]: "Pending answer" },
+    });
+    renderScreen();
+    fireEvent.click(screen.getByRole("button", { name: "Project overview" }));
+
+    const panel = screen.getByRole("region", { name: "Interactive project" });
+    const rows = within(panel).getAllByRole("button");
+    expect(rows.map((row) => Array.from(row.querySelectorAll("span > span")).map((part) => part.textContent))).toEqual([
+      // The roster spans two machines, so each row names its own.
+      ["OMP on 5", "Not running on zoo-005"],
+      ["OMP 1", "Working · zoo-006 · On autopilot"],
+      ["OMP 2", "Idle · zoo-006"],
+      ["OMP 3", "Pending answer · zoo-006 · Autopilot paused"],
+    ]);
+
+    fireEvent.click(rows[1]);
+    expect(screen.queryByRole("region", { name: "Project overview" })).toBeNull();
+    expect(notice()).toBeTruthy();
   });
 });
 

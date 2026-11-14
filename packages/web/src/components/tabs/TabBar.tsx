@@ -20,7 +20,9 @@ import {
 import {
   DEEPSEEK_FLASH_MODEL,
   isDeepseekModel,
+  isRetiredPiProvider,
   isRetiredProviderModel,
+  PI_RETIRED_MESSAGE,
 } from "@/lib/providerOptions";
 import { autopilotMarkerLabel, type AutopilotListStatus } from "@/lib/autopilot";
 
@@ -38,8 +40,6 @@ interface TabBarProps {
     kind?: PaneKind,
     machine?: MachineChoice,
   ) => void;
-  onAddAutonomous?: () => void;
-  autonomousUnavailableReason?: string;
   jobTabs?: ReactNode;
   overviewTab?: ReactNode;
   onRenameTab?: (paneId: number, newLabel: string) => void;
@@ -195,7 +195,16 @@ function ProviderIcon({
     );
   }
   if (isRetiredProviderModel(provider, model)) {
-    return <span className={`${className} text-center font-bold`} aria-label="Unsupported provider">!</span>;
+    // A saved Pi tab lands here too: Pi was retired, and its tab stays listed
+    // until someone closes it.
+    return (
+      <span
+        className={`${className} text-center font-bold`}
+        aria-label={isRetiredPiProvider(provider) ? PI_RETIRED_MESSAGE : "Unsupported provider"}
+      >
+        !
+      </span>
+    );
   }
   if (isDeepseekTab(provider, model, label)) {
     // DeepSeek logo — stylized whale silhouette (abstracted as a "D" with fin)
@@ -215,18 +224,15 @@ function ProviderIcon({
   }
   if (provider === "omp") {
     // OMP is Pi-derived; the doubled pi marks the fork without a new glyph.
+    // Drawn inside the icon's own box, like the other providers' marks: as
+    // plain text the two letters were wider than the 14px box and ran into
+    // the tab's name. `textLength` fits them to the box at any icon size.
     return (
-      <span className={`${className} text-center font-bold leading-none`} aria-label="OMP">
-        ππ
-      </span>
-    );
-  }
-  if (provider === "pi") {
-    // Pi logo — the Greek letter the terminal harness is named for.
-    return (
-      <span className={`${className} text-center font-bold leading-none`} aria-label="Pi">
-        π
-      </span>
+      <svg className={className} viewBox="0 0 24 24" fill="currentColor" role="img" aria-label="OMP" data-provider-icon="omp">
+        <text x="12" y="19" textAnchor="middle" fontSize="26" fontWeight="700" textLength="23" lengthAdjust="spacingAndGlyphs">
+          ππ
+        </text>
+      </svg>
     );
   }
   if (provider === "cursor-agent") {
@@ -251,8 +257,6 @@ export function TabBar({
   onSelectTab,
   onCloseTab,
   onAddTab,
-  onAddAutonomous,
-  autonomousUnavailableReason,
   jobTabs,
   overviewTab,
   onRenameTab,
@@ -495,11 +499,11 @@ export function TabBar({
                       ? "text-sky-500"
                       : tab.provider === "opencode"
                         ? "text-orange-500"
-                        : tab.provider === "pi"
-                          ? "text-purple-500"
+                        : tab.provider === "omp"
+                          ? "text-violet-500"
                           : isUnsupported
                             ? "text-red-500"
-                              : "text-blue-500"
+                            : "text-blue-500"
                 }`}
                 title={
                   tab.provider === "codex"
@@ -508,10 +512,12 @@ export function TabBar({
                       ? "Cursor"
                       : tab.provider === "opencode"
                         ? "OpenCode"
-                        : tab.provider === "pi"
-                          ? "Pi"
-                          : isUnsupported
-                            ? "Unsupported provider"
+                        : tab.provider === "omp"
+                          ? "OMP"
+                          : isRetiredPiProvider(tab.provider)
+                            ? PI_RETIRED_MESSAGE
+                            : isUnsupported
+                              ? "Unsupported provider"
                               : "Claude"
                 }
               >
@@ -687,8 +693,6 @@ export function TabBar({
       <div className="flex items-center gap-1 pr-1">
         <AddTabButton
           onAddTab={onAddTab}
-          onAddAutonomous={onAddAutonomous}
-          autonomousUnavailableReason={autonomousUnavailableReason}
           machineChoices={machineChoices}
         />
         {/* One slot, two states: a project is either open or closed. Closing
@@ -865,15 +869,14 @@ function MachineChoiceFieldset({
 
 function AddTabButton({
   onAddTab,
-  onAddAutonomous,
-  autonomousUnavailableReason,
   machineChoices,
-}: Pick<TabBarProps, "onAddTab" | "onAddAutonomous" | "autonomousUnavailableReason" | "machineChoices">) {
-  // Presentation only; server/CLI still enforce interactive profile policy,
-  // and autonomous admission has its own authority and readiness checks.
+}: Pick<TabBarProps, "onAddTab" | "machineChoices">) {
+  // "+" creates an interactive agent and nothing else. An autonomous worker is
+  // created from the Overview tab or /code/workers, where its mandate,
+  // readiness and limits are reviewed.
+  // Presentation only; server/CLI still enforce interactive profile policy.
   const isAllowed = useIsLaunchProfileAllowed();
   const [showMenu, setShowMenu] = useState(false);
-  const [interactive, setInteractive] = useState(false);
   const [isolatedWorktree, setIsolatedWorktree] = useState(false);
   const [machineKey, setMachineKey] = useState<string | null>(null);
   const [position, setPosition] = useState({ top: 0, left: 12 });
@@ -909,7 +912,6 @@ function AddTabButton({
   const toggleMenu = () => {
     const rect = buttonRef.current?.getBoundingClientRect();
     if (rect) setPosition({ top: rect.bottom + 4, left: Math.max(12, Math.min(rect.right - 288, window.innerWidth - 300)) });
-    setInteractive(false);
     // Each opening starts from the default: the selected tab's machine.
     setMachineKey(null);
     setShowMenu((value) => !value);
@@ -925,7 +927,6 @@ function AddTabButton({
     { provider: "claude", label: "Claude / DeepSeek 4.1 Flash", model: DEEPSEEK_FLASH_MODEL },
     { provider: "codex", label: "Codex" },
     { provider: "opencode", label: "OpenCode" },
-    { provider: "pi", label: "Pi" },
     { provider: "omp", label: "OMP" },
   ].filter((entry) => isAllowed("terminal", entry.provider, entry.model));
 
@@ -950,51 +951,34 @@ function AddTabButton({
           className="fixed w-72 max-w-[calc(100vw-24px)] overflow-y-auto bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-lg shadow-lg py-1 z-50"
           style={{ ...position, maxHeight: `calc(100dvh - ${position.top + 12}px)` }}
         >
-          {!interactive ? <>
-            <button type="button" onClick={() => setInteractive(true)} className="w-full min-h-11 text-left px-3 py-3 hover:bg-gray-100 dark:hover:bg-gray-700">
-              <span className="block text-sm font-semibold">Interactive agent</span>
-              <span className="block mt-1 text-xs text-gray-500 dark:text-gray-400">Work directly with a provider in a terminal.</span>
-            </button>
+          <label
+            className="flex min-h-11 items-center gap-2 px-3 py-2 text-xs text-gray-600 dark:text-gray-300 border-b border-gray-100 dark:border-gray-700 cursor-pointer"
+            title="Runs in a fresh git worktree so it cannot race other panes on file edits. Requires a git repository."
+          >
+            <input type="checkbox" checked={isolatedWorktree} onChange={(event) => setIsolatedWorktree(event.target.checked)} className="h-4 w-4" />
+            Isolated git worktree
+          </label>
+          {showMachineStep && machineChoices && (
+            <MachineChoiceFieldset model={machineChoices} selectedKey={selectedKey} onSelect={setMachineKey} />
+          )}
+          <p className="px-3 pt-2 text-xs font-semibold text-gray-500 dark:text-gray-400">Interactive provider</p>
+          {needsMachine && (
+            <p className="px-3 pt-1 text-xs text-gray-500 dark:text-gray-400">Choose where the tab runs first.</p>
+          )}
+          {providers.map((entry) => (
             <button
               type="button"
-              disabled={!onAddAutonomous}
-              onClick={() => { setShowMenu(false); onAddAutonomous?.(); }}
-              className="w-full min-h-11 text-left px-3 py-3 hover:bg-gray-100 dark:hover:bg-gray-700 disabled:opacity-60 disabled:cursor-not-allowed"
+              key={entry.model ? `${entry.provider}/${entry.model}` : entry.provider}
+              disabled={needsMachine}
+              title={needsMachine ? "Choose where the tab runs first" : undefined}
+              onClick={() => handlePick(entry.provider, entry.model)}
+              className="w-full min-h-11 text-left px-3 py-2 text-sm hover:bg-gray-100 dark:hover:bg-gray-700 flex items-center gap-2 disabled:cursor-not-allowed disabled:opacity-50 disabled:hover:bg-transparent"
             >
-              <span className="block text-sm font-semibold">Autonomous worker</span>
-              <span className="block mt-1 text-xs text-gray-500 dark:text-gray-400">{autonomousUnavailableReason || (onAddAutonomous ? "Review a responsibility, standing checklist and recurring allowance." : "Open a project to configure autonomous work.")}</span>
+              <span className="flex-shrink-0 text-gray-500 dark:text-gray-400"><ProviderIcon provider={entry.provider} className="w-4 h-4" /></span>
+              {entry.label}
             </button>
-          </> : <>
-            <button type="button" onClick={() => setInteractive(false)} className="min-h-11 w-full text-left px-3 text-sm text-blue-600 dark:text-blue-400 hover:bg-gray-100 dark:hover:bg-gray-700">Back to agent types</button>
-            <label
-              className="flex min-h-11 items-center gap-2 px-3 py-2 text-xs text-gray-600 dark:text-gray-300 border-y border-gray-100 dark:border-gray-700 cursor-pointer"
-              title="Runs in a fresh git worktree so it cannot race other panes on file edits. Requires a git repository."
-            >
-              <input type="checkbox" checked={isolatedWorktree} onChange={(event) => setIsolatedWorktree(event.target.checked)} className="h-4 w-4" />
-              Isolated git worktree
-            </label>
-            {showMachineStep && machineChoices && (
-              <MachineChoiceFieldset model={machineChoices} selectedKey={selectedKey} onSelect={setMachineKey} />
-            )}
-            <p className="px-3 pt-2 text-xs font-semibold text-gray-500 dark:text-gray-400">Interactive provider</p>
-            {needsMachine && (
-              <p className="px-3 pt-1 text-xs text-gray-500 dark:text-gray-400">Choose where the tab runs first.</p>
-            )}
-            {providers.map((entry) => (
-              <button
-                type="button"
-                key={entry.model ? `${entry.provider}/${entry.model}` : entry.provider}
-                disabled={needsMachine}
-                title={needsMachine ? "Choose where the tab runs first" : undefined}
-                onClick={() => handlePick(entry.provider, entry.model)}
-                className="w-full min-h-11 text-left px-3 py-2 text-sm hover:bg-gray-100 dark:hover:bg-gray-700 flex items-center gap-2 disabled:cursor-not-allowed disabled:opacity-50 disabled:hover:bg-transparent"
-              >
-                <span className="flex-shrink-0 text-gray-500 dark:text-gray-400"><ProviderIcon provider={entry.provider} className="w-4 h-4" /></span>
-                {entry.label}
-              </button>
-            ))}
-            {!providers.length && <p className="px-3 py-3 text-sm">No interactive provider is allowed by this project&apos;s launch policy.</p>}
-          </>}
+          ))}
+          {!providers.length && <p className="px-3 py-3 text-sm">No interactive provider is allowed by this project&apos;s launch policy.</p>}
         </div>
       )}
     </div>

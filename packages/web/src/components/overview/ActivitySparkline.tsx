@@ -16,8 +16,8 @@ interface ActivitySparklineProps {
 
 export function ActivitySparkline({
   messages,
-  width = 80,
-  height = 18,
+  width = 96,
+  height = 20,
   now,
 }: ActivitySparklineProps) {
   const { buckets, total, max } = useMemo(
@@ -31,6 +31,9 @@ export function ActivitySparkline({
       ? "no activity in last hour"
       : `${total} message${total === 1 ? "" : "s"} in last hour`;
 
+  // A baseline is always drawn, so the strip reads as an hour of time whether
+  // or not anything happened in it. The bars are tall and saturated enough to
+  // be seen at a glance; the faint grey ones this replaced were not.
   return (
     <svg
       width={width}
@@ -38,40 +41,32 @@ export function ActivitySparkline({
       viewBox={`0 0 ${width} ${height}`}
       role="img"
       aria-label={title}
-      className="text-gray-300 dark:text-gray-600"
+      className="shrink-0 text-gray-200 dark:text-gray-700"
     >
       <title>{title}</title>
-      {max === 0 ? (
-        <line
-          x1={0}
-          y1={height - 0.5}
-          x2={width}
-          y2={height - 0.5}
-          stroke="currentColor"
-          strokeWidth={1}
-          strokeDasharray="2 2"
-        />
-      ) : (
-        buckets.map((count, idx) => {
-          if (count === 0) return null;
-          const h = Math.max(1, (count / max) * (height - 2));
-          const isLatest = idx === BUCKET_COUNT - 1;
-          return (
-            <rect
-              key={idx}
-              x={idx * barWidth}
-              y={height - h}
-              width={Math.max(0.8, barWidth - 0.3)}
-              height={h}
-              className={
-                isLatest
-                  ? "fill-indigo-500 dark:fill-indigo-400"
-                  : "fill-gray-400 dark:fill-gray-500"
-              }
-            />
-          );
-        })
-      )}
+      <line
+        x1={0}
+        y1={height - 0.5}
+        x2={width}
+        y2={height - 0.5}
+        stroke="currentColor"
+        strokeWidth={1}
+      />
+      {buckets.map((count, idx) => {
+        if (count === 0) return null;
+        const h = Math.max(3, (count / max) * (height - 2));
+        return (
+          <rect
+            key={idx}
+            x={idx * barWidth}
+            y={height - 1 - h}
+            width={Math.max(1, barWidth - 0.4)}
+            height={h}
+            rx={0.5}
+            className="fill-blue-500 dark:fill-blue-400"
+          />
+        );
+      })}
     </svg>
   );
 }

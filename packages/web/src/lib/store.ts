@@ -19,7 +19,9 @@ import {
 import {
   canonicalDeepseekModel,
   DEEPSEEK_DEFAULT_MODEL,
+  isRetiredPiProvider,
   isRetiredProviderModel,
+  PI_RETIRED_MESSAGE,
 } from "./providerOptions";
 import {
   PANE_STATUS_PENDING_ANSWER,
@@ -224,7 +226,9 @@ export interface UsageLimitedStatus {
 
 export type Provider = "claude" | "codex" | "minimax" | "glm" | "deepseek" | "opencode" | "pi" | "omp" | "cursor-agent";
 
-export type SupportedProvider = Exclude<Provider, "minimax" | "glm">;
+/** Providers that can run a tab. The retired ones stay in `Provider` so a
+ *  saved tab and an older frame still parse. */
+export type SupportedProvider = Exclude<Provider, "minimax" | "glm" | "pi">;
 
 export type UsageLimitsByProvider = Partial<Record<SupportedProvider, UsageLimits>>;
 
@@ -386,6 +390,8 @@ export interface ProjectUsageStats {
 }
 
 export interface EffectiveProjectPolicy {
+  /** Retained from the wire for older servers and builds. Team mode is
+   *  removed: nothing may read this to decide anything. */
   teamAvailable: boolean;
   allowedLaunchProfiles: string[];
   version: number;
@@ -635,6 +641,7 @@ function normalizeProvider(raw: unknown): Provider | null {
     if (normalized === "glm" || normalized === "zai" || normalized === "z.ai" || normalized === "zhipu") return "glm";
     if (normalized === "deepseek" || normalized === "deep_seek" || normalized === "deep-seek") return "deepseek";
     if (normalized === "opencode") return "opencode";
+    // Retired, and still parsed: an old roster or stored session names it.
     if (normalized === "pi") return "pi";
     if (normalized === "omp" || normalized === "oh-my-pi") return "omp";
     if (normalized === "cursor-agent" || normalized === "cursor_agent" || normalized === "cursor") return "cursor-agent";
@@ -1709,7 +1716,6 @@ function newTabRefusal(
     return "Legacy bot creation is retired. Review an autonomous worker mandate instead.";
   }
   const kind = spec.kind ?? "agent";
-  const managed = spec.managed ?? false;
   if (machineId) {
     if (!state.negotiatedCapabilities.has(PROJECT_INSTANCES_CAPABILITY)) {
       return "Choosing a machine for a new tab needs a newer APAS server.";
@@ -1725,6 +1731,7 @@ function newTabRefusal(
   }
   const policy = state.projectPolicies[sessionId];
   const typedProvider = spec.provider as Provider;
+  if (isRetiredPiProvider(spec.provider)) return PI_RETIRED_MESSAGE;
   if (isRetiredProviderModel(spec.provider, spec.model)) {
     return "MiniMax and GLM providers are no longer supported.";
   }
@@ -1734,10 +1741,9 @@ function newTabRefusal(
   if (policy.projectSuspended) {
     return "This project is suspended by a cluster administrator.";
   }
-  if (managed && !policy.teamAvailable) {
-    return `Team launch is disabled by cluster policy v${policy.version}.`;
-  }
-  if (!managed && kind === "agent") {
+  // `managed` and the policy's `teamAvailable` are leftovers of the removed
+  // team mode: neither refuses nor permits anything.
+  if (kind === "agent") {
     return "Conversation-only panes are retired. Create a Claude, Codex, or OpenCode terminal pane instead.";
   }
   if (!policyAllowsLaunch(policy, kind, typedProvider, spec.model)) {
@@ -3297,6 +3303,9 @@ export const useStore = create<AppState>((set, get) => ({
     const paneConfig = paneId == null
       ? undefined
       : paneConfigs.find((candidate) => candidate.pane_id === paneId);
+    if (paneConfig && isRetiredPiProvider(paneConfig.provider)) {
+      return { success: false, error: `${PI_RETIRED_MESSAGE} This tab is read-only.` };
+    }
     if (paneConfig && isRetiredProviderModel(paneConfig.provider, paneConfig.model)) {
       return {
         success: false,
@@ -3472,9 +3481,12 @@ export const useStore = create<AppState>((set, get) => ({
   },
 
   resumePane: (paneId: number) => {
-    const { ws, sessionId, paneConfigs, projectPolicies, showToast } = get();
+    const { ws, sessionId, paneConfigs, showToast } = get();
     const pane = paneConfigs.find((candidate) => candidate.pane_id === paneId);
-    const policy = sessionId ? projectPolicies[sessionId] : undefined;
+    if (pane && isRetiredPiProvider(pane.provider)) {
+      showToast(PI_RETIRED_MESSAGE, "error");
+      return;
+    }
     if (pane && isRetiredProviderModel(pane.provider, pane.model)) {
       showToast("This pane uses a retired provider and cannot be resumed", "error");
       return;
@@ -3483,11 +3495,10 @@ export const useStore = create<AppState>((set, get) => ({
       showToast("Legacy bots cannot be resumed. Create and approve a new autonomous worker independently.", "error");
       return;
     }
-    // No allowlist check: it decides what may be created, and this pane exists.
-    // Team availability still applies — it is the switch that stops a running
-    // team, not a catalogue of profiles.
-    if (!sessionId || !pane || (pane.managed && !policy?.teamAvailable)) {
-      showToast("Resume refused by the current cluster policy", "error");
+    // No policy check: the allowlist decides what may be created, and this
+    // pane exists. A pane an older `.apas` marked managed is an ordinary pane.
+    if (!sessionId || !pane) {
+      showToast("This tab is no longer open, so it cannot be resumed", "error");
       return;
     }
     if (ws && ws.readyState === WebSocket.OPEN) {
@@ -3496,9 +3507,12 @@ export const useStore = create<AppState>((set, get) => ({
   },
 
   rebootPane: (paneId: number) => {
-    const { ws, sessionId, paneConfigs, projectPolicies, showToast } = get();
+    const { ws, sessionId, paneConfigs, showToast } = get();
     const pane = paneConfigs.find((candidate) => candidate.pane_id === paneId);
-    const policy = sessionId ? projectPolicies[sessionId] : undefined;
+    if (pane && isRetiredPiProvider(pane.provider)) {
+      showToast(PI_RETIRED_MESSAGE, "error");
+      return;
+    }
     if (pane && isRetiredProviderModel(pane.provider, pane.model)) {
       showToast("This pane uses a retired provider and cannot be rebooted", "error");
       return;
@@ -3507,9 +3521,9 @@ export const useStore = create<AppState>((set, get) => ({
       showToast("Legacy bots cannot be restored. Create and approve a new autonomous worker independently.", "error");
       return;
     }
-    // Existing pane: team availability only, never the allowlist.
-    if (!sessionId || !pane || (pane.managed && !policy?.teamAvailable)) {
-      showToast("Reboot refused by the current cluster policy", "error");
+    // Existing pane: never the allowlist, and nothing for a managed marker.
+    if (!sessionId || !pane) {
+      showToast("This tab is no longer open, so it cannot be rebooted", "error");
       return;
     }
     if (ws && ws.readyState === WebSocket.OPEN) {
@@ -3530,13 +3544,13 @@ export const useStore = create<AppState>((set, get) => ({
       backstory?: string;
       planReviewMode?: PlanReviewMode;
     },
-    /** v3.5 — true when this pane is being added through the Overview's
-     *  + Add Worker flow (joins the team / Tech Lead can delegate to it);
-     *  false (default) when it's a TabBar + side chat / experiment. */
+    /** A leftover of the removed team mode. It is still sent, because the
+     *  wire keeps the field, and it decides nothing here or on the server.
+     *  No caller passes true. */
     managed: boolean = false,
     /** "terminal" hosts the provider's real TUI on a pty instead of the
-     *  headless stream-json worker. Such panes are never managed — they
-     *  publish no stream events, so the Tech Lead can't delegate to them. */
+     *  headless stream-json worker, and is the only kind that can be
+     *  created. Its `managed` is always sent false. */
     kind: PaneKind = "agent",
     /** Machine whose instance runs the tab; absent = the primary. */
     machineId?: string,
@@ -3769,8 +3783,11 @@ export const useStore = create<AppState>((set, get) => ({
 
   /** Forward keystrokes to the pane's pty. */
   sendTerminalInput: (paneId: number, data: string) => {
-    const { ws, sessionId } = get();
+    const { ws, sessionId, paneConfigs } = get();
     if (!sessionId || !ws || ws.readyState !== WebSocket.OPEN) return;
+    // A retired provider's tab (a saved Pi tab) has no terminal to type into.
+    const pane = paneConfigs.find((candidate) => candidate.pane_id === paneId);
+    if (pane && isRetiredProviderModel(pane.provider, pane.model)) return;
     // xterm hands us a JS string whose code units are the input bytes
     // (it does its own UTF-8 encoding), so treat it as binary here.
     const bytes = new Uint8Array(data.length);
@@ -3784,12 +3801,24 @@ export const useStore = create<AppState>((set, get) => ({
   },
 
   sendTerminalConversationMessage: (paneId: number, text: string) => {
-    const { ws, sessionId, isAttached } = get();
+    const { ws, sessionId, isAttached, paneConfigs } = get();
     if (!ws || ws.readyState !== WebSocket.OPEN) {
       return { success: false, error: "Not connected to server" };
     }
     if (!sessionId || !isAttached) {
       return { success: false, error: "Session is not active. Start the CLI to send messages." };
+    }
+    // The same refusals `sendMessageToPane` gives. A retired provider's tab
+    // has no agent, so a message sent to it would stay unconfirmed forever.
+    const paneConfig = paneConfigs.find((candidate) => candidate.pane_id === paneId);
+    if (paneConfig && isRetiredPiProvider(paneConfig.provider)) {
+      return { success: false, error: `${PI_RETIRED_MESSAGE} This tab is read-only.` };
+    }
+    if (paneConfig && isRetiredProviderModel(paneConfig.provider, paneConfig.model)) {
+      return {
+        success: false,
+        error: "This pane uses a retired provider and is read-only.",
+      };
     }
     const body = text.trim();
     if (!body) return { success: false, error: "Message cannot be empty" };
@@ -3894,6 +3923,19 @@ export const useStore = create<AppState>((set, get) => ({
     const pane = paneConfigs.find((candidate) => candidate.pane_id === paneId);
     const desiredProvider = (provider || pane?.provider) as Provider | undefined;
     const policy = sessionId ? projectPolicies[sessionId] : undefined;
+    if (pane && isRetiredPiProvider(pane.provider)) {
+      // The tab itself is Pi. It cannot become another provider: the server
+      // and its CLI refuse the switch too.
+      showToast(
+        `Tab ${paneId} uses Pi, which is no longer supported. Close it and open an OMP tab.`,
+        "error",
+      );
+      return;
+    }
+    if (pane && isRetiredPiProvider(desiredProvider)) {
+      showToast(PI_RETIRED_MESSAGE, "error");
+      return;
+    }
     if (
       pane && (
         isRetiredProviderModel(pane.provider, pane.model)
@@ -3903,7 +3945,7 @@ export const useStore = create<AppState>((set, get) => ({
       showToast("This provider is retired; model and provider switches are disabled", "error");
       return;
     }
-    if (!sessionId || !pane || !desiredProvider || (pane.managed && !policy?.teamAvailable) || !policyAllowsLaunch(
+    if (!sessionId || !pane || !desiredProvider || !policyAllowsLaunch(
       policy,
       pane.kind ?? "agent",
       desiredProvider,
@@ -4068,8 +4110,7 @@ export const useStore = create<AppState>((set, get) => ({
           === targetMachineId)
       : paneConfigs;
     if (!policy || affectedPanes.some((pane) =>
-      (pane.managed && !policy.teamAvailable)
-      || !policyAllowsLaunch(policy, pane.kind ?? "agent", pane.provider, pane.model)
+      !policyAllowsLaunch(policy, pane.kind ?? "agent", pane.provider, pane.model)
     )) {
       showToast("CLI reboot refused because one or more panes are outside cluster policy", "error");
       return null;

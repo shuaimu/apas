@@ -60,6 +60,10 @@ function card(label: string): HTMLElement {
   return screen.getByTitle(`Open ${label}`);
 }
 
+function closeButton(label: string): HTMLElement {
+  return within(card(label)).getByRole("button", { name: `Close tab ${label}` });
+}
+
 function agentSelect(label: string): HTMLSelectElement {
   return within(card(label)).getByTitle(/Agent frontend \/ API backend/) as HTMLSelectElement;
 }
@@ -76,22 +80,123 @@ describe("PaneGrid empty states", () => {
     });
   });
 
-  it("shows Remove for unmanaged side chats with coordinator-like roles", () => {
+  it("offers Close tab for unmanaged side chats with coordinator-like roles", () => {
     seedPaneGrid([
       pane({ pane_id: 20, label: "Side Manager", role: "manager", managed: false }),
       pane({ pane_id: 21, label: "Side Tech Lead", role: "tech lead", managed: false }),
     ]);
 
-    const { onRemovePane } = renderPaneGrid();
+    const { onRemovePane, onOpenPane } = renderPaneGrid();
 
-    expect(within(card("Side Manager")).getByText("Remove")).toBeTruthy();
-    expect(within(card("Side Tech Lead")).getByText("Remove")).toBeTruthy();
+    expect(closeButton("Side Manager").textContent).toBe("Close tab");
+    expect(closeButton("Side Tech Lead").textContent).toBe("Close tab");
 
-    fireEvent.click(within(card("Side Manager")).getByText("Remove"));
-    fireEvent.click(within(card("Side Tech Lead")).getByText("Remove"));
+    fireEvent.click(closeButton("Side Manager"));
+    fireEvent.click(closeButton("Side Tech Lead"));
 
     expect(onRemovePane).toHaveBeenCalledWith(20);
     expect(onRemovePane).toHaveBeenCalledWith(21);
+    // Closing a tab from its card does not also open it.
+    expect(onOpenPane).not.toHaveBeenCalled();
+  });
+
+  it("opens a tab from its name, which is a button, and from anywhere on its card", () => {
+    seedPaneGrid([pane({ pane_id: 24, label: "Docs", role: undefined, managed: false })]);
+    const { onOpenPane } = renderPaneGrid();
+
+    const name = screen.getByRole("button", { name: "Open Docs" });
+    expect(name.textContent).toBe("Docs");
+    fireEvent.click(name);
+    expect(onOpenPane).toHaveBeenCalledTimes(1);
+    expect(onOpenPane).toHaveBeenLastCalledWith(24);
+
+    fireEvent.click(card("Docs"));
+    expect(onOpenPane).toHaveBeenCalledTimes(2);
+  });
+
+  it("gives every card a status line, and says when a tab last worked", () => {
+    seedPaneGrid(
+      [
+        pane({ pane_id: 25, label: "Busy", role: undefined, managed: false }),
+        pane({ pane_id: 26, label: "Quiet", role: undefined, managed: false }),
+        pane({ pane_id: 27, label: "Reported", role: undefined, managed: false }),
+      ],
+      vi.fn(),
+      { "25": "Working..." },
+    );
+    const counters = { prompts: 0, responses: 0, input_tokens: 0, output_tokens: 0, cache_read_tokens: 0, cache_creation_tokens: 0, cost_usd: 0 };
+    useStore.setState({
+      sessionId: "S",
+      // The server's record covers a tab whose messages this browser never loaded.
+      usageStats: { S: { panes: [{ pane_id: 27, lifetime: counters, last_7d: counters, today: counters, last_active: new Date(Date.now() - 5 * 60_000).toISOString() }], lifetime: counters, last_7d: counters, today: counters } },
+    });
+    renderPaneGrid();
+
+    expect(within(card("Busy")).getByText("Working...")).toBeTruthy();
+    expect(within(card("Quiet")).getByText("Idle")).toBeTruthy();
+    expect(within(card("Quiet")).getByText(/No activity yet/)).toBeTruthy();
+    expect(within(card("Reported")).getByText(/Last active 5m ago/)).toBeTruthy();
+  });
+
+  it("lists the cards in the tab bar's order, whatever their ids or states", () => {
+    // The roster's order is the tab bar's. Ids are not creation order, and a
+    // working tab keeps its place.
+    seedPaneGrid(
+      [
+        pane({ pane_id: 612, label: "First in tab bar", role: undefined, managed: false }),
+        pane({ pane_id: 265, label: "Second", role: undefined, managed: false }),
+        pane({ pane_id: 44, label: "Third", role: undefined, managed: false }),
+      ],
+      vi.fn(),
+      { "44": "Working..." },
+    );
+    renderPaneGrid();
+
+    expect(screen.getAllByRole("heading", { level: 4 }).map((heading) => heading.textContent))
+      .toEqual(["First in tab bar", "Second", "Third"]);
+  });
+
+  it("never shows a negative time when the server's clock is ahead of this browser's", () => {
+    seedPaneGrid([
+      pane({ pane_id: 28, label: "Ahead", role: undefined, managed: false }),
+      pane({ pane_id: 29, label: "Recent", role: undefined, managed: false }),
+    ]);
+    const counters = { prompts: 0, responses: 0, input_tokens: 0, output_tokens: 0, cache_read_tokens: 0, cache_creation_tokens: 0, cost_usd: 0 };
+    const usage = (pane_id: number, offsetMs: number) => ({
+      pane_id,
+      lifetime: counters,
+      last_7d: counters,
+      today: counters,
+      last_active: new Date(Date.now() + offsetMs).toISOString(),
+    });
+    useStore.setState({
+      sessionId: "S",
+      usageStats: { S: { panes: [usage(28, 90_000), usage(29, -44_000)], lifetime: counters, last_7d: counters, today: counters } },
+    });
+    renderPaneGrid();
+
+    // Same words as the usage table's row for the same tab.
+    expect(within(card("Ahead")).getByText("· Last active just now")).toBeTruthy();
+    expect(within(card("Recent")).getByText("· Last active just now")).toBeTruthy();
+    expect(card("Ahead").textContent).not.toMatch(/-\d/);
+  });
+
+  it("says what a terminal tab runs", () => {
+    seedPaneGrid([
+      { ...pane({ pane_id: 28, label: "Flash", role: undefined, managed: false, model: DEEPSEEK_FLASH_MODEL }), kind: "terminal" },
+      { ...pane({ pane_id: 29, label: "Shell", role: undefined, managed: false, provider: "omp" }), kind: "terminal" },
+    ]);
+    renderPaneGrid();
+
+    expect(within(card("Flash")).getByText("Claude / DeepSeek 4.1 Flash")).toBeTruthy();
+    expect(within(card("Shell")).getByText("OMP")).toBeTruthy();
+    expect(within(card("Shell")).queryByRole("combobox")).toBeNull();
+  });
+
+  it("points a project without tabs at the tab bar", () => {
+    seedPaneGrid([]);
+    renderPaneGrid();
+    expect(screen.getByText(/No tabs yet/)).toBeTruthy();
   });
 
   it("labels a blocked pane as pending answer rather than thinking", () => {
@@ -117,7 +222,7 @@ describe("PaneGrid empty states", () => {
     expect(screen.queryByText("+ Add to team")).toBeNull();
     fireEvent.click(card("Earlier coordinator"));
     expect(onOpenPane).toHaveBeenCalledWith(23);
-    fireEvent.click(within(card("Earlier coordinator")).getByText("Remove"));
+    fireEvent.click(closeButton("Earlier coordinator"));
     expect(onRemovePane).toHaveBeenCalledWith(23);
   });
 });
@@ -307,7 +412,7 @@ describe("PaneGrid existing-pane selectors", () => {
     expect(within(retiredCard).queryByText("Role")).toBeNull();
     expect(within(retiredCard).queryByText("Resume")).toBeNull();
     expect(within(retiredCard).queryByText("+ Add to team")).toBeNull();
-    fireEvent.click(within(retiredCard).getByText("Remove"));
+    fireEvent.click(closeButton("Historical Worker"));
     expect(onRemovePane).toHaveBeenCalledWith(61);
     expect(updatePaneModel).not.toHaveBeenCalled();
     expect(promotePaneToManaged).not.toHaveBeenCalled();
