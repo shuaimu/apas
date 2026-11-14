@@ -11,6 +11,7 @@ use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
 
 pub mod autopilot;
+pub mod autopilot_prompts;
 pub mod instances;
 mod local_projects;
 pub mod pane_launches;
@@ -156,6 +157,12 @@ pub struct SessionManager {
     /// arrived, by session, pane and request id. Removed on receipt, on
     /// disconnect, or when the requester stops waiting.
     autopilot_waiters: DashMap<(Uuid, u32, String), autopilot::AutopilotWaiter>,
+    /// Changes to a session's saved autopilot prompts forwarded to its
+    /// primary instance whose receipt has not arrived, by session and request
+    /// id. Removed on receipt, on disconnect, or when the requester stops
+    /// waiting.
+    autopilot_prompts_waiters:
+        DashMap<(Uuid, String), autopilot_prompts::AutopilotPromptsWaiter>,
     /// Per-user mobile mutation request state. A retry with the same opaque
     /// request id either observes the retained acknowledgement or waits for
     /// the original in-flight operation; it never applies the action twice.
@@ -381,6 +388,14 @@ pub struct SessionState {
     /// autopilot lives in its OMP session, and its instance reports it again
     /// after every registration.
     pub pane_autopilot: HashMap<u32, autopilot::PaneAutopilotReport>,
+    /// The project's saved autopilot prompts as the primary instance last
+    /// reported them, kept when it leaves. In memory only; see
+    /// `autopilot_prompts`.
+    pub autopilot_prompts: Option<autopilot_prompts::AutopilotPromptsView>,
+    /// Each attached instance's last report of the saved prompts, by its
+    /// connection, so the next primary's list is shown at once on a
+    /// handover. Dropped with its instance.
+    pub autopilot_prompts_reports: HashMap<Uuid, autopilot_prompts::AutopilotPromptsView>,
     /// Cached project_goal.md content (last `ProjectGoalChanged` from CLI).
     /// Replayed to newly-attaching web clients so a hard-refresh doesn't
     /// leave the Project goal textbox empty until the next file change.
@@ -435,6 +450,8 @@ impl SessionState {
             pane_statuses: HashMap::new(),
             pane_idle_since: HashMap::new(),
             pane_autopilot: HashMap::new(),
+            autopilot_prompts: None,
+            autopilot_prompts_reports: HashMap::new(),
             project_goal: None,
             working_dir: None,
             hostname: None,
@@ -510,6 +527,7 @@ impl SessionManager {
             omp_answer_waiters: DashMap::new(),
             autopilot_request_ids: DashMap::new(),
             autopilot_waiters: DashMap::new(),
+            autopilot_prompts_waiters: DashMap::new(),
             mutation_requests: DashMap::new(),
             mutation_request_order: DashMap::new(),
             lifecycle_requests: DashMap::new(),
@@ -999,6 +1017,8 @@ impl SessionManager {
             .retain(|_, pending| pending.cli_id != *cli_id);
         // Dropping a waiter answers its request as not confirmed at once.
         self.autopilot_waiters
+            .retain(|_, pending| pending.cli_id != *cli_id);
+        self.autopilot_prompts_waiters
             .retain(|_, pending| pending.cli_id != *cli_id);
         let keys_to_remove: Vec<(Uuid, Provider)> = self
             .cli_usage_limits
@@ -2638,6 +2658,8 @@ impl SessionManager {
             pane_statuses: s.pane_statuses.clone(),
             pane_idle_since: s.pane_idle_since.clone(),
             pane_autopilot: s.pane_autopilot.clone(),
+            autopilot_prompts: s.autopilot_prompts.clone(),
+            autopilot_prompts_reports: s.autopilot_prompts_reports.clone(),
             project_goal: s.project_goal.clone(),
             working_dir: s.working_dir.clone(),
             hostname: s.hostname.clone(),

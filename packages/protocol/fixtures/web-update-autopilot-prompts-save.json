@@ -1,0 +1,11 @@
+{
+  "type": "update_autopilot_prompts",
+  "session_id": "20000000-0000-4000-8000-000000000001",
+  "request_id": "prompts-1",
+  "change": {
+    "kind": "save",
+    "name": "Nightly review",
+    "prompt": "Review the open pull requests and fix what the checks report.",
+    "replace": true
+  }
+}

@@ -1,0 +1,9 @@
+{
+  "type": "update_autopilot_prompts",
+  "session_id": "20000000-0000-4000-8000-000000000001",
+  "request_id": "prompts-2",
+  "change": {
+    "kind": "delete",
+    "name": "Nightly review"
+  }
+}

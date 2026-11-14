@@ -211,14 +211,74 @@ fn update_project_operations(
 /// One tick of the flag rebroadcast: the project's settings as `.apas` holds
 /// them now, or as last read when it cannot be read.
 fn project_flags_message(store: &ProjectStore) -> CliToServer {
-    let meta = store.read();
+    project_flags_frame(store, &store.read())
+}
+
+/// [`project_flags_message`] for a read already made.
+fn project_flags_frame(store: &ProjectStore, meta: &ProjectMetadata) -> CliToServer {
     CliToServer::ProjectFlagsChanged {
         session_id: store.project_id,
         auto_approve_todos: meta.auto_approve_todos,
         auto_merge_prs: meta.auto_merge_prs,
         team_enabled: meta.team_enabled,
-        disallowed_tab_types: meta.disallowed_tab_types,
+        disallowed_tab_types: meta.disallowed_tab_types.clone(),
     }
+}
+
+/// Apply one change to the project's saved autopilot prompts and answer it:
+/// exactly one receipt, then the list as `.apas` now holds it, both on
+/// `queue` so they reach the server in that order. Nothing here touches a
+/// tab: saving a prompt never starts, pauses or stops an autopilot.
+///
+/// Blocking: it waits for the project lock. A request for another session is
+/// refused without reading anything.
+fn update_autopilot_prompts(
+    store: &ProjectStore,
+    reporter: &crate::autopilot_prompts::PromptsReporter,
+    session_id: Uuid,
+    target_session: Uuid,
+    request_id: String,
+    change: &shared::AutopilotPromptChange,
+    queue: &tokio_mpsc::Sender<CliToServer>,
+) {
+    let written = if target_session == session_id {
+        crate::project_instances::update_autopilot_prompts(
+            &store.dir,
+            store.project_id,
+            change,
+            &crate::autopilot_prompts::now_rfc3339(),
+        )
+    } else {
+        Ok(Err("This project's runtime does not run that session.".to_string()))
+    };
+    let receipt = crate::autopilot_prompts::receipt(target_session, request_id, written);
+    if queue.blocking_send(receipt).is_err() {
+        return;
+    }
+    report_autopilot_prompts(store, reporter, session_id, true, queue);
+}
+
+/// Queue the saved prompts for the server: always after a registration and
+/// a change, otherwise only when their content differs from what was last
+/// sent. A server that did not echo the capability is sent nothing.
+fn report_autopilot_prompts(
+    store: &ProjectStore,
+    reporter: &crate::autopilot_prompts::PromptsReporter,
+    session_id: Uuid,
+    always: bool,
+    queue: &tokio_mpsc::Sender<CliToServer>,
+) -> bool {
+    // The ticket is taken before the read, so this copy is never reported
+    // after a newer read's (`PromptsReporter`).
+    let ticket = if always {
+        reporter.fresh_ticket()
+    } else {
+        reporter.ticket()
+    };
+    let view = crate::autopilot_prompts::PromptsView::of_metadata(&store.read());
+    reporter.report(session_id, view, ticket, always, |frame| {
+        queue.try_send(frame).is_ok()
+    })
 }
 
 /// The settings snapshot sent after every (re)connect, which the server takes
@@ -3007,6 +3067,11 @@ async fn run_inner(
     // Explicit connection state, for the heartbeat that tells each OMP tab
     // whether its controller is present and can reach the server.
     let server_link = Arc::new(crate::omp_autopilot::ServerLink::new());
+    // The project's saved autopilot prompts: what was last reported, and the
+    // one queue every list frame and receipt goes out on, so they reach the
+    // server in the order they were decided.
+    let prompts_reporter = Arc::new(crate::autopilot_prompts::PromptsReporter::new());
+    let (prompts_tx, prompts_rx) = tokio_mpsc::channel::<CliToServer>(16);
 
     // Shutdown flag
     // Supplied by the caller so a project can be stopped from outside; a
@@ -3271,6 +3336,8 @@ async fn run_inner(
         let project_policy_for_server = project_policy.clone();
         let connection_generation_for_server = server_connection_generation.clone();
         let server_link_for_server = server_link.clone();
+        let prompts_reporter_for_server = prompts_reporter.clone();
+        let prompts_tx_for_server = prompts_tx.clone();
         let instance = instance.clone();
         let store = store.clone();
         tokio::spawn(async move {
@@ -3297,6 +3364,7 @@ async fn run_inner(
                 store,
                 connection_generation_for_server,
                 server_link_for_server,
+                (prompts_reporter_for_server, prompts_tx_for_server, prompts_rx),
                 reboot_handoff,
             )
             .await
@@ -3535,9 +3603,27 @@ async fn run_inner(
         let server_tx_for_flags = server_tx.clone();
         let shutdown_for_flags = shutdown.clone();
         let store_for_flags = store.clone();
+        let prompts_reporter_for_flags = prompts_reporter.clone();
+        let prompts_tx_for_flags = prompts_tx.clone();
         thread::spawn(move || {
             while !shutdown_for_flags.load(Ordering::SeqCst) {
-                let _ = server_tx_for_flags.blocking_send(project_flags_message(&store_for_flags));
+                // Taken before the read: a change that writes the prompts
+                // after this read reports them itself, and this older copy
+                // is then not reported after it (`PromptsReporter`).
+                let prompts_ticket = prompts_reporter_for_flags.ticket();
+                let meta = store_for_flags.read();
+                let _ = server_tx_for_flags
+                    .blocking_send(project_flags_frame(&store_for_flags, &meta));
+                // The saved prompts ride the same read, but are sent only
+                // when their content changed: a list can be large.
+                let view = crate::autopilot_prompts::PromptsView::of_metadata(&meta);
+                prompts_reporter_for_flags.report(
+                    session_id,
+                    view,
+                    prompts_ticket,
+                    false,
+                    |frame| prompts_tx_for_flags.try_send(frame).is_ok(),
+                );
                 thread::sleep(Duration::from_secs(5));
             }
         });
@@ -10788,6 +10874,7 @@ mod tests {
         // Speaking the autopilot protocol does not depend on the instance.
         // Whether a tab can run autopilot is reported per tab.
         assert!(capabilities.contains(&shared::OMP_TAB_AUTOPILOT_CAPABILITY.to_string()));
+        assert!(capabilities.contains(&shared::PROJECT_AUTOPILOT_PROMPTS_CAPABILITY.to_string()));
         assert!(capabilities.contains(&shared::PANE_WORK_SUMMARY_CAPABILITY.to_string()));
         assert!(capabilities.contains(&shared::PERSISTENT_TERMINAL_HOST_CAPABILITY.to_string()));
     }
@@ -10838,6 +10925,213 @@ mod tests {
                     .collect::<Vec<_>>()
             );
         });
+    }
+
+    /// A change to the saved prompts is answered with exactly one receipt and
+    /// then the list, in that order, on the one queue; a refusal writes
+    /// nothing. The list goes out after each registration and then only when
+    /// the periodic read finds its content changed, and never to a server
+    /// that did not echo the capability. Nothing here touches a tab.
+    #[test]
+    fn saved_prompt_changes_are_answered_once_and_then_listed() {
+        use crate::autopilot_prompts::PromptsReporter;
+        let _config = crate::config::test_config::isolated_config_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let other_machine = Uuid::new_v4();
+        let mut metadata = ProjectMetadata::with_id_and_name(Uuid::new_v4(), None);
+        let mut theirs = recorded_pane(7, shared::PaneKind::Terminal, Some((other_machine, "zoo-006")));
+        theirs.provider = Provider::Omp;
+        metadata.panes = vec![theirs];
+        write_metadata(dir.path(), &metadata);
+        let store = existing_project_store(dir.path(), instance_owner("zoo-005"));
+        let session = metadata.id;
+        let reporter = PromptsReporter::new();
+        let (queue, mut sent) = tokio_mpsc::channel::<CliToServer>(16);
+        let mut drain = || {
+            let mut frames = Vec::new();
+            while let Ok(frame) = sent.try_recv() {
+                frames.push(frame);
+            }
+            frames
+        };
+        let names = |frame: &CliToServer| match frame {
+            CliToServer::ProjectAutopilotPrompts {
+                session_id,
+                prompts,
+                default,
+                unreadable,
+            } => {
+                assert_eq!(*session_id, session);
+                assert!(!unreadable);
+                (
+                    prompts.iter().map(|saved| saved.name.clone()).collect::<Vec<_>>(),
+                    default.clone(),
+                )
+            }
+            other => panic!("expected the list, got {other:?}"),
+        };
+        let receipt_of = |frame: &CliToServer| match frame {
+            CliToServer::AutopilotPromptsReceipt {
+                session_id,
+                request_id,
+                outcome,
+                reason,
+            } => (*session_id, request_id.clone(), *outcome, reason.clone()),
+            other => panic!("expected a receipt, got {other:?}"),
+        };
+        let save = |name: &str, replace: bool| shared::AutopilotPromptChange::Save {
+            name: name.into(),
+            prompt: "Review the open pull requests.".into(),
+            replace,
+        };
+
+        // Registered with a server that cannot take the list: the receipt
+        // still answers the request, and no list follows.
+        reporter.registered(&[shared::OMP_TAB_AUTOPILOT_CAPABILITY.to_string()]);
+        super::update_autopilot_prompts(
+            &store, &reporter, session, session, "r1".into(), &save("Nightly", false), &queue,
+        );
+        let frames = drain();
+        assert_eq!(frames.len(), 1, "{frames:?}");
+        assert_eq!(
+            receipt_of(&frames[0]),
+            (session, "r1".to_string(), shared::AutopilotReceiptOutcome::Accepted, None)
+        );
+
+        // A server that echoes it is sent the list at registration, and the
+        // periodic read of the same content sends nothing more.
+        reporter.registered(&[shared::PROJECT_AUTOPILOT_PROMPTS_CAPABILITY.to_string()]);
+        assert!(super::report_autopilot_prompts(&store, &reporter, session, true, &queue));
+        for _ in 0..3 {
+            assert!(!super::report_autopilot_prompts(&store, &reporter, session, false, &queue));
+        }
+        let frames = drain();
+        assert_eq!(frames.len(), 1);
+        assert_eq!(names(&frames[0]), (vec!["Nightly".to_string()], None));
+
+        // A refusal: one receipt with the reason, then the unchanged list.
+        let before = std::fs::read(crate::project::get_apas_path(dir.path())).unwrap();
+        super::update_autopilot_prompts(
+            &store, &reporter, session, session, "r2".into(), &save("nightly", false), &queue,
+        );
+        let frames = drain();
+        assert_eq!(frames.len(), 2, "{frames:?}");
+        assert_eq!(
+            receipt_of(&frames[0]),
+            (
+                session,
+                "r2".to_string(),
+                shared::AutopilotReceiptOutcome::Refused,
+                Some("A saved prompt named \"Nightly\" already exists.".to_string())
+            )
+        );
+        assert_eq!(names(&frames[1]), (vec!["Nightly".to_string()], None));
+        assert_eq!(std::fs::read(crate::project::get_apas_path(dir.path())).unwrap(), before);
+
+        // A request for another session is refused without writing.
+        super::update_autopilot_prompts(
+            &store,
+            &reporter,
+            session,
+            Uuid::new_v4(),
+            "r3".into(),
+            &shared::AutopilotPromptChange::Delete { name: "Nightly".into() },
+            &queue,
+        );
+        let frames = drain();
+        assert_eq!(receipt_of(&frames[0]).2, shared::AutopilotReceiptOutcome::Refused);
+        assert_eq!(std::fs::read(crate::project::get_apas_path(dir.path())).unwrap(), before);
+
+        // Making it the default: receipt, then the list naming the default.
+        super::update_autopilot_prompts(
+            &store,
+            &reporter,
+            session,
+            session,
+            "r4".into(),
+            &shared::AutopilotPromptChange::SetDefault { name: Some("NIGHTLY".into()) },
+            &queue,
+        );
+        let frames = drain();
+        assert_eq!(frames.len(), 2);
+        assert_eq!(receipt_of(&frames[0]).2, shared::AutopilotReceiptOutcome::Accepted);
+        assert_eq!(
+            names(&frames[1]),
+            (vec!["Nightly".to_string()], Some("Nightly".to_string()))
+        );
+
+        // A person edits `.apas` by hand: the next periodic read reports it,
+        // once.
+        crate::project_instances::update_autopilot_prompts(
+            dir.path(),
+            session,
+            &save("Release check", false),
+            "2026-11-14T10:00:00Z",
+        )
+        .unwrap()
+        .unwrap();
+        assert!(super::report_autopilot_prompts(&store, &reporter, session, false, &queue));
+        assert!(!super::report_autopilot_prompts(&store, &reporter, session, false, &queue));
+        let frames = drain();
+        assert_eq!(frames.len(), 1);
+        assert_eq!(
+            names(&frames[0]).0,
+            vec!["Nightly".to_string(), "Release check".to_string()]
+        );
+
+        // The other machine's tab is still in the file as it was, and no
+        // autopilot request or input went anywhere: the queue held only
+        // receipts and lists.
+        let disk = read_project_metadata(dir.path()).unwrap();
+        assert_eq!(disk.panes.len(), 1);
+        assert_eq!(disk.panes[0].machine_id, Some(other_machine));
+    }
+
+    /// The dispatch arm applies a change on the blocking pool of the
+    /// runtime the connection runs in, where the store's reads step off the
+    /// runtime. The receipt and the list still go out.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_saved_prompt_change_is_answered_from_the_blocking_pool() {
+        let config = crate::config::test_config::isolated_config_dir();
+        let config_dir = config.path().to_path_buf();
+        let dir = tempfile::tempdir().unwrap();
+        let metadata = ProjectMetadata::with_id_and_name(Uuid::new_v4(), None);
+        write_metadata(dir.path(), &metadata);
+        let store = existing_project_store(dir.path(), instance_owner("zoo-005"));
+        let reporter = Arc::new(crate::autopilot_prompts::PromptsReporter::new());
+        reporter.registered(&[shared::PROJECT_AUTOPILOT_PROMPTS_CAPABILITY.to_string()]);
+        let (queue, mut sent) = tokio_mpsc::channel::<CliToServer>(16);
+        let session = metadata.id;
+        tokio::task::spawn_blocking(move || {
+            crate::config::test_config::with_config_dir(&config_dir, || {
+                super::update_autopilot_prompts(
+                    &store,
+                    &reporter,
+                    session,
+                    session,
+                    "r1".into(),
+                    &shared::AutopilotPromptChange::Save {
+                        name: "Nightly".into(),
+                        prompt: "Review.".into(),
+                        replace: false,
+                    },
+                    &queue,
+                )
+            })
+        })
+        .await
+        .unwrap();
+        assert!(matches!(
+            sent.recv().await,
+            Some(CliToServer::AutopilotPromptsReceipt {
+                outcome: shared::AutopilotReceiptOutcome::Accepted,
+                ..
+            })
+        ));
+        assert!(matches!(
+            sent.recv().await,
+            Some(CliToServer::ProjectAutopilotPrompts { prompts, .. }) if prompts.len() == 1
+        ));
     }
 
     #[test]
@@ -13116,6 +13410,9 @@ fn cli_capabilities(
         // The build speaks the autopilot protocol. Whether one tab can run
         // autopilot is data, reported per tab as its support value.
         shared::OMP_TAB_AUTOPILOT_CAPABILITY.to_string(),
+        // Saved autopilot prompts live in `.apas`, which every run can write
+        // through the locked merge.
+        shared::PROJECT_AUTOPILOT_PROMPTS_CAPABILITY.to_string(),
         shared::CLI_LIFECYCLE_CAPABILITY.to_string(),
     ];
     if pane_summaries {
@@ -13187,6 +13484,13 @@ async fn run_server_connection(
     // from, and whether it can control autopilot: what the heartbeat tells
     // each OMP tab.
     server_link: Arc<crate::omp_autopilot::ServerLink>,
+    // The saved autopilot prompts: what was last reported, and the queue
+    // their frames and receipts go out on.
+    (prompts_reporter, prompts_tx, mut prompts_rx): (
+        Arc<crate::autopilot_prompts::PromptsReporter>,
+        tokio_mpsc::Sender<CliToServer>,
+        tokio_mpsc::Receiver<CliToServer>,
+    ),
     mut reboot_handoff: Option<(std::path::PathBuf, crate::pane_host::RebootHandoffMarker)>,
 ) -> Result<()> {
     use futures::{SinkExt, StreamExt};
@@ -13223,6 +13527,7 @@ async fn run_server_connection(
     while !shutdown.load(Ordering::SeqCst) {
         let ws_url = format!("{}/ws/cli", server_url);
         server_link.reconnecting();
+        prompts_reporter.disconnected();
 
         if connection_count > 0 {
             let _ = status_tx.send(PaneOutput {
@@ -13320,6 +13625,7 @@ async fn run_server_connection(
                 match registration_timeout {
                     Ok(Some(Ok((cli_id, negotiated_capabilities)))) => {
                         server_link.registered(&negotiated_capabilities);
+                        prompts_reporter.registered(&negotiated_capabilities);
                         let _ = status_tx.send(PaneOutput {
                             text: format!("[Server: Connected ({})]", &cli_id.to_string()[..8]),
                             pane_id: shared::PANE_ID_DEADLOOP,
@@ -13400,6 +13706,10 @@ async fn run_server_connection(
                 if let Ok(text) = serde_json::to_string(&project_policy_snapshot(&store)) {
                     let _ = ws_sender.send(Message::Text(text.into())).await;
                 }
+                // The saved prompts, once per registration, after the attach
+                // they belong to. Queued, so anything decided earlier goes
+                // out first and this copy is the one the server keeps.
+                report_autopilot_prompts(&store, &prompts_reporter, session_id, true, &prompts_tx);
 
                 // Send PaneList separately too
                 let pane_list_msg = CliToServer::PaneList {
@@ -13507,6 +13817,13 @@ async fn run_server_connection(
                     tokio::select! {
                         Some(result) = omp_answer_rx.recv() => {
                             if let Ok(text) = serde_json::to_string(&result) {
+                                if ws_sender.send(Message::Text(text.into())).await.is_err() {
+                                    break;
+                                }
+                            }
+                        }
+                        Some(frame) = prompts_rx.recv() => {
+                            if let Ok(text) = serde_json::to_string(&frame) {
                                 if ws_sender.send(Message::Text(text.into())).await.is_err() {
                                     break;
                                 }
@@ -15556,6 +15873,21 @@ async fn run_server_connection(
                                                         .send(Message::Text(text.into()))
                                                         .await;
                                                 }
+                                            }
+                                            ServerToCli::UpdateAutopilotPrompts {
+                                                session_id: target_session, request_id, change,
+                                            } => {
+                                                let store = store.clone();
+                                                let reporter = prompts_reporter.clone();
+                                                let queue = prompts_tx.clone();
+                                                // The write waits for the project lock, and this
+                                                // task also serves every other message.
+                                                tokio::task::spawn_blocking(move || {
+                                                    update_autopilot_prompts(
+                                                        &store, &reporter, session_id,
+                                                        target_session, request_id, &change, &queue,
+                                                    );
+                                                });
                                             }
                                             ServerToCli::UpdateProjectFlags {
                                                 session_id: _,

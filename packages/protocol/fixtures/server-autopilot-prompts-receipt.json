@@ -1,0 +1,7 @@
+{
+  "type": "autopilot_prompts_receipt",
+  "session_id": "20000000-0000-4000-8000-000000000001",
+  "request_id": "prompts-1",
+  "outcome": "refused",
+  "reason": "A saved prompt named \"Nightly review\" already exists."
+}

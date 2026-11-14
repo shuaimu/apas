@@ -602,6 +602,38 @@ pub enum CliToServer {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reported_at: Option<String>,
     },
+
+    /// How this instance answered one [`ServerToCli::UpdateAutopilotPrompts`]:
+    /// exactly one per request. `Accepted` means the change is written to
+    /// `.apas`; the list follows as [`Self::ProjectAutopilotPrompts`].
+    /// `Refused` carries the reason and means `.apas` was not written. The
+    /// server relays only the primary instance's receipt.
+    AutopilotPromptsReceipt {
+        session_id: Uuid,
+        request_id: String,
+        outcome: crate::AutopilotReceiptOutcome,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+    },
+
+    /// The project's saved autopilot prompts as this instance's `.apas` holds
+    /// them. Sent after each registration that echoed
+    /// [`crate::PROJECT_AUTOPILOT_PROMPTS_CAPABILITY`], after each change it
+    /// applied, and when its periodic `.apas` read finds the list's content
+    /// changed; never periodically otherwise. The server keeps the primary
+    /// instance's report.
+    ProjectAutopilotPrompts {
+        session_id: Uuid,
+        prompts: Vec<crate::SavedAutopilotPrompt>,
+        /// The name of the project's default saved prompt, if any.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        default: Option<String>,
+        /// `.apas` holds a list that does not parse. `prompts` is then empty
+        /// and every change is refused until a person fixes the file; the
+        /// CLI never rewrites it.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        unreadable: bool,
+    },
 }
 
 /// Messages sent from server to CLI client
@@ -614,7 +646,9 @@ pub enum ServerToCli {
         /// The capabilities this CLI advertised that the server implements
         /// and echoes, as [`ServerToDaemon::Registered`] does. Today that is
         /// [`crate::OMP_TAB_AUTOPILOT_CAPABILITY`]: a CLI that does not see it
-        /// echoed tells its tabs that the server cannot control autopilot.
+        /// echoed tells its tabs that the server cannot control autopilot;
+        /// and [`crate::PROJECT_AUTOPILOT_PROMPTS_CAPABILITY`]: a CLI that
+        /// does not see it echoed reports no saved prompts.
         /// Empty from an older server, and then left off the wire.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         negotiated_capabilities: Vec<String>,
@@ -921,6 +955,19 @@ pub enum ServerToCli {
         request_id: String,
         command: crate::AutopilotCommand,
     },
+
+    /// Apply one change to the project's saved autopilot prompts in `.apas`.
+    /// Sent to every attached instance that advertised
+    /// [`crate::PROJECT_AUTOPILOT_PROMPTS_CAPABILITY`]; each validates it
+    /// again against its own file
+    /// ([`crate::validate_autopilot_prompt_change`]), writes it through the
+    /// locked merge, and answers with exactly one
+    /// [`CliToServer::AutopilotPromptsReceipt`]. It sends nothing to any tab.
+    UpdateAutopilotPrompts {
+        session_id: Uuid,
+        request_id: String,
+        change: crate::AutopilotPromptChange,
+    },
 }
 
 /// Which attached instance of a session a [`ServerToCli`] message is for.
@@ -1045,6 +1092,7 @@ impl ServerToCli {
             | Self::UpdateProjectFlags { .. }
             | Self::UpdateProjectOperations { .. }
             | Self::ProjectPolicy { .. }
+            | Self::UpdateAutopilotPrompts { .. }
             | Self::SessionDisconnected { .. } => Project,
 
             Self::Signal { .. } | Self::RebootCli { .. } | Self::CliLifecycleRequest { .. } => {
@@ -2091,6 +2139,20 @@ pub enum WebToServer {
         action: crate::AutopilotAction,
     },
 
+    /// Save, replace or delete one of the project's saved autopilot prompts,
+    /// or set or clear its default. Accepted from anyone who may start
+    /// autopilot on the session's tabs (runtime access), and only from a
+    /// connection that negotiated
+    /// [`crate::PROJECT_AUTOPILOT_PROMPTS_CAPABILITY`]. `request_id` is at
+    /// most [`crate::AUTOPILOT_REQUEST_ID_MAX_BYTES`]. Answered to the sender
+    /// only, with one [`ServerToWeb::AutopilotPromptsReceipt`]. A client
+    /// never resends it.
+    UpdateAutopilotPrompts {
+        session_id: Uuid,
+        request_id: String,
+        change: crate::AutopilotPromptChange,
+    },
+
     /// Liveness probe from the browser. Server echoes
     /// `ServerToWeb::Heartbeat` so the client can detect silently-stale
     /// connections (mobile OS throttling, NAT timeout, swallowed RST)
@@ -2735,6 +2797,35 @@ pub enum ServerToWeb {
         state: Option<Box<crate::PaneAutopilotState>>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reported_at: Option<String>,
+    },
+
+    /// The answer to one [`WebToServer::UpdateAutopilotPrompts`], sent to the
+    /// requesting connection only and only once: the primary instance's
+    /// receipt, a refusal by the server, or `Uncertain` when the primary did
+    /// not answer in time. The list a viewer shows changes only with
+    /// [`Self::ProjectAutopilotPrompts`].
+    AutopilotPromptsReceipt {
+        session_id: Uuid,
+        request_id: String,
+        outcome: crate::AutopilotReceiptOutcome,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+    },
+
+    /// The project's saved autopilot prompts, as the session's primary
+    /// instance reported them. Sent only to viewers that negotiated
+    /// [`crate::PROJECT_AUTOPILOT_PROMPTS_CAPABILITY`]: on attach, after
+    /// `SessionAttached`, when the server holds a list, and whenever the
+    /// list changes.
+    ProjectAutopilotPrompts {
+        session_id: Uuid,
+        prompts: Vec<crate::SavedAutopilotPrompt>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        default: Option<String>,
+        /// See `CliToServer::ProjectAutopilotPrompts::unreadable`: the
+        /// dialog says the list cannot be read and offers no save.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        unreadable: bool,
     },
 
     /// Echo of `WebToServer::Heartbeat`. The browser's liveness loop
@@ -6243,6 +6334,14 @@ mod project_instances_tests {
                 },
                 Project,
             ),
+            (
+                ServerToCli::UpdateAutopilotPrompts {
+                    session_id: s,
+                    request_id: "prompts-1".into(),
+                    change: crate::AutopilotPromptChange::SetDefault { name: None },
+                },
+                Project,
+            ),
             (ServerToCli::SessionDisconnected { session_id: s }, Project),
             (
                 ServerToCli::Signal {
@@ -6890,6 +6989,113 @@ mod project_instances_tests {
             serde_json::to_value(&receipt).unwrap()["outcome"],
             "uncertain"
         );
+    }
+
+    /// The saved-prompt frames keep their wire shape: a change's optional
+    /// fields may be left out, the list's empty default and readable flag
+    /// stay off the wire, and the forwarded change is project-wide.
+    #[test]
+    fn autopilot_prompt_frames_round_trip() {
+        let session_id = Uuid::new_v4();
+        let request: WebToServer = serde_json::from_value(json!({
+            "type": "update_autopilot_prompts",
+            "session_id": session_id,
+            "request_id": "prompts-1",
+            "change": { "kind": "save", "name": "Nightly review", "prompt": "Review." },
+        }))
+        .unwrap();
+        match request {
+            WebToServer::UpdateAutopilotPrompts {
+                change: crate::AutopilotPromptChange::Save { replace, .. },
+                ..
+            } => assert!(!replace),
+            other => panic!("expected UpdateAutopilotPrompts, got {other:?}"),
+        }
+        let clear: WebToServer = serde_json::from_value(json!({
+            "type": "update_autopilot_prompts",
+            "session_id": session_id,
+            "request_id": "prompts-2",
+            "change": { "kind": "set_default" },
+        }))
+        .unwrap();
+        assert!(matches!(
+            clear,
+            WebToServer::UpdateAutopilotPrompts {
+                change: crate::AutopilotPromptChange::SetDefault { name: None },
+                ..
+            }
+        ));
+
+        let forwarded = ServerToCli::UpdateAutopilotPrompts {
+            session_id,
+            request_id: "prompts-1".into(),
+            change: crate::AutopilotPromptChange::Delete {
+                name: "Nightly review".into(),
+            },
+        };
+        assert_eq!(forwarded.scope(), ServerToCliScope::Project);
+        assert_eq!(
+            serde_json::to_value(&forwarded).unwrap(),
+            json!({
+                "type": "update_autopilot_prompts",
+                "session_id": session_id,
+                "request_id": "prompts-1",
+                "change": { "kind": "delete", "name": "Nightly review" },
+            })
+        );
+
+        let empty = CliToServer::ProjectAutopilotPrompts {
+            session_id,
+            prompts: Vec::new(),
+            default: None,
+            unreadable: false,
+        };
+        assert_eq!(
+            serde_json::to_value(&empty).unwrap(),
+            json!({
+                "type": "project_autopilot_prompts",
+                "session_id": session_id,
+                "prompts": [],
+            })
+        );
+        let listed = ServerToWeb::ProjectAutopilotPrompts {
+            session_id,
+            prompts: vec![crate::SavedAutopilotPrompt {
+                name: "Nightly review".into(),
+                prompt: "Review.".into(),
+                updated_at: "2026-11-14T09:00:00Z".into(),
+            }],
+            default: Some("Nightly review".into()),
+            unreadable: true,
+        };
+        let value = serde_json::to_value(&listed).unwrap();
+        assert_eq!(value["default"], "Nightly review");
+        assert_eq!(value["unreadable"], true);
+        assert_eq!(value["prompts"][0]["updated_at"], "2026-11-14T09:00:00Z");
+        let back: ServerToWeb = serde_json::from_value(value).unwrap();
+        assert!(matches!(
+            back,
+            ServerToWeb::ProjectAutopilotPrompts { unreadable: true, .. }
+        ));
+
+        let receipt = CliToServer::AutopilotPromptsReceipt {
+            session_id,
+            request_id: "prompts-1".into(),
+            outcome: crate::AutopilotReceiptOutcome::Refused,
+            reason: Some(crate::AUTOPILOT_PROMPTS_UNREADABLE_REASON.into()),
+        };
+        let value = serde_json::to_value(&receipt).unwrap();
+        assert_eq!(value["type"], "autopilot_prompts_receipt");
+        assert_eq!(value["outcome"], "refused");
+        let relayed: ServerToWeb = serde_json::from_value(value).unwrap();
+        assert!(matches!(
+            relayed,
+            ServerToWeb::AutopilotPromptsReceipt {
+                outcome: crate::AutopilotReceiptOutcome::Refused,
+                reason: Some(_),
+                ..
+            }
+        ));
     }
 
     /// A refused input comes back as a rejection carrying the input's

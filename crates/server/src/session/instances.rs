@@ -326,6 +326,8 @@ struct LockedDetach {
     /// The panes whose cached status the detach dropped, which viewers are
     /// told are no longer busy.
     cleared_statuses: Vec<(u32, PaneType)>,
+    /// The saved prompts viewers are shown changed to the next primary's.
+    prompts_changed: bool,
 }
 
 impl SessionState {
@@ -369,12 +371,32 @@ impl SessionState {
             report.reporter != instance.cli_id && !departing.touches(*pane_id)
         });
         self.sync_primary();
+        // The saved prompts shown are the primary's. When it leaves, the next
+        // primary's last report takes their place at once: on separate
+        // checkouts it is a different list, and its CLI, having reported it
+        // already, sends it again only when it changes. A next primary that
+        // has reported nothing keeps the departed one's list on show, as
+        // `autopilot_prompts` explains.
+        self.autopilot_prompts_reports.remove(&instance.cli_id);
+        let mut prompts_changed = false;
+        if index == 0 {
+            let promoted = self
+                .instances
+                .first()
+                .and_then(|primary| self.autopilot_prompts_reports.get(&primary.cli_id))
+                .cloned();
+            if let Some(view) = promoted {
+                prompts_changed = self.autopilot_prompts.as_ref() != Some(&view);
+                self.autopilot_prompts = Some(view);
+            }
+        }
         LockedDetach {
             instance,
             was_primary: index == 0,
             primary: self.instances.first().cloned(),
             departing,
             cleared_statuses,
+            prompts_changed,
         }
     }
 }
@@ -580,6 +602,11 @@ impl SessionManager {
             session.pane_autopilot.retain(|_, report| {
                 report.reporter == cli_id || !replaced.contains(&report.reporter)
             });
+            // Nor are its saved prompts; the list on show stays until the new
+            // connection reports its own.
+            for old_cli in replaced.iter().filter(|old_cli| **old_cli != cli_id) {
+                session.autopilot_prompts_reports.remove(old_cli);
+            }
             match replace.split_first() {
                 Some((&first, rest)) => {
                     incoming.attached_at = session.instances[first].attached_at;
@@ -676,6 +703,7 @@ impl SessionManager {
             primary,
             departing,
             cleared_statuses,
+            prompts_changed,
         } = locked;
         if let Some(mut tracked) = self.cli_sessions.get_mut(&instance.cli_id) {
             tracked.retain(|tracked_session| tracked_session != session_id);
@@ -729,6 +757,9 @@ impl SessionManager {
         }
         self.broadcast_session_instances(session_id);
         self.broadcast_pane_autopilot(session_id, None);
+        if prompts_changed {
+            self.broadcast_autopilot_prompts(session_id);
+        }
         if let Some(user_id) = self.cli_users.get(&instance.cli_id).map(|owner| *owner) {
             self.broadcast_machines_update_for_user(&user_id);
         }

@@ -8,6 +8,7 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 mod attach;
 mod auth;
+mod autopilot_prompts;
 mod claude;
 mod claude_session_hook;
 mod config;

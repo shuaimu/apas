@@ -274,6 +274,73 @@
         }
       ]
     },
+    "AutopilotPromptChange": {
+      "description": "One change to a project's saved prompts\n(`WebToServer::UpdateAutopilotPrompts.change`). Validated by the server\nagainst its cached list and again by each CLI against its `.apas`, with\n[`validate_autopilot_prompt_change`].",
+      "oneOf": [
+        {
+          "description": "Save `prompt` under `name`. A name that is already saved, ignoring\ncase, is refused unless `replace` is true, which the dialog sends only\nafter telling the person the save replaces that prompt. A replacement\ntakes the entry's place in the list.",
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "save"
+            },
+            "name": {
+              "type": "string"
+            },
+            "prompt": {
+              "type": "string"
+            },
+            "replace": {
+              "type": "boolean",
+              "default": false
+            }
+          },
+          "required": [
+            "kind",
+            "name",
+            "prompt"
+          ]
+        },
+        {
+          "description": "Delete a saved prompt. Deleting the default also clears the default.",
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "delete"
+            },
+            "name": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "name"
+          ]
+        },
+        {
+          "description": "Make a saved prompt the project's default, or clear the default with\nno name.",
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "set_default"
+            },
+            "name": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "default": null
+            }
+          },
+          "required": [
+            "kind"
+          ]
+        }
+      ]
+    },
     "AutopilotReceiptOutcome": {
       "description": "How a request was answered. `Accepted` means the tab took the request; the\ndisplayed state changes only when the tab reports it.",
       "oneOf": [
@@ -4866,6 +4933,29 @@
         "min_interval_seconds"
       ]
     },
+    "SavedAutopilotPrompt": {
+      "description": "One prompt saved to a project, as `.apas` keeps it and the wire carries\nit.",
+      "type": "object",
+      "properties": {
+        "name": {
+          "description": "Trimmed, 1 to [`AUTOPILOT_PROMPT_NAME_MAX_CHARS`] characters, unique in\nthe project ignoring case.",
+          "type": "string"
+        },
+        "prompt": {
+          "description": "Meets the bounds of a start's prompt\n([`crate::validate_autopilot_prompt`]).",
+          "type": "string"
+        },
+        "updated_at": {
+          "description": "RFC 3339 time of the last save, set by the CLI that wrote it.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "prompt",
+        "updated_at"
+      ]
+    },
     "ServerToWeb": {
       "oneOf": [
         {
@@ -6525,6 +6615,73 @@
             "session_id",
             "pane_id",
             "support"
+          ]
+        },
+        {
+          "description": "The answer to one [`WebToServer::UpdateAutopilotPrompts`], sent to the\nrequesting connection only and only once: the primary instance's\nreceipt, a refusal by the server, or `Uncertain` when the primary did\nnot answer in time. The list a viewer shows changes only with\n[`Self::ProjectAutopilotPrompts`].",
+          "type": "object",
+          "properties": {
+            "outcome": {
+              "$ref": "#/$defs/AutopilotReceiptOutcome"
+            },
+            "reason": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "request_id": {
+              "type": "string"
+            },
+            "session_id": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "type": {
+              "type": "string",
+              "const": "autopilot_prompts_receipt"
+            }
+          },
+          "required": [
+            "type",
+            "session_id",
+            "request_id",
+            "outcome"
+          ]
+        },
+        {
+          "description": "The project's saved autopilot prompts, as the session's primary\ninstance reported them. Sent only to viewers that negotiated\n[`crate::PROJECT_AUTOPILOT_PROMPTS_CAPABILITY`]: on attach, after\n`SessionAttached`, when the server holds a list, and whenever the\nlist changes.",
+          "type": "object",
+          "properties": {
+            "default": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "prompts": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/SavedAutopilotPrompt"
+              }
+            },
+            "session_id": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "type": {
+              "type": "string",
+              "const": "project_autopilot_prompts"
+            },
+            "unreadable": {
+              "description": "See `CliToServer::ProjectAutopilotPrompts::unreadable`: the\ndialog says the list cannot be read and offers no save.",
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "type",
+            "session_id",
+            "prompts"
           ]
         },
         {
@@ -8813,6 +8970,32 @@
             "pane_id",
             "request_id",
             "action"
+          ]
+        },
+        {
+          "description": "Save, replace or delete one of the project's saved autopilot prompts,\nor set or clear its default. Accepted from anyone who may start\nautopilot on the session's tabs (runtime access), and only from a\nconnection that negotiated\n[`crate::PROJECT_AUTOPILOT_PROMPTS_CAPABILITY`]. `request_id` is at\nmost [`crate::AUTOPILOT_REQUEST_ID_MAX_BYTES`]. Answered to the sender\nonly, with one [`ServerToWeb::AutopilotPromptsReceipt`]. A client\nnever resends it.",
+          "type": "object",
+          "properties": {
+            "change": {
+              "$ref": "#/$defs/AutopilotPromptChange"
+            },
+            "request_id": {
+              "type": "string"
+            },
+            "session_id": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "type": {
+              "type": "string",
+              "const": "update_autopilot_prompts"
+            }
+          },
+          "required": [
+            "type",
+            "session_id",
+            "request_id",
+            "change"
           ]
         },
         {

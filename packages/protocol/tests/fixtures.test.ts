@@ -57,6 +57,35 @@ describe("Rust protocol golden fixtures", () => {
     expect(validateServerMessage({ ...receipt, outcome: "probably" }).valid).toBe(false);
   });
 
+  it("keeps older viewers connected: a schema without saved prompts cannot read their frames", async () => {
+    const { default: Ajv2020 } = await import("ajv/dist/2020.js");
+    const legacySchema = JSON.parse(readFileSync(
+      fileURLToPath(new URL("./legacy/server-to-web.pre-autopilot.schema.json", import.meta.url)), "utf8"));
+    const validate = new Ajv2020({ allErrors: true, strict: false }).compile(legacySchema);
+    // Which is why the server sends them only to viewers that negotiated
+    // project_autopilot_prompts_v1.
+    for (const name of [
+      "server-project-autopilot-prompts.json",
+      "server-project-autopilot-prompts-unreadable.json",
+      "server-autopilot-prompts-receipt.json",
+    ]) {
+      const frame = JSON.parse(readFileSync(`${fixturesDirectory}/${name}`, "utf8"));
+      expect(validate(frame), name).toBe(false);
+    }
+  });
+
+  it("parses each saved-prompt change and refuses an invented one", () => {
+    const save = JSON.parse(readFileSync(`${fixturesDirectory}/web-update-autopilot-prompts-save.json`, "utf8"));
+    const { replace: _replace, ...withoutReplace } = save.change;
+    expect(validateClientMessage({ ...save, change: withoutReplace }).valid).toBe(true);
+    expect(validateClientMessage({ ...save, change: { kind: "set_default" } }).valid).toBe(true);
+    expect(validateClientMessage({ ...save, change: { kind: "rename", name: "x" } }).valid).toBe(false);
+    expect(validateClientMessage({ ...save, change: { kind: "delete" } }).valid).toBe(false);
+    const list = JSON.parse(readFileSync(`${fixturesDirectory}/server-project-autopilot-prompts.json`, "utf8"));
+    const { updated_at: _updatedAt, ...undated } = list.prompts[0];
+    expect(validateServerMessage({ ...list, prompts: [undated] }).valid).toBe(false);
+  });
+
   it("still parses the retired Pi provider, in a frame from an older client and in a stored roster", () => {
     // Pi can no longer be created, and the server refuses a request for it.
     // The value stays in the schema so the frame is refused with a sentence

@@ -2683,6 +2683,44 @@ autopilot. With it off, the turn after that looks again, so a timed repeat or
 a later run rereads the files and never answers "nothing left" for ever. Keep
 the tests green has no end of its own: set a limit or stop it.
 
+**A project can keep its own prompts** in its `.apas` (since 2026-11-14,
+change `add-autopilot-prompt-library`). In the start dialog, **Save to
+project…** stores the prompt field's text under a name; with a saved prompt
+selected, **Make default** / **Clear default** and **Delete** (with a
+confirmation) change it. The Template control lists them under "This project",
+the default marked "(default)", before the built-ins. A tab's starting text is
+its last ended autopilot's prompt, else the project's default, else APAS
+worker. None of these actions sends anything to a tab or touches a running
+autopilot, and each is answered once (saved, refused with the reason, or not
+confirmed) and never resent. Anyone who may start autopilot on the project's
+tabs may change them.
+
+- **Storage.** Two optional top-level `.apas` fields: `autopilot_prompts`
+  (`[{name, prompt, updated_at}]`) and `default_autopilot_prompt`. Only the
+  CLI writes them, through the locked merge, so other machines' panes and
+  unknown fields are kept; deleting the last prompt removes both fields. A
+  value that does not parse is shown as "This project's saved prompts cannot
+  be read.", every change is refused, and the CLI never rewrites it: fix the
+  file by hand.
+- **Rules** (`crates/shared/src/autopilot_prompts.rs`, checked by the server
+  and again by the CLI): a name is 1 to 80 characters after trimming, unique
+  in the project ignoring case, and not a built-in template's name; a prompt
+  meets a start's bounds; at most 50 per project. A shared test fails if the
+  web's built-in template names change without
+  `AUTOPILOT_BUILTIN_TEMPLATE_NAMES`.
+- **Several machines.** A change goes to the primary instance first; only
+  after it accepts does the server send it to the other capable instances, so
+  on a shared home the second write cannot turn a save into a refusal. With
+  separate checkouts each keeps its own list, and viewers see the primary's.
+  A machine not running the project gets a change only with a later save.
+  `.apas` is usually git-ignored, so a fresh clone has no saved prompts.
+- **Capability** `project_autopilot_prompts_v1`, negotiated by CLIs (echoed in
+  `Registered`) and viewers (in `Authenticated`); older viewers get no new
+  frame. If the primary instance's CLI is older, a change is refused with
+  "<host> runs an older APAS that cannot save prompts. Reboot <host> to update
+  it." Deploy server, web, then CLI; each machine gains it at its daemon
+  reboot.
+
 **Anyone who may type into the tab may start, pause, resume and stop its
 autopilot** (`check_session_runtime_access`, the check input uses). The agent
 then works under that machine's OMP login and spends that login's quota,

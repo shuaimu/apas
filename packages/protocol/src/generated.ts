@@ -605,6 +605,26 @@ export type ServerToWeb =
       [k: string]: unknown;
     }
   | {
+      outcome: AutopilotReceiptOutcome;
+      reason?: string | null;
+      request_id: string;
+      session_id: string;
+      type: "autopilot_prompts_receipt";
+      [k: string]: unknown;
+    }
+  | {
+      default?: string | null;
+      prompts: SavedAutopilotPrompt[];
+      session_id: string;
+      type: "project_autopilot_prompts";
+      /**
+       * See `CliToServer::ProjectAutopilotPrompts::unreadable`: the
+       * dialog says the list cannot be read and offers no save.
+       */
+      unreadable?: boolean;
+      [k: string]: unknown;
+    }
+  | {
       type: "heartbeat";
       [k: string]: unknown;
     };
@@ -1363,6 +1383,13 @@ export type WebToServer =
       [k: string]: unknown;
     }
   | {
+      change: AutopilotPromptChange;
+      request_id: string;
+      session_id: string;
+      type: "update_autopilot_prompts";
+      [k: string]: unknown;
+    }
+  | {
       type: "heartbeat";
       [k: string]: unknown;
     };
@@ -1424,6 +1451,30 @@ export type AutopilotLimit =
   | {
       kind: "at_most";
       value: number;
+    };
+/**
+ * One change to a project's saved prompts
+ * (`WebToServer::UpdateAutopilotPrompts.change`). Validated by the server
+ * against its cached list and again by each CLI against its `.apas`, with
+ * [`validate_autopilot_prompt_change`].
+ */
+export type AutopilotPromptChange =
+  | {
+      kind: "save";
+      name: string;
+      prompt: string;
+      replace?: boolean;
+      [k: string]: unknown;
+    }
+  | {
+      kind: "delete";
+      name: string;
+      [k: string]: unknown;
+    }
+  | {
+      kind: "set_default";
+      name?: string | null;
+      [k: string]: unknown;
     };
 export type WorkerResultDisposition = "select_work" | "no_work" | "candidate_ready" | "blocked" | "no_change";
 export type WorkerConversionSource = {
@@ -3219,6 +3270,27 @@ export interface OmpLoopModeView {
    * "active" or "paused".
    */
   status: string;
+  [k: string]: unknown;
+}
+/**
+ * One prompt saved to a project, as `.apas` keeps it and the wire carries
+ * it.
+ */
+export interface SavedAutopilotPrompt {
+  /**
+   * Trimmed, 1 to [`AUTOPILOT_PROMPT_NAME_MAX_CHARS`] characters, unique in
+   * the project ignoring case.
+   */
+  name: string;
+  /**
+   * Meets the bounds of a start's prompt
+   * ([`crate::validate_autopilot_prompt`]).
+   */
+  prompt: string;
+  /**
+   * RFC 3339 time of the last save, set by the CLI that wrote it.
+   */
+  updated_at: string;
   [k: string]: unknown;
 }
 export interface MobileTaskLaunchRequest {

@@ -319,3 +319,83 @@ fn autopilot_fixtures_populate_the_new_fields() {
     );
     assert!(!fixture("server-sessions-autopilot.json").contains("prompt"));
 }
+
+/// The saved-prompt fixtures carry what they exist to exercise: each kind of
+/// change with its fields, a list with its default, and an unreadable list.
+/// Every change the web fixtures send is one the validation accepts against
+/// the listed prompts.
+#[test]
+fn autopilot_prompt_fixtures_populate_the_new_fields() {
+    use shared::{validate_autopilot_prompt_change, AutopilotPromptChange, AutopilotReceiptOutcome};
+
+    let ServerToWeb::ProjectAutopilotPrompts {
+        prompts,
+        default,
+        unreadable,
+        ..
+    } = server("server-project-autopilot-prompts.json")
+    else {
+        panic!("expected ProjectAutopilotPrompts");
+    };
+    assert_eq!(prompts.len(), 2);
+    assert_eq!(prompts[0].name, "Nightly review");
+    assert_eq!(prompts[1].updated_at, "2026-11-14T09:05:00Z");
+    assert!(prompts[1].prompt.contains('\n'));
+    assert_eq!(default.as_deref(), Some("Nightly review"));
+    assert!(!unreadable);
+
+    assert!(matches!(
+        server("server-project-autopilot-prompts-unreadable.json"),
+        ServerToWeb::ProjectAutopilotPrompts {
+            ref prompts,
+            default: None,
+            unreadable: true,
+            ..
+        } if prompts.is_empty()
+    ));
+
+    match server("server-autopilot-prompts-receipt.json") {
+        ServerToWeb::AutopilotPromptsReceipt {
+            request_id,
+            outcome,
+            reason,
+            ..
+        } => {
+            assert_eq!(request_id, "prompts-1");
+            assert_eq!(outcome, AutopilotReceiptOutcome::Refused);
+            assert!(reason.is_some());
+        }
+        other => panic!("expected AutopilotPromptsReceipt, got {other:?}"),
+    }
+
+    let change = |name: &str| match web(name) {
+        WebToServer::UpdateAutopilotPrompts {
+            request_id, change, ..
+        } => {
+            assert!(request_id.starts_with("prompts-"));
+            change
+        }
+        other => panic!("expected UpdateAutopilotPrompts, got {other:?}"),
+    };
+    let save = change("web-update-autopilot-prompts-save.json");
+    assert!(matches!(
+        &save,
+        AutopilotPromptChange::Save { name, replace: true, .. } if name == "Nightly review"
+    ));
+    let delete = change("web-update-autopilot-prompts-delete.json");
+    assert!(matches!(&delete, AutopilotPromptChange::Delete { name } if name == "Nightly review"));
+    let set_default = change("web-update-autopilot-prompts-set-default.json");
+    assert!(matches!(
+        &set_default,
+        AutopilotPromptChange::SetDefault { name: Some(name) } if name == "Nightly review"
+    ));
+    let clear_default = change("web-update-autopilot-prompts-clear-default.json");
+    assert_eq!(clear_default, AutopilotPromptChange::SetDefault { name: None });
+    for change in [&save, &delete, &set_default, &clear_default] {
+        assert_eq!(
+            validate_autopilot_prompt_change(change, &prompts, default.as_deref()),
+            Ok(()),
+            "{change:?}"
+        );
+    }
+}

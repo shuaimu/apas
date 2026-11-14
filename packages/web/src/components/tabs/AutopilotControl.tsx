@@ -256,6 +256,7 @@ export function AutopilotControl({
 
       {dialogOpen && (
         <AutopilotStartDialog
+          sessionId={sessionId}
           tabLabel={tabLabel}
           hostname={hostname}
           sharedCheckout={sharedCheckout}

@@ -122,23 +122,29 @@ fn is_refused_control(character: char) -> bool {
     (code <= 0x1f && character != '\n' && character != '\t') || (0x7f..=0x9f).contains(&code)
 }
 
+/// The bounds on a prompt's text alone: what a start checks of its prompt,
+/// and what a prompt saved to a project must meet so that it can start one
+/// (see [`crate::validate_autopilot_prompt_change`]).
+pub fn validate_autopilot_prompt(prompt: &str) -> Result<(), AutopilotRefusal> {
+    if prompt.trim().is_empty() {
+        return Err("Autopilot needs a prompt.".into());
+    }
+    if prompt.len() > AUTOPILOT_PROMPT_MAX_BYTES {
+        return Err(format!(
+            "The prompt is longer than {AUTOPILOT_PROMPT_MAX_BYTES} bytes."
+        ));
+    }
+    if prompt.chars().any(is_refused_control) {
+        return Err("The prompt contains control characters other than newline and tab.".into());
+    }
+    Ok(())
+}
+
 impl AutopilotSpec {
     /// The bounds of design decision 2. The server, the CLI and the tab's
     /// extension each check them; this is the one Rust statement of them.
     pub fn validate(&self) -> Result<(), AutopilotRefusal> {
-        if self.prompt.trim().is_empty() {
-            return Err("Autopilot needs a prompt.".into());
-        }
-        if self.prompt.len() > AUTOPILOT_PROMPT_MAX_BYTES {
-            return Err(format!(
-                "The prompt is longer than {AUTOPILOT_PROMPT_MAX_BYTES} bytes."
-            ));
-        }
-        if self.prompt.chars().any(is_refused_control) {
-            return Err(
-                "The prompt contains control characters other than newline and tab.".into(),
-            );
-        }
+        validate_autopilot_prompt(&self.prompt)?;
         let interval = match self.repeat {
             AutopilotRepeat::AfterEachTurn => None,
             AutopilotRepeat::Every { seconds } => {

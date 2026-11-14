@@ -40,7 +40,7 @@ import {
 } from "./projectInstances";
 import { noRuntimeAccessReason } from "./tabHosts";
 import { receiveWorkerMessage } from "./workers";
-import type { AutopilotAction, PaneAutopilotSummary } from "@apas/protocol";
+import type { AutopilotAction, AutopilotPromptChange, PaneAutopilotSummary } from "@apas/protocol";
 import {
   AUTOPILOT_OFFLINE_TEXT,
   autopilotRequestKind,
@@ -51,6 +51,12 @@ import {
   type AutopilotRequest,
   type PaneAutopilotEntry,
 } from "./autopilot";
+import {
+  parseProjectAutopilotPromptsFrame,
+  PROJECT_AUTOPILOT_PROMPTS_CAPABILITY,
+  type AutopilotPromptsRequest,
+  type ProjectAutopilotPrompts,
+} from "./autopilotPrompts";
 
 // UUID generator with fallback for environments without crypto.randomUUID
 function generateId(): string {
@@ -797,6 +803,15 @@ interface AppState {
    *  receipt, accepted until the tab reports, or refused or unconfirmed until
    *  dismissed. Never resent. */
   autopilotRequests: Record<string, AutopilotRequest>;
+  /** Each attached session's project's saved autopilot prompts, as its
+   *  primary instance last reported them (`project_autopilot_prompts`). Held
+   *  only when the server negotiated saved prompts, dropped with the socket
+   *  and replayed on attach. A session with no entry has not reported. */
+  projectAutopilotPrompts: Record<string, ProjectAutopilotPrompts>;
+  /** Changes to saved prompts by request id: waiting for their receipt, or
+   *  settled. Kept settled so the dialog can say what became of its last one.
+   *  Never resent. */
+  autopilotPromptRequests: Record<string, AutopilotPromptsRequest>;
 
   // Messages (single pane mode / fallback)
   messages: Message[];
@@ -1104,6 +1119,15 @@ interface AppState {
   ) => { success: boolean; error?: string; requestId?: string };
   /** Forget a request that is no longer in flight. */
   dismissAutopilotRequest: (requestId: string) => void;
+  /** Save, replace or delete one of a project's saved autopilot prompts, or
+   *  set or clear its default. One `update_autopilot_prompts` is sent and
+   *  tracked in `autopilotPromptRequests` until its receipt; nothing is sent
+   *  while the page is offline or the server has no saved prompts, and
+   *  nothing is ever sent again. It touches no tab and no autopilot. */
+  updateAutopilotPrompts: (
+    sessionId: string,
+    change: AutopilotPromptChange,
+  ) => { success: boolean; error?: string; requestId?: string };
   reorderPanes: (paneIds: number[]) => void;
   /** Reboot the CLI of one of the project's instances; absent = the
    *  primary's. A daemon runs every project on its machine, so this restarts
@@ -1598,14 +1622,95 @@ function pruneAutopilotToRoster(state: AppState, sessionId: string, listedPaneId
   };
 }
 
-/** Forget every autopilot state and request of the given sessions. */
-function withoutAutopilotOfSessions(state: AppState, sessionIds: Set<string>): Pick<AppState, "paneAutopilot" | "autopilotRequests"> {
+/** Forget every autopilot state and request of the given sessions, and their
+ *  projects' saved prompts. */
+function withoutAutopilotOfSessions(
+  state: AppState,
+  sessionIds: Set<string>,
+): Pick<AppState, "paneAutopilot" | "autopilotRequests" | "projectAutopilotPrompts" | "autopilotPromptRequests"> {
   return {
+    projectAutopilotPrompts: Object.fromEntries(Object.entries(state.projectAutopilotPrompts).filter(([sessionId]) =>
+      !sessionIds.has(sessionId))),
+    autopilotPromptRequests: withoutAutopilotPromptRequests(state.autopilotPromptRequests, (request) =>
+      sessionIds.has(request.sessionId)),
     paneAutopilot: Object.fromEntries(Object.entries(state.paneAutopilot).filter(([key]) =>
       !sessionIds.has(key.slice(0, key.lastIndexOf("/"))))),
     autopilotRequests: withoutAutopilotRequests(state.autopilotRequests, (request) =>
       sessionIds.has(request.sessionId)),
   };
+}
+
+// A change to saved prompts waits as long as an autopilot request for its
+// receipt: the server answers within five seconds, with "uncertain" when the
+// project's machine has not answered it.
+const AUTOPILOT_PROMPTS_RECEIPT_TIMEOUT_MS = AUTOPILOT_RECEIPT_TIMEOUT_MS;
+const autopilotPromptRequestTimers = new Map<string, ReturnType<typeof setTimeout>>();
+/** The socket generation each saved-prompt request was sent on. */
+const autopilotPromptRequestGenerations = new Map<string, number>();
+
+function clearAutopilotPromptRequestTimer(requestId: string) {
+  const timer = autopilotPromptRequestTimers.get(requestId);
+  if (timer) clearTimeout(timer);
+  autopilotPromptRequestTimers.delete(requestId);
+}
+
+function withoutAutopilotPromptRequests(
+  requests: Record<string, AutopilotPromptsRequest>,
+  drop: (request: AutopilotPromptsRequest) => boolean,
+): Record<string, AutopilotPromptsRequest> {
+  let changed = false;
+  const kept: Record<string, AutopilotPromptsRequest> = {};
+  for (const [id, request] of Object.entries(requests)) {
+    if (drop(request)) {
+      clearAutopilotPromptRequestTimer(id);
+      autopilotPromptRequestGenerations.delete(id);
+      changed = true;
+    } else {
+      kept[id] = request;
+    }
+  }
+  return changed ? kept : requests;
+}
+
+/** Report saved-prompt changes whose receipt can no longer be relied on.
+ *  They are never sent again: the change may already be in `.apas`. */
+function markAutopilotPromptRequestsUnconfirmed(
+  set: StoreSet,
+  cause: NonNullable<AutopilotPromptsRequest["cause"]>,
+  shouldMark: (request: AutopilotPromptsRequest) => boolean,
+) {
+  set((state) => {
+    let changed = false;
+    const next = { ...state.autopilotPromptRequests };
+    for (const [id, request] of Object.entries(state.autopilotPromptRequests)) {
+      if (!shouldMark(request)) continue;
+      clearAutopilotPromptRequestTimer(id);
+      next[id] = { ...request, status: "unconfirmed", cause, reason: undefined };
+      changed = true;
+    }
+    return changed ? { autopilotPromptRequests: next } : {};
+  });
+}
+
+/** Apply an `autopilot_prompts_receipt`: the primary instance's answer to
+ *  one change. A late receipt still settles a change reported as not
+ *  confirmed; one for a change already answered is ignored. */
+function applyAutopilotPromptsReceipt(data: Record<string, unknown>, set: StoreSet, get: () => AppState) {
+  const requestId = data.request_id;
+  if (typeof requestId !== "string") return;
+  const request = get().autopilotPromptRequests[requestId];
+  if (!request || request.sessionId !== data.session_id) return;
+  if (request.status !== "pending" && request.status !== "unconfirmed") return;
+  clearAutopilotPromptRequestTimer(requestId);
+  const reason = typeof data.reason === "string" && data.reason.trim() ? data.reason : undefined;
+  const settled: AutopilotPromptsRequest = data.outcome === "accepted"
+    ? { ...request, status: "saved", cause: undefined, reason: undefined }
+    : data.outcome === "refused"
+      ? { ...request, status: "refused", cause: undefined, reason }
+      : { ...request, status: "unconfirmed", cause: "uncertain", reason: undefined };
+  set((state) => state.autopilotPromptRequests[requestId]
+    ? { autopilotPromptRequests: { ...state.autopilotPromptRequests, [requestId]: settled } }
+    : {});
 }
 
 /** Where this browser tab keeps its launches across a reload. Per tab, like
@@ -1991,6 +2096,8 @@ export const useStore = create<AppState>((set, get) => ({
   addPaneRequests: loadAddPaneRequests(),
   paneAutopilot: {},
   autopilotRequests: {},
+  projectAutopilotPrompts: {},
+  autopilotPromptRequests: {},
   messages: [],
   hasMoreMessages: false,
   isLoadingMore: false,
@@ -2112,6 +2219,8 @@ export const useStore = create<AppState>((set, get) => ({
       addPaneRequests: withoutAddPaneRequests(get().addPaneRequests, () => true),
       paneAutopilot: {},
       autopilotRequests: withoutAutopilotRequests(get().autopilotRequests, () => true),
+      projectAutopilotPrompts: {},
+      autopilotPromptRequests: withoutAutopilotPromptRequests(get().autopilotPromptRequests, () => true),
       workingPanesBySession: new Map(),
       machines: [],
       machineListReceived: false,
@@ -2202,6 +2311,7 @@ export const useStore = create<AppState>((set, get) => ({
           "autonomous_workers_v1",
           PROJECT_INSTANCES_CAPABILITY,
           TAB_AUTOPILOT_CAPABILITY,
+          PROJECT_AUTOPILOT_PROMPTS_CAPABILITY,
         ],
         client_kind: "web",
         app_version: process.env.NEXT_PUBLIC_WEB_UI_VERSION || "development",
@@ -2254,6 +2364,8 @@ export const useStore = create<AppState>((set, get) => ({
         // So do autopilot states. Until they are replayed every tab reads as
         // not reported, which is what is known.
         paneAutopilot: {},
+        // And each project's saved prompts, replayed on attach.
+        projectAutopilotPrompts: {},
       }));
       // An autopilot receipt goes only to the connection that asked. A request
       // still waiting for one is reported as not confirmed; it is never
@@ -2262,6 +2374,10 @@ export const useStore = create<AppState>((set, get) => ({
       markAutopilotRequestsUnconfirmed(set, "connection", (request) =>
         request.status === "pending"
           && (autopilotRequestGenerations.get(request.requestId) ?? 0) <= generation);
+      // A change to saved prompts may already be in the project's .apas.
+      markAutopilotPromptRequestsUnconfirmed(set, "connection", (request) =>
+        request.status === "pending"
+          && (autopilotPromptRequestGenerations.get(request.requestId) ?? 0) <= generation);
       // New-tab answers go only to the connection that asked, so any still
       // outstanding on this socket are lost. Report them; never resend.
       markAddPaneRequestsUnconfirmed(set, get, (_request, sentOn) =>
@@ -4034,6 +4150,46 @@ export const useStore = create<AppState>((set, get) => ({
     });
   },
 
+  updateAutopilotPrompts: (sessionId, change) => {
+    const state = get();
+    if (!state.negotiatedCapabilities.has(PROJECT_AUTOPILOT_PROMPTS_CAPABILITY)) {
+      return { success: false, error: "This APAS server cannot save prompts." };
+    }
+    const { ws } = state;
+    // Nothing is queued for a later connection, as with autopilot requests.
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
+      return { success: false, error: AUTOPILOT_OFFLINE_TEXT };
+    }
+    const requestId = generateId();
+    try {
+      ws.send(JSON.stringify({
+        type: "update_autopilot_prompts",
+        session_id: sessionId,
+        request_id: requestId,
+        change,
+      }));
+    } catch {
+      return { success: false, error: "The change could not be sent. Try again." };
+    }
+    set((current) => ({
+      autopilotPromptRequests: {
+        ...current.autopilotPromptRequests,
+        [requestId]: { requestId, sessionId, change, status: "pending", sentAt: Date.now() },
+      },
+    }));
+    autopilotPromptRequestGenerations.set(requestId, wsGeneration);
+    clearAutopilotPromptRequestTimer(requestId);
+    const timer = setTimeout(() => {
+      autopilotPromptRequestTimers.delete(requestId);
+      markAutopilotPromptRequestsUnconfirmed(set, "timeout", (request) =>
+        request.requestId === requestId && request.status === "pending");
+    }, AUTOPILOT_PROMPTS_RECEIPT_TIMEOUT_MS);
+    // Node-based component tests should not stay alive solely for this UI timer.
+    (timer as unknown as { unref?: () => void }).unref?.();
+    autopilotPromptRequestTimers.set(requestId, timer);
+    return { success: true, requestId };
+  },
+
   reorderPanes: (paneIds: number[]) => {
     const { ws } = get();
     if (ws && ws.readyState === WebSocket.OPEN) {
@@ -5636,6 +5792,23 @@ export function handleServerMessage(
     case "pane_autopilot_receipt":
       applyAutopilotReceipt(data, set, get);
       break;
+
+    case "autopilot_prompts_receipt":
+      applyAutopilotPromptsReceipt(data, set, get);
+      break;
+
+    case "project_autopilot_prompts": {
+      // The server sends it only to a viewer that negotiated saved prompts;
+      // anything else is not this page's to show.
+      if (!get().negotiatedCapabilities.has(PROJECT_AUTOPILOT_PROMPTS_CAPABILITY)) break;
+      const reported = parseProjectAutopilotPromptsFrame(data);
+      if (!reported) break;
+      // Each frame is the whole list: it replaces what was held.
+      set((state) => ({
+        projectAutopilotPrompts: { ...state.projectAutopilotPrompts, [reported.sessionId]: reported.list },
+      }));
+      break;
+    }
 
     case "pane_autopilot_state": {
       const reported = parsePaneAutopilotFrame(data);

@@ -1,0 +1,17 @@
+{
+  "type": "project_autopilot_prompts",
+  "session_id": "20000000-0000-4000-8000-000000000001",
+  "prompts": [
+    {
+      "name": "Nightly review",
+      "prompt": "Review the open pull requests and fix what the checks report.",
+      "updated_at": "2026-11-14T09:00:00Z"
+    },
+    {
+      "name": "Release check",
+      "prompt": "Run the release checklist in docs/release.md.\nStop at the first failure.",
+      "updated_at": "2026-11-14T09:05:00Z"
+    }
+  ],
+  "default": "Nightly review"
+}

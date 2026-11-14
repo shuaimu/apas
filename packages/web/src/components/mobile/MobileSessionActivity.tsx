@@ -1623,6 +1623,7 @@ export function MobileSessionActivity({ connected, onBack, onReconnect }: Mobile
       {autopilot && autopilotPane && autopilotSheetKind === "start" && (
         <AutopilotStartDialog
           variant="sheet"
+          sessionId={sessionId ?? undefined}
           tabLabel={paneLabel(autopilotPane)}
           hostname={autopilotHost}
           sharedCheckout={!autopilotPane.worktree_path}

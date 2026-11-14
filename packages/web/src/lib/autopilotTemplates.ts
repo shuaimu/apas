@@ -193,13 +193,14 @@ export function autopilotTemplateForPrompt(prompt: string): AutopilotTemplate | 
 
 /**
  * The dialog's proposal with templates: `autopilotStartForm`, except that a
- * tab with no earlier autopilot is offered the default template's prompt
- * instead of an empty field. A tab with one keeps that autopilot's prompt.
- * Timing, limits and the no-tool-call option are never taken from a template.
+ * tab with no earlier autopilot is offered the project's default saved
+ * prompt, when it has one, else the default template's prompt, instead of an
+ * empty field. A tab with one keeps that autopilot's prompt. Timing, limits
+ * and the no-tool-call option are never taken from a template.
  */
-export function autopilotTemplateStartForm(last?: AutopilotSpec): AutopilotStartForm {
+export function autopilotTemplateStartForm(last?: AutopilotSpec, projectDefaultPrompt?: string): AutopilotStartForm {
   const form = autopilotStartForm(last);
-  return last ? form : { ...form, prompt: DEFAULT_AUTOPILOT_TEMPLATE.prompt };
+  return last ? form : { ...form, prompt: projectDefaultPrompt ?? DEFAULT_AUTOPILOT_TEMPLATE.prompt };
 }
 
 /**

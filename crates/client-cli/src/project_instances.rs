@@ -384,6 +384,24 @@ pub fn update_project_settings<R>(
     Ok(result)
 }
 
+/// Apply one change to the project's saved autopilot prompts
+/// (`autopilot_prompts` and `default_autopilot_prompt`), checked against the
+/// file as it is now, under the lock. `Ok(Err(reason))` when the change is
+/// refused, in which case nothing is written: also when the file holds a
+/// list that does not parse, which is never rewritten. Like every settings
+/// write, it leaves every other field and every machine's panes as the file
+/// has them, and a missing file is created with this project's id.
+pub fn update_autopilot_prompts(
+    dir: &Path,
+    project_id: Uuid,
+    change: &shared::AutopilotPromptChange,
+    now: &str,
+) -> Result<std::result::Result<(), String>> {
+    update_project_settings(dir, project_id, |meta| {
+        crate::autopilot_prompts::apply_change(meta, change, now)
+    })
+}
+
 /// Change one pane's fields, whichever machine's it is, such as its worktree
 /// assignment or a replaced provider session id. Only the fields `update`
 /// changes are written. Its id and its machine tag are kept: a pane never
@@ -2383,5 +2401,173 @@ mod tests {
                 .with_instances(true)
                 .capable
         );
+    }
+
+    /// A project shared with another machine, written by a newer build: an
+    /// unknown top-level field, and the other machine's pane with a field of
+    /// its own. Returns the directory, the project and the file's bytes.
+    fn shared_project_from_a_newer_build(extra: &[(&str, serde_json::Value)]) -> (TempDir, Uuid, Vec<u8>) {
+        let dir = tempfile::tempdir().unwrap();
+        let project = Uuid::new_v4();
+        let other = tagged(pane(7, Uuid::new_v4()), Uuid::new_v4(), "zoo-006");
+        let mut other_entry = to_object(&other).unwrap();
+        other_entry.push((
+            "future_pane_field".to_string(),
+            OrderedJson::Scalar(serde_json::json!("kept")),
+        ));
+        let mut root = to_object(&ProjectMetadata::with_id_and_name(
+            project,
+            Some("demo".to_string()),
+        ))
+        .unwrap();
+        set_field(&mut root, "panes", OrderedJson::Array(vec![OrderedJson::Object(other_entry)]));
+        root.insert(
+            2,
+            (
+                "future_field".to_string(),
+                serde_json::from_value::<OrderedJson>(serde_json::json!({"z": 1, "a": [true]}))
+                    .unwrap(),
+            ),
+        );
+        for (key, value) in extra {
+            root.push((key.to_string(), serde_json::from_value(value.clone()).unwrap()));
+        }
+        let bytes = serde_json::to_vec_pretty(&OrderedJson::Object(root)).unwrap();
+        std::fs::write(get_apas_path(dir.path()), &bytes).unwrap();
+        (dir, project, bytes)
+    }
+
+    /// The file without the two saved-prompt fields, keys in file order.
+    fn without_saved_prompts(bytes: &[u8]) -> Object {
+        match serde_json::from_slice::<OrderedJson>(bytes).unwrap() {
+            OrderedJson::Object(mut root) => {
+                root.retain(|(key, _)| {
+                    key != "autopilot_prompts" && key != "default_autopilot_prompt"
+                });
+                root
+            }
+            other => panic!("not an object: {other:?}"),
+        }
+    }
+
+    /// Each kind of change to the saved prompts goes through the locked
+    /// merge: it writes only its two fields, and every other field, the
+    /// other machine's pane and the fields a newer build wrote stay as the
+    /// file has them. Undoing every change gives back the original bytes.
+    #[test]
+    fn saved_prompt_changes_write_only_their_fields() {
+        use shared::AutopilotPromptChange::{Delete, Save, SetDefault};
+        let _config = isolated_config_dir();
+        let (dir, project, original) = shared_project_from_a_newer_build(&[]);
+        let now = "2026-11-14T10:00:00Z";
+        let apply = |change: shared::AutopilotPromptChange| {
+            update_autopilot_prompts(dir.path(), project, &change, now).unwrap()
+        };
+        let view = || crate::autopilot_prompts::PromptsView::of_metadata(&on_disk(dir.path()));
+
+        assert_eq!(
+            apply(Save {
+                name: " Nightly review ".into(),
+                prompt: "Review the open pull requests.".into(),
+                replace: false,
+            }),
+            Ok(())
+        );
+        assert_eq!(without_saved_prompts(&bytes(dir.path())), without_saved_prompts(&original));
+        assert_eq!(
+            raw(dir.path())["autopilot_prompts"],
+            serde_json::json!([{
+                "name": "Nightly review",
+                "prompt": "Review the open pull requests.",
+                "updated_at": now,
+            }])
+        );
+        assert_eq!(raw(dir.path())["panes"][0]["future_pane_field"], "kept");
+
+        assert_eq!(apply(SetDefault { name: Some("nightly review".into()) }), Ok(()));
+        assert_eq!(raw(dir.path())["default_autopilot_prompt"], "Nightly review");
+
+        // Saving under a taken name needs `replace`; a refusal writes nothing.
+        let before = bytes(dir.path());
+        assert_eq!(
+            apply(Save {
+                name: "NIGHTLY REVIEW".into(),
+                prompt: "Something else.".into(),
+                replace: false,
+            }),
+            Err("A saved prompt named \"Nightly review\" already exists.".to_string())
+        );
+        assert_eq!(
+            apply(Save {
+                name: "apas worker".into(),
+                prompt: "Mine.".into(),
+                replace: true,
+            }),
+            Err("\"APAS worker\" is the name of a built-in template. Choose another name.".to_string())
+        );
+        assert_eq!(bytes(dir.path()), before, "a refused change writes nothing");
+        assert_eq!(
+            apply(Save {
+                name: "Nightly review".into(),
+                prompt: "Review and merge.".into(),
+                replace: true,
+            }),
+            Ok(())
+        );
+        assert_eq!(view().prompts.len(), 1);
+        assert_eq!(view().prompts[0].prompt, "Review and merge.");
+        assert_eq!(view().default.as_deref(), Some("Nightly review"));
+
+        // Deleting the default clears it, and with nothing saved neither
+        // field is left: the file is the one the newer build wrote.
+        assert_eq!(apply(Delete { name: "Nightly review".into() }), Ok(()));
+        assert_eq!(view(), crate::autopilot_prompts::PromptsView::default());
+        assert_eq!(bytes(dir.path()), original);
+        assert_eq!(apply(SetDefault { name: None }), Ok(()));
+        assert_eq!(bytes(dir.path()), original, "clearing no default writes nothing");
+    }
+
+    /// A list that does not parse leaves the file readable, is reported
+    /// unreadable, refuses every change and is never rewritten: not by a
+    /// change, and not by a pane save or a settings write.
+    #[test]
+    fn a_malformed_saved_prompt_list_is_left_untouched() {
+        use shared::AutopilotPromptChange::{Delete, Save, SetDefault};
+        let _config = isolated_config_dir();
+        let malformed = serde_json::json!([{"name": "No time", "prompt": "x"}]);
+        let (dir, project, original) = shared_project_from_a_newer_build(&[
+            ("autopilot_prompts", malformed.clone()),
+            ("default_autopilot_prompt", serde_json::json!("No time")),
+        ]);
+        let view = crate::autopilot_prompts::PromptsView::of_metadata(&on_disk(dir.path()));
+        assert!(view.unreadable);
+        assert!(view.prompts.is_empty() && view.default.is_none());
+
+        for change in [
+            Save {
+                name: "New".into(),
+                prompt: "x".into(),
+                replace: true,
+            },
+            Delete { name: "No time".into() },
+            SetDefault { name: None },
+        ] {
+            assert_eq!(
+                update_autopilot_prompts(dir.path(), project, &change, "now").unwrap(),
+                Err(shared::AUTOPILOT_PROMPTS_UNREADABLE_REASON.to_string())
+            );
+            assert_eq!(bytes(dir.path()), original);
+        }
+
+        // This machine's panes and the flags still save, around the list.
+        let me = Uuid::new_v4();
+        save_instance_panes(dir.path(), project, &instance(me, "zoo-005"), &[pane(3, Uuid::new_v4())])
+            .unwrap();
+        update_project_settings(dir.path(), project, |meta| meta.auto_merge_prs = true).unwrap();
+        let after = raw(dir.path());
+        assert_eq!(after["autopilot_prompts"], malformed);
+        assert_eq!(after["default_autopilot_prompt"], "No time");
+        assert_eq!(after["auto_merge_prs"], true);
+        assert_eq!(panes_of(&on_disk(dir.path()), Some(me)), vec![3]);
     }
 }

@@ -2013,7 +2013,19 @@ async fn send_autopilot_receipt(
 /// answer, so it is never sent one. Clients show this same wording for such
 /// a tab.
 fn older_instance_autopilot_refusal(state: &AppState, instance: &InstanceAttachment) -> String {
-    let host = instance
+    match instance_host(state, instance) {
+        Some(host) => format!(
+            "{host} runs an older APAS that cannot run autopilot. Reboot {host} to update it."
+        ),
+        None => "This tab's machine runs an older APAS that cannot run autopilot. Reboot it to update it."
+            .to_string(),
+    }
+}
+
+/// The host an instance runs on, as a refusal names it: what it reported,
+/// else what its machine is known as.
+fn instance_host(state: &AppState, instance: &InstanceAttachment) -> Option<String> {
+    instance
         .hostname
         .as_deref()
         .map(|host| host.trim().to_string())
@@ -2024,14 +2036,7 @@ fn older_instance_autopilot_refusal(state: &AppState, instance: &InstanceAttachm
                 .and_then(|machine_id| state.sessions.machine_hostname(&machine_id))
                 .map(|host| host.trim().to_string())
                 .filter(|host| !host.is_empty())
-        });
-    match host {
-        Some(host) => format!(
-            "{host} runs an older APAS that cannot run autopilot. Reboot {host} to update it."
-        ),
-        None => "This tab's machine runs an older APAS that cannot run autopilot. Reboot it to update it."
-            .to_string(),
-    }
+        })
 }
 
 /// Check one autopilot request and forward it to the instance that owns its
@@ -2227,6 +2232,236 @@ async fn handle_pane_autopilot_control(
     });
 }
 
+/// Answer one change to a project's saved prompts, to the connection that
+/// sent it and to no other, and only when it negotiated saved prompts:
+/// older native builds drop their socket on a frame type they do not know.
+async fn send_autopilot_prompts_receipt(
+    state: &AppState,
+    connection_id: &Uuid,
+    session_id: Uuid,
+    request_id: String,
+    receipt: AutopilotReceipt,
+) {
+    if !state
+        .sessions
+        .web_supports_capability(connection_id, shared::PROJECT_AUTOPILOT_PROMPTS_CAPABILITY)
+    {
+        return;
+    }
+    state
+        .sessions
+        .send_to_web(
+            connection_id,
+            ServerToWeb::AutopilotPromptsReceipt {
+                session_id,
+                request_id,
+                outcome: receipt.outcome,
+                reason: receipt.reason,
+            },
+        )
+        .await;
+}
+
+/// Why a change to the saved prompts is refused when no instance runs the
+/// project: the prompts are in `.apas`, which only a running instance writes.
+const AUTOPILOT_PROMPTS_NOT_RUNNING: &str =
+    "No machine is running this project. Start it to save prompts.";
+
+/// Check one change to a project's saved prompts and forward it to the
+/// project's primary instance. Returns the wait for the primary's receipt, or
+/// why the change is refused, in which case nothing was sent to any
+/// instance.
+///
+/// Access is the check a start of autopilot gets, on the primary's machine,
+/// and reads the same when refused: whoever may leave a tab of the project
+/// on autopilot may keep prompts for it. The primary decides, because its
+/// list is the one viewers are shown and its receipt is the answer.
+async fn forward_autopilot_prompts_change(
+    state: &AppState,
+    connection_id: &Uuid,
+    session_id: Uuid,
+    request_id: &str,
+    change: &shared::AutopilotPromptChange,
+) -> Result<tokio::sync::oneshot::Receiver<AutopilotReceipt>, String> {
+    use crate::session::autopilot_prompts::AutopilotPromptsForwardError;
+    let session_id = target_session(state, connection_id, Some(session_id), None)
+        .await
+        .map_err(|refusal| refusal.unwrap_or("Project is unavailable").to_string())?;
+    // Held until the change is handed over: a project being suspended or
+    // deleted waits for it, and none is forwarded after.
+    let Ok((_project_id, _project_guard)) = state
+        .active_session_operation(&session_id.to_string())
+        .await
+    else {
+        return Err("Project is unavailable".to_string());
+    };
+    let Some(primary) = state.sessions.primary_instance(&session_id) else {
+        return Err(AUTOPILOT_PROMPTS_NOT_RUNNING.to_string());
+    };
+    if let Some(refusal) =
+        instance_access_refusal(state, connection_id, &session_id, &primary).await
+    {
+        return Err(refusal);
+    }
+    if !state
+        .sessions
+        .cli_supports_capability(&primary.cli_id, shared::PROJECT_AUTOPILOT_PROMPTS_CAPABILITY)
+    {
+        return Err(match instance_host(state, &primary) {
+            Some(host) => shared::autopilot_prompts_instance_update_required(&host),
+            None => "This project's machine runs an older APAS that cannot save prompts. Reboot it to update it.".to_string(),
+        });
+    }
+    // Checked here against the list viewers are shown, so a refusal can say
+    // why before anything is sent. The instances check again against their
+    // own `.apas`, which is what decides.
+    let cached = state.sessions.autopilot_prompts(&session_id).unwrap_or_default();
+    if cached.unreadable {
+        return Err(shared::AUTOPILOT_PROMPTS_UNREADABLE_REASON.to_string());
+    }
+    shared::validate_autopilot_prompt_change(change, &cached.prompts, cached.default.as_deref())?;
+    state
+        .sessions
+        .forward_autopilot_prompts_change(session_id, primary.cli_id, request_id, change)
+        .map_err(|error| match error {
+            AutopilotPromptsForwardError::AlreadyWaiting => {
+                "A request with this identifier is already being answered."
+            }
+            AutopilotPromptsForwardError::Undelivered => {
+                "The project runtime is unavailable; nothing was saved."
+            }
+        })
+        .map_err(str::to_string)
+}
+
+/// `UpdateAutopilotPrompts`: save, replace or delete one of a project's
+/// saved autopilot prompts, or change its default.
+///
+/// The change goes to the primary instance and, once it accepted it, to every
+/// other instance of the project that can keep saved prompts
+/// (`session::autopilot_prompts` says why in that order). Nothing goes to
+/// any tab: no autopilot is started, paused or stopped by it. The requesting connection gets exactly one
+/// `AutopilotPromptsReceipt`: a refusal with its reason, the primary
+/// instance's answer, or not confirmed when that answer does not come in
+/// time. Nothing is ever sent again: a repeated copy of a request has no
+/// further effect. The answer is awaited in a task of its own, so a slow
+/// instance cannot hold up this connection's other frames.
+///
+/// `receipt_wait` is [`AUTOPILOT_RECEIPT_WAIT`]; tests shorten it.
+async fn handle_autopilot_prompts_update(
+    state: &AppState,
+    connection_id: &Uuid,
+    command: WebToServer,
+    receipt_wait: Duration,
+) {
+    let WebToServer::UpdateAutopilotPrompts {
+        session_id,
+        request_id,
+        change,
+    } = command
+    else {
+        return;
+    };
+    let Some(user_id) = state.sessions.get_web_user(connection_id) else {
+        return;
+    };
+    // Checked first: everything below is answered with a frame that only a
+    // connection that negotiated saved prompts is ever sent.
+    if !state
+        .sessions
+        .web_supports_capability(connection_id, shared::PROJECT_AUTOPILOT_PROMPTS_CAPABILITY)
+    {
+        send_policy_error(
+            state,
+            connection_id,
+            "This client did not negotiate saved prompts; reload it after updating the web deployment",
+        )
+        .await;
+        return;
+    }
+    if request_id.is_empty() || request_id.len() > shared::AUTOPILOT_REQUEST_ID_MAX_BYTES {
+        send_policy_error(state, connection_id, "Invalid saved prompt request identifier").await;
+        return;
+    }
+    // Remembered beside the autopilot request ids, in a namespace of its own.
+    if !state
+        .sessions
+        .claim_autopilot_request(user_id, &format!("prompts:{request_id}"))
+    {
+        tracing::debug!(%session_id, "ignoring a repeated saved prompt request");
+        return;
+    }
+    let receiver = match forward_autopilot_prompts_change(
+        state,
+        connection_id,
+        session_id,
+        &request_id,
+        &change,
+    )
+    .await
+    {
+        Ok(receiver) => receiver,
+        Err(reason) => {
+            send_autopilot_prompts_receipt(
+                state,
+                connection_id,
+                session_id,
+                request_id,
+                AutopilotReceipt {
+                    outcome: shared::AutopilotReceiptOutcome::Refused,
+                    reason: Some(reason),
+                },
+            )
+            .await;
+            return;
+        }
+    };
+    let state = state.clone();
+    let connection_id = *connection_id;
+    tokio::spawn(async move {
+        let receipt = match tokio::time::timeout(receipt_wait, receiver).await {
+            Ok(Ok(receipt)) => receipt,
+            // No receipt in time, or the primary's connection closed first.
+            // The change was delivered and may have been written: not
+            // confirmed, never refused.
+            _ => {
+                state
+                    .sessions
+                    .drop_abandoned_autopilot_prompts_request(session_id, &request_id);
+                AutopilotReceipt {
+                    outcome: shared::AutopilotReceiptOutcome::Uncertain,
+                    reason: None,
+                }
+            }
+        };
+        send_autopilot_prompts_receipt(&state, &connection_id, session_id, request_id, receipt)
+            .await;
+    });
+}
+
+/// What a viewer that just attached is told about the project's saved
+/// prompts: the list the primary last reported, if any. Only a viewer that
+/// negotiated saved prompts is sent it. Read as it is queued, so a change
+/// broadcast meanwhile is never overtaken by an older copy.
+async fn replay_autopilot_prompts_after_attach(
+    state: &AppState,
+    connection_id: &Uuid,
+    session_id: Uuid,
+) {
+    if !state
+        .sessions
+        .web_supports_capability(connection_id, shared::PROJECT_AUTOPILOT_PROMPTS_CAPABILITY)
+    {
+        return;
+    }
+    state
+        .sessions
+        .send_to_web_with(connection_id, || {
+            state.sessions.autopilot_prompts_frame(&session_id)
+        })
+        .await;
+}
+
 /// What a viewer that just attached is told about autopilot: the availability
 /// of every OMP terminal tab, with the state its instance last reported and
 /// when. Only a viewer that negotiated autopilot is sent anything; older
@@ -2269,12 +2504,19 @@ fn autopilot_outbound_allowed(
     connection_id: &Uuid,
     message: &ServerToWeb,
 ) -> bool {
-    !matches!(
-        message,
-        ServerToWeb::PaneAutopilotState { .. } | ServerToWeb::PaneAutopilotReceipt { .. }
-    ) || state
+    let needed = match message {
+        ServerToWeb::PaneAutopilotState { .. } | ServerToWeb::PaneAutopilotReceipt { .. } => {
+            shared::TAB_AUTOPILOT_CAPABILITY
+        }
+        ServerToWeb::ProjectAutopilotPrompts { .. }
+        | ServerToWeb::AutopilotPromptsReceipt { .. } => {
+            shared::PROJECT_AUTOPILOT_PROMPTS_CAPABILITY
+        }
+        _ => return true,
+    };
+    state
         .sessions
-        .web_supports_capability(connection_id, shared::TAB_AUTOPILOT_CAPABILITY)
+        .web_supports_capability(connection_id, needed)
 }
 
 /// Load the latest effective policy for a launch-like mutation. Both ends of
@@ -7001,6 +7243,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                                     | shared::AUTONOMOUS_WORKERS_CAPABILITY
                                                     | shared::PROJECT_INSTANCES_CAPABILITY
                                                     | shared::TAB_AUTOPILOT_CAPABILITY
+                                                    | shared::PROJECT_AUTOPILOT_PROMPTS_CAPABILITY
                                                     | "mobile_bootstrap_v1"
                                                     | "mobile_coding_mutations_v1"
                                                     | "mobile_terminal_v1"
@@ -8526,6 +8769,15 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     )
                     .await;
                 }
+                Ok(command @ WebToServer::UpdateAutopilotPrompts { .. }) => {
+                    handle_autopilot_prompts_update(
+                        &state,
+                        &connection_id,
+                        command,
+                        AUTOPILOT_RECEIPT_WAIT,
+                    )
+                    .await;
+                }
                 Ok(WebToServer::AnswerQuestion {
                     session_id: msg_sid,
                     tool_use_id,
@@ -9031,6 +9283,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                         }
 
                         replay_pane_autopilot_after_attach(&state, &connection_id, sid).await;
+                        replay_autopilot_prompts_after_attach(&state, &connection_id, sid).await;
 
                         state
                             .sessions
@@ -14521,5 +14774,605 @@ mod project_instance_tests {
         );
         assert!(autopilot_states(&web.drain()).is_empty());
         assert!(autopilot_states(&older_web.drain()).is_empty());
+    }
+
+    // ---- Saved autopilot prompts ----------------------------------------
+
+    /// What the CLI of a machine that keeps saved prompts advertises.
+    const PROMPTS_CLI: &[&str] = &[
+        PROJECT_INSTANCES_CAPABILITY,
+        shared::PROJECT_POLICY_CAPABILITY,
+        shared::OMP_TAB_AUTOPILOT_CAPABILITY,
+        shared::PROJECT_AUTOPILOT_PROMPTS_CAPABILITY,
+    ];
+    /// What a web client that offers saved prompts negotiates.
+    const PROMPTS_VIEWER: &[&str] = &[
+        PROJECT_INSTANCES_CAPABILITY,
+        shared::TAB_AUTOPILOT_CAPABILITY,
+        shared::PROJECT_AUTOPILOT_PROMPTS_CAPABILITY,
+    ];
+
+    fn saved(name: &str) -> shared::SavedAutopilotPrompt {
+        shared::SavedAutopilotPrompt {
+            name: name.to_string(),
+            prompt: format!("Do what {name} says."),
+            updated_at: "2026-11-14T09:00:00Z".to_string(),
+        }
+    }
+
+    fn save_prompt(name: &str, replace: bool) -> shared::AutopilotPromptChange {
+        shared::AutopilotPromptChange::Save {
+            name: name.to_string(),
+            prompt: "Review the open pull requests.".to_string(),
+            replace,
+        }
+    }
+
+    /// `viewer` asks for `change`, with a receipt wait of `wait`.
+    async fn change_prompts_within(
+        p: &Project,
+        viewer: &Uuid,
+        request_id: &str,
+        change: shared::AutopilotPromptChange,
+        wait: Duration,
+    ) {
+        handle_autopilot_prompts_update(
+            &p.state,
+            viewer,
+            WebToServer::UpdateAutopilotPrompts {
+                session_id: p.session,
+                request_id: request_id.to_string(),
+                change,
+            },
+            wait,
+        )
+        .await;
+    }
+
+    async fn change_prompts(
+        p: &Project,
+        viewer: &Uuid,
+        request_id: &str,
+        change: shared::AutopilotPromptChange,
+    ) {
+        change_prompts_within(p, viewer, request_id, change, AUTOPILOT_RECEIPT_WAIT).await;
+    }
+
+    fn prompt_receipts(messages: &[ServerToWeb]) -> Vec<Receipt> {
+        messages
+            .iter()
+            .filter_map(|message| match message {
+                ServerToWeb::AutopilotPromptsReceipt {
+                    request_id,
+                    outcome,
+                    reason,
+                    ..
+                } => Some((request_id.clone(), *outcome, reason.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    async fn next_prompt_receipt(web: &mut Endpoint<ServerToWeb>) -> Receipt {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let message = web.rx.recv().await.expect("web sender closed");
+                if let Some(receipt) = prompt_receipts(&[message]).pop() {
+                    return receipt;
+                }
+            }
+        })
+        .await
+        .expect("the request is answered")
+    }
+
+    /// The saved-prompt changes an instance was sent: request id and change.
+    fn prompt_changes(
+        cli: &mut Endpoint<ServerToCli>,
+    ) -> Vec<(String, shared::AutopilotPromptChange)> {
+        cli.drain()
+            .into_iter()
+            .filter_map(|message| match message {
+                ServerToCli::UpdateAutopilotPrompts {
+                    request_id, change, ..
+                } => Some((request_id, change)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn answer_prompts(
+        p: &Project,
+        cli: &Endpoint<ServerToCli>,
+        request_id: &str,
+        outcome: shared::AutopilotReceiptOutcome,
+        reason: Option<&str>,
+    ) -> bool {
+        p.state.sessions.finish_autopilot_prompts_request(
+            p.session,
+            cli.id,
+            request_id,
+            AutopilotReceipt {
+                outcome,
+                reason: reason.map(str::to_string),
+            },
+        )
+    }
+
+    /// The saved-prompt lists a viewer was sent: names and default.
+    fn prompt_lists(messages: &[ServerToWeb]) -> Vec<(Vec<String>, Option<String>, bool)> {
+        messages
+            .iter()
+            .filter_map(|message| match message {
+                ServerToWeb::ProjectAutopilotPrompts {
+                    prompts,
+                    default,
+                    unreadable,
+                    ..
+                } => Some((
+                    prompts.iter().map(|saved| saved.name.clone()).collect(),
+                    default.clone(),
+                    *unreadable,
+                )),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn report_prompts(
+        p: &Project,
+        cli: &Endpoint<ServerToCli>,
+        prompts: Vec<shared::SavedAutopilotPrompt>,
+        default: Option<&str>,
+        unreadable: bool,
+    ) {
+        p.state.sessions.report_autopilot_prompts(
+            &p.session,
+            cli.id,
+            crate::session::autopilot_prompts::AutopilotPromptsView {
+                prompts,
+                default: default.map(str::to_string),
+                unreadable,
+            },
+        );
+    }
+
+    /// Whoever may start autopilot on the project's tabs on the primary's
+    /// machine may change its saved prompts, and nobody else: a project user
+    /// with no machine, a collaborator the hosting cluster does not admit to
+    /// the primary's machine, and an account without access are each refused
+    /// with the text autopilot gives them, and nothing reaches any instance.
+    #[tokio::test]
+    async fn saved_prompts_follow_the_access_autopilot_has() {
+        let (p, member) = hosted_project().await;
+        let stranger = Uuid::new_v4();
+        p.state.db.create_user(&user(stranger)).await.unwrap();
+        p.state
+            .db
+            .add_project_cluster_placement(
+                &p.project_id(),
+                &p.host.to_string(),
+                &p.owner.to_string(),
+                "test",
+            )
+            .await
+            .unwrap();
+        // zoo-006 is primary; the member may use only zoo-005.
+        let mut b = p.instance_with(p.m6, HOST_B, PROMPTS_CLI);
+        let mut a = p.instance_with(p.m5, HOST_A, PROMPTS_CLI);
+        let mut host_web = p.viewer(p.host, PROMPTS_VIEWER);
+        let mut member_web = p.viewer(member, PROMPTS_VIEWER);
+        let mut owner_web = p.viewer(p.owner, PROMPTS_VIEWER);
+        let mut stranger_web = {
+            let id = Uuid::new_v4();
+            let (tx, rx) = mpsc::channel(256);
+            p.state.sessions.register_web(id, tx);
+            p.state.sessions.set_web_user(id, stranger);
+            p.state.sessions.set_web_capabilities(
+                id,
+                PROMPTS_VIEWER
+                    .iter()
+                    .map(|capability| capability.to_string())
+                    .collect(),
+            );
+            Endpoint { id, rx }
+        };
+        p.roster(vec![omp_tab(3, p.m5, HOST_A), omp_tab(4, p.m6, HOST_B)]);
+
+        // The texts a start of autopilot on the primary's tab gets.
+        let mut refusals = Vec::new();
+        for (who, web) in [
+            ("member", &mut member_web),
+            ("owner", &mut owner_web),
+            ("stranger", &mut stranger_web),
+        ] {
+            let id = format!("autopilot-{who}");
+            autopilot(&p, &web.id, 4, &id, autopilot_start()).await;
+            let (_, outcome, reason) = receipts(&web.drain()).pop().expect("answered");
+            assert_eq!(outcome, Refused);
+            refusals.push((who, reason.unwrap()));
+        }
+        assert!(refusals[0].1.starts_with("Access denied") && refusals[0].1.contains(HOST_B));
+
+        for (who, refusal) in &refusals {
+            let web = match *who {
+                "member" => &mut member_web,
+                "owner" => &mut owner_web,
+                _ => &mut stranger_web,
+            };
+            let id = format!("prompts-{who}");
+            change_prompts(&p, &web.id, &id, save_prompt("Nightly", false)).await;
+            let delivered = web.drain();
+            assert_eq!(
+                prompt_receipts(&delivered),
+                vec![receipt(&id, Refused, Some(refusal))],
+                "{who}"
+            );
+            assert!(errors(&delivered).is_empty(), "{delivered:?}");
+        }
+        assert!(a.drain().is_empty() && b.drain().is_empty());
+
+        // The hosting account may. zoo-005 hears of it once zoo-006 saved it.
+        change_prompts(&p, &host_web.id, "prompts-host", save_prompt("Nightly", false)).await;
+        assert_eq!(prompt_changes(&mut b).len(), 1);
+        assert!(prompt_changes(&mut a).is_empty());
+        assert!(answer_prompts(&p, &b, "prompts-host", Accepted, None));
+        assert_eq!(prompt_changes(&mut a).len(), 1);
+        assert_eq!(
+            next_prompt_receipt(&mut host_web).await,
+            receipt("prompts-host", Accepted, None)
+        );
+    }
+
+    /// A change goes to the primary first, and to every other instance that
+    /// can keep saved prompts only once the primary accepted it: on a shared
+    /// home the instance that writes second refuses a save it finds already
+    /// there, and that must never be the answer. It is answered once, with
+    /// the primary's receipt, to the requesting connection only. A secondary
+    /// instance cannot answer it, and a change the primary refused reaches
+    /// no other. A save sends nothing to any tab and leaves a running
+    /// autopilot as it is.
+    #[tokio::test]
+    async fn a_saved_prompt_change_reaches_every_capable_instance_and_is_answered_once() {
+        let p = project().await;
+        let mut a = p.instance_with(p.m5, HOST_A, PROMPTS_CLI);
+        let mut b = p.instance_with(p.m6, HOST_B, PROMPTS_CLI);
+        let mut web = p.viewer(p.owner, PROMPTS_VIEWER);
+        let mut other_web = p.viewer(p.owner, PROMPTS_VIEWER);
+        p.roster(vec![omp_tab(3, p.m5, HOST_A), omp_tab(4, p.m6, HOST_B)]);
+        // zoo-006's tab is on autopilot.
+        p.state.sessions.report_pane_autopilot(
+            &p.session,
+            b.id,
+            4,
+            AutopilotSupport::Supported,
+            Some(waiting_autopilot()),
+            Some("2026-11-13T14:07:00Z".to_string()),
+        );
+        let running = serde_json::to_value(
+            p.state
+                .sessions
+                .pane_autopilot_frame(&p.session, 4)
+                .unwrap(),
+        )
+        .unwrap();
+        web.drain();
+        other_web.drain();
+
+        let change = save_prompt("Nightly", false);
+        let is_the_change = |sent: &[ServerToCli]| {
+            sent.len() == 1
+                && matches!(
+                    &sent[0],
+                    ServerToCli::UpdateAutopilotPrompts { request_id, change: sent_change, .. }
+                        if request_id == "save-1" && *sent_change == change
+                )
+        };
+        change_prompts(&p, &web.id, "save-1", change.clone()).await;
+        let to_a = a.drain();
+        assert!(is_the_change(&to_a), "one frame and nothing for a tab: {to_a:?}");
+        assert!(b.drain().is_empty(), "not before the primary saved it");
+        assert!(prompt_receipts(&web.drain()).is_empty(), "not answered yet");
+
+        assert!(
+            !answer_prompts(&p, &b, "save-1", Accepted, None),
+            "a secondary instance's receipt is not the answer"
+        );
+        assert!(b.drain().is_empty());
+        assert!(answer_prompts(&p, &a, "save-1", Accepted, None));
+        let to_b = b.drain();
+        assert!(is_the_change(&to_b), "one frame and nothing for a tab: {to_b:?}");
+        assert!(a.drain().is_empty(), "the primary is not sent it again");
+        assert_eq!(
+            next_prompt_receipt(&mut web).await,
+            receipt("save-1", Accepted, None)
+        );
+        // On a shared home zoo-006 finds the save already written and
+        // refuses it. That is not the answer, and the change was answered.
+        assert!(!answer_prompts(
+            &p,
+            &b,
+            "save-1",
+            Refused,
+            Some("A saved prompt named \"Nightly\" already exists.")
+        ));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(prompt_receipts(&web.drain()).is_empty(), "answered once");
+        let elsewhere = other_web.drain();
+        assert!(prompt_receipts(&elsewhere).is_empty(), "{elsewhere:?}");
+        assert!(autopilot_states(&elsewhere).is_empty(), "{elsewhere:?}");
+
+        // The running autopilot is as it was.
+        assert_eq!(
+            serde_json::to_value(p.state.sessions.pane_autopilot_frame(&p.session, 4).unwrap())
+                .unwrap(),
+            running
+        );
+        assert!(a.drain().is_empty() && b.drain().is_empty());
+
+        // A repeated copy has no further effect.
+        change_prompts(&p, &web.id, "save-1", change).await;
+        assert!(a.drain().is_empty() && b.drain().is_empty());
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(prompt_receipts(&web.drain()).is_empty());
+
+        // A change the primary refuses goes nowhere else.
+        let other = save_prompt("Weekly", false);
+        change_prompts(&p, &web.id, "save-2", other).await;
+        assert_eq!(prompt_changes(&mut a).len(), 1);
+        assert!(answer_prompts(&p, &a, "save-2", Refused, Some("No.")));
+        assert_eq!(
+            next_prompt_receipt(&mut web).await,
+            receipt("save-2", Refused, Some("No."))
+        );
+        assert!(b.drain().is_empty(), "a refused change reaches no other instance");
+    }
+
+    /// A primary instance whose CLI cannot keep saved prompts refuses every
+    /// change by naming its machine, and is sent nothing; neither is a
+    /// capable secondary. A secondary that cannot keep them is skipped. A
+    /// viewer that did not negotiate saved prompts has its request ignored
+    /// and is never sent a saved-prompt frame.
+    #[tokio::test]
+    async fn saved_prompts_are_gated_on_the_primary_and_on_the_viewer() {
+        let p = project().await;
+        // zoo-005, primary, has not been rebooted to update yet.
+        let mut a = p.instance_with(p.m5, HOST_A, AUTOPILOT_CLI);
+        let mut b = p.instance_with(p.m6, HOST_B, PROMPTS_CLI);
+        let mut web = p.viewer(p.owner, PROMPTS_VIEWER);
+        let mut older_web = p.viewer(p.owner, AUTOPILOT_VIEWER);
+
+        change_prompts(&p, &web.id, "older-primary", save_prompt("Nightly", false)).await;
+        assert_eq!(
+            prompt_receipts(&web.drain()),
+            vec![receipt(
+                "older-primary",
+                Refused,
+                Some("zoo-005 runs an older APAS that cannot save prompts. Reboot zoo-005 to update it.")
+            )]
+        );
+        assert!(a.drain().is_empty() && b.drain().is_empty());
+
+        // An older instance cannot report a list either.
+        report_prompts(&p, &a, vec![saved("Nightly")], None, false);
+        assert!(p.state.sessions.autopilot_prompts(&p.session).is_none());
+
+        // zoo-005 leaves: zoo-006 is primary, and a later older instance is
+        // skipped.
+        p.state
+            .sessions
+            .detach_cli_instance(&p.session, &a.id)
+            .unwrap();
+        let mut c = p.instance_with(Uuid::new_v4(), HOST_C, AUTOPILOT_CLI);
+        change_prompts(&p, &web.id, "capable-primary", save_prompt("Nightly", false)).await;
+        assert_eq!(prompt_changes(&mut b).len(), 1);
+        assert!(c.drain().is_empty(), "an older CLI drops the frame unanswered");
+        assert!(answer_prompts(&p, &b, "capable-primary", Accepted, None));
+        assert!(c.drain().is_empty(), "nor once the primary saved it");
+        assert_eq!(
+            next_prompt_receipt(&mut web).await,
+            receipt("capable-primary", Accepted, None)
+        );
+
+        // An older viewer.
+        change_prompts(&p, &older_web.id, "older-viewer", save_prompt("Other", false)).await;
+        assert!(b.drain().is_empty());
+        let delivered = older_web.drain();
+        assert!(prompt_receipts(&delivered).is_empty());
+        assert_eq!(errors(&delivered).len(), 1, "{delivered:?}");
+
+        // Lists go only to viewers that negotiated them, live and on attach,
+        // and the outbound task holds the same line.
+        report_prompts(&p, &b, vec![saved("Nightly")], Some("Nightly"), false);
+        let live = (vec!["Nightly".to_string()], Some("Nightly".to_string()), false);
+        assert_eq!(prompt_lists(&web.drain()), vec![live.clone()]);
+        assert!(prompt_lists(&older_web.drain()).is_empty());
+        for viewer in [&web.id, &older_web.id] {
+            replay_autopilot_prompts_after_attach(&p.state, viewer, p.session).await;
+        }
+        assert_eq!(prompt_lists(&web.drain()), vec![live]);
+        assert!(older_web.drain().is_empty());
+        let list_frame = p.state.sessions.autopilot_prompts_frame(&p.session).unwrap();
+        let receipt_frame = ServerToWeb::AutopilotPromptsReceipt {
+            session_id: p.session,
+            request_id: "any".to_string(),
+            outcome: Uncertain,
+            reason: None,
+        };
+        for frame in [&list_frame, &receipt_frame] {
+            assert!(autopilot_outbound_allowed(&p.state, &web.id, frame));
+            assert!(!autopilot_outbound_allowed(&p.state, &older_web.id, frame));
+        }
+    }
+
+    /// The primary's list is cached and sent to capable viewers when its
+    /// content changes, never again for the same content, and replayed on
+    /// attach. A secondary's report is not shown, but is kept: when the
+    /// primary leaves, the next primary's list is shown at once, since its
+    /// CLI sends it again only when it changes. A change is checked against
+    /// the cached list before anything is sent, and an unreadable list
+    /// refuses every change. With no instance attached nothing is sent.
+    #[tokio::test]
+    async fn the_primarys_list_is_cached_checked_against_and_relayed_on_change() {
+        let p = project().await;
+        let mut web = p.viewer(p.owner, PROMPTS_VIEWER);
+        change_prompts(&p, &web.id, "not-running", save_prompt("Nightly", false)).await;
+        assert_eq!(
+            prompt_receipts(&web.drain()),
+            vec![receipt(
+                "not-running",
+                Refused,
+                Some("No machine is running this project. Start it to save prompts.")
+            )]
+        );
+
+        let mut a = p.instance_with(p.m5, HOST_A, PROMPTS_CLI);
+        let mut b = p.instance_with(p.m6, HOST_B, PROMPTS_CLI);
+        web.drain();
+        // Nothing reported yet: a viewer that attaches hears nothing.
+        replay_autopilot_prompts_after_attach(&p.state, &web.id, p.session).await;
+        assert!(prompt_lists(&web.drain()).is_empty());
+
+        report_prompts(&p, &b, vec![saved("From zoo-006")], None, false);
+        assert!(p.state.sessions.autopilot_prompts(&p.session).is_none());
+        report_prompts(&p, &a, vec![saved("Nightly")], None, false);
+        report_prompts(&p, &a, vec![saved("Nightly")], None, false);
+        assert_eq!(
+            prompt_lists(&web.drain()),
+            vec![(vec!["Nightly".to_string()], None, false)],
+            "the same content is sent once"
+        );
+
+        for (id, change, reason) in [
+            (
+                "taken",
+                save_prompt("NIGHTLY", false),
+                "A saved prompt named \"Nightly\" already exists.",
+            ),
+            (
+                "built-in",
+                save_prompt("APAS worker", true),
+                "\"APAS worker\" is the name of a built-in template. Choose another name.",
+            ),
+            (
+                "missing",
+                shared::AutopilotPromptChange::Delete {
+                    name: "Weekly".to_string(),
+                },
+                "No saved prompt is named \"Weekly\".",
+            ),
+        ] {
+            change_prompts(&p, &web.id, id, change).await;
+            assert_eq!(
+                prompt_receipts(&web.drain()),
+                vec![receipt(id, Refused, Some(reason))]
+            );
+        }
+        assert!(a.drain().is_empty() && b.drain().is_empty());
+
+        report_prompts(&p, &a, Vec::new(), None, true);
+        assert_eq!(
+            prompt_lists(&web.drain()),
+            vec![(Vec::new(), None, true)]
+        );
+        change_prompts(&p, &web.id, "unreadable", save_prompt("New", false)).await;
+        assert_eq!(
+            prompt_receipts(&web.drain()),
+            vec![receipt(
+                "unreadable",
+                Refused,
+                Some(shared::AUTOPILOT_PROMPTS_UNREADABLE_REASON)
+            )]
+        );
+        assert!(a.drain().is_empty() && b.drain().is_empty());
+
+        // zoo-005 leaves: zoo-006 reported its own list long ago, and that
+        // is shown at once, and checked against.
+        web.drain();
+        p.state
+            .sessions
+            .detach_cli_instance(&p.session, &a.id)
+            .unwrap();
+        let from_b = (vec!["From zoo-006".to_string()], None, false);
+        assert_eq!(prompt_lists(&web.drain()), vec![from_b.clone()]);
+        assert_eq!(
+            p.state.sessions.autopilot_prompts(&p.session).unwrap().prompts,
+            vec![saved("From zoo-006")]
+        );
+        change_prompts(&p, &web.id, "after-handover", save_prompt("Nightly", false)).await;
+        assert_eq!(prompt_changes(&mut b).len(), 1, "checked against zoo-006's list");
+        assert!(answer_prompts(&p, &b, "after-handover", Accepted, None));
+        web.drain();
+
+        // A next primary that has reported nothing keeps the list on show:
+        // zoo-006 is replaced by a new connection, zoo-005 comes back behind
+        // it with a list of its own, and zoo-006's new connection leaves
+        // before reporting.
+        let b2 = p.instance_with(p.m6, HOST_B, PROMPTS_CLI);
+        let mut a2 = p.instance_with(p.m5, HOST_A, PROMPTS_CLI);
+        report_prompts(&p, &a2, vec![saved("Back on zoo-005")], None, false);
+        assert!(prompt_lists(&web.drain()).is_empty(), "zoo-005 is not primary");
+        p.state
+            .sessions
+            .detach_cli_instance(&p.session, &b2.id)
+            .unwrap();
+        assert_eq!(
+            prompt_lists(&web.drain()),
+            vec![(vec!["Back on zoo-005".to_string()], None, false)],
+            "zoo-005's kept report is promoted"
+        );
+        p.state
+            .sessions
+            .detach_cli_instance(&p.session, &a2.id)
+            .unwrap();
+        assert!(prompt_lists(&web.drain()).is_empty(), "nobody is left to promote");
+        assert_eq!(
+            p.state.sessions.autopilot_prompts(&p.session).unwrap().prompts,
+            vec![saved("Back on zoo-005")],
+            "the last list stays on show"
+        );
+        let _ = (a2.drain(), b.drain());
+    }
+
+    /// A change the primary does not answer in time is reported as not
+    /// confirmed, never as refused, and never sent again. So is one whose
+    /// primary disconnects first, without waiting out the time limit.
+    #[tokio::test]
+    async fn an_unanswered_saved_prompt_change_is_not_confirmed() {
+        let p = project().await;
+        let mut a = p.instance_with(p.m5, HOST_A, PROMPTS_CLI);
+        let mut b = p.instance_with(p.m6, HOST_B, PROMPTS_CLI);
+        let mut web = p.viewer(p.owner, PROMPTS_VIEWER);
+
+        change_prompts_within(
+            &p,
+            &web.id,
+            "slow",
+            save_prompt("Nightly", false),
+            Duration::from_millis(50),
+        )
+        .await;
+        assert_eq!(prompt_changes(&mut a).len(), 1);
+        assert_eq!(
+            next_prompt_receipt(&mut web).await,
+            receipt("slow", Uncertain, None)
+        );
+        assert!(
+            !answer_prompts(&p, &a, "slow", Accepted, None),
+            "a late receipt finds nothing waiting"
+        );
+        assert!(a.drain().is_empty(), "nothing is sent again");
+        assert!(b.drain().is_empty(), "nor on to the other instance");
+
+        change_prompts(&p, &web.id, "gone", save_prompt("Nightly", false)).await;
+        assert_eq!(prompt_changes(&mut a).len(), 1);
+        let sent = std::time::Instant::now();
+        p.state.sessions.unregister_cli(&a.id);
+        assert_eq!(
+            next_prompt_receipt(&mut web).await,
+            receipt("gone", Uncertain, None)
+        );
+        assert!(sent.elapsed() < AUTOPILOT_RECEIPT_WAIT);
+        assert!(prompt_receipts(&web.drain()).is_empty());
     }
 }

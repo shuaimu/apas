@@ -80,6 +80,25 @@ pub struct ProjectMetadata {
     #[serde(default)]
     pub disallowed_tab_types: Vec<String>,
 
+    /// The project's saved autopilot prompts, by name, in the order the start
+    /// dialog lists them. Changed only through
+    /// `crate::autopilot_prompts::apply_change` under the project lock.
+    /// Lenient, so a list that does not parse is kept as written and reported
+    /// unreadable instead of making the whole file unreadable.
+    #[serde(
+        default,
+        skip_serializing_if = "crate::autopilot_prompts::Lenient::is_absent"
+    )]
+    pub autopilot_prompts: crate::autopilot_prompts::Lenient<Vec<shared::SavedAutopilotPrompt>>,
+
+    /// The name of the saved prompt a tab with no earlier autopilot starts
+    /// from. Absent when there is none.
+    #[serde(
+        default,
+        skip_serializing_if = "crate::autopilot_prompts::Lenient::is_absent"
+    )]
+    pub default_autopilot_prompt: crate::autopilot_prompts::Lenient<String>,
+
     // Legacy fields for backward compatibility (read-only migration)
     /// Claude session ID for the deadloop pane (legacy - use panes instead)
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -107,6 +126,8 @@ impl ProjectMetadata {
             auto_merge_prs: false,
             team_enabled: false,
             disallowed_tab_types: Vec::new(),
+            autopilot_prompts: Default::default(),
+            default_autopilot_prompt: Default::default(),
             deadloop_claude_session_id: None,
             interactive_claude_session_id: None,
             is_paused: false,
@@ -127,6 +148,8 @@ impl ProjectMetadata {
             auto_merge_prs: false,
             team_enabled: false,
             disallowed_tab_types: Vec::new(),
+            autopilot_prompts: Default::default(),
+            default_autopilot_prompt: Default::default(),
             deadloop_claude_session_id: None,
             interactive_claude_session_id: None,
             is_paused: false,
@@ -1020,6 +1043,8 @@ pub fn get_or_create_project(dir: &Path) -> Result<ProjectMetadata> {
             auto_merge_prs: false,
             team_enabled: false,
             disallowed_tab_types: Vec::new(),
+            autopilot_prompts: Default::default(),
+            default_autopilot_prompt: Default::default(),
             deadloop_claude_session_id: None,
             interactive_claude_session_id: None,
             is_paused: false,

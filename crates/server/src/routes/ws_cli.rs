@@ -146,7 +146,15 @@ fn inbound_scope(message: &CliToServer) -> InboundScope {
         | CliToServer::ProjectPolicySnapshot { session_id, .. }
         | CliToServer::CliLifecycleInventory { session_id, .. }
         | CliToServer::CliLifecycleStatus { session_id, .. } => Session(*session_id),
-        CliToServer::ProjectFlagsChanged { session_id, .. } => Primary(*session_id),
+        // Every capable instance reports its saved prompts. Only the
+        // primary's list is shown, but every instance's is kept, so the next
+        // primary's is shown as soon as it takes over (`session::
+        // autopilot_prompts`).
+        CliToServer::ProjectAutopilotPrompts { session_id, .. } => Session(*session_id),
+        // Every capable instance answers each change it was sent; the
+        // answer, like the flags, is the primary's.
+        CliToServer::ProjectFlagsChanged { session_id, .. }
+        | CliToServer::AutopilotPromptsReceipt { session_id, .. } => Primary(*session_id),
     }
 }
 
@@ -544,9 +552,14 @@ async fn relay_primary_inventory_after_handover(state: &AppState, detach: &Insta
 /// those a CLI reads the echo of. A CLI that advertised
 /// `omp_tab_autopilot_v1` and does not see it echoed tells its OMP tabs that
 /// the server cannot control autopilot, and they hold. This server relays
-/// autopilot state and controls, so it must echo it.
+/// autopilot state and controls, so it must echo it. A CLI that does not see
+/// `project_autopilot_prompts_v1` echoed reports no saved prompts, which an
+/// older server could not parse.
 fn negotiated_cli_capabilities(advertised: &[String]) -> Vec<String> {
-    [shared::OMP_TAB_AUTOPILOT_CAPABILITY]
+    [
+        shared::OMP_TAB_AUTOPILOT_CAPABILITY,
+        shared::PROJECT_AUTOPILOT_PROMPTS_CAPABILITY,
+    ]
         .into_iter()
         .filter(|negotiable| advertised.iter().any(|capability| capability == negotiable))
         .map(str::to_string)
@@ -2219,6 +2232,40 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             Ok(CliToServer::Register { .. }) => {
                                 // Already registered, ignore
                             }
+                            Ok(CliToServer::AutopilotPromptsReceipt {
+                                session_id,
+                                request_id,
+                                outcome,
+                                reason,
+                            }) => {
+                                // Only the primary gets this far, and the waiter also
+                                // names the connection the change was checked against.
+                                state.sessions.finish_autopilot_prompts_request(
+                                    session_id,
+                                    cli_id,
+                                    &request_id,
+                                    crate::session::AutopilotReceipt { outcome, reason },
+                                );
+                            }
+                            Ok(CliToServer::ProjectAutopilotPrompts {
+                                session_id,
+                                prompts,
+                                default,
+                                unreadable,
+                            }) => {
+                                // Kept per instance; the primary's is cached for viewers
+                                // that attach later and relayed only to viewers that
+                                // negotiated saved prompts.
+                                state.sessions.report_autopilot_prompts(
+                                    &session_id,
+                                    cli_id,
+                                    crate::session::autopilot_prompts::AutopilotPromptsView {
+                                        prompts,
+                                        default,
+                                        unreadable,
+                                    },
+                                );
+                            }
                             Ok(CliToServer::PaneAutopilotReceipt {
                                 session_id,
                                 pane_id,
@@ -3035,6 +3082,24 @@ mod instance_tests {
                     reported_at: None,
                 },
                 Pane(s, 4),
+            ),
+            (
+                CliToServer::AutopilotPromptsReceipt {
+                    session_id: s,
+                    request_id: "prompts-1".into(),
+                    outcome: shared::AutopilotReceiptOutcome::Accepted,
+                    reason: None,
+                },
+                Primary(s),
+            ),
+            (
+                CliToServer::ProjectAutopilotPrompts {
+                    session_id: s,
+                    prompts: Vec::new(),
+                    default: None,
+                    unreadable: false,
+                },
+                Session(s),
             ),
         ]
     }
@@ -3866,6 +3931,102 @@ mod instance_tests {
         .await;
         assert!(echoed.is_empty(), "{echoed:?}");
         assert!(super::negotiated_cli_capabilities(&[]).is_empty());
+    }
+
+    /// A CLI that advertised saved prompts is told this server takes them.
+    /// Over the socket, the primary's list reaches viewers that negotiated
+    /// saved prompts and no other, a secondary's list and receipt are not the
+    /// session's, and the primary's receipt answers the waiting change.
+    #[tokio::test]
+    async fn saved_prompts_travel_from_the_primary_to_capable_viewers() {
+        let harness = harness().await;
+        let with_prompts: Vec<&str> = AUTOPILOT_CLI
+            .iter()
+            .copied()
+            .chain([shared::PROJECT_AUTOPILOT_PROMPTS_CAPABILITY])
+            .collect();
+        let (mut a, a_id, echoed) = register_cli(&harness, &with_prompts).await;
+        assert_eq!(
+            echoed,
+            vec![
+                shared::OMP_TAB_AUTOPILOT_CAPABILITY.to_string(),
+                shared::PROJECT_AUTOPILOT_PROMPTS_CAPABILITY.to_string(),
+            ]
+        );
+        let (mut b, _, _) = register_cli(&harness, &with_prompts).await;
+        let session = Uuid::new_v4();
+        let (m5, m6) = (Uuid::new_v4(), Uuid::new_v4());
+        start(&mut a, session_start(session, m5, HOST_A, Some(vec![omp_tab(3)]))).await;
+        start(&mut b, session_start(session, m6, HOST_B, Some(vec![omp_tab(4)]))).await;
+        let mut web = viewer_with(
+            &harness,
+            session,
+            &[shared::PROJECT_AUTOPILOT_PROMPTS_CAPABILITY],
+        );
+        let mut older_web = viewer_with(&harness, session, &[shared::TAB_AUTOPILOT_CAPABILITY]);
+        let list = |name: &str| CliToServer::ProjectAutopilotPrompts {
+            session_id: session,
+            prompts: vec![shared::SavedAutopilotPrompt {
+                name: name.to_string(),
+                prompt: "Review.".to_string(),
+                updated_at: "2026-11-14T09:00:00Z".to_string(),
+            }],
+            default: None,
+            unreadable: false,
+        };
+        let names = |message: &ServerToWeb| match message {
+            ServerToWeb::ProjectAutopilotPrompts { prompts, .. } => {
+                prompts.iter().map(|saved| saved.name.clone()).collect::<Vec<_>>()
+            }
+            _ => Vec::new(),
+        };
+
+        send(&mut b, list("From zoo-006")).await;
+        send(&mut a, list("From zoo-005")).await;
+        let (first, before) = receive_web(&mut web, |message| {
+            matches!(message, ServerToWeb::ProjectAutopilotPrompts { .. })
+        })
+        .await;
+        assert_eq!(names(&first), vec!["From zoo-005".to_string()]);
+        assert!(before.iter().all(|message| names(message).is_empty()));
+
+        let receipt = harness
+            .state
+            .sessions
+            .forward_autopilot_prompts_change(
+                session,
+                a_id,
+                "save-1",
+                &shared::AutopilotPromptChange::SetDefault { name: None },
+            )
+            .unwrap();
+        let answered = |reason: &str| CliToServer::AutopilotPromptsReceipt {
+            session_id: session,
+            request_id: "save-1".to_string(),
+            outcome: shared::AutopilotReceiptOutcome::Accepted,
+            reason: Some(reason.to_string()),
+        };
+        send(&mut b, answered("from the secondary")).await;
+        send(&mut a, answered("from the primary")).await;
+        let receipt = tokio::time::timeout(Duration::from_secs(5), receipt)
+            .await
+            .expect("the receipt arrives")
+            .unwrap();
+        assert_eq!(receipt.reason.as_deref(), Some("from the primary"));
+
+        send(&mut a, terminal_output(session, 3)).await;
+        let (_, before) = receive_web(&mut older_web, |message| {
+            matches!(message, ServerToWeb::TerminalOutput { pane_id: 3, .. })
+        })
+        .await;
+        assert!(
+            !before.iter().any(|message| matches!(
+                message,
+                ServerToWeb::ProjectAutopilotPrompts { .. }
+                    | ServerToWeb::AutopilotPromptsReceipt { .. }
+            )),
+            "{before:?}"
+        );
     }
 
     /// A tab's autopilot state and the receipt for a request come only from

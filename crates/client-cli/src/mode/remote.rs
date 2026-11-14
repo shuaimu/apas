@@ -551,6 +551,22 @@ async fn run_connection(
                             })
                             .await;
                     }
+                    // Remote-only mode does not advertise saved prompts, so the
+                    // server should never send this; answer it anyway, once.
+                    Ok(ServerToCli::UpdateAutopilotPrompts {
+                        session_id,
+                        request_id,
+                        ..
+                    }) => {
+                        let _ = ws_tx_clone
+                            .send(CliToServer::AutopilotPromptsReceipt {
+                                session_id,
+                                request_id,
+                                outcome: shared::AutopilotReceiptOutcome::Refused,
+                                reason: Some("Remote-only mode cannot save prompts to .apas".into()),
+                            })
+                            .await;
+                    }
                     Ok(ServerToCli::StartBot {
                         session_id,
                         pane_id,
