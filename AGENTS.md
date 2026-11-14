@@ -53,6 +53,16 @@ not the bot restored either: it is a loop a person starts inside one OMP
 terminal tab's own session, it shares no code or state with the bot, and a
 legacy bot pane cannot be put on autopilot.
 
+**Raw Pi was retired as a provider on 2026-11-13; OMP, which is derived from
+it, stays.** `Provider::Pi` and the web value `"pi"` survive only so an older
+`.apas`, a stored roster, a stored policy that lists
+`terminal:pi:official:default` and a frame from an older client still parse.
+Nothing can create a Pi tab, switch a tab to Pi or launch one. If you find
+code that launches `pi`, looks for sessions under `~/.pi` or reads `pi_path`,
+it is stale. Names such as `PiTranscriptReader` and `PI_CODING_AGENT_DIR` are
+not: OMP writes Pi's session format and reads Pi's overrides. See "Pi is
+retired; OMP stays" under Terminal panes.
+
 ## Architecture
 
 ```
@@ -133,9 +143,14 @@ continuation. Failed items require an explicit retry under their retained limits
 
 #### Browser and native workflow
 
-Desktop and mobile-browser `+` offers **Interactive agent** or **Autonomous
-worker**. The latter opens a project-fixed mandate/checklist composer; an
-unavailable preferred machine is explained, never silently replaced.
+The desktop tab bar's `+` and the mobile-browser pane sheet create an
+interactive agent tab directly: the provider, then the **Run on** step where it
+applies. The release of 2026-11-11 made `+` first ask **Interactive agent** or
+**Autonomous worker**; that step was removed again at the owner's request. An
+autonomous worker is created with **New autonomous worker** in the Overview
+tab's Autonomous workers section, or from `/code/workers/`. Both open the
+project-fixed mandate/checklist composer; an unavailable preferred machine is
+explained, never silently replaced.
 `/code/workers/` is the cross-project Workers/Attention surface. Native uses the
 same contracts in native screens, not a WebView.
 
@@ -144,6 +159,42 @@ zero panes and lists responsibilities, backlog/status and paginated history.
 Global inventory, project inventory, backlog and run history are independently
 paged; a loaded subset is not a whole-project count. Selecting or hiding a view
 does not close a terminal or change a worker's lifecycle.
+
+**The Overview tab is one page, tabs first.** Its order is the project's name,
+**Tabs** (one card per tab), **Usage**, **Resource use**, **Allowed launch
+profiles**, then **Autonomous workers** with Earlier results. Workers used to
+open the page, above an "Interactive project" block; they moved to the end
+because the tabs are what is running and workers are off until a deployment
+enables them. Every worker function is still there: the worker cards, New
+autonomous worker, Refresh, load more, and Earlier results. The page has no
+"Back to interactive agents" button, since the tab bar above it leads to every
+tab; the worker, composer and earlier-result screens keep theirs.
+
+- Tab cards follow the tab bar's order (the roster's), never pane id, and a
+  card does not move when its tab's state changes. The card's remove control
+  is **Close tab**.
+- The Usage table lists open tabs first, most recently active first, then
+  usage no tab accounts for, then one folded row for closed tabs that carries
+  their sum, so the rows still add up to the totals. Counts use k, M, B or T
+  (`lib/formatCount.ts`).
+- A tab card's "Last active" and the Usage table's use one formatter
+  (`lib/formatRelativeTime.ts`). Under a minute, or a server time ahead of the
+  browser's clock, reads "just now".
+- Allowed launch profiles are shown by their names from the provider catalog
+  (`lib/launchProfileLabels.ts`), with the policy key as the tooltip. A key the
+  catalog cannot name is shown as the key. A retired provider's key is left
+  out, as on the Machines and admin pages.
+
+The phone's project screen shows the same page with a shorter body: the
+project's name, its tabs as rows that open them, then Autonomous workers.
+Usage, Resource use and Allowed launch profiles are on the desktop page only.
+
+`ProjectWorkersWorkspace` renders this page from the shared parts in
+`components/overview/OverviewElements.tsx`, outside the Jobs stylesheet. The
+composer, worker and earlier-result views are the Jobs pages' own screens and
+keep that style. Tests outside the Overview's own files find the tab panels by
+the region and heading "Interactive project"; the page keeps that heading for
+screen readers only, so do not delete it without changing those tests.
 
 **Pause after this run** fences new dispatch but lets the admitted run finish.
 **Stop now** also requests whole-unit termination and fences publication; its
@@ -354,6 +405,54 @@ both. Exact check counts and the still-open host/device qualification gates are
 recorded in `openspec/changes/unify-autonomous-workers/tasks.md`. This local work
 did not deploy, enable a policy, approve a real worker or satisfy those gates.
 
+**Not yet deployed, as of 2026-11-13.** Four changes are in the tree and not in
+production: `+` creating an interactive agent directly, the retirement of Pi,
+the rebuilt Overview tab, and the prompt templates in the Start autopilot
+dialog. Production still shows the chooser, offers Pi and has the older
+Overview. The Pi retirement touches server, web and CLI and goes out in that
+order (see "Pi is retired; OMP stays"); the other three are web only. The
+smaller fixes made with them are undeployed too: the last `team_available`
+reads in server, web and CLI, and the one-machine reboot confirmation. The
+CLI's part reaches each machine only at its next daemon reboot from the
+Machines page. The design record for all of it is
+`openspec/changes/refine-interactive-workspace/`.
+
+**What was checked for these four, as of 2026-11-13.** Each work stream ran
+only its own tests. The complete gates were not run on the combined tree: not
+the whole web test suite, `npm run build`, the static musl CLI build, the
+native checks or a two-host smoke (task 10.1 of the change). The templates'
+own record is under "Prompt templates" in the autopilot section.
+
+- Pi retirement: `cargo test` for shared (92 + 3 + 1), server (456) and CLI
+  (595, 1 ignored as before); the protocol's 68 tests, the extension's 137
+  node tests, and a schema regeneration that changed nothing more; the web
+  tests of the tab bar, workspace, phone screen, sidebar rail, store, tab
+  types and provider options (441 in 31 files), typecheck and lint. In the read-only viewer at
+  1440 px and 390 px, `+` and Add agent list no Pi.
+- `+`: the same web tests; the viewer showed `+` opening the provider list at
+  once on the desktop, and Add agent opening on Run on and the profiles on a
+  390 px phone.
+- Overview: its own tests (87 in ten files), typecheck and lint; the viewer at
+  1440x900 light and dark and 1024x768 on the real project (768x1024 only
+  before the last Overview edits), the worker composer opened from New
+  autonomous worker, and the phone's Overview at 390 px in the light theme.
+
+Not exercised:
+
+- **a saved Pi tab anywhere but in unit tests.** No tab of this deployment uses
+  Pi and the viewer is read-only, so its notice, its exited state, the Reboot
+  CLI refusal and closing it were not seen in a browser or on a real CLI. The
+  CLI test of the pane-host cleanup uses hosts whose tmux sessions do not
+  exist: it proves a Pi host's runtime files are removed and an OMP host's are
+  kept, not that a live Pi agent is ended. Production was not checked for Pi
+  tabs;
+- worker cards with real workers: they were seen only with stand-in data the
+  viewer answered in the browser, and Earlier results only in unit tests;
+- in a browser: a project with no tabs, a legacy agent-kind tab, a tab with a
+  worktree or a role, the access-changed state, and the phone's Overview at
+  360 px;
+- a real phone, iOS and the on-screen keyboard, and any real OMP launch.
+
 ### Project sidebar ordering
 
 The expanded web sidebar has drag handles on repository headers and, when a
@@ -454,7 +553,7 @@ apas/
 │       │   │   ├── layout.tsx
 │       │   │   └── page.tsx
 │       │   ├── components/
-│       │   │   ├── overview/         # Project policy, pane and usage panels
+│       │   │   ├── overview/         # The Overview page and its shared parts
 │       │   │   ├── workers/          # Responsibilities, backlog and exact-run results
 │       │   │   ├── tabs/             # Pane tabs, task bars, diff modal
 │       │   │   │   └── TerminalPane.tsx  # xterm.js view for kind:"terminal" panes
@@ -468,6 +567,10 @@ apas/
 │       │       ├── tabHosts.ts       # Which machine runs each tab, and why a tab cannot be used
 │       │       ├── machineChoice.ts  # The "Run on" step for a new tab
 │       │       ├── autopilot.ts      # Autopilot: frame parsing, the control's model, texts
+│       │       ├── autopilotTemplates.ts # Built-in prompts the Start autopilot dialog offers
+│       │       ├── launchProfileLabels.ts # Catalog names for launch-profile keys and providers
+│       │       ├── formatCount.ts    # Compact counts and money for tables
+│       │       ├── formatRelativeTime.ts # "5m ago", one formatter for cards and tables
 │       │       └── mobileSelectedPane.ts # Which pane a session screen opens on
 │       └── package.json
 │
@@ -992,10 +1095,13 @@ everything allowed = existing projects unaffected. It also means a provider
 added later is permitted until an owner says otherwise, rather than vanishing
 from their menu.
 
-The catalog is deliberately **not** every `Provider`. DeepSeek is the Claude
-binary against a different backend, so the add-tab menu offers it as a Claude
-model. `shared::all_tab_types` and `packages/web/src/lib/tabTypes.ts` must
-agree; a test in `shared` reads the TS file and asserts they do.
+The catalog is deliberately **not** every `Provider`. It lists exactly
+`terminal:claude`, `terminal:codex`, `terminal:opencode` and `terminal:omp`.
+DeepSeek is the Claude binary against a different backend, so the add-tab menu
+offers it as a Claude model. The retired values (MiniMax, GLM, and Pi since
+2026-11-13) still decode and are never offered. `shared::all_tab_types` and
+`packages/web/src/lib/tabTypes.ts` must agree; a test in `shared` reads the TS
+file and asserts they do.
 
 Enforced in the CLI (`tab_type_allowed_for`), which re-reads `.apas` on every
 `AddPane` — the web only hides menu entries, and the same message can arrive
@@ -1012,12 +1118,25 @@ machines required deployment-wide authority over everyone else's projects.
 
 **A virtual cluster is derived, not stored.** Every account operates exactly
 one: the machines whose client registered under it, plus the projects hosted in
-it. A project is hosted in an account's cluster when the account **owns it** or
-when **at least one of its sessions was created under it** (`db::
-project_in_user_cluster`). Sessions are the durable evidence of where a project
-actually runs — machines live only in memory, and projects carry no machine
-column. So a project owned by `soumojit.dalui` that runs on your daemon is in
-*your* cluster, and you administer it without being a member of it.
+it. The cluster has no row of its own; what is stored is each project's
+placement. A project is hosted in an account's cluster when
+`project_cluster_placements` holds a row for that project and that account, and
+for no other reason (`db::project_in_user_cluster`). Ownership, membership and
+session history are not read when the question is asked. A placement is written
+when an account's CLI starts or registers the project
+(`authorize_project_registration`, which admits only the project's owner, a
+member, or an account that already hosts it) and when a cluster member
+provisions a project on a shared machine.
+
+The rule used to be read from live data: the account **owns it**, or **at
+least one of its sessions was created under it**. Sessions were the durable
+evidence of where a project runs, since machines live only in memory and
+projects carry no machine column. A one-time migration froze that relation
+into placement rows (`legacy_owner`, `legacy_session`), so every project hosted
+under the old rule still is, and session history stopped being an authorization
+source. So a project owned by `soumojit.dalui` that ran on your daemon, or that
+he provisioned on a machine you shared, is in *your* cluster, and you
+administer it without being a member of it.
 
 **Belonging to a project is deliberately not hosting it.** Content access is
 owner ∨ member ∨ host; administration (lifecycle, stop-runtime, membership,
@@ -1161,7 +1280,15 @@ so a multi-hosted project still has one answer.
 so web and mobile builds that predate the team-mode removal keep parsing what
 they are sent — the same reason `cluster_role` survives — and it decides
 nothing. Do not reintroduce a read of it; a test asserts a policy carrying it
-behaves exactly like one without it.
+behaves exactly like one without it. Four leftovers were still reading it
+until 2026-11-13: the policy editor on `/machines` and `/admin` showed a
+"Team launch available" switch, the web store refused to resume, reboot or
+switch a `managed` pane while it was off, the server listed a stored
+`managed` pane as outside policy while it was off, which is its default, and
+the CLI's AddPane check refused a new pane marked `managed` while it was off.
+All four are gone, so no UI offers it. The CLI's part reaches a machine only
+when its daemon is rebooted to update. A policy save sends back the value the
+editor was given, so saving the launch profiles cannot change it.
 
 **Audit carries an actor kind and a cluster.** `admin_audit_events` was rebuilt
 once (create-copy-drop-rename, guarded by `schema_migrations`) because
@@ -1306,6 +1433,15 @@ restarting. The server authorizes the machine against the requester's own daemon
 registrations — the same check `StartMachineProjectCli` uses — and reports an
 offline daemon rather than dropping the request.
 
+The confirmation for one machine says what that costs: "Every project running
+on <host> restarts with it. Terminal agents normally keep running during the
+restart, because their hosts are separate processes." (`rebootEffectNote` in
+`lib/daemonVersion.ts`, used on the Machines page and on the phone). It used
+to say that projects, panes and agents keep running because the
+daemon does not own them, which stopped being true when projects moved into
+the daemon. "Normally", because a pane host whose runtime files were lost is
+not found again and its tab gets a fresh agent.
+
 A requested restart **applies an available update first**, via
 `prepare_cli_restart`, so `check_for_update_available` syncs the git repo and
 pull/build/install all complete while the current daemon is still serving; a
@@ -1378,9 +1514,9 @@ history, one sharing and one policy; what multiplies is the **instance**, one
 machine's runtime of the project inside that machine's daemon. (This is not the
 per-host APAS process of "One instance per user per host": a daemon can run one
 instance each of many projects.) Tabs never move between machines. The design
-record is `openspec/changes/run-project-tabs-across-machines/`; the doc comments
-on the contract types in `crates/shared/src/messages.rs` are the binding
-statement of the wire.
+record is `openspec/changes/archive/2026-11-13-run-project-tabs-across-machines/`;
+the doc comments on the contract types in `crates/shared/src/messages.rs` are
+the binding statement of the wire.
 
 **The server keeps every instance as an attachment of the one session**
 (`session/instances.rs`). The **primary** is the earliest still attached. It
@@ -1789,28 +1925,19 @@ otherwise have had to volunteer.
   `--session-dir` instead (see "Terminal panes" below). New Linux panes report
   their exact transcript through the pane-local activity extension below.
   Already-running panes use the newest flat `.jsonl` in their private directory.
-  `PiTranscriptReader` reads both Pi and OMP records; a real OMP capture guards
-  their shared conversation format.
-- **pi** — `--session-id <uuid>` pins the pane's identity at spawn, and Pi names
-  the session file after it:
-  `~/.pi/agent/sessions/--<cwd slug>--/<timestamp>_<uuid>.jsonl`. APAS finds
-  that exact id anywhere under the sessions root (honoring
-  `PI_CODING_AGENT_DIR` and `PI_CODING_AGENT_SESSION_DIR`), so sibling panes
-  and provider subprocesses sharing a cwd are never adopted. Pi writes the file
-  only once the session's first assistant message exists; before that the pane
-  simply has no history. In-TUI `/new` and `/resume` switches are deliberately
-  not followed: nothing distinguishes a deliberate switch from an oh-my-pi
-  subagent's session, and pinned identity is exact.
+  `PiTranscriptReader` reads it. The reader keeps the name of the Pi session
+  format, which OMP writes; a real OMP capture guards that format. Raw Pi
+  sessions under `~/.pi` are no longer located or read: Pi was retired on
+  2026-11-13 and its lookup went with it.
 
 Parsing keeps only real conversation. claude transcripts also carry `mode`,
 `ai-title`, `last-prompt` bookkeeping; codex carries `developer` messages (the
 harness's own injected context), `reasoning`, and tool calls; OpenCode exports
-typed reasoning/tool/synthetic parts; pi sessions are trees whose `custom` and
-`custom_message` extension entries (what the oh-my-pi package writes),
-thinking, tool results, shell executions, and compaction/branch summaries are
-not turns. None of those are turns, and rendering them would be noise. For pi,
-only the active parent chain is read, so an abandoned `/tree` branch never
-reappears in history. Tool-use-only turns with no text are skipped rather than
+typed reasoning/tool/synthetic parts; OMP sessions, in the Pi session format,
+are trees whose `custom` and `custom_message` extension entries, thinking, tool
+results, shell executions, and compaction/branch summaries are not turns. None
+of those are turns, and rendering them would be noise. For OMP, only the active
+parent chain is read, so an abandoned branch never reappears in history. Tool-use-only turns with no text are skipped rather than
 recorded blank. In-progress OpenCode assistant messages are held until their
 completion timestamp arrives so APAS never advances its cursor over a partial
 reply.
@@ -1850,7 +1977,7 @@ also has no terminal-settle notification for potential background work
 cancelled without another lifecycle event; do not fabricate one from elapsed
 time or file inactivity.
 
-**A three-second poll must not hide a two-minute parse.** Pi/OMP parent chains
+**A three-second poll must not hide a two-minute parse.** OMP parent chains
 are indexed once rather than repeatedly searching all preceding records.
 The old reader took 127.8 seconds on a live 158 MB transcript and blocked
 every other pane in that project's serial watcher. Parsed snapshots are now
@@ -1956,10 +2083,9 @@ native-terminal precedence, browser refresh, and a server restart that preserved
 the provider PID. A production mobile answer was also verified with OMP 18.8.9.
 The native UI API remains version-sensitive.
 
-Pi's extension-provided `ask` has no answerable card or keystroke bridge;
-answer it in the terminal view. OpenCode has no question interface either.
-Adding another provider requires verifying its picker contract, not assuming
-Claude's keystrokes or OMP's native API.
+OpenCode has no question interface. Adding another provider requires
+verifying its picker contract, not assuming Claude's keystrokes or OMP's
+native API.
 
 **The conversation view is writable, and that is the point on mobile.** An
 xterm TUI on a phone is close to unusable — no modifier keys, tiny hit targets,
@@ -1993,13 +2119,13 @@ Each turn is then dressed as the stream message an agent pane would have sent
 cheap: no new wire message, no new storage path, no new renderer, and no server
 or web change at all. A turn carrying token counts emits a second `Result`
 message, because `ws_cli` reads usage only from `extra.usage` on that variant;
-Pi reports real per-turn cost in its session file and that number is used,
-while providers that report only tokens keep `total_cost_usd` at 0 rather than
-inventing a price.
+an OMP record that carries a real per-turn cost (`usage.cost.total`, from the
+Pi session format) has that number used, while providers that report only
+tokens keep `total_cost_usd` at 0 rather than inventing a price.
 
 ## Terminal panes (`kind: "terminal"`)
 
-New user-created Claude, Codex, OpenCode, Pi, OMP, and DeepSeek work uses
+New user-created Claude, Codex, OpenCode, OMP, and DeepSeek work uses
 `kind: "terminal"`. The structured `kind: "agent"` path is retained only for
 historical panes: the CLI runs the provider headlessly and parses stream-json
 into structured events. Missing `kind` still deserializes as `agent` so old
@@ -2012,39 +2138,37 @@ to xterm.js in the browser. Nothing is parsed, so nothing has to be kept in
 sync with a provider's output format — the point is to reuse the CLI as it
 ships.
 
-Only `claude`, `codex`, `opencode`, `pi`, and `omp` can host one
+Only `claude`, `codex`, `opencode`, and `omp` can host one
 (`terminal_pane::terminal_binary_for`). DeepSeek uses the Claude terminal with
 the supported Anthropic-compatible backend environment; Cursor Agent has no
-supported launch profile. OpenCode launches with `--auto`; a fresh mobile task
-uses `--prompt <instruction>`, while restoration uses `--continue`. Pi launches
-with the pane's id pinned as `--session-id <uuid>` and its initial instruction
-positional; restoration opens the exact retained session file with `--session
-<path>` and falls back to `--session-id` when Pi has not written it yet. APAS
-deliberately passes no trust flag for Pi: it has no permission prompts at all,
-and `--approve` would trust repository-controlled settings and extensions on
-the host's behalf. Pi is therefore the one hostable provider with no
-permission-bypass argument.
+supported launch profile, and Pi is retired (see "Pi is retired; OMP stays").
+OpenCode launches with `--auto`; a fresh mobile task uses `--prompt
+<instruction>`, while restoration uses `--continue`. Every hostable provider
+is launched with its permission-bypass argument.
 
 **OMP pins a pane by directory, not by id.** `omp` has no `--session-id`, so a
-pane cannot pin an exact identity the way Pi does. It accepts `--session-dir`,
+pane cannot pin an exact identity by id. It accepts `--session-dir`,
 which is stronger: the pane owns a private directory under
 `~/.omp/agent/sessions/apas-<conversation id>/`, so a sibling pane or a
 provider subprocess sharing a working directory can never select this pane's
 session, and `--continue` inside it is unambiguous without consulting recency.
 The directory is passed on **every** launch and must precede `--continue`, or
-that flag resolves against the shared default store. Unlike Pi, OMP does have
-approval prompts, so it is launched with `--auto-approve` like the others.
+that flag resolves against the shared default store. OMP has approval
+prompts, so it is launched with `--auto-approve` like the others.
 Verified against omp 18.1.20: a run writes one flat `<ts>_<uuid>.jsonl` there,
 `--continue` appends to that same file, and the default store stays untouched.
 
-APAS does not install OpenCode, Pi, or OMP, choose their model provider, or
+A new OMP tab from the desktop `+` is labelled "OMP N", and its icon in the tab
+bar is titled OMP and coloured violet. Until 2026-11-13 both were Claude's.
+
+APAS does not install OpenCode or OMP, choose their model provider, or
 authenticate them. Install and authenticate them on every intended project host
-before enabling the profile. The default executables are `opencode`, `pi`, and
+before enabling the profile. The default executables are `opencode` and
 `omp`; override nonstandard installations with `apas config set
-opencode_path ...`, `apas config set pi_path ...`, and `apas config set
-omp_path ...`. Existing explicit cluster/project allowlists remain opt-in and
-must add `terminal:opencode:official:default`, `terminal:pi:official:default`,
-or `terminal:omp:official:default` through the normal policy controls.
+opencode_path ...` and `apas config set omp_path ...`. Existing explicit
+cluster/project allowlists remain opt-in and must add
+`terminal:opencode:official:default` or `terminal:omp:official:default`
+through the normal policy controls.
 
 On Linux, a newly launched **terminal** pane uses a host-local copy of a
 native Claude, Codex, or OMP executable under
@@ -2104,22 +2228,15 @@ providers without replacing them; ordinary new-pane launches remain nonblocking.
 
 **Two different things share the oh-my-pi name; do not conflate them.**
 
-The npm package `oh-my-pi` is a **Pi extension, not an APAS provider**: it
-peer-depends on Pi and declares `pi.extensions` in its package. Install it into
-Pi globally (`pi install npm:oh-my-pi`) so APAS panes never hit Pi's
-project-trust prompt, or install it project-locally and answer `/trust` in the
-terminal view; APAS never does that on the user's behalf. Its published
-`oh-my-pi` bin is broken (it imports `../src/*.ts` files the tarball does not
-ship), so the `/oh-my-pi` slash command inside a Pi pane is the supported way to
-diagnose an install. Pi extension entries are excluded from conversation
-recovery, and APAS never adopts a subagent session as the pane's own.
+The npm package `oh-my-pi` is an extension for raw Pi, which APAS no longer
+hosts. It has nothing to do with an OMP tab, and installing it does nothing to
+one.
 
 `omp` (<https://github.com/can1357/oh-my-pi>) is a **standalone agent and its
 own APAS provider**, `Provider::Omp`. It is Pi-derived — same session record
 shape, same `PI_CODING_AGENT_*` overrides — but it is a separate binary with
 its own store under `~/.omp`, role-based model selection (`--smol`/`--slow`/
-`--plan`), subagents, and an ACP mode. Installing it does nothing to a Pi pane,
-and installing the npm extension does nothing to an OMP pane.
+`--plan`), subagents, and an ACP mode.
 
 The desktop tab bar, mobile browser pane picker, native mobile task launcher,
 server authorization, and CLI local add-tab path all enforce this boundary.
@@ -2201,22 +2318,90 @@ running state.
 Native mobile launch advertises `mobile_task_launch_v2`. The version bump is
 intentional: v2 creates a terminal pane and passes the first instruction as a
 provider-native CLI prompt; a v1 CLI would otherwise accept the pane and drop
-that instruction. OpenCode additionally requires `terminal_opencode_v1`, Pi
-`terminal_pi_v1`, and OMP `terminal_omp_v1`, so a rolling server/web deployment
-refuses to route any of them to an older v2 CLI that can launch Claude/Codex but
-not that provider. The server
-asks the user to update/reconnect instead of pretending an older launch
-succeeded.
+that instruction. OpenCode additionally requires `terminal_opencode_v1` and
+OMP `terminal_omp_v1`, so a rolling server/web deployment refuses to route
+either of them to an older v2 CLI that can launch Claude/Codex but not that
+provider. The server asks the user to update/reconnect instead of pretending
+an older launch succeeded. `terminal_pi_v1` was deleted with Pi: an older CLI
+may still advertise it, and the server routes nothing on it.
 
-Roll out OpenCode, Pi, and OMP support in this order: server first, web second,
+Roll out OpenCode and OMP support in this order: server first, web second,
 then upgrade and reconnect project CLIs so they advertise
-`terminal_opencode_v1`, `terminal_pi_v1`, and `terminal_omp_v1`. Install and
-authenticate the provider and opt the intended policies into its profile only
-after the host CLI has reconnected.
+`terminal_opencode_v1` and `terminal_omp_v1`. Install and authenticate the
+provider and opt the intended policies into its profile only after the host
+CLI has reconnected.
+
+### Pi is retired; OMP stays
+
+Raw Pi (`pi`) was a hostable provider until 2026-11-13. OMP is the Pi-derived
+agent APAS hosts, and nothing about OMP changed. Pi joined the pattern MiniMax
+and GLM already use: a decode-only value that is never offered, never launched
+and never silently replaced by another provider.
+
+- **The wire value still parses.** `Provider::Pi` and the web value `"pi"`
+  remain, deprecated, so an older `.apas`, a stored roster, a stored policy and
+  a frame from an older client load. The JSON schema keeps `pi`.
+- **Nobody can create one.** Pi is out of `shared::all_tab_types`, the
+  supported launch profiles, the desktop `+` menu, the phone's pane sheet and
+  the provider switcher. A request to create a Pi tab, switch a tab to Pi or
+  relaunch a saved one is answered by server, CLI and web with "Pi is no longer
+  supported. Use OMP instead." (`shared::PI_RETIRED_MESSAGE`). A native launch
+  that still sends the Pi profile key gets the same sentence.
+- **A saved Pi tab stays stopped.** It stays in `.apas` and in the roster until
+  someone closes it. No path starts it: `spawn_terminal_pane` refuses before it
+  looks for a binary. At every registration its CLI reports it as an exited
+  terminal whose status is the Pi sentence. Desktop and phone show "Pi is no
+  longer supported. Use OMP instead." above its history, which is read-only:
+  nothing can be typed into the tab, and it cannot be resumed or rebooted. It
+  can still be closed.
+- **Input to it is refused by the server too.** Typed input gets "Pi is no
+  longer supported. Use OMP instead. This tab is read-only.", raw keystrokes
+  are dropped without an error per key, and a provider switch gets "Tab N uses
+  Pi, which is no longer supported. Close it and open an OMP tab." A refused
+  switch does not edit the roster. The same input rule now covers old MiniMax
+  and GLM tabs ("This pane uses a retired provider and is read-only."); the
+  server used to pass their input to the CLI.
+- **A Pi agent that was still running is ended by the update.** A retired tab
+  is left out of the pane hosts a starting project keeps, so reconciliation
+  removes its host instead of leaving the agent alive and unreachable until its
+  lease ran out.
+- **It blocks the project's Reboot CLI until it is closed**, like any retired
+  pane: "Tab N uses Pi, which is no longer supported. Close that tab, then
+  reboot the CLI." The Machines page reboot is not blocked.
+- **`pi_path` is no longer a setting.** A config file that still has the key
+  loads, and the key is dropped at the next save. `apas config set pi_path`
+  and `get` answer "pi_path is no longer a setting. Pi is no longer supported.
+  Use OMP instead (omp_path)."
+
+The line "[Pi is no longer supported. Use OMP instead. This tab stays
+stopped.]" goes to a local `apas --attach` view only. It is never sent to the
+server, so do not look for it in a tab's conversation: the web learns the
+reason from the exited terminal state.
+
+What stayed, because OMP uses it: `PiTranscriptReader` and the Pi
+session-format parser with their tests, the `PI_CODING_AGENT_*` overrides, and
+`omp_activity.mjs`. In the Overview, a leftover Pi tab's row in the Usage
+table is named "Pi" by `providerDisplayName` in `lib/launchProfileLabels.ts`,
+since the provider catalog no longer has a Pi group. Its tab card reads
+"Unsupported provider", and it adds no Resource use card.
+
+Most of this section has been seen in unit tests only: no tab of this
+deployment uses Pi. See "What was checked for these four" near the top, and
+the change's record, `openspec/changes/refine-interactive-workspace/`.
+
+**Deploying it** follows the usual order: server, then web, then CLI. On its
+first start the new server drops `terminal:pi:official:default` from stored
+policies and keeps the rest; a changed row gets a new version, an override
+that listed only Pi becomes an empty allowlist, and writing the key back is
+rejected as a retired profile. An older web that still offers Pi is refused by
+the server with the Pi sentence. To roll back, redeploy the older server and
+web. The Pi profile is not restored to stored policies automatically. The
+work assumed that no tab of this deployment uses Pi. Nobody checked production
+for one.
 
 ### Persistent pane hosts and CLI lifecycle
 
-On supported Unix project hosts, each new Claude, Codex, OpenCode, or Pi
+On supported Unix project hosts, each new Claude, Codex, OpenCode, or OMP
 terminal pane is owned by a hidden `apas pane-host` process in its own
 project-scoped tmux session. The replaceable project CLI is only its
 authenticated controller.
@@ -2373,7 +2558,7 @@ stops it, or something goes wrong. It is the light, in-tab way to leave an
 agent running. It is not an autonomous worker: there is no container, no
 independent verification, no budget and no draft PR, and the agent keeps the
 tab's ordinary permissions on its machine. The design record is
-`openspec/changes/add-omp-tab-autopilot/`; the doc comments in
+`openspec/changes/archive/2026-11-13-add-omp-tab-autopilot/`; the doc comments in
 `crates/shared/src/autopilot.rs` and `crates/client-cli/src/omp_autopilot.rs`
 are the binding statement of the wire and of the files between the CLI and
 the tab.
@@ -2402,6 +2587,55 @@ Pane actions sheet. The dialog asks for:
   **"No limit" is the default for both**, by the owner's decision. There is no
   token or spend limit.
 - **Optionally, "end when an iteration makes no tool call"**.
+
+**The dialog has a Template control above the prompt** with three built-in
+prompts and **My own text**:
+
+- **Implement from a design document**, the default. Each iteration closes one
+  gap between the design and the code, with tests and a commit. It uses
+  `docs/design.md`, or else only the one document the README or `AGENTS.md`
+  names as the project's current design, architecture or specification. With
+  neither it changes nothing. It keeps its notes in
+  `docs/autopilot-progress.md` and commits them.
+- **Work through TODO.md**. Each iteration does the next open task in
+  `TODO.md` that is not marked blocked.
+- **Keep the tests green**. Each iteration runs the project's checks and fixes
+  the first failure at its cause.
+
+A tab with no earlier autopilot opens with the default template in the prompt
+field. A tab that had one opens with that autopilot's prompt, as before.
+
+**A template is only starting text.** What is sent is whatever the prompt
+field holds, and the control shows a template only while the field holds that
+template's exact text. Choosing one replaces the prompt and nothing else: it
+never changes the timing, the limits or the no-tool-call option, and a line
+under the control says how that template's run ends with the option as it
+stands. Text a person wrote is kept when a template is chosen, and My own text
+brings it back in the same dialog; editing the template's text replaces the
+kept text, and the dialog says so.
+
+With the Template control the dialog is taller than a laptop window. Its body
+scrolls, and Cancel and Start autopilot stay in view below it.
+
+The templates live in `packages/web/src/lib/autopilotTemplates.ts`, whose
+header says how such a prompt has to be written. The same text is submitted
+every iteration, so each describes one step. Each forbids pushing, rewriting
+history (stash, reset, clean, amend, rebase, skipping hooks) and touching
+changes the agent did not make. The first two also say where their notes are
+(`docs/autopilot-progress.md`, `TODO.md`) and how to mark a step that cannot
+be done, so the next iteration does not take it again. Keep the tests green
+keeps no notes and marks nothing: it relies on the conversation alone to skip
+a failure it already tried twice.
+A unit test puts every template through the start's own validation.
+
+**The first two templates end a run in two turns, and only if the
+no-tool-call option is ticked.** Finding out that nothing is left takes tool
+calls. So one turn finds nothing left and ends its reply with "Nothing is left
+to do."; the next sees that sentence, calls no tool and replies "Nothing has
+changed since I last looked." With the option ticked, that turn ends the
+autopilot. With it off, the turn after that looks again, so a timed repeat or
+a later run rereads the files and never answers "nothing left" for ever. Keep
+the tests green has no end of its own: set a limit or stop it.
 
 **Anyone who may type into the tab may start, pause, resume and stop its
 autopilot** (`check_session_runtime_access`, the check input uses). The agent
@@ -2631,3 +2865,31 @@ Not checked in production: the autopilot control itself in a signed-in
 browser, and a real autopilot. Both wait for the first machine to be rebooted
 and the first tab's agent to be relaunched.
 
+### Prompt templates
+
+**Checked on 2026-11-13, not deployed.** The templates are a web-only change
+and are not in production yet.
+
+- The dialog's and the templates' unit tests passed, with the web typecheck
+  and lint: 208 tests in nine files when the templates were finished, and 211
+  when the same nine files were run again later on 2026-11-13.
+- Headless Chromium at 1440 px and at 390 px, through a read-only viewer on
+  the real project: the dialog opened on the default template; choosing each
+  other template replaced the prompt; typed text was kept and came back with
+  My own text; the phone sheet kept 16 px fields and did not scroll sideways.
+
+Not exercised:
+
+- **the templates' wording on a real OMP tab.** Whether an agent follows the
+  two-turn ending, marks a step blocked, leaves other people's uncommitted
+  work alone and stops retrying a failure it tried twice is untested. Only the
+  text is asserted;
+- a start through the server: the viewer forwards no request, so no autopilot
+  was started from a template;
+- the dialog for a tab with an earlier autopilot, in a browser (unit tests
+  only);
+- a real phone, iOS, the on-screen keyboard and a 360 px screen.
+
+One limit is known. Keep the tests green remembers that it tried a failure
+twice only through the conversation, and it keeps no notes file. After OMP
+compacts the conversation it can try the same failure again.

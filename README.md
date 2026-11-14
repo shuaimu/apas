@@ -23,7 +23,7 @@ terminal views, the project overview, and the diff and pull-request handoffs.
 
 - **Terminal panes**: each pane runs a provider's real interactive TUI on a pty
   and streams it to the browser, so you get the CLI exactly as it ships
-- **Claude, Codex, OpenCode, and Pi**, plus Claude against a DeepSeek backend
+- **Claude, Codex, OpenCode, and OMP**, plus Claude against a DeepSeek backend
 - **Read it as a conversation**: a per-pane toggle swaps the live terminal for a
   structured transcript, recovered from the provider's own session files
 - **Drive it from a phone**: type into the conversation view and answer an
@@ -120,10 +120,10 @@ output format.
 headlessly and parses its stream-JSON. It is kept only for panes that already
 exist. Nothing creates one any more.
 
-Claude, Codex, OpenCode, Pi, and OMP can host terminal panes. DeepSeek runs
+Claude, Codex, OpenCode, and OMP can host terminal panes. DeepSeek runs
 the Claude binary against an Anthropic-compatible endpoint. APAS does not
 install or authenticate these tools; install and log into them on each host
-first.
+first. Pi was retired on 2026-11-13; see "Pi is retired; OMP remains" below.
 
 ### Terminal panes have history
 
@@ -136,37 +136,35 @@ provider already writes:
 - **Codex** is located by the terminal's process group, so several panes can
   share one directory without sharing history.
 - **OpenCode** is asked for its session list and export.
-- **Pi** pins its exact session id at launch and is read back from that session
-  file, so sibling panes and subagents sharing a directory never mix.
+- **OMP** is given a private session directory for each pane and is read back
+  from the session file it writes there, so sibling panes and subagents
+  sharing a working directory never mix.
 
 That transcript is what gives a terminal pane its conversation view, its token
-counts, and its working/idle state. Questions a Claude agent asks appear there
-and can be answered there, and typed messages go straight into the live pty. Pi
-questions stay in the terminal view: its `ask` tool comes from the oh-my-pi
-extension and its picker has not been verified, so APAS does not write answers
-into it blindly.
+counts, and its working/idle state. Questions a Claude or OMP agent asks appear
+there and can be answered there, and typed messages go straight into the live
+pty. OpenCode has no question interface.
 
-### Pi and oh-my-pi
+### Pi is retired; OMP remains
 
-Install and authenticate Pi on the host (`npm install -g
-@earendil-works/pi-coding-agent`, or the installer at
-[pi.dev](https://pi.dev)). Override a nonstandard installation with
-`apas config set pi_path /path/to/pi`, then allow `terminal:pi:official:default`
-through cluster or project policy.
+Raw Pi (`pi`) was retired as a provider on 2026-11-13. It can no longer be
+created, switched to or launched, and `pi_path` is no longer a setting: a
+config file that still has the key loads, and the key is dropped at the next
+save. A request for a Pi tab is answered with "Pi is no longer supported. Use
+OMP instead."
 
-The [oh-my-pi](https://github.com/can1357/oh-my-pi) orchestration layer is a Pi
-package, not a separate agent. Install it into Pi **globally**:
+Old data still loads. A Pi tab saved in an `.apas` file stays listed and stays
+stopped, shows that sentence above its read-only history, and can be closed.
+A stored policy that lists `terminal:pi:official:default` loses that entry
+when the server starts.
 
-```bash
-pi install npm:oh-my-pi
-```
-
-A global install means APAS panes never hit Pi's project-trust prompt. If you
-install it project-locally (`-l`), answer `/trust` once in the pane's terminal
-view; APAS deliberately never trusts repository-controlled extensions on your
-behalf. Run `/oh-my-pi doctor` inside a Pi pane to diagnose an install — the
-package's published shell launcher is broken (it imports TypeScript sources the
-tarball does not ship), so the slash command is the supported entry point.
+OMP (`omp`, <https://github.com/can1357/oh-my-pi>) is the Pi-derived agent APAS
+hosts. It is a standalone binary with its own store under `~/.omp`. Install
+and authenticate it on the host, override a nonstandard installation with
+`apas config set omp_path /path/to/omp`, and allow
+`terminal:omp:official:default` through cluster or project policy. The npm
+package `oh-my-pi` is an extension for raw Pi and has nothing to do with an OMP
+pane.
 
 ### Worktrees and diff review
 
@@ -235,10 +233,12 @@ These are two separate jobs with two separate surfaces.
 
 **Your virtual cluster** is `/machines`, available to every account with no role
 check. It is derived, not stored: the machines your client registered, plus the
-projects hosted on them. A project is hosted in your cluster if you own it or if
-one of its sessions was created under it, so a project someone else owns but
-runs on your machine is yours to administer. You can share that cluster with
-another account, scoped to specific machines.
+projects hosted in it. A project is hosted in your cluster once a placement
+records it there: when your CLI registers or starts a project you own or
+belong to, or when a member of your cluster creates one on a machine you
+shared. So a project that someone else owns but that is placed in your cluster
+is yours to administer. You can share that cluster with another account,
+scoped to specific machines.
 
 **System administration** is `/admin`. It is a credential, not an account: one
 per deployment, stored outside the users table, with its own login. No UI can
@@ -262,11 +262,11 @@ token = "your-token"
 claude_path = "claude"
 codex_path = "codex"
 opencode_path = "opencode"
-pi_path = "pi"
+omp_path = "omp"
 ```
 
 Set values with `apas config set KEY VALUE`. Useful keys include `server`,
-`claude_path`, `codex_path`, `opencode_path`, `pi_path`, `deepseek_api_base_url`,
+`claude_path`, `codex_path`, `opencode_path`, `omp_path`, `deepseek_api_base_url`,
 `deepseek_api_key`, `daemon_roots`, and the pane-host grace periods
 `pane_host_adoption_grace_seconds` and `pane_host_reboot_grace_seconds`.
 
@@ -306,7 +306,7 @@ working.
 
 `disallowed_tab_types` restricts which tab types users may create, where a tab
 type is a pane kind plus a provider (`terminal:claude`, `terminal:codex`,
-`terminal:opencode`, `terminal:pi`, `terminal:omp`). It is stored as a deny
+`terminal:opencode`, `terminal:omp`). It is stored as a deny
 list, so an empty value means everything is allowed and a provider added later
 is permitted until an owner says otherwise. The CLI enforces it by re-reading
 `.apas` on every request, because the web only hides menu entries.

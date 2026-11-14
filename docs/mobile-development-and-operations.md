@@ -131,12 +131,16 @@ Worker/run/question identities remain exact across cold links and reconnect;
 an older review never opens the newest candidate instead. Attention does not
 require push permission.
 
-The responsive **web** project screen has its own `+` → Interactive agent /
-Autonomous worker chooser and embedded worker views. **Overview** is present
-with zero interactive panes. Responsibilities, project history, backlog and runs
-use bounded pagination rather than treating a loaded page as a total. Selecting
-or hiding a worker does not unmount an interactive terminal or change execution.
-Global Workers/Attention remain cross-project views.
+On the responsive **web** project screen, `+` opens the pane sheet and creates
+an interactive agent directly; the Interactive agent / Autonomous worker
+chooser it had from 2026-11-11 is gone. An autonomous worker is created with
+**New autonomous worker** on the project's **Overview**, or from
+`/code/workers/`. The worker views stay embedded in the project screen.
+**Overview** is present with zero interactive panes. Responsibilities, project
+history, backlog and runs use bounded pagination rather than treating a loaded
+page as a total. Selecting or hiding a worker does not unmount an interactive
+terminal or change execution. Global Workers/Attention remain cross-project
+views.
 
 `/code/jobs/...` is read-only Earlier results. A safely stopped finite job or
 saved standalone draft can prefill a fresh worker proposal; admission still

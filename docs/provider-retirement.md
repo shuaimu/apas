@@ -92,3 +92,31 @@ been rolled back. Restoring policy does not restore credentials removed from a
 rewritten local config; recover those only from the operator's secret store.
 Before ending rollback, issue a staging launch and verify the exact intended
 provider starts—never rely on fallback behavior.
+
+## Pi (retired 2026-11-13)
+
+Raw Pi (`pi`) follows the same pattern. OMP, which is derived from Pi, stays a
+supported provider and is unchanged. The canonical description is in
+`AGENTS.md`, under "Pi is retired; OMP stays". What differs from MiniMax and
+GLM:
+
+- The sentence a person sees is "Pi is no longer supported. Use OMP instead."
+  (`shared::PI_RETIRED_MESSAGE`), not the generic unsupported-provider text.
+- A saved Pi tab is a terminal tab. It stays listed and stopped, and its CLI
+  reports it as an exited terminal whose status is that sentence. An updated
+  project host ends a Pi agent that an older CLI left running under a pane
+  host when it next starts the project.
+- `pi_path` is no longer a setting. A config file that still has the key
+  loads, and the key is dropped at the next save.
+- The `terminal_pi_v1` capability was deleted. An older CLI may still
+  advertise it; the server routes nothing on it.
+- The startup cleanup above also removes `terminal:pi:official:default` from
+  stored policies. To check it, add `OR lower(allowed_launch_profiles) GLOB
+  '*:pi:*'` to the last verification query.
+
+Deploy server, then web, then CLI. As above, the policy cleanup is not
+reversed by a rollback.
+
+This change was not deployed when this section was written. A saved Pi tab,
+and the ending of a Pi agent left by an older CLI, were checked by unit tests
+only; see "What was checked for these four" in `AGENTS.md`.
