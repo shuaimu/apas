@@ -1851,6 +1851,12 @@ acting on its projects.
 
 ## Pane work summaries: which summarizer
 
+The desktop summary drawer can be resized from its left divider, by dragging
+or using the arrow keys. Its width is a browser-local preference under
+`apas_layout_global_summary_width`, shared across tabs and projects. It fits
+the available workspace when the window or project sidebar changes size;
+the phone's summary sheet keeps its existing layout.
+
 A tab's work summaries are written by a separate, headless run of a
 summarizer on the tab's machine, configured in the CLI's `[summaries]`
 section (`apas config set summary_enabled|summary_adapter|summary_model|

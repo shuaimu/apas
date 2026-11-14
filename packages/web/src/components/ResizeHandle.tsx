@@ -52,6 +52,7 @@ export function ResizeHandle({ direction, onResize, onResizeEnd, className = "" 
     document.addEventListener("mouseup", handleEnd);
     document.addEventListener("touchmove", handleTouchMove);
     document.addEventListener("touchend", handleEnd);
+    document.addEventListener("touchcancel", handleEnd);
 
     // Prevent text selection while dragging
     document.body.style.userSelect = "none";
@@ -62,6 +63,7 @@ export function ResizeHandle({ direction, onResize, onResizeEnd, className = "" 
       document.removeEventListener("mouseup", handleEnd);
       document.removeEventListener("touchmove", handleTouchMove);
       document.removeEventListener("touchend", handleEnd);
+      document.removeEventListener("touchcancel", handleEnd);
       document.body.style.userSelect = "";
       document.body.style.cursor = "";
     };

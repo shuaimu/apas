@@ -116,4 +116,17 @@ describe("ResizeHandle", () => {
     expect(onResize).not.toHaveBeenCalled();
     expect(onResizeEnd).not.toHaveBeenCalled();
   });
+
+  it("ends a cancelled touch drag without leaving the page in resize mode", () => {
+    const { handle, onResize, onResizeEnd } = renderHandle("horizontal");
+    fireEvent.touchStart(handle, { touches: [{ clientX: 100, clientY: 40 }] });
+    fireEvent.touchMove(document, { touches: [{ clientX: 80, clientY: 40 }] });
+    expect(onResize).toHaveBeenCalledWith(-20);
+    fireEvent.touchCancel(document);
+    expect(onResizeEnd).toHaveBeenCalledOnce();
+    expect(document.body.style.cursor).toBe("");
+    expect(document.body.style.userSelect).toBe("");
+    fireEvent.touchMove(document, { touches: [{ clientX: 60, clientY: 40 }] });
+    expect(onResize).toHaveBeenCalledOnce();
+  });
 });

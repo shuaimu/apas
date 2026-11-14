@@ -1483,7 +1483,7 @@ export function TabbedView({
         </div>
       )}
 
-      <div className="flex flex-1 min-h-0">
+      <div className="flex flex-1 min-h-0 min-w-0">
         <div className="flex flex-1 flex-col min-w-0 min-h-0">
       {/* Visited pane bodies stay mounted and visibility-toggled, including
           while the project overview or a job is selected. */}
@@ -1627,14 +1627,12 @@ export function TabbedView({
       )}
         </div>
         {summaryDrawerOpen && canShowSummary && sessionId && activeTabId != null && activeConfig && (
-          <div id="pane-work-summary-drawer" className="h-full">
-            <PaneWorkSummaryDrawer
-              sessionId={sessionId}
-              paneId={activeTabId}
-              paneLabel={activeConfig.label || `Pane ${activeTabId}`}
-              onClose={() => setSummaryDrawerOpen(false)}
-            />
-          </div>
+          <PaneWorkSummaryDrawer
+            sessionId={sessionId}
+            paneId={activeTabId}
+            paneLabel={activeConfig.label || `Pane ${activeTabId}`}
+            onClose={() => setSummaryDrawerOpen(false)}
+          />
         )}
       </div>
       </div>
