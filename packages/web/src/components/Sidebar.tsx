@@ -3,7 +3,6 @@
 import { useStore } from "@/lib/store";
 import { ThemePicker } from "@/components/ThemePicker";
 import { PaneStatusDots } from "@/components/PaneStatusDots";
-import { WorkersNav } from "@/components/workers/WorkersNav";
 import { FolderOpen, RefreshCw, Share2, Users, X, Crown, Trash2, ChevronLeft, ChevronDown, ChevronRight, BarChart3, Server, Plus, LogOut, ArrowRightLeft, AlertTriangle, MoreHorizontal, GripVertical } from "lucide-react";
 import { CreateInstanceModal } from "./CreateInstanceModal";
 import Link from "next/link";
@@ -731,8 +730,6 @@ export function Sidebar({ onClose, onCollapse, width }: SidebarProps) {
           </div>
         </div>
       </div>
-      <WorkersNav />
-
       {/* Which question the list is answering */}
       <div className="flex gap-1 border-b border-gray-200 px-2 py-2 dark:border-gray-800">
         {([

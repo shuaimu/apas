@@ -122,6 +122,15 @@ describe("SidebarRail", () => {
     expect(screen.getAllByRole("separator")).toHaveLength(1);
   });
 
+  it("offers no Workers or Attention links", () => {
+    seedRail({ sessions: [] });
+    render(<SidebarRail onExpand={() => {}} />);
+
+    expect(
+      screen.queryAllByRole("link").some((link) => (link.getAttribute("href") ?? "").startsWith("/code/workers")),
+    ).toBe(false);
+  });
+
   it("attaches the project's session when its icon is clicked", () => {
     const attachSession = seedRail({
       sessions: [makeSession({ id: "s-apas", projectId: "p-apas", workingDir: "/work/apas" })],

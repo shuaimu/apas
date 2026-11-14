@@ -182,3 +182,7 @@ The persistent-worker cutover reached production with server and web release `20
 - [x] 13.4 Add "Applicability after `refine-interactive-workspace`" to `proposal.md`.
 
 These are text corrections only. The code they describe is recorded in `refine-interactive-workspace`. Tasks 11.4, 11.5, 11.6 and 11.8 stay open and unchanged. Nothing in this change named Pi.
+
+## Amendment, 2026-11-14 (later the same day)
+
+- [x] The web project list, the collapsed rail and the phone's project list no longer show the Workers and Attention buttons, at the owner's request ("not useful"). `/code/workers` and its attention view stay reachable by address and by links to a worker; native keeps its own tabs. Requirement "Global Workers and Attention remain bounded cross-project views" amended in place.

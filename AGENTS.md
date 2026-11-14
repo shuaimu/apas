@@ -151,8 +151,11 @@ autonomous worker is created with **New autonomous worker** in the Overview
 tab's Autonomous workers section, or from `/code/workers/`. Both open the
 project-fixed mandate/checklist composer; an unavailable preferred machine is
 explained, never silently replaced.
-`/code/workers/` is the cross-project Workers/Attention surface. Native uses the
-same contracts in native screens, not a WebView.
+`/code/workers/` is the cross-project Workers/Attention surface. The web
+reaches it by its address and by links to a worker; since 2026-11-14 the
+project list, the collapsed rail and the phone's project list no longer show
+Workers and Attention buttons, at the owner's request. Native uses the same
+contracts in native screens, not a WebView, and keeps its own tabs for them.
 
 Worker views sit beside interactive panes. **Overview** is visible even with
 zero panes and lists responsibilities, backlog/status and paginated history.

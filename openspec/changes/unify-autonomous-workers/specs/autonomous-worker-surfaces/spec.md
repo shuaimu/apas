@@ -44,7 +44,11 @@ Authorized users SHALL be able to inspect discovery rationale, add/edit/repriori
 - **AND** it does not claim the running execution received the new instruction
 
 ### Requirement: Global Workers and Attention remain bounded cross-project views
-Both clients SHALL expose accessible workers and attention destinations across projects, with status filtering and explicit bounded pagination. Worker lists SHALL retain idle and paused responsibilities rather than hiding them as completed tasks. Attention SHALL identify the exact worker and relevant question, review, blocked item, or recovery reason. Counts derived from a loaded subset SHALL be labeled as such unless the server supplies a separately authoritative total.
+Both clients SHALL expose accessible workers and attention destinations across projects, with status filtering and explicit bounded pagination. On the web these destinations SHALL be reached by their address and by links to a worker, and SHALL NOT be linked from the project list, the collapsed project rail or the phone's project list. Worker lists SHALL retain idle and paused responsibilities rather than hiding them as completed tasks. Attention SHALL identify the exact worker and relevant question, review, blocked item, or recovery reason. Counts derived from a loaded subset SHALL be labeled as such unless the server supplies a separately authoritative total.
+
+#### Scenario: The web project list
+- **WHEN** a person looks at the project list on the desktop, in the collapsed rail or on a phone
+- **THEN** it shows no Workers or Attention button, and /code/workers and its attention view still open by their address
 
 #### Scenario: A project has workers beyond the first global page
 - **WHEN** the user opens its project-specific worker view

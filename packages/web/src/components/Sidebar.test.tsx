@@ -128,6 +128,18 @@ describe("Sidebar project list", () => {
     ).toBe(false);
   });
 
+  it("offers no Workers or Attention links in the project list", () => {
+    seedSidebarState({ sessions: [] });
+    render(<Sidebar />);
+
+    // Removed at the owner's request on 2026-11-14: the global worker pages
+    // stay reachable by their address, not from the project list.
+    expect(screen.queryByRole("navigation", { name: "Autonomous workers" })).toBeNull();
+    expect(
+      screen.queryAllByRole("link").some((link) => (link.getAttribute("href") ?? "").startsWith("/code/workers")),
+    ).toBe(false);
+  });
+
 
   it("deduplicates by project id and sorts active CLI and daemon projects before inactive history", () => {
     seedSidebarState({

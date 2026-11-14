@@ -38,7 +38,6 @@ import {
 } from "@/lib/daemonVersion";
 import { CreateInstanceModal } from "@/components/CreateInstanceModal";
 import { PaneStatusDots } from "@/components/PaneStatusDots";
-import { WorkersNav } from "@/components/workers/WorkersNav";
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || "https://apas.mpaxos.com";
 const EMPTY_USAGE_LIMITS = new Map<string, UsageLimitsByProvider>();
@@ -674,8 +673,6 @@ export function MobileCodeHome({
           )}
         </div>
       </div>
-      <WorkersNav />
-
       <div className="no-scrollbar flex shrink-0 gap-2 overflow-x-auto px-4 pt-3.5 pb-1">
         {FILTERS.map((item) => {
           const selected = filter === item.key;
