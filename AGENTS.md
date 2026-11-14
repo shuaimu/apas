@@ -2913,8 +2913,17 @@ and the first tab's agent to be relaunched.
 
 ### Prompt templates
 
-**Checked on 2026-11-13, not deployed.** The templates are a web-only change
-and are not in production yet.
+**Rolled out.** The first three templates went out with web release
+`20261114T002349Z`. "APAS worker" became the default with web-only release
+`20261114T033111Z` (version 26.11.41, built at 0095aa2 from the committed
+tree), live since 03:32 UTC on 2026-11-14; the server was not restarted.
+Ten public routes and the 18 referenced static assets answered `200`, and the
+web logged no error. Its backups are under
+`/opt/apas/backups/deploy-20261114T033111Z`. Its wording was revised after an
+independent review of how an agent reads it over many iterations; it has not
+yet run on a real OMP tab.
+
+**Checked on 2026-11-13** for the first three templates:
 
 - The dialog's and the templates' unit tests passed, with the web typecheck
   and lint: 208 tests in nine files when the templates were finished, and 211
