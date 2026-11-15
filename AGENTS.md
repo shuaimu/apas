@@ -1512,6 +1512,20 @@ exited terminal state with the reason, a terminal exit and a conversation
 line, at once and again after every reconnect. Until then such a tab, like the
 Mac's OMP 4, reported nothing and stayed blank.
 
+**Rolled out on 2026-11-15.** Server and web release `20261115T230257Z`
+(version 26.11.55, built at aa3f42b) since 23:05 UTC; backups under
+`/opt/apas/backups/deploy-20261115T230257Z`. Dependencies had not changed and
+audited clean on the host. Ten public routes and 17 referenced static assets
+answered `200` with no redirect, `/projects/by-remote` answered `401` from
+`apas-server`, and the server logged no error and no frame it could not
+parse. `master` was pushed for the CLI; each machine gains it at its daemon
+reboot (a Mac with several old daemons by hand, as above). Gates at aa3f42b:
+shared 107 + 4 + 1, server 464, CLI 670 (2 ignored), static musl build,
+protocol 80 and the extension's 137, web 1,353 with lint, typecheck and build
+(one worker test timed out under load and passed alone), native 136,
+`openspec validate --all --strict`. Not yet seen: any of it on a Mac, a real
+OMP download and install, the providers line with a real daemon's report.
+
 ## The daemon is replaced only when asked
 
 Replacing the daemon used to be nearly free: it owned no long-lived children, so
