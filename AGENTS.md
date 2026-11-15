@@ -2747,7 +2747,21 @@ prompts and **My own text**:
   specs require. Nothing is removed only because the layer above does not
   mention it. It never does a task outside the checkout (deploying, servers,
   accounts) and installs nothing. Its notes between iterations are
-  `docs/apas-worker/progress.md`. The whitepaper rule is in the prompt only,
+  `docs/apas-worker/progress.md`. **For Rust code it proves instead of
+  tests** (owner, 2026-11-15): where Verus can check a property, it writes a
+  Verus specification and proof taken from the OpenSpec requirement, and keeps
+  tests only for files, network, terminal, timing, other crates and code no
+  proof models. A proof counts only when the project's verification command
+  verifies it, with nothing Verus trusts unchecked (`assume`, `admit`,
+  `assume_specification`, `external`/`external_body`, `assume_new`, axioms,
+  code moved out of `verus!`). An existing test may be deleted only in the
+  commit that adds a verified proof covering it, written as a kept function
+  in `verus!` with the test's inputs and asserted results; each judged test is
+  recorded in `docs/apas-worker/verus.md` so it is not retried forever. It
+  never installs Verus: without one on the machine it asks in the report
+  whether to make it available or keep tests, and sets Verus up (pinned, with
+  the command written into the README or `AGENTS.md` and CI) only with the
+  Verus already there. The whitepaper rule is in the prompt only,
   with a `git status` check before each commit that undoes only the agent's
   own edit; a project that wants it enforced can add a commit hook.
 - **Implement from a design document**. Each iteration closes one

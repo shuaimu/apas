@@ -23,3 +23,9 @@
 - [x] 4.2 Look at the dialog with saved prompts in a browser at desktop and phone width (2026-11-14: read-only viewer with a stand-in list at 1440x900, 390 and 360 px; a real save and its receipt were not seen, because the viewer forwards no request)
 - [ ] 4.3 Run "APAS worker" on a real OMP tab in a scratch project with a whitepaper and an OpenSpec tree: a spec step, an implementation step, a report entry, an answered entry, a blocking question, and the two-turn ending
 - [x] 4.4 Deploy server, then web, then push the CLI (2026-11-14: release 20261114T044521Z at ae14eb3; machines gain saving at their daemon reboot)
+
+## 5. Verus in the APAS worker (owner, 2026-11-15)
+
+- [x] 5.1 Add the Verus rules for Rust code to "APAS worker": proofs in place of tests where Verus can check a property, no trusted escape hatches, a test deleted only with a verified proof covering it, judged tests recorded in docs/apas-worker/verus.md, Verus never installed
+- [x] 5.2 Revise the wording after an independent review by a Verus-aware reader and a loop-behaviour reader; tests for the rules; the size bound raised to 70% of the prompt limit
+- [ ] 5.3 Run "APAS worker" with the Verus rules on a real OMP tab in a Rust project with Verus available

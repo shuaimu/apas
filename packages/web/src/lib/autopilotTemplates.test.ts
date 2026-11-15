@@ -66,6 +66,26 @@ describe("the built-in autopilot templates", () => {
     expect(prompt).not.toContain("Do not ask me anything.");
   });
 
+  it("has the APAS worker prove Rust code with Verus instead of testing it, without cheating", () => {
+    const prompt = autopilotTemplateById("apas_worker")!.prompt;
+    expect(prompt).toContain("Verus rules, for Rust code:");
+    expect(prompt).toContain("write its Verus specification (requires, ensures, loop invariants, decreases) and proof instead of a test, taking the property from its OpenSpec requirement, not from what the code does");
+    // Nothing Verus trusts unchecked makes a proof count.
+    for (const hatch of ["assume,", "admit,", "assume_specification", "external_body", "assume_new", "an axiom", "moving code out of verus!"]) {
+      expect(prompt).toContain(hatch);
+    }
+    expect(prompt).toContain("Never make one go through by weakening or adding a requires, ensures or invariant");
+    // A test goes only with a verified proof that covers it, and that is the
+    // only exception to the rule against deleting tests.
+    expect(prompt).toContain("An existing test may be deleted only in the commit that adds a verified proof covering it");
+    expect(prompt).toContain("This is the only exception to the rule in step 6 against deleting tests.");
+    // The judged tests are recorded, so a run does not retry them forever.
+    expect(prompt).toContain("docs/apas-worker/verus.md");
+    // Nothing is installed; a missing Verus is a question for the person.
+    expect(prompt).toContain('before setup "verus --version"');
+    expect(prompt).toContain("never install it");
+  });
+
   it("keep the design-document template, which does not guess a document or work without one", () => {
     const prompt = autopilotTemplateById("design_document")!.prompt;
     expect(prompt).toContain("Use docs/design.md if it exists.");
@@ -97,9 +117,10 @@ describe("the built-in autopilot templates", () => {
       const checked = autopilotStartSpec({ ...autopilotStartForm(), prompt: template.prompt });
       expect(checked.error).toBeUndefined();
       expect(checked.spec?.prompt).toBe(template.prompt);
-      // Well under the limit, so there is room to add to it. The APAS
-      // worker, which states three layers and a report, is the longest.
-      expect(bytes(template.prompt)).toBeLessThan(AUTOPILOT_PROMPT_MAX_BYTES / 2);
+      // Well under the limit, so there is room to add to it, and room for
+      // the loop prompt's instruction around it. The APAS worker, which
+      // states three layers, a report and the Verus rules, is the longest.
+      expect(bytes(template.prompt)).toBeLessThan(AUTOPILOT_PROMPT_MAX_BYTES * 0.7);
     },
   );
 
@@ -159,7 +180,7 @@ describe("the built-in autopilot templates", () => {
     const worker = autopilotTemplateById("apas_worker")!.prompt;
     expect(worker).toContain("Pass over a step the notes mark blocked, unless you have a new way to try it.");
     expect(worker).toContain("mark that step blocked, and commit the notes alone");
-    expect(worker).toContain("If step 3 finds the three layers in line, or only blocked steps are left,");
+    expect(worker).toContain("If step 3 finds the three layers in line and no Rust test that a proof could replace, or only blocked steps are left,");
 
     const design = autopilotTemplateById("design_document")!.prompt;
     expect(design).toContain("Pass over a gap the notes mark blocked, unless you have a new way to try it.");
