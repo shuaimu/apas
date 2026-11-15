@@ -45,6 +45,15 @@ struct ProvisioningReceipt {
     project_id: String,
 }
 
+/// The PATH the user's interactive shell builds, so providers installed by
+/// nvm, cargo or Homebrew are found.
+///
+/// On macOS the shell is asked as a login shell too (`-lic`): zsh reads
+/// `/etc/zprofile` (path_helper) and `~/.zprofile`, where Homebrew's
+/// `brew shellenv` adds `/opt/homebrew/bin`, only then. A daemon started
+/// from a minimal environment otherwise lost Homebrew's tmux, and its
+/// terminals silently fell back to direct PTYs. Linux keeps `-ic`: a login
+/// shell there can print from `.bash_profile`, which would pollute the answer.
 fn resolve_user_shell_path() -> Option<String> {
     let shell = std::env::var("SHELL")
         .ok()
@@ -52,7 +61,11 @@ fn resolve_user_shell_path() -> Option<String> {
         .unwrap_or_else(|| "/bin/bash".to_string());
 
     let output = Command::new(shell)
-        .arg("-ic")
+        .arg(if cfg!(target_os = "macos") {
+            "-lic"
+        } else {
+            "-ic"
+        })
         .arg("printf %s \"$PATH\"")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -69,6 +82,25 @@ fn resolve_user_shell_path() -> Option<String> {
     } else {
         Some(path)
     }
+}
+
+/// The shell's PATH, then any inherited entry it lacks. Replacing the PATH
+/// outright could drop a directory the daemon was started with.
+fn merge_paths(shell: &str, inherited: &str) -> String {
+    let mut entries: Vec<&str> = Vec::new();
+    for entry in shell.split(':').chain(inherited.split(':')) {
+        if !entry.is_empty() && !entries.contains(&entry) {
+            entries.push(entry);
+        }
+    }
+    entries.join(":")
+}
+
+fn find_on_path(name: &str) -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path)
+        .map(|dir| dir.join(name))
+        .find(|candidate| crate::omp_install::is_executable_file(candidate))
 }
 
 fn normalize_optional_string(value: Option<String>) -> Option<String> {
@@ -116,39 +148,19 @@ fn update_local_deepseek_backend_config(
 fn headless_pids_for(project_path: &Path) -> Vec<u32> {
     let path_str = project_path.to_string_lossy();
     let my_pid = std::process::id();
-    let mut matches = Vec::new();
-
-    let Ok(entries) = std::fs::read_dir("/proc") else {
-        return matches;
-    };
-    for entry in entries.flatten() {
-        let pid: u32 = match entry.file_name().to_str().and_then(|s| s.parse().ok()) {
-            Some(pid) => pid,
-            None => continue,
-        };
-        if pid == my_pid {
-            continue;
-        }
-        let cmdline_path = entry.path().join("cmdline");
-        let Ok(data) = std::fs::read(&cmdline_path) else {
-            continue;
-        };
-        let args: Vec<&str> = data
-            .split(|&b| b == 0)
-            .filter(|s| !s.is_empty())
-            .filter_map(|s| std::str::from_utf8(s).ok())
-            .collect();
-
-        let is_apas = args.first().map_or(false, |a| a.contains("apas"));
-        let has_headless = args.iter().any(|a| *a == "--headless");
-        let has_dir = args
-            .windows(2)
-            .any(|w| w[0] == "-d" && w[1] == path_str.as_ref());
-        if is_apas && has_headless && has_dir {
-            matches.push(pid);
-        }
-    }
-    matches
+    // `/proc` on Linux, `ps` elsewhere. Reading `/proc` alone found nothing
+    // on macOS, so a standalone `apas --headless -d <path>` there was never
+    // seen and the daemon could start a second owner of the same `.apas`.
+    crate::process_info::list()
+        .into_iter()
+        .filter(|(pid, _)| *pid != my_pid)
+        .filter(|(_, args)| {
+            args.first().is_some_and(|arg| arg.contains("apas"))
+                && args.iter().any(|arg| arg == "--headless")
+                && crate::process_info::args_have_flag_value(args, "-d", path_str.as_ref())
+        })
+        .map(|(pid, _)| pid)
+        .collect()
 }
 
 fn headless_pid_for(project_path: &Path) -> Option<u32> {
@@ -168,19 +180,10 @@ pub(crate) fn is_headless_running_for(project_path: &Path) -> bool {
     headless_pid_for(project_path).is_some()
 }
 
-/// Read resident-set size (VmRSS) of a running process from /proc/<pid>/status,
-/// returned in KiB. Returns None if the process is gone or /proc is unreadable.
+/// Resident-set size of a running process in KiB (`/proc` on Linux, `ps`
+/// elsewhere). `None` if the process is gone.
 fn read_process_rss_kb(pid: u32) -> Option<u64> {
-    let status = std::fs::read_to_string(format!("/proc/{}/status", pid)).ok()?;
-    for line in status.lines() {
-        if let Some(rest) = line.strip_prefix("VmRSS:") {
-            // "VmRSS:     12345 kB"
-            let trimmed = rest.trim();
-            let numeric = trimmed.split_whitespace().next()?;
-            return numeric.parse::<u64>().ok();
-        }
-    }
-    None
+    crate::process_info::rss_kb(pid)
 }
 
 fn sanitize_for_unit(project_id: &str) -> String {
@@ -329,11 +332,36 @@ fn write_resume_manifest_at(path: &std::path::Path, projects: &[ResumeProject]) 
 
 /// Read and clear the manifest. Cleared on read so a crash during resume does
 /// not leave the instance trying the same start on every boot.
+///
+/// On a Mac it also takes the manifest an APAS from before the macOS runtime
+/// dir wrote under the temp dir. That APAS is what a Mac's first Reboot to
+/// update replaces, and `exec` keeps its `$TMPDIR`, so its manifest is found
+/// exactly; without this the projects it was running did not come back. A
+/// manifest left there by a replacement that then did not stay (another old
+/// daemon was found running) is taken by the next daemon to start instead,
+/// which is the daemon that should resume them.
 fn take_resume_manifest() -> Vec<ResumeProject> {
-    match resume_manifest_path() {
-        Some(path) => take_resume_manifest_at(&path),
-        None => Vec::new(),
+    let legacy = crate::config::Config::legacy_daemon_state_dirs()
+        .into_iter()
+        .map(|dir| dir.join("sup").join("resume.json"));
+    let paths: Vec<std::path::PathBuf> = resume_manifest_path().into_iter().chain(legacy).collect();
+    take_resume_manifests_at(&paths)
+}
+
+/// Take every manifest in `paths`, the first naming a project winning.
+fn take_resume_manifests_at(paths: &[std::path::PathBuf]) -> Vec<ResumeProject> {
+    let mut projects: Vec<ResumeProject> = Vec::new();
+    for path in paths {
+        for project in take_resume_manifest_at(path) {
+            if !projects
+                .iter()
+                .any(|known| known.project_id == project.project_id)
+            {
+                projects.push(project);
+            }
+        }
     }
+    projects
 }
 
 fn take_resume_manifest_at(path: &std::path::Path) -> Vec<ResumeProject> {
@@ -2201,11 +2229,28 @@ pub async fn run(
     // every project at once. Providers are resolved to absolute paths at
     // project startup, so this has to be right before any project starts.
     if let Some(path) = resolve_user_shell_path() {
+        let path = merge_paths(&path, &std::env::var("PATH").unwrap_or_default());
         if std::env::var("PATH").ok().as_deref() != Some(path.as_str()) {
             tracing::info!("using the login shell PATH so projects can find their providers");
             std::env::set_var("PATH", &path);
         }
     }
+    // Without tmux, terminal tabs run on direct PTYs that end with the CLI.
+    // Say which one is used, or that there is none, rather than leave it to
+    // a missing "survives a reboot" to tell.
+    match find_on_path("tmux") {
+        Some(tmux) => {
+            tracing::info!(tmux = %tmux.display(), "terminal tabs can use persistent pane hosts")
+        }
+        None => tracing::warn!(
+            "tmux is not on PATH, so terminal tabs run without persistent pane hosts and \
+             restart with this CLI; install tmux to keep them across a restart"
+        ),
+    }
+    tracing::info!(
+        hostname = %hostname::get().ok().and_then(|name| name.into_string().ok()).unwrap_or_default(),
+        "this machine's id is derived from its user and hostname; a changed hostname is a new machine"
+    );
 
     let hostname = hostname::get()
         .ok()
@@ -2214,6 +2259,10 @@ pub async fn run(
         .unwrap_or_else(|| "unknown".to_string());
 
     let config = crate::config::Config::load().unwrap_or_default();
+    // Which providers this machine can launch: a quick look now, so the
+    // registration carries it, versions from the monitor shortly after.
+    let providers = crate::provider_availability::quick(&config);
+    crate::provider_availability::start_monitor();
     let machine_info = MachineInfo {
         machine_id,
         hostname,
@@ -2222,6 +2271,7 @@ pub async fn run(
         daemon_version: Some(VERSION.to_string()),
         deepseek_backend: deepseek_backend_info_from_config(&config),
         last_seen: None,
+        providers: Some(providers),
     };
     // From the same setting the machine id came from: a configured id is
     // shared with every host on this home, so instances could not be told
@@ -2547,6 +2597,19 @@ async fn run_connection(
                 state.reap_exited_processes();
                 state.refresh_projects();
                 state.refresh_git_remotes();
+
+                // A provider installed or removed since the last report.
+                if let Some(latest) = crate::provider_availability::latest() {
+                    if state.machine_info.providers.as_ref() != Some(&latest) {
+                        state.machine_info.providers = Some(latest);
+                        let update = DaemonToServer::MachineInfoUpdate {
+                            machine: state.machine_info.clone(),
+                        };
+                        ws_sender
+                            .send(Message::Text(serde_json::to_string(&update)?.into()))
+                            .await?;
+                    }
+                }
 
                 let heartbeat_msg = DaemonToServer::Heartbeat {
                     projects: state.snapshot_projects(),
@@ -3063,6 +3126,7 @@ mod local_registration_tests {
                 daemon_version: None,
                 deepseek_backend: None,
                 last_seen: None,
+                providers: None,
             },
             ClaimMode::Instances,
         )
@@ -3180,6 +3244,7 @@ mod requested_restart_tests {
             daemon_version: None,
             deepseek_backend: None,
             last_seen: None,
+            providers: None,
         }
     }
 
@@ -3298,9 +3363,47 @@ mod requested_restart_tests {
 #[cfg(test)]
 mod resume_tests {
     use super::{
-        should_forget_project, take_resume_manifest_at, write_resume_manifest_at, ResumeProject,
+        should_forget_project, take_resume_manifest_at, take_resume_manifests_at,
+        write_resume_manifest_at, ResumeProject,
     };
     use std::path::PathBuf;
+
+    /// A Mac's first Reboot to update: the replaced APAS wrote its manifest
+    /// under the temp dir, the replacement reads its new runtime dir first.
+    /// Both are taken and cleared, and a project named in both resumes once,
+    /// as the current manifest says.
+    #[test]
+    fn a_manifest_the_replaced_apas_wrote_in_its_old_place_is_taken_too() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let current = dir.path().join("run/sup/resume.json");
+        let legacy = dir.path().join("tmp/apas-501/apas/sup/resume.json");
+        let missing = dir.path().join("elsewhere/sup/resume.json");
+        std::fs::create_dir_all(current.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        let project = |id: &str, path: &str, alone: bool| ResumeProject {
+            project_id: id.to_string(),
+            path: Some(PathBuf::from(path)),
+            single_machine_server: alone,
+        };
+        write_resume_manifest_at(&current, &[project("alpha", "/new/alpha", false)]);
+        write_resume_manifest_at(
+            &legacy,
+            &[
+                project("alpha", "/old/alpha", true),
+                project("chiral", "/Users/me/chiral-network", false),
+            ],
+        );
+        let paths = vec![current.clone(), missing, legacy.clone()];
+        assert_eq!(
+            take_resume_manifests_at(&paths),
+            vec![
+                project("alpha", "/new/alpha", false),
+                project("chiral", "/Users/me/chiral-network", false),
+            ]
+        );
+        assert!(!current.exists() && !legacy.exists(), "both are cleared");
+        assert!(take_resume_manifests_at(&paths).is_empty());
+    }
 
     /// Under the process-per-project model an upgrade left projects alone —
     /// they were in their own tmux sessions and `exec` never touched them.
@@ -3532,6 +3635,7 @@ mod instance_tests {
                 daemon_version: None,
                 deepseek_backend: None,
                 last_seen: None,
+                providers: None,
             },
             mode,
         );
@@ -4654,6 +4758,7 @@ mod join_tests {
                 daemon_version: None,
                 deepseek_backend: None,
                 last_seen: None,
+                providers: None,
             },
             mode,
         );
@@ -4956,5 +5061,15 @@ mod join_tests {
                 .expect("registry")
                 .is_empty());
         });
+    }
+
+    #[test]
+    fn the_shell_path_comes_first_and_nothing_inherited_is_lost() {
+        assert_eq!(
+            super::merge_paths("/opt/homebrew/bin:/usr/bin", "/usr/bin:/bin:/custom"),
+            "/opt/homebrew/bin:/usr/bin:/bin:/custom"
+        );
+        assert_eq!(super::merge_paths("", "/usr/bin"), "/usr/bin");
+        assert_eq!(super::merge_paths("/a::/a", ""), "/a");
     }
 }

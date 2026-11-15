@@ -18,7 +18,7 @@
 //! `0600` file. That pattern is already proven here, and a second convention
 //! would be one more thing to get subtly wrong.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -207,7 +207,8 @@ pub fn read_credential(paths: &SupervisorPaths) -> Result<String> {
 /// outlives the process. Checking the pid is what keeps a new supervisor from
 /// refusing to start because of a dead one's leftovers.
 pub fn descriptor_is_live(descriptor: &SupervisorDescriptor) -> bool {
-    Path::new(&format!("/proc/{}", descriptor.pid)).exists()
+    // `kill(pid, 0)`, not `/proc/<pid>`: macOS has no `/proc`.
+    crate::process_info::alive(descriptor.pid)
 }
 
 #[cfg(test)]

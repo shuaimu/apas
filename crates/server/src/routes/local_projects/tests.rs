@@ -34,6 +34,7 @@ fn machine(machine_id: Uuid) -> MachineInfo {
         daemon_version: Some("test".to_string()),
         deepseek_backend: None,
         last_seen: None,
+        providers: None,
     }
 }
 

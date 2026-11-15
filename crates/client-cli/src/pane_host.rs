@@ -212,13 +212,31 @@ fn prune_project_runtime_root(project_id: Uuid) {
 pub fn runtime_paths(project_id: Uuid, pane_id: u32, runtime_id: Uuid) -> Result<RuntimePaths> {
     let dir =
         project_runtime_root(project_id)?.join(format!("{pane_id}-{}", short_uuid(runtime_id)));
+    let socket = dir.join("c.sock");
+    check_socket_path(&socket)?;
     ensure_private_dir(&dir)?;
     Ok(RuntimePaths {
         descriptor: dir.join("runtime.json"),
         credential: dir.join("credential"),
-        socket: dir.join("c.sock"),
+        socket,
         dir,
     })
+}
+
+/// A Unix socket path must fit `sun_path`: 104 bytes on macOS, 108 on Linux,
+/// including the terminating NUL. Too long, `bind` fails inside the host and
+/// the controller only saw a handshake time out before falling back.
+fn check_socket_path(socket: &Path) -> Result<()> {
+    let limit = if cfg!(target_os = "linux") { 108 } else { 104 };
+    let length = socket.as_os_str().len();
+    if length >= limit {
+        bail!(
+            "pane-host socket path is {length} bytes, longer than this platform's {} byte limit: {}",
+            limit - 1,
+            socket.display()
+        );
+    }
+    Ok(())
 }
 
 /// Log file for the host running `runtime_dir`, keyed the way the runtime
@@ -695,6 +713,42 @@ pub fn launch_host(
 
 pub fn list_project_descriptors(project_id: Uuid) -> Result<Vec<(PathBuf, RuntimeDescriptor)>> {
     let root = project_runtime_root(project_id)?;
+    // Hosts an APAS from before the macOS runtime dir started on a Mac are
+    // under its old root. A Mac's first Reboot to update would otherwise
+    // never adopt them: each tab got a fresh provider while the old one ran
+    // on, detached, until its lease ended. Descriptors carry absolute socket
+    // and credential paths, so adopting and ending such a host is unchanged.
+    let legacy: Vec<PathBuf> = crate::config::Config::legacy_daemon_state_dirs()
+        .into_iter()
+        .map(|dir| dir.join("ph").join(short_uuid(project_id)))
+        .filter(|dir| *dir != root)
+        .collect();
+    list_project_descriptors_in(&root, &legacy, project_id)
+}
+
+/// The descriptors under `root`, which must be readable, then under each of
+/// `legacy`, which may be absent. Only `root` is tidied: an unreadable entry
+/// under a legacy root may be a live host this binary cannot read, and
+/// removing its files would leave it unreachable.
+fn list_project_descriptors_in(
+    root: &Path,
+    legacy: &[PathBuf],
+    project_id: Uuid,
+) -> Result<Vec<(PathBuf, RuntimeDescriptor)>> {
+    let mut descriptors = list_descriptors_under(root, project_id, true)?;
+    for dir in legacy {
+        if let Ok(found) = list_descriptors_under(dir, project_id, false) {
+            descriptors.extend(found);
+        }
+    }
+    Ok(descriptors)
+}
+
+fn list_descriptors_under(
+    root: &Path,
+    project_id: Uuid,
+    remove_unreadable: bool,
+) -> Result<Vec<(PathBuf, RuntimeDescriptor)>> {
     let mut descriptors = Vec::new();
     for entry in fs::read_dir(root)? {
         let entry = entry?;
@@ -709,9 +763,10 @@ pub fn list_project_descriptors(project_id: Uuid) -> Result<Vec<(PathBuf, Runtim
             Ok(descriptor) if descriptor.project_id == project_id => {
                 descriptors.push((path, descriptor));
             }
-            Ok(_) | Err(_) => {
+            Ok(_) | Err(_) if remove_unreadable => {
                 let _ = fs::remove_dir_all(entry.path());
             }
+            Ok(_) | Err(_) => {}
         }
     }
     Ok(descriptors)
@@ -959,7 +1014,18 @@ impl HostedProcess {
     }
 }
 
+/// The uid of the process at the other end of `stream`. `None` when the
+/// platform cannot say, which the caller refuses: skipping the check on a
+/// platform without `SO_PEERCRED` used to drop it without a word.
 fn peer_uid(stream: &UnixStream) -> Option<u32> {
+    #[cfg(any(target_os = "macos", target_os = "freebsd"))]
+    unsafe {
+        let mut uid: libc::uid_t = 0;
+        let mut gid: libc::gid_t = 0;
+        if libc::getpeereid(std::os::fd::AsRawFd::as_raw_fd(stream), &mut uid, &mut gid) == 0 {
+            return Some(uid);
+        }
+    }
     #[cfg(target_os = "linux")]
     unsafe {
         let mut cred: libc::ucred = std::mem::zeroed();
@@ -1037,8 +1103,10 @@ fn serve_controller(
     if project_tombstone(descriptor.project_id)?.exists() {
         bail!("project pane-host cleanup is in progress");
     }
-    if peer_uid(&stream).is_some_and(|uid| uid != descriptor.owner_uid) {
-        bail!("pane-host peer uid mismatch");
+    match peer_uid(&stream) {
+        Some(uid) if uid == descriptor.owner_uid => {}
+        Some(_) => bail!("pane-host peer uid mismatch"),
+        None => bail!("pane-host cannot verify its peer's uid"),
     }
     stream.set_read_timeout(Some(Duration::from_secs(5)))?;
     let first = read_frame::<ControllerToHost>(&mut stream)?;
@@ -2190,5 +2258,76 @@ mod tests {
             scope.spawn(|| exercise_controller_replacement(Provider::Claude, project_id, 30));
             scope.spawn(|| exercise_controller_replacement(Provider::Codex, project_id, 31));
         });
+    }
+
+    /// A Mac's first Reboot to update: hosts the replaced APAS started are
+    /// under its old root and are adopted from there, and nothing under that
+    /// root is removed for being unreadable.
+    #[test]
+    fn hosts_under_the_old_macos_root_are_listed_too() {
+        let base = tempfile::tempdir().unwrap();
+        let project = Uuid::new_v4();
+        let root = base.path().join("run/ph").join(short_uuid(project));
+        let legacy = base.path().join("tmp/apas/ph").join(short_uuid(project));
+        let absent = base.path().join("gone/ph").join(short_uuid(project));
+        let write = |dir: &Path, pane_id: u32| {
+            let pane_dir = dir.join(format!("{pane_id}-x"));
+            ensure_private_dir(&pane_dir).unwrap();
+            let descriptor = RuntimeDescriptor {
+                protocol_version: HOST_PROTOCOL_VERSION,
+                project_id: project,
+                pane_id,
+                runtime_id: Uuid::new_v4(),
+                instance_id: Uuid::new_v4(),
+                controller_id: None,
+                controller_generation: 1,
+                owner_uid: unsafe { libc::getuid() },
+                created_at_unix_ms: 0,
+                session_name: format!("ph_{pane_id}_test"),
+                socket_path: pane_dir.join("c.sock"),
+                credential_path: pane_dir.join("credential"),
+            };
+            write_descriptor(&pane_dir.join("runtime.json"), &descriptor).unwrap();
+            pane_dir
+        };
+        ensure_private_dir(&root).unwrap();
+        ensure_private_dir(&legacy).unwrap();
+        write(&root, 1);
+        write(&legacy, 2);
+        let unreadable = legacy.join("3-x");
+        ensure_private_dir(&unreadable).unwrap();
+        fs::write(unreadable.join("runtime.json"), b"not json").unwrap();
+        fs::set_permissions(
+            unreadable.join("runtime.json"),
+            fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+
+        let panes: Vec<u32> =
+            list_project_descriptors_in(&root, &[legacy.clone(), absent], project)
+                .unwrap()
+                .into_iter()
+                .map(|(_, descriptor)| descriptor.pane_id)
+                .collect();
+        assert_eq!(panes, vec![1, 2]);
+        assert!(unreadable.exists(), "a legacy root is never tidied");
+        // The current root must be readable, as before.
+        assert!(list_project_descriptors_in(&base.path().join("none"), &[], project).is_err());
+    }
+
+    #[test]
+    fn a_socket_path_too_long_for_the_platform_is_refused_by_name() {
+        let limit = if cfg!(target_os = "linux") { 108 } else { 104 };
+        let fits = PathBuf::from(format!("/{}", "a".repeat(limit - 2)));
+        assert!(check_socket_path(&fits).is_ok());
+        let too_long = PathBuf::from(format!("/{}", "a".repeat(limit - 1)));
+        let error = check_socket_path(&too_long).unwrap_err().to_string();
+        assert!(error.contains("longer than this platform's"), "{error}");
+    }
+
+    #[test]
+    fn a_peer_uid_is_known_on_this_platform() {
+        let (left, _right) = UnixStream::pair().unwrap();
+        assert_eq!(peer_uid(&left), Some(unsafe { libc::getuid() }));
     }
 }

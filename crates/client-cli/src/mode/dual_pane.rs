@@ -2010,7 +2010,26 @@ fn spawn_terminal_pane(
         tracing::info!(pane_id, "replacing existing terminal pty");
         previous.shutdown();
     }
+    crate::launch_status::clear(session_id, pane_id);
+    if matches!(provider, Provider::Omp) {
+        note_omp_platform_limits();
+    }
     Ok(())
+}
+
+/// OMP's APAS extension identifies its provider through `/proc`, so off
+/// Linux it reports nothing: the tab's state comes from its transcript only,
+/// OMP's questions are answered in the terminal, and autopilot is refused.
+/// Said once per process, so it is not a silent difference.
+fn note_omp_platform_limits() {
+    static NOTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !cfg!(target_os = "linux") && !NOTED.swap(true, Ordering::Relaxed) {
+        tracing::info!(
+            os = std::env::consts::OS,
+            "OMP tabs on this platform: status comes from the transcript only, questions are \
+             answered in the terminal, and autopilot is unavailable"
+        );
+    }
 }
 
 /// Launch an already selected executable, without cache selection or fallback.
@@ -2083,14 +2102,20 @@ fn terminal_state_reports(
                 .and_then(|panes| panes.get(&pane_id).cloned());
             match handle {
                 Some(handle) => handle.state_message(session_id),
-                None => CliToServer::TerminalState {
-                    session_id,
-                    pane_id,
-                    instance_id: None,
-                    lifecycle: shared::TerminalLifecycle::Exited,
-                    status: Some(unavailable_terminal_status(provider, model.as_deref())),
-                    runtime: None,
-                },
+                // A retired provider's reason first; then why its launch
+                // failed or that its provider is being installed; only then
+                // the generic text.
+                None => (!shared::is_retired_launch(provider, model.as_deref()))
+                    .then(|| crate::launch_status::state_report(session_id, pane_id))
+                    .flatten()
+                    .unwrap_or_else(|| CliToServer::TerminalState {
+                        session_id,
+                        pane_id,
+                        instance_id: None,
+                        lifecycle: shared::TerminalLifecycle::Exited,
+                        status: Some(unavailable_terminal_status(provider, model.as_deref())),
+                        runtime: None,
+                    }),
             }
         })
         .collect()
@@ -2650,6 +2675,22 @@ fn finish_omp_reboot(
         }
         let binary = match prepared {
             Ok(binary) => binary,
+            Err(error) if request.runtime_instance_id.is_none() => {
+                // Nothing was running, so nothing "was not stopped": the tab
+                // stays without a process, and the server is told why.
+                let text = format!("[OMP could not be started: {error}]");
+                let status = crate::launch_status::status_text(&text);
+                crate::launch_status::set(
+                    session_id,
+                    pane_id,
+                    crate::launch_status::LaunchStatus::Failed(status.clone()),
+                );
+                for frame in crate::launch_status::exited_frames(session_id, pane_id, None, &status)
+                {
+                    let _ = server_tx.blocking_send(frame);
+                }
+                return Some(text);
+            }
             Err(error) => {
                 return Some(format!(
                     "[Error preparing OMP reboot: {error}. Running provider was not stopped.]"
@@ -2738,6 +2779,13 @@ fn finish_omp_reboot(
                 "[Error restarting OMP with {}: {error}. Pane and conversation were retained.]",
                 binary.display()
             );
+            crate::launch_status::set(
+                session_id,
+                pane_id,
+                crate::launch_status::LaunchStatus::Failed(crate::launch_status::status_text(
+                    &error,
+                )),
+            );
             let _ = server_tx.blocking_send(CliToServer::TerminalState {
                 session_id,
                 pane_id,
@@ -2770,6 +2818,7 @@ fn finish_omp_reboot(
         }
         return None;
     }
+    crate::launch_status::clear(session_id, pane_id);
     let launcher_note = if binary == request.source {
         " Configured launcher retained; APAS cannot auto-update packages."
     } else {
@@ -2799,6 +2848,267 @@ fn report_omp_reboot(
         pane_type: None,
         pane_id: Some(pane_id),
     });
+}
+
+/// A tab waiting for OMP to be installed on this machine.
+struct PendingOmpInstall {
+    request_id: Uuid,
+    /// The installer's own terminal, which the real process replaces.
+    instance_id: Uuid,
+    /// The pane generation to launch when the install ends. A tab closed or
+    /// re-added meanwhile has another, and the newest request wins.
+    child_process: Arc<Mutex<Option<std::process::Child>>>,
+    resume: bool,
+    initial_input: Option<String>,
+}
+
+/// This machine's name as a person knows it, for the text a tab shows.
+fn host_label() -> String {
+    hostname::get()
+        .ok()
+        .and_then(|name| name.into_string().ok())
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| "this machine".to_string())
+}
+
+/// Install OMP for an OMP tab on a machine that has none, then launch it.
+///
+/// The download runs on a thread of its own and ends in
+/// [`TuiEvent::OmpInstallFinished`]; nothing here waits for it. Meanwhile the
+/// tab shows the installer's progress as its terminal. A second launch of the
+/// same tab joins the install in flight rather than starting another.
+#[allow(clippy::too_many_arguments)]
+fn start_omp_install(
+    pending: &mut HashMap<u32, PendingOmpInstall>,
+    pane_id: u32,
+    pane_metas: &PaneMetas,
+    resume: bool,
+    initial_input: Option<String>,
+    session_id: Uuid,
+    server_tx: &tokio_mpsc::Sender<CliToServer>,
+    output_tx: &mpsc::Sender<PaneOutput>,
+    completion_tx: &mpsc::Sender<TuiEvent>,
+) {
+    let Some(generation) = pane_metas.lock().ok().and_then(|metas| {
+        metas
+            .get(&pane_id)
+            .filter(|meta| meta.provider == Provider::Omp && meta.kind.is_terminal())
+            .map(|meta| meta.child_process.clone())
+    }) else {
+        return;
+    };
+    if let Some(existing) = pending.get_mut(&pane_id) {
+        existing.child_process = generation;
+        existing.resume = resume;
+        if initial_input.is_some() {
+            existing.initial_input = initial_input;
+        }
+        return;
+    }
+    let platform = match crate::omp_install::host_platform() {
+        Ok(platform) => platform,
+        Err(reason) => {
+            let text = format!(
+                "[{}]",
+                crate::omp_install::failure_text(&host_label(), &reason)
+            );
+            let _ = output_tx.send(PaneOutput {
+                text: text.clone(),
+                pane_id,
+            });
+            crate::launch_status::report_failure(server_tx, session_id, pane_id, None, &text);
+            return;
+        }
+    };
+    let request_id = Uuid::new_v4();
+    let instance_id = Uuid::new_v4();
+    let first_line = crate::omp_install::starting_line(crate::omp_install::OMP_VERSION, &platform);
+    tracing::info!(
+        pane_id,
+        "OMP is not installed here; installing it for this tab"
+    );
+    crate::launch_status::set(
+        session_id,
+        pane_id,
+        crate::launch_status::LaunchStatus::Installing {
+            instance_id,
+            status: first_line.clone(),
+        },
+    );
+    let _ = server_tx.blocking_send(CliToServer::TerminalState {
+        session_id,
+        pane_id,
+        instance_id: Some(instance_id),
+        lifecycle: shared::TerminalLifecycle::Running,
+        status: Some(first_line),
+        runtime: None,
+    });
+    pending.insert(
+        pane_id,
+        PendingOmpInstall {
+            request_id,
+            instance_id,
+            child_process: generation,
+            resume,
+            initial_input,
+        },
+    );
+    let thread_server_tx = server_tx.clone();
+    let thread_completion_tx = completion_tx.clone();
+    let spawned = thread::Builder::new()
+        .name(format!("omp-install-{pane_id}"))
+        .spawn(move || {
+            let mut seq = 0u64;
+            let mut progress = |line: String| {
+                tracing::info!(pane_id, "{line}");
+                let _ = thread_server_tx.blocking_send(CliToServer::TerminalOutput {
+                    session_id,
+                    pane_id,
+                    instance_id: Some(instance_id),
+                    data_b64: base64::engine::general_purpose::STANDARD
+                        .encode(format!("{line}\r\n")),
+                    seq,
+                });
+                seq += 1;
+            };
+            // A panic must still end the install, or the tab would read as
+            // installing forever and every reboot would join a dead install.
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                crate::omp_install::InstallRequest::official()
+                    .and_then(|request| crate::omp_install::install(request, &mut progress))
+                    .map_err(|error| format!("{error:#}"))
+            }))
+            .unwrap_or_else(|_| Err("the installer stopped unexpectedly".to_string()));
+            let _ = thread_completion_tx.send(TuiEvent::OmpInstallFinished {
+                pane_id,
+                request_id,
+                result,
+            });
+        });
+    if let Err(error) = spawned {
+        pending.remove(&pane_id);
+        let text = format!(
+            "[{}]",
+            crate::omp_install::failure_text(&host_label(), &format!("{error}"))
+        );
+        crate::launch_status::report_failure(
+            server_tx,
+            session_id,
+            pane_id,
+            Some(instance_id),
+            &text,
+        );
+    }
+}
+
+/// Launch the tab an install was for, or say why it cannot be.
+#[allow(clippy::too_many_arguments)]
+fn finish_omp_install(
+    pending: &mut HashMap<u32, PendingOmpInstall>,
+    pane_id: u32,
+    request_id: Uuid,
+    result: Result<PathBuf, String>,
+    shutdown: &AtomicBool,
+    pane_metas: &PaneMetas,
+    pane_sessions: &Arc<Mutex<HashMap<u32, Uuid>>>,
+    terminal_panes: &TerminalPanes,
+    session_id: Uuid,
+    working_dir: &str,
+    server_tx: &tokio_mpsc::Sender<CliToServer>,
+    output_tx: &mpsc::Sender<PaneOutput>,
+) {
+    if pending.get(&pane_id).map(|request| request.request_id) != Some(request_id) {
+        return;
+    }
+    let Some(request) = pending.remove(&pane_id) else {
+        return;
+    };
+    if shutdown.load(Ordering::SeqCst) {
+        return;
+    }
+    let Some((model, worktree_path)) = pane_metas.lock().ok().and_then(|metas| {
+        metas
+            .get(&pane_id)
+            .filter(|meta| Arc::ptr_eq(&meta.child_process, &request.child_process))
+            .map(|meta| (meta.model.clone(), meta.worktree_path.clone()))
+    }) else {
+        // The tab was closed while OMP was installed.
+        crate::launch_status::clear(session_id, pane_id);
+        return;
+    };
+    if terminal_panes
+        .lock()
+        .map(|terminals| terminals.contains_key(&pane_id))
+        .unwrap_or(true)
+    {
+        return;
+    }
+    let report = |text: String, instance_id: Option<Uuid>| {
+        tracing::warn!(pane_id, %text, "OMP tab could not start");
+        let _ = output_tx.send(PaneOutput {
+            text: text.clone(),
+            pane_id,
+        });
+        crate::launch_status::report_failure(server_tx, session_id, pane_id, instance_id, &text);
+    };
+    let binary = match result {
+        Ok(binary) => binary,
+        Err(error) => {
+            report(
+                format!(
+                    "[{}]",
+                    crate::omp_install::failure_text(&host_label(), &error)
+                ),
+                Some(request.instance_id),
+            );
+            return;
+        }
+    };
+    let Some(conversation_id) = pane_sessions
+        .lock()
+        .ok()
+        .and_then(|sessions| sessions.get(&pane_id).copied())
+    else {
+        report(
+            "[OMP was installed, but this tab's conversation id is unavailable. Reboot the tab.]"
+                .to_string(),
+            Some(request.instance_id),
+        );
+        return;
+    };
+    if let Err(error) = spawn_terminal_pane(
+        terminal_panes,
+        pane_id,
+        session_id,
+        conversation_id,
+        &Provider::Omp,
+        model.as_deref(),
+        &binary.to_string_lossy(),
+        working_dir,
+        worktree_path.as_deref(),
+        server_tx,
+        request.resume,
+        request.initial_input.as_deref(),
+    ) {
+        report(error, Some(request.instance_id));
+    }
+}
+
+/// Report a terminal launch that failed: the server learns the tab exited and
+/// why, the local status line and the conversation say it too.
+fn report_terminal_launch_failure(
+    output_tx: &mpsc::Sender<PaneOutput>,
+    server_tx: &tokio_mpsc::Sender<CliToServer>,
+    session_id: Uuid,
+    pane_id: u32,
+    error: String,
+) {
+    tracing::error!(pane_id, %error, "failed to start terminal pane");
+    let _ = output_tx.send(PaneOutput {
+        text: error.clone(),
+        pane_id,
+    });
+    crate::launch_status::report_failure(server_tx, session_id, pane_id, None, &error);
 }
 
 /// One held tool_use waiting on user approval (Phase 3.2b2).
@@ -3245,6 +3555,22 @@ async fn run_inner(
             &omp_path,
             &cursor_agent_path,
         );
+        let binary_path = if matches!(provider, Provider::Omp) {
+            match tokio::task::block_in_place(|| crate::omp_install::plan_for_host(&binary_path)) {
+                // Installed and launched by the event loop once it runs.
+                crate::omp_install::OmpLaunchPlan::Install => {
+                    let _ = event_tx.send(TuiEvent::InstallOmp {
+                        pane_id: *pane_id,
+                        resume: true,
+                        initial_input: None,
+                    });
+                    continue;
+                }
+                crate::omp_install::OmpLaunchPlan::Launch(path) => path,
+            }
+        } else {
+            binary_path
+        };
         if let Err(err) = tokio::task::block_in_place(|| {
             spawn_terminal_pane(
                 &terminal_panes,
@@ -3262,6 +3588,13 @@ async fn run_inner(
             )
         }) {
             tracing::error!(pane_id, %err, "failed to restore terminal pane");
+            // Reported when this run registers with the server, which
+            // reports every configured terminal's state.
+            crate::launch_status::set(
+                session_id,
+                *pane_id,
+                crate::launch_status::LaunchStatus::Failed(crate::launch_status::status_text(&err)),
+            );
         }
     }
 
@@ -4693,13 +5026,74 @@ fn handle_tui_events(
     store: ProjectStore,
 ) {
     let mut pending_omp_reboots = HashMap::new();
+    let mut pending_omp_installs: HashMap<u32, PendingOmpInstall> = HashMap::new();
     while !shutdown.load(Ordering::SeqCst) {
         match event_rx.recv_timeout(Duration::from_millis(100)) {
+            Ok(TuiEvent::InstallOmp {
+                pane_id,
+                resume,
+                initial_input,
+            }) => {
+                start_omp_install(
+                    &mut pending_omp_installs,
+                    pane_id,
+                    &pane_metas,
+                    resume,
+                    initial_input,
+                    session_id,
+                    &server_tx,
+                    &output_tx,
+                    &event_tx,
+                );
+            }
+            Ok(TuiEvent::OmpInstallFinished {
+                pane_id,
+                request_id,
+                result,
+            }) => {
+                finish_omp_install(
+                    &mut pending_omp_installs,
+                    pane_id,
+                    request_id,
+                    result,
+                    &shutdown,
+                    &pane_metas,
+                    &pane_sessions,
+                    &terminal_panes,
+                    session_id,
+                    working_dir,
+                    &server_tx,
+                    &output_tx,
+                );
+            }
             Ok(TuiEvent::RebootOmpPane {
                 pane_id,
                 generation,
             }) => {
                 if pending_omp_reboots.contains_key(&pane_id) {
+                    continue;
+                }
+                // A tab whose OMP never started because this machine has
+                // none: its reboot is another try at the install.
+                let has_runtime = terminal_panes
+                    .lock()
+                    .map(|terminals| terminals.contains_key(&pane_id))
+                    .unwrap_or(true);
+                if !has_runtime
+                    && crate::omp_install::plan_for_host(&resolve_binary_path(omp_path))
+                        == crate::omp_install::OmpLaunchPlan::Install
+                {
+                    start_omp_install(
+                        &mut pending_omp_installs,
+                        pane_id,
+                        &pane_metas,
+                        true,
+                        None,
+                        session_id,
+                        &server_tx,
+                        &output_tx,
+                        &event_tx,
+                    );
                     continue;
                 }
                 let source = PathBuf::from(resolve_binary_path(omp_path));
@@ -4953,22 +5347,47 @@ fn handle_tui_events(
                 // Terminal tab: allocate a pty running the provider's real
                 // Terminal panes have no headless agent input or system prompt.
                 if kind.is_terminal() {
-                    if let Err(err) = spawn_terminal_pane(
-                        &terminal_panes,
-                        pane_id,
-                        session_id,
-                        claude_session_id,
-                        &provider,
-                        model.as_deref(),
-                        &binary_path,
-                        working_dir,
-                        worktree_path.as_deref(),
-                        &server_tx,
-                        try_resume_first,
-                        initial_input.as_deref(),
-                    ) {
-                        tracing::error!(pane_id, %err, "failed to start terminal pane");
-                        let _ = output_tx.send(PaneOutput { text: err, pane_id });
+                    // OMP missing on this machine: install it first. The
+                    // install ends in `OmpInstallFinished`, which launches.
+                    let omp_plan = matches!(provider, Provider::Omp)
+                        .then(|| crate::omp_install::plan_for_host(&binary_path));
+                    if omp_plan == Some(crate::omp_install::OmpLaunchPlan::Install) {
+                        start_omp_install(
+                            &mut pending_omp_installs,
+                            pane_id,
+                            &pane_metas,
+                            try_resume_first,
+                            initial_input.clone(),
+                            session_id,
+                            &server_tx,
+                            &output_tx,
+                            &event_tx,
+                        );
+                    } else {
+                        let binary_path = match omp_plan {
+                            Some(crate::omp_install::OmpLaunchPlan::Launch(path)) => path,
+                            _ => binary_path.clone(),
+                        };
+                        if let Err(err) = spawn_terminal_pane(
+                            &terminal_panes,
+                            pane_id,
+                            session_id,
+                            claude_session_id,
+                            &provider,
+                            model.as_deref(),
+                            &binary_path,
+                            working_dir,
+                            worktree_path.as_deref(),
+                            &server_tx,
+                            try_resume_first,
+                            initial_input.as_deref(),
+                        ) {
+                            // Logged and shown locally used to be all: the
+                            // tab then sat in the web with no terminal state.
+                            report_terminal_launch_failure(
+                                &output_tx, &server_tx, session_id, pane_id, err,
+                            );
+                        }
                     }
                     // Announce before returning. This early return used to skip
                     // the shared tail below, so a new terminal tab never
@@ -7569,6 +7988,203 @@ mod tests {
             }
             other => panic!("unexpected report: {other:?}"),
         }
+    }
+
+    /// A terminal tab whose provider cannot be found used to be logged and
+    /// shown locally only; the web then showed its terminal as "state
+    /// unknown" with nothing in it. It is reported as exited with the reason,
+    /// at once and again at every reconnect.
+    #[test]
+    fn a_tab_whose_provider_is_missing_is_reported_exited_with_the_reason() {
+        let session_id = Uuid::new_v4();
+        let root = tempfile::tempdir().unwrap();
+        let missing = root.path().join("no-codex-here");
+        let handles = crate::terminal_pane::TerminalPanes::default();
+        let (server_tx, mut server_rx) = tokio_mpsc::channel(8);
+        let (output_tx, output_rx) = mpsc::channel();
+        let error = super::spawn_terminal_pane(
+            &handles,
+            655,
+            session_id,
+            Uuid::new_v4(),
+            &Provider::Codex,
+            None,
+            &missing.to_string_lossy(),
+            &root.path().to_string_lossy(),
+            None,
+            &server_tx,
+            false,
+            None,
+        )
+        .expect_err("no codex to start");
+        super::report_terminal_launch_failure(&output_tx, &server_tx, session_id, 655, error);
+
+        let expected = format!(
+            "Error spawning Codex binary '{}': executable not found. Configure with: apas config set codex_path <path>",
+            missing.display()
+        );
+        match server_rx.try_recv().unwrap() {
+            CliToServer::TerminalState {
+                pane_id,
+                lifecycle,
+                status,
+                instance_id,
+                ..
+            } => {
+                assert_eq!(pane_id, 655);
+                assert_eq!(lifecycle, shared::TerminalLifecycle::Exited);
+                assert!(instance_id.is_none());
+                assert_eq!(status.as_deref(), Some(expected.as_str()));
+            }
+            other => panic!("unexpected frame {other:?}"),
+        }
+        assert!(matches!(
+            server_rx.try_recv().unwrap(),
+            CliToServer::TerminalExited { pane_id: 655, .. }
+        ));
+        assert!(output_rx
+            .try_recv()
+            .unwrap()
+            .text
+            .contains("executable not found"));
+
+        let mut meta = test_pane_meta(Provider::Codex, false, None, Arc::new(Mutex::new(None)));
+        meta.kind = shared::PaneKind::Terminal;
+        meta.mode = shared::PaneMode::Interactive;
+        let panes: PaneMetas = Arc::new(Mutex::new(HashMap::from([(655, meta)])));
+        match &terminal_state_reports(session_id, &panes, &handles)[..] {
+            [CliToServer::TerminalState {
+                status, lifecycle, ..
+            }] => {
+                assert_eq!(*lifecycle, shared::TerminalLifecycle::Exited);
+                assert_eq!(status.as_deref(), Some(expected.as_str()));
+            }
+            other => panic!("unexpected reports {other:?}"),
+        }
+        crate::launch_status::clear(session_id, 655);
+    }
+
+    /// The end of an OMP install for a tab: a failure is the tab's exit
+    /// reason, on the installer's own terminal; a tab closed meanwhile is
+    /// left alone, and a stale completion does nothing.
+    #[test]
+    fn a_failed_omp_install_is_the_tabs_exit_reason() {
+        let session_id = Uuid::new_v4();
+        let mut meta = test_pane_meta(Provider::Omp, false, None, Arc::new(Mutex::new(None)));
+        meta.kind = shared::PaneKind::Terminal;
+        meta.mode = shared::PaneMode::Interactive;
+        let generation = meta.child_process.clone();
+        let metas: PaneMetas = Arc::new(Mutex::new(HashMap::from([(655, meta)])));
+        let sessions = Arc::new(Mutex::new(HashMap::from([(655, Uuid::new_v4())])));
+        let terminals = crate::terminal_pane::TerminalPanes::default();
+        let (server_tx, mut server_rx) = tokio_mpsc::channel(8);
+        let (output_tx, _output_rx) = mpsc::channel();
+        let shutdown = AtomicBool::new(false);
+        let instance_id = Uuid::new_v4();
+        let request_id = Uuid::new_v4();
+        let pending = |child_process| {
+            HashMap::from([(
+                655,
+                super::PendingOmpInstall {
+                    request_id,
+                    instance_id,
+                    child_process,
+                    resume: false,
+                    initial_input: None,
+                },
+            )])
+        };
+
+        // A completion for another request changes nothing.
+        let mut waiting = pending(generation.clone());
+        super::finish_omp_install(
+            &mut waiting,
+            655,
+            Uuid::new_v4(),
+            Err("x".into()),
+            &shutdown,
+            &metas,
+            &sessions,
+            &terminals,
+            session_id,
+            "/",
+            &server_tx,
+            &output_tx,
+        );
+        assert!(waiting.contains_key(&655));
+        assert!(server_rx.try_recv().is_err());
+
+        super::finish_omp_install(
+            &mut waiting,
+            655,
+            request_id,
+            Err("checksum mismatch for omp-darwin-arm64".into()),
+            &shutdown,
+            &metas,
+            &sessions,
+            &terminals,
+            session_id,
+            "/",
+            &server_tx,
+            &output_tx,
+        );
+        assert!(waiting.is_empty());
+        match server_rx.try_recv().unwrap() {
+            CliToServer::TerminalState {
+                instance_id: Some(reported),
+                lifecycle,
+                status: Some(status),
+                ..
+            } => {
+                assert_eq!(reported, instance_id);
+                assert_eq!(lifecycle, shared::TerminalLifecycle::Exited);
+                assert!(
+                    status.contains("could not install it: checksum mismatch"),
+                    "{status}"
+                );
+                assert!(
+                    status.contains(crate::omp_install::MANUAL_INSTALL),
+                    "{status}"
+                );
+            }
+            other => panic!("unexpected frame {other:?}"),
+        }
+        assert!(matches!(
+            crate::launch_status::get(session_id, 655),
+            Some(crate::launch_status::LaunchStatus::Failed(_))
+        ));
+        while server_rx.try_recv().is_ok() {}
+
+        // The tab was closed and opened again while OMP installed: the old
+        // install's end does not touch the new tab's state.
+        let mut stale = pending(Arc::new(Mutex::new(None)));
+        crate::launch_status::set(
+            session_id,
+            655,
+            crate::launch_status::LaunchStatus::Installing {
+                instance_id,
+                status: "Installing".into(),
+            },
+        );
+        super::finish_omp_install(
+            &mut stale,
+            655,
+            request_id,
+            Err("late".into()),
+            &shutdown,
+            &metas,
+            &sessions,
+            &terminals,
+            session_id,
+            "/",
+            &server_tx,
+            &output_tx,
+        );
+        assert!(
+            server_rx.try_recv().is_err(),
+            "nothing reported for a closed tab"
+        );
+        assert!(crate::launch_status::get(session_id, 655).is_none());
     }
 
     /// Pi was retired as a provider. A tab saved while it was supported is
@@ -14826,11 +15442,9 @@ async fn run_server_connection(
                                                         std::thread::spawn(move || {
                                                             std::thread::sleep(Duration::from_secs(2));
                                                             // If still alive, escalate.
-                                                            let alive = std::path::Path::new(&format!(
-                                                                "/proc/{}",
-                                                                pid_for_fallback
-                                                            ))
-                                                            .exists();
+                                                            let alive = crate::process_info::alive(
+                                                                pid_for_fallback,
+                                                            );
                                                             if alive {
                                                                 tracing::warn!(
                                                                     pane_id = pane_for_fallback,

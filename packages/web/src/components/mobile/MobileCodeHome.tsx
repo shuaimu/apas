@@ -12,11 +12,13 @@ import {
   X,
 } from "lucide-react";
 import type {
+  MachineProviderStatus,
   MachineWithProjects,
   SessionInfo,
   SessionPaneSummary,
   UsageLimitsByProvider,
 } from "@/lib/store";
+import { installedProvidersSummary, parseMachineProviders } from "@/lib/machineChoice";
 import { writeSelectedPane } from "@/lib/mobileSelectedPane";
 import { compareRecentlyIdle } from "@/lib/idlePaneOrdering";
 import { buildProjectList } from "@/lib/projectList";
@@ -85,6 +87,9 @@ interface MobileMachineSummary {
     arch?: string | null;
     daemon_version?: string | null;
     last_seen?: string | null;
+    /** Which providers the daemon can launch; absent means unknown. Read
+     *  through `machineProviders`, which drops entries it cannot parse. */
+    providers?: Array<{ provider: string; installed: boolean; version?: string | null; can_install: boolean }> | null;
   };
   projects?: MobileMachineProject[];
   cluster_owner_user_id?: string;
@@ -116,6 +121,12 @@ const FILTERS: { key: MobileHomeView; label: string }[] = [
 /// slow tick.
 const MACHINE_STALE_MS = 60_000;
 
+/// A machine's provider report, read as leniently as the pushed list reads
+/// it: the bootstrap is the server's own JSON.
+function machineProviders(entry: MobileMachineSummary): MachineProviderStatus[] | undefined {
+  return parseMachineProviders(entry.machine.providers);
+}
+
 /// The pushed list carries the same facts under the client's own names.
 function adaptMachine(entry: MachineWithProjects): MobileMachineSummary {
   return {
@@ -126,6 +137,12 @@ function adaptMachine(entry: MachineWithProjects): MobileMachineSummary {
       arch: entry.machine.arch,
       daemon_version: entry.machine.daemonVersion,
       last_seen: entry.machine.lastSeen,
+      providers: entry.machine.providers?.map((status) => ({
+        provider: status.provider,
+        installed: status.installed,
+        version: status.version,
+        can_install: status.canInstall,
+      })),
     },
     projects: entry.projects.map((project) => ({
       project_id: project.projectId,
@@ -337,6 +354,7 @@ export function MobileCodeHome({
         arch: entry.machine.arch ?? "",
         daemonVersion: entry.machine.daemon_version ?? undefined,
         lastSeen: entry.machine.last_seen ?? undefined,
+        providers: machineProviders(entry),
       },
       projects: (entry.projects ?? []).map((project) => ({
         projectId: project.project_id,
@@ -744,6 +762,12 @@ export function MobileCodeHome({
                       {" · "}
                       {daemonVersionLabel(entry.machine.daemon_version)}
                     </p>
+                    {(() => {
+                      const installed = installedProvidersSummary(machineProviders(entry));
+                      return installed && (
+                        <p className="mt-1 truncate text-xs text-[#686873] dark:text-[#aaaab6]" title={installed.title}>{installed.text}</p>
+                      );
+                    })()}
                     {entry.cluster_access !== "member" && <div className="mt-2.5 flex items-center justify-end">
                       <button
                         type="button"

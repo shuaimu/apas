@@ -87,6 +87,18 @@ pub enum TuiEvent {
         request_id: uuid::Uuid,
         result: Result<std::path::PathBuf, String>,
     },
+    /// OMP is not on this machine: install it, then launch this OMP tab.
+    InstallOmp {
+        pane_id: u32,
+        resume: bool,
+        initial_input: Option<String>,
+    },
+    /// An install started for `pane_id` ended, with the installed executable.
+    OmpInstallFinished {
+        pane_id: u32,
+        request_id: uuid::Uuid,
+        result: Result<std::path::PathBuf, String>,
+    },
     StopBot {
         pane_id: u32,
     },

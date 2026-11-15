@@ -3310,6 +3310,7 @@ mod tests {
             daemon_version: None,
             deepseek_backend: None,
             last_seen: None,
+            providers: None,
         }
     }
 
@@ -3395,6 +3396,72 @@ mod tests {
         assert_eq!(
             mgr.get_machines_for_user(&owner)[0].projects[0].preferred_machine_id,
             None
+        );
+    }
+
+    #[test]
+    fn provider_availability_reaches_every_machine_projection_as_reported() {
+        let mgr = SessionManager::new();
+        let owner = Uuid::new_v4();
+        let machine_id = Uuid::new_v4();
+        let (tx, _daemon_rx) = mpsc::channel(16);
+        // An older daemon reports nothing: unknown, not "none installed".
+        mgr.register_daemon(
+            machine_id,
+            owner,
+            tx,
+            test_machine(machine_id, "mac-host"),
+            vec![test_project("project", "/work/project")],
+        );
+        assert_eq!(mgr.get_machines_for_user(&owner)[0].machine.providers, None);
+
+        let web = Uuid::new_v4();
+        let (web_tx, mut web_rx) = mpsc::channel(16);
+        mgr.register_web(web, web_tx);
+        mgr.set_web_user(web, owner);
+        let omp_missing = vec![shared::MachineProviderStatus {
+            provider: Provider::Omp,
+            installed: false,
+            version: None,
+            can_install: true,
+        }];
+        let mut machine = test_machine(machine_id, "mac-host");
+        machine.providers = Some(omp_missing.clone());
+        mgr.update_daemon_machine_info(&machine_id, machine);
+        let ServerToWeb::Machines { machines } = web_rx.try_recv().unwrap() else {
+            panic!("expected the machine update to be broadcast");
+        };
+        assert_eq!(machines[0].machine.providers, Some(omp_missing.clone()));
+        assert_eq!(
+            mgr.get_machines_for_user(&owner)[0].machine.providers,
+            Some(omp_missing.clone())
+        );
+        // A project-share viewer loses the DeepSeek configuration, not the
+        // availability a tab launched on this machine depends on.
+        let shared = mgr.get_machines_for_project_refs(
+            &HashSet::new(),
+            &HashSet::from(["/work/project".to_string()]),
+        );
+        assert_eq!(shared[0].machine.providers, Some(omp_missing.clone()));
+        let redacted = mgr.get_redacted_shared_cluster_machines(&HashMap::from([(
+            machine_id,
+            HashSet::from(["project".to_string()]),
+        )]));
+        assert_eq!(redacted[0].machine.providers, Some(omp_missing));
+
+        // The latest report replaces the previous one as it is.
+        let installed = vec![shared::MachineProviderStatus {
+            provider: Provider::Omp,
+            installed: true,
+            version: Some("18.20.2".to_string()),
+            can_install: true,
+        }];
+        let mut machine = test_machine(machine_id, "mac-host");
+        machine.providers = Some(installed.clone());
+        mgr.update_daemon_machine_info(&machine_id, machine);
+        assert_eq!(
+            mgr.get_machines_for_user(&owner)[0].machine.providers,
+            Some(installed)
         );
     }
 

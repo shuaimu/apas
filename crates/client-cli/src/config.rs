@@ -267,6 +267,24 @@ pub(crate) mod test_config {
     }
 }
 
+/// `~/Library/Application Support/apas/run`, owner-only. See
+/// [`Config::runtime_dir`].
+fn macos_runtime_dir() -> Result<PathBuf> {
+    use std::os::unix::fs::DirBuilderExt;
+    let home = dirs::home_dir()
+        .ok_or_else(|| anyhow::anyhow!("Could not determine the home directory"))?;
+    let dir = home
+        .join("Library")
+        .join("Application Support")
+        .join("apas")
+        .join("run");
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&dir)?;
+    Ok(dir)
+}
+
 impl Config {
     pub fn config_dir() -> Result<PathBuf> {
         // Tests isolate themselves per-thread; env vars can't, see `test_config`.
@@ -314,17 +332,56 @@ impl Config {
     /// pid: it should not survive a reboot. Falls back to a uid-scoped dir
     /// under the system temp dir when the variable is unset (cron, ssh
     /// without a login session).
+    ///
+    /// macOS has no `XDG_RUNTIME_DIR`, and its temp dir is no substitute: the
+    /// `$TMPDIR` of a Terminal session, a GUI session and an ssh command can
+    /// differ, so two launch contexts read two `daemon.json` files and start
+    /// two daemons, and the system deletes what it holds after a few days
+    /// unused (the pane-host loss described for `/tmp`). A Mac's home is a
+    /// local disk, so its state goes under `~/Library/Application Support`,
+    /// the same path for every context, short enough for the pane-host
+    /// sockets, and never cleaned.
     pub fn runtime_dir() -> Result<PathBuf> {
-        let base = std::env::var_os("XDG_RUNTIME_DIR")
+        let dir = match std::env::var_os("XDG_RUNTIME_DIR")
             .map(PathBuf::from)
             .filter(|p| p.is_dir())
-            .unwrap_or_else(|| {
+        {
+            Some(base) => base.join("apas"),
+            None if cfg!(target_os = "macos") => macos_runtime_dir()?,
+            None => {
                 let uid = unsafe { libc::getuid() };
-                std::env::temp_dir().join(format!("apas-{uid}"))
-            });
-        let dir = base.join("apas");
+                std::env::temp_dir()
+                    .join(format!("apas-{uid}"))
+                    .join("apas")
+            }
+        };
         std::fs::create_dir_all(&dir)?;
         Ok(dir)
+    }
+
+    /// Where an APAS built before [`Self::runtime_dir`] knew about macOS kept
+    /// its daemon state on this host, so a daemon started by it is still
+    /// found and not joined by a second one. Empty everywhere else.
+    pub fn legacy_daemon_state_dirs() -> Vec<PathBuf> {
+        if !cfg!(target_os = "macos") || std::env::var_os("XDG_RUNTIME_DIR").is_some() {
+            return Vec::new();
+        }
+        let uid = unsafe { libc::getuid() };
+        let mut dirs = vec![std::env::temp_dir()
+            .join(format!("apas-{uid}"))
+            .join("apas")];
+        let tmp = PathBuf::from(format!("/tmp/apas-{uid}/apas"));
+        if !dirs.contains(&tmp) {
+            dirs.push(tmp);
+        }
+        dirs
+    }
+
+    /// The lock a running daemon holds for its whole life. Host-local, like
+    /// the rest of [`Self::runtime_dir`]: on the shared home a lock would
+    /// keep every other host's daemon out.
+    pub fn daemon_lock_path() -> Result<PathBuf> {
+        Ok(Self::runtime_dir()?.join("daemon.lock"))
     }
 
     pub fn daemon_pid_path() -> Result<PathBuf> {

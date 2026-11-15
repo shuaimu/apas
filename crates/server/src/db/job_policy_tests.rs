@@ -1223,6 +1223,7 @@ async fn deletion_stops_reachable_interactive_host_while_job_host_is_offline() {
             daemon_version: None,
             deepseek_backend: None,
             last_seen: None,
+            providers: None,
         },
         vec![MachineProjectInfo {
             project_id: project.clone(),

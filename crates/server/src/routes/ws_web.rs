@@ -1169,6 +1169,7 @@ mod machine_access_tests {
             daemon_version: None,
             deepseek_backend: None,
             last_seen: None,
+            providers: None,
         }
     }
 
@@ -10270,6 +10271,7 @@ mod project_instance_tests {
                     daemon_version: None,
                     deepseek_backend: None,
                     last_seen: None,
+                    providers: None,
                 },
                 vec![shared::MachineProjectInfo {
                     project_id: self.project_id(),
@@ -11800,6 +11802,7 @@ mod project_instance_tests {
                 daemon_version: None,
                 deepseek_backend: None,
                 last_seen: None,
+                providers: None,
             },
             projects,
         );
@@ -12889,6 +12892,7 @@ mod project_instance_tests {
                     daemon_version: None,
                     deepseek_backend: None,
                     last_seen: None,
+                    providers: None,
                 },
                 projects,
             );

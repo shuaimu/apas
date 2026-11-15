@@ -1416,6 +1416,7 @@ mod tests {
                     daemon_version: None,
                     deepseek_backend: None,
                     last_seen: None,
+                    providers: None,
                 },
                 vec![shared::MachineProjectInfo {
                     project_id: self.session.to_string(),

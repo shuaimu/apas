@@ -272,6 +272,49 @@ describe("MobileCodeHome", () => {
     expect(screen.getByText("Connected")).toBeTruthy();
   });
 
+  it("lists each machine's installed providers, from the bootstrap and from the live list", async () => {
+    stubBootstrap({
+      sessions: [],
+      machines: [
+        {
+          machine: {
+            machine_id: "machine-mac",
+            hostname: "Shuais-MacBook-Air-2.local",
+            providers: [
+              { provider: "claude", installed: true, version: "2.1.233", can_install: false },
+              { provider: "omp", installed: false, can_install: true },
+            ],
+          },
+          projects: [],
+        },
+        // An older daemon reports nothing: no line at all.
+        { machine: { machine_id: "machine-old", hostname: "zoo-005" }, projects: [] },
+      ],
+    });
+    const { props, rerender } = renderHomeWith({ active: true });
+
+    fireEvent.click(await screen.findByRole("button", { name: "Machines" }));
+    const line = await screen.findByText("Providers: Claude");
+    expect(line.getAttribute("title")).toBe("Claude 2.1.233");
+    expect(screen.getAllByText(/^Providers:/)).toHaveLength(1);
+
+    const live: MachineWithProjects[] = [{
+      machine: {
+        machineId: "machine-mac",
+        hostname: "Shuais-MacBook-Air-2.local",
+        os: "macos",
+        arch: "aarch64",
+        providers: [
+          { provider: "claude", installed: true, version: "2.1.233", canInstall: false },
+          { provider: "omp", installed: true, version: "18.20.0", canInstall: true },
+        ],
+      },
+      projects: [],
+    }];
+    rerender({ ...props, machineListReceived: true, liveMachines: live });
+    expect((await screen.findByText("Providers: Claude, OMP")).getAttribute("title")).toBe("Claude 2.1.233, OMP 18.20.0");
+  });
+
   it("reports a machine whose daemon has gone quiet as offline", async () => {
     stubBootstrap({
       sessions: [],

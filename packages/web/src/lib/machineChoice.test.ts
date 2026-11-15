@@ -1,11 +1,14 @@
 import { describe, expect, it } from "vitest";
 import {
   buildMachineChoices,
+  installedProvidersSummary,
+  parseMachineProviders,
+  providerOfferOn,
   sessionCanCloneJoin,
   type MachineChoiceInput,
 } from "./machineChoice";
 import type { SessionInstance } from "./projectInstances";
-import type { MachineWithProjects, PaneConfig } from "./store";
+import type { MachineProviderStatus, MachineWithProjects, PaneConfig } from "./store";
 
 const PROJECT = "30000000-0000-4000-8000-000000000001";
 
@@ -238,5 +241,93 @@ describe("sessionCanCloneJoin", () => {
     expect(sessionCanCloneJoin({ gitRemote: "github.com/acme/repo", isShared: true })).toBe(false);
     expect(sessionCanCloneJoin({})).toBe(false);
     expect(sessionCanCloneJoin(undefined)).toBe(false);
+  });
+});
+
+describe("provider availability on the machine that receives a tab", () => {
+  const MAC = "Shuais-MacBook-Air-2.local";
+  const claude: MachineProviderStatus = { provider: "claude", installed: true, version: "2.1.233", canInstall: false };
+  const ompInstallable: MachineProviderStatus = { provider: "omp", installed: false, canInstall: true };
+  const ompMissing: MachineProviderStatus = { provider: "omp", installed: false, canInstall: false };
+  const codexMissing: MachineProviderStatus = { provider: "codex", installed: false, canInstall: false };
+
+  it("carries each machine's report onto its choice, for instances and registered machines", () => {
+    const providers = [claude, ompInstallable];
+    const result = model({
+      instances: [instance("mac", MAC, { primary: true }), instance(undefined, "zoo-005")],
+      machines: [
+        { ...machine("mac"), machine: { machineId: "mac", hostname: MAC, os: "macos", arch: "aarch64", providers } },
+        // A sole instance that reported no machine still finds its machine
+        // by host.
+        { ...machine("zoo-005"), machine: { machineId: "zoo-005", hostname: "zoo-005", os: "linux", arch: "x86_64", providers: [claude] } },
+        machine("zoo-006", { registered: true }),
+      ],
+    });
+    const byHost = new Map(result.choices.map((choice) => [choice.hostname, choice.providers]));
+    expect(byHost.get(MAC)).toEqual(providers);
+    expect(byHost.get("zoo-005")).toEqual([claude]);
+    // An older daemon reports nothing: unknown, not "none installed".
+    expect(byHost.get("zoo-006")).toBeUndefined();
+  });
+
+  it("changes nothing for an installed provider", () => {
+    expect(providerOfferOn({ hostname: MAC, providers: [claude] }, "claude")).toEqual({});
+  });
+
+  it("offers a provider the machine can install, with a note", () => {
+    const offer = providerOfferOn({ hostname: MAC, providers: [claude, ompInstallable] }, "omp");
+    expect(offer.disabledReason).toBeUndefined();
+    expect(offer.note).toBe("Installs OMP first");
+    expect(offer.noteTitle).toBe(`The tab installs OMP on ${MAC}, then starts it. You may need to log in to OMP in its terminal.`);
+  });
+
+  it("disables a provider the machine has not got and cannot install, and says only that", () => {
+    expect(providerOfferOn({ hostname: MAC, providers: [ompMissing] }, "omp"))
+      .toEqual({ disabledReason: `OMP is not installed on ${MAC}.` });
+    expect(providerOfferOn({ hostname: "zoo-005", providers: [codexMissing] }, "codex"))
+      .toEqual({ disabledReason: "Codex is not installed on zoo-005." });
+  });
+
+  it("reads DeepSeek as the Claude binary it runs", () => {
+    const missingClaude: MachineProviderStatus = { provider: "claude", installed: false, canInstall: false };
+    expect(providerOfferOn({ hostname: MAC, providers: [missingClaude] }, "deepseek"))
+      .toEqual({ disabledReason: `Claude is not installed on ${MAC}.` });
+  });
+
+  it("changes nothing when the machine reports nothing, an empty list, or not this provider", () => {
+    expect(providerOfferOn(undefined, "omp")).toEqual({});
+    expect(providerOfferOn({ hostname: MAC }, "omp")).toEqual({});
+    expect(providerOfferOn({ hostname: MAC, providers: [] }, "omp")).toEqual({});
+    expect(providerOfferOn({ hostname: MAC, providers: [claude] }, "omp")).toEqual({});
+  });
+
+  it("reads the wire's list leniently", () => {
+    expect(parseMachineProviders(undefined)).toBeUndefined();
+    expect(parseMachineProviders(null)).toBeUndefined();
+    expect(parseMachineProviders([])).toEqual([]);
+    expect(parseMachineProviders([
+      { provider: "claude", installed: true, version: "2.1.233", can_install: false },
+      { provider: "omp", installed: false, version: null, can_install: true },
+      { provider: "codex", installed: true },
+      { installed: true, can_install: false },
+      "omp",
+    ])).toEqual([
+      { provider: "claude", installed: true, version: "2.1.233", canInstall: false },
+      { provider: "omp", installed: false, version: undefined, canInstall: true },
+    ]);
+  });
+
+  it("names a machine's installed providers in the menu's order, with versions in the title", () => {
+    expect(installedProvidersSummary(undefined)).toBeNull();
+    expect(installedProvidersSummary([])).toEqual({ text: "No providers installed", title: "No providers installed" });
+    expect(installedProvidersSummary([
+      { provider: "omp", installed: true, version: "18.20.0", canInstall: true },
+      ompMissing,
+      { provider: "codex", installed: true, canInstall: false },
+      claude,
+    ])).toEqual({
+      text: "Providers: Claude, Codex, OMP",
+      title: "Claude 2.1.233, Codex, OMP 18.20.0",
+    });
   });
 });

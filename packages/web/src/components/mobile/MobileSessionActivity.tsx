@@ -45,7 +45,7 @@ import {
   unconfirmedDeliveries,
 } from "@/lib/terminalDelivery";
 import { instancesNegotiated, primaryInstance, selectSessionInstances } from "@/lib/projectInstances";
-import { buildMachineChoices, sessionCanCloneJoin, type MachineChoice } from "@/lib/machineChoice";
+import { buildMachineChoices, providerOfferOn, sessionCanCloneJoin, type MachineChoice, type ProviderOffer } from "@/lib/machineChoice";
 import {
   cloneHereCopy,
   cloneInstanceName,
@@ -547,6 +547,10 @@ export function MobileSessionActivity({ connected, onBack, onReconnect }: Mobile
     ? machineChoices.choices.find((choice) => choice.key === selectedMachineKey && !choice.disabledReason)
     : undefined;
   const needsMachine = machineChoices.showChoice && !selectedMachine;
+  // The machine that receives the agent: the pick, or the hidden step's
+  // default. What a provider needs there is said on the provider, as on
+  // desktop: a machine without OMP still takes a Claude agent.
+  const targetMachine = selectedMachine ?? (machineChoices.showChoice ? undefined : machineChoices.defaultChoice);
   const launches = useMemo(
     () => Object.values(addPaneRequests)
       .filter((request) => request.sessionId === sessionId)
@@ -825,6 +829,7 @@ export function MobileSessionActivity({ connected, onBack, onReconnect }: Mobile
     // sent so the pane cannot land elsewhere; a default that would start the
     // project is never hidden (`buildMachineChoices`).
     const target = selectedMachine ?? machineChoices.defaultChoice;
+    if (providerOfferOn(target, option.provider).disabledReason) return;
     if (target?.kind === "clone") {
       // Cloning onto a machine is confirmed on its own sheet first.
       const gitRemote = session?.gitRemote;
@@ -1440,7 +1445,25 @@ export function MobileSessionActivity({ connected, onBack, onReconnect }: Mobile
             )}
             {needsMachine && <p className="mt-3 text-xs text-[#686873] dark:text-[#aaaab6]">Choose where the agent runs first.</p>}
             <div className="mt-4 space-y-2">
-              {launchOptions.map((option) => <button key={option.key} type="button" disabled={needsMachine} onClick={() => { workspace.selectInteractive(); createPane(option); }} className="flex w-full items-center justify-between rounded-2xl border border-[#dedee7] bg-white p-3.5 text-left disabled:opacity-40 dark:border-[#383842] dark:bg-[#1b1b21]"><span><span className="block font-bold">{option.label}</span><span className="mt-0.5 block text-xs text-[#686873] dark:text-[#aaaab6]">{option.kind === "terminal" ? "Interactive TUI" : "Coding activity pane"}</span></span><Plus className="h-5 w-5 text-[#6d5efc]" /></button>)}
+              {launchOptions.map((option) => {
+                const offer: ProviderOffer = needsMachine ? {} : providerOfferOn(targetMachine, option.provider);
+                return (
+                  <button
+                    key={option.key}
+                    type="button"
+                    disabled={needsMachine || Boolean(offer.disabledReason)}
+                    title={offer.disabledReason ?? offer.noteTitle}
+                    onClick={() => { workspace.selectInteractive(); createPane(option); }}
+                    className="flex w-full items-center justify-between rounded-2xl border border-[#dedee7] bg-white p-3.5 text-left disabled:opacity-40 dark:border-[#383842] dark:bg-[#1b1b21]"
+                  >
+                    <span>
+                      <span className="block font-bold">{option.label}</span>
+                      <span className="mt-0.5 block text-xs text-[#686873] dark:text-[#aaaab6]">{offer.disabledReason ?? offer.note ?? (option.kind === "terminal" ? "Interactive TUI" : "Coding activity pane")}</span>
+                    </span>
+                    <Plus className="h-5 w-5 text-[#6d5efc]" />
+                  </button>
+                );
+              })}
               {launchOptions.length === 0 && <div className="rounded-2xl border border-[#dedee7] bg-white p-4 text-sm text-[#686873] dark:border-[#383842] dark:bg-[#1b1b21] dark:text-[#aaaab6]">Waiting for the project's launch policy, or no profiles are currently allowed.</div>}
             </div>
           </div>

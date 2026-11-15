@@ -1,4 +1,5 @@
-import type { MachineWithProjects, PaneConfig } from "./store";
+import type { MachineProviderStatus, MachineWithProjects, PaneConfig } from "./store";
+import { PROVIDER_MODEL_GROUPS } from "./providerOptions";
 import {
   instanceIsLegacy,
   paneMachineId,
@@ -30,6 +31,10 @@ export interface MachineChoice {
   primary: boolean;
   /** Why the machine cannot take the tab; absent when it can. */
   disabledReason?: string;
+  /** The machine's provider report (`MachineInfo.providers`); absent when
+   *  unknown. A machine can take a tab of one provider and not another, so
+   *  this never disables the machine: see `providerOfferOn`. */
+  providers?: MachineProviderStatus[];
 }
 
 export interface MachineChoiceInput {
@@ -102,6 +107,9 @@ export function buildMachineChoices(input: MachineChoiceInput): MachineChoiceMod
     kind: "instance",
     primary: instance.primary,
     disabledReason: instance.runtimeAccess === false ? NO_RUNTIME_ACCESS_REASON : undefined,
+    providers: machines.find((entry) => instance.machineId
+      ? entry.machine.machineId === instance.machineId
+      : sameHost(entry.machine.hostname, instance.hostname))?.machine.providers,
   }));
 
   const registered: MachineChoice[] = [];
@@ -131,6 +139,7 @@ export function buildMachineChoices(input: MachineChoiceInput): MachineChoiceMod
       kind: hasProject ? "registered" : "clone",
       primary: false,
       disabledReason,
+      providers: entry.machine.providers,
     });
   }
 
@@ -163,4 +172,98 @@ export function buildMachineChoices(input: MachineChoiceInput): MachineChoiceMod
     // same start. A clone is never a default, so it is always picked here.
     showChoice: eligible.length > 1 || (eligible.length === 1 && defaultChoice?.kind !== "instance"),
   };
+}
+
+/** Reads `MachineInfo.providers` leniently: an entry without a provider or
+ *  its two flags is dropped, as the server drops one it cannot parse, and
+ *  anything but a list is unknown. */
+export function parseMachineProviders(value: unknown): MachineProviderStatus[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  return value.flatMap((entry): MachineProviderStatus[] => {
+    if (!entry || typeof entry !== "object") return [];
+    const record = entry as Record<string, unknown>;
+    if (typeof record.provider !== "string" || typeof record.installed !== "boolean" || typeof record.can_install !== "boolean") {
+      return [];
+    }
+    return [{
+      provider: record.provider,
+      installed: record.installed,
+      version: typeof record.version === "string" && record.version ? record.version : undefined,
+      canInstall: record.can_install,
+    }];
+  });
+}
+
+// Names the daemon's provider values the way the add-tab menu does.
+const PROVIDER_NAMES: Record<string, string> = Object.fromEntries(
+  PROVIDER_MODEL_GROUPS.map((group) => [group.iconProvider, group.label]),
+);
+// The order the Machines page lists installed providers in: the menu's.
+const PROVIDER_ORDER = PROVIDER_MODEL_GROUPS.map((group) => group.iconProvider);
+
+function providerName(provider: string): string {
+  return PROVIDER_NAMES[provider] ?? provider;
+}
+
+/** The binary a tab of `provider` runs. DeepSeek is the Claude binary
+ *  against another backend, so a machine reports it as Claude. */
+function launchedBinary(provider: string): string {
+  return provider === "deepseek" ? "claude" : provider;
+}
+
+/** What the add-tab menu says about one provider on the machine that will
+ *  receive the tab. Empty when the provider is installed or its state is not
+ *  reported: an older daemon reports nothing, and the menu is then what it
+ *  always was. */
+export interface ProviderOffer {
+  /** A short line under the provider, when picking it does more than open a
+   *  tab. */
+  note?: string;
+  /** A longer explanation of the note, for its tooltip. */
+  noteTitle?: string;
+  /** Why the provider cannot run on that machine; the pick is disabled. */
+  disabledReason?: string;
+}
+
+export function providerOfferOn(
+  machine: Pick<MachineChoice, "hostname" | "providers"> | undefined,
+  provider: string,
+): ProviderOffer {
+  // Only an explicit "not installed" changes anything. A machine that lists
+  // other providers but not this one has said nothing about it.
+  const status = machine?.providers?.find((entry) => entry.provider === launchedBinary(provider));
+  if (!machine || !status || status.installed) return {};
+  const name = providerName(status.provider);
+  if (status.canInstall) {
+    return {
+      note: `Installs ${name} first`,
+      noteTitle: `The tab installs ${name} on ${machine.hostname}, then starts it. You may need to log in to ${name} in its terminal.`,
+    };
+  }
+  return { disabledReason: `${name} is not installed on ${machine.hostname}.` };
+}
+
+/** The installed providers a machine reports, for its Machines page row:
+ *  `text` names them, `title` adds their versions. Null when the machine
+ *  reports nothing (an older daemon). */
+export function installedProvidersSummary(
+  providers: MachineProviderStatus[] | undefined,
+): { text: string; title: string } | null {
+  if (!providers) return null;
+  const installed = providers
+    .filter((entry) => entry.installed)
+    .sort((a, b) => rank(a.provider) - rank(b.provider) || a.provider.localeCompare(b.provider));
+  if (installed.length === 0) return { text: "No providers installed", title: "No providers installed" };
+  const names = installed.map((entry) => providerName(entry.provider));
+  return {
+    text: `Providers: ${names.join(", ")}`,
+    title: installed
+      .map((entry) => entry.version ? `${providerName(entry.provider)} ${entry.version}` : providerName(entry.provider))
+      .join(", "),
+  };
+}
+
+function rank(provider: string): number {
+  const index = PROVIDER_ORDER.indexOf(provider);
+  return index === -1 ? PROVIDER_ORDER.length : index;
 }

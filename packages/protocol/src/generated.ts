@@ -1700,6 +1700,16 @@ export interface MachineInfo {
   last_seen?: string | null;
   machine_id: string;
   os: string;
+  /**
+   * Which terminal providers this machine's daemon can launch. `None` means
+   * unknown: an older daemon reports nothing, and a viewer must not read
+   * that as "not installed". `Some(list)` is the daemon's whole answer, so
+   * a daemon sends the full list in every `MachineInfo` it sends (register
+   * and `MachineInfoUpdate`); the server keeps the latest report as it is.
+   * An entry this build cannot parse, such as a provider added later, is
+   * dropped rather than failing the whole registration.
+   */
+  providers?: MachineProviderStatus[] | null;
   [k: string]: unknown;
 }
 /**
@@ -1709,6 +1719,27 @@ export interface DeepseekBackendInfo {
   api_base_url?: string | null;
   api_key?: string | null;
   api_key_configured?: boolean;
+  [k: string]: unknown;
+}
+/**
+ * One provider's availability on a machine, as its daemon found it.
+ */
+export interface MachineProviderStatus {
+  /**
+   * The daemon can install this provider by itself (today only OMP). This
+   * says what the machine can do, not what the viewer may ask for: the
+   * command that performs an install authorizes its requester.
+   */
+  can_install: boolean;
+  /**
+   * The daemon resolved an executable it would launch for this provider.
+   */
+  installed: boolean;
+  provider: Provider;
+  /**
+   * The version the executable reported, when the daemon asked it.
+   */
+  version?: string | null;
   [k: string]: unknown;
 }
 /**

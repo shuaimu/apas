@@ -1426,6 +1426,92 @@ would stop the daemon running more than one project.
 is a local view for when the web is unreachable, it renders little beyond pane
 names, and it is expected to be removed if nothing uses it.
 
+## macOS hosts
+
+A Mac can run the daemon and host tabs. Until 2026-11-15 it could not do so
+reliably: the running-daemon check read `/proc`, which macOS lacks, so every
+`apas` command started another daemon. The owner's MacBook Air had three,
+sharing one machine id and knocking each other off the server, and an OMP tab
+there never showed an agent (change
+`openspec/changes/support-macos-hosts-and-install-omp/`).
+
+- **Process checks** (`process_info.rs`) use `kill(pid, 0)` and, off Linux,
+  `/bin/ps` or `/usr/bin/ps` with a 5 s timeout. Linux still reads `/proc`.
+- **`apas daemon` holds `<runtime dir>/daemon.lock` for its life.** A second
+  one prints "Daemon already running (pid N, version V)." and exits. A
+  requested restart keeps the lock's pid. Daemons from an older APAS take no
+  lock: a new daemon names them ("Other APAS daemons are running on this
+  host …") and never stops them.
+- **Runtime dir on macOS** without `XDG_RUNTIME_DIR` is
+  `~/Library/Application Support/apas/run` (daemon state, lock, resume
+  manifest, pane hosts and their logs). `$TMPDIR` differs between a GUI
+  session, ssh and launchd, and the system cleans it. The first update from an
+  older APAS also takes the resume manifest and lists the pane hosts the old
+  one left under `$TMPDIR/apas-<uid>/apas`. Config is under
+  `~/Library/Application Support/com.apas.apas`.
+- The daemon merges the login shell's PATH (`-lic`) with its own and logs
+  which tmux it found. The pane host checks its controller with
+  `getpeereid`. A socket path over 104 bytes fails with that reason.
+- **Not on macOS, logged once:** OMP status comes from the transcript only,
+  OMP questions are answered in the terminal, and autopilot is unavailable
+  (the extension's process identity is Linux-only). Claude and Codex run
+  from their configured paths; provider copies stay in `/var/tmp`.
+- The machine id is derived from user@hostname, so a Mac whose hostname
+  changes (a Bonjour `-2`, DHCP) appears as a new machine. "Reboot to update"
+  needs git and a Rust toolchain on the Mac.
+
+**First update of a Mac that ran APAS 26.11.54 or older, by hand:** stop every
+`apas … daemon` (`pgrep -fl 'apas .*daemon'`, then `kill` each pid, keeping
+none); update the CLI; start one daemon (`apas daemon`); check the machine
+shows once on the Machines page without reconnecting; start the project again
+from the web. Do not use Reboot to update there: the new image can read the
+old `daemon.json`, find another old daemon alive, and exit.
+
+None of the macOS-only code was compiled or run before it shipped: the build
+hosts have no macOS target and there was no Mac to test on.
+
+## Machines report their providers; OMP is installed when missing
+
+Each daemon reports, in `MachineInfo.providers`, whether it finds Claude,
+Codex, OpenCode and OMP the way a launch would, their versions, and whether
+APAS can install them (only OMP, and only where a launch would). It sends a
+quick list at registration and refreshes it every five minutes, after an
+install and at daemon start (`provider_availability.rs`). A missing list means
+an older daemon and changes nothing in the UI.
+
+When a tab is created, the provider choice for the machine that will get it
+reads "Installs OMP first" where the machine will install OMP, and is disabled
+with "<Provider> is not installed on <host>." where the provider is missing
+and cannot be installed (`providerOfferOn` in `lib/machineChoice.ts`). The
+machine itself is never disabled for this. The Machines page and the phone's
+Machines card show "Providers: Claude, Codex, OMP", versions in the tooltip.
+
+**The OMP install** (`omp_install.rs`) pins one checked version, **18.20.2**,
+with the SHA-256 and size of the darwin-arm64, darwin-x64, linux-x64 and
+linux-arm64 assets. It downloads the GitHub release asset, requires the
+release's `SHA256SUMS.txt` to list the pinned hash and the file to match, on
+macOS requires `codesign --verify --strict` and team `VTLHGQC72S`, checks
+`--version`, and publishes `~/.local/bin/omp` with a hard link, so it never
+replaces an existing file. It never runs OMP's `install.sh`, never installs to
+a custom `omp_path`, and edits no shell rc file. An Intel APAS under Rosetta
+gets the arm64 build; musl hosts and Windows are refused with the reason.
+Progress shows in the tab's terminal. One install runs per machine (a lock
+beside the host-local store, 20 min wait); the 15-minute download limit
+starts once the lock is taken; partial `.omp.download.*` files older than
+that are removed by the next install. A failure ends the tab with the cause,
+`curl -fsSL https://omp.sh/install | sh` and `apas config set omp_path`.
+After the install the host-local copy and its `omp update` take over as
+before. Any user with runtime access to a project on a machine can trigger
+the install there. **To move the pin:** take the new release's
+`SHA256SUMS.txt` and sizes, update `OMP_VERSION` and `PINNED_ASSETS`, and run
+the real-OMP check on a minor-version change.
+
+**A failed terminal launch is reported** (`launch_status.rs`). Creating,
+restoring, rebooting or switching a tab whose provider cannot start sends an
+exited terminal state with the reason, a terminal exit and a conversation
+line, at once and again after every reconnect. Until then such a tab, like the
+Mac's OMP 4, reported nothing and stayed blank.
+
 ## The daemon is replaced only when asked
 
 Replacing the daemon used to be nearly free: it owned no long-lived children, so
@@ -2254,9 +2340,14 @@ Verified against omp 18.1.20: a run writes one flat `<ts>_<uuid>.jsonl` there,
 A new OMP tab from the desktop `+` is labelled "OMP N", and its icon in the tab
 bar is titled OMP and coloured violet. Until 2026-11-13 both were Claude's.
 
-APAS does not install OpenCode or OMP, choose their model provider, or
-authenticate them. Install and authenticate them on every intended project host
-before enabling the profile. The default executables are `opencode` and
+APAS does not install Claude, Codex or OpenCode, and does not choose any
+provider's model provider or authenticate it. **It installs OMP by itself**
+(since 2026-11-15) when an OMP tab is opened, restored or rebooted on a
+machine with no `omp` on the daemon's PATH, no verified host-local copy and
+nothing at `~/.local/bin/omp`, and only when `omp_path` is the bare name or
+`~/.local/bin/omp`; see "Machines report their providers; OMP is installed
+when missing". The person still signs OMP in to a model provider in the tab's
+Terminal view. The default executables are `opencode` and
 `omp`; override nonstandard installations with `apas config set
 opencode_path ...` and `apas config set omp_path ...`. Existing explicit
 cluster/project allowlists remain opt-in and must add

@@ -339,6 +339,134 @@ describe("the new-tab machine step", () => {
   });
 });
 
+describe("what each provider needs on the new tab's machine", () => {
+  const MAC = "50000000-0000-4000-8000-0000000000aa";
+  const MAC_HOST = "Shuais-MacBook-Air-2.local";
+  const OMP_POLICY = ["terminal:claude:official:default", "terminal:omp:official:default"];
+
+  function withProviders(entry: MachineWithProjects, providers: MachineWithProjects["machine"]["providers"]): MachineWithProjects {
+    return { ...entry, machine: { ...entry.machine, providers } };
+  }
+
+  function allowProfiles() {
+    act(() => useStore.setState({
+      sessionId: "session-1",
+      projectPolicies: {
+        "session-1": {
+          teamAvailable: false,
+          allowedLaunchProfiles: OMP_POLICY,
+          version: 1,
+          projectSuspended: false,
+          noncompliantPaneIds: [],
+        },
+      },
+    }));
+  }
+
+  function singleMac(providers: MachineWithProjects["machine"]["providers"]): MachineChoiceModel {
+    // The Mac is the project's only running instance, so the menu shows no
+    // machine step; the tab still goes to the Mac.
+    return buildMachineChoices({
+      projectId: PROJECT,
+      instances: [instance(MAC, MAC_HOST, { primary: true })],
+      machines: [withProviders(machine(MAC, MAC_HOST), providers)],
+      instancesSupported: true,
+      canClone: false,
+      selectedPane: null,
+    });
+  }
+
+  function providerButton(name: string): HTMLButtonElement {
+    const menu = screen.getByLabelText("Add agent choices");
+    const button = within(menu).getAllByRole("button")
+      // The OMP icon draws its mark as text, so match within the label.
+      .find((candidate) => candidate.textContent?.includes(name) && !candidate.textContent.includes(`${name} /`));
+    expect(button).toBeTruthy();
+    return button as HTMLButtonElement;
+  }
+
+  it("offers OMP with a note when the machine can install it", () => {
+    allowProfiles();
+    const { onAddTab } = renderBar({
+      machineChoices: singleMac([
+        { provider: "claude", installed: true, version: "2.1.233", canInstall: false },
+        { provider: "omp", installed: false, canInstall: true },
+      ]),
+    });
+    fireEvent.click(screen.getByTitle("New tab"));
+    expect(screen.queryByRole("group", { name: "Run on" })).toBeNull();
+    const omp = providerButton("OMP");
+    expect(omp.disabled).toBe(false);
+    expect(within(omp).getByText("Installs OMP first")).toBeTruthy();
+    expect(omp.title).toContain("You may need to log in to OMP in its terminal.");
+    // Claude is installed: as it always was.
+    expect(providerButton("Claude").textContent).toBe("Claude");
+    expect(providerButton("Claude").title).toBe("");
+
+    fireEvent.click(omp);
+    expect(onAddTab).toHaveBeenCalledWith(
+      "omp", undefined, undefined, "terminal",
+      undefined,
+    );
+  });
+
+  it("disables OMP with the reason when the machine has not got it and cannot install it", () => {
+    allowProfiles();
+    const { onAddTab } = renderBar({
+      machineChoices: singleMac([
+        { provider: "claude", installed: true, canInstall: false },
+        { provider: "omp", installed: false, canInstall: false },
+      ]),
+    });
+    fireEvent.click(screen.getByTitle("New tab"));
+    const omp = providerButton("OMP");
+    expect(omp.disabled).toBe(true);
+    expect(within(omp).getByText(`OMP is not installed on ${MAC_HOST}.`)).toBeTruthy();
+    expect(omp.title).toBe(`OMP is not installed on ${MAC_HOST}.`);
+    fireEvent.click(omp);
+    expect(onAddTab).not.toHaveBeenCalled();
+    expect(providerButton("Claude").disabled).toBe(false);
+  });
+
+  it("leaves the menu as it was when the machine reports nothing", () => {
+    allowProfiles();
+    renderBar({ machineChoices: singleMac(undefined) });
+    fireEvent.click(screen.getByTitle("New tab"));
+    const omp = providerButton("OMP");
+    expect(omp.disabled).toBe(false);
+    expect(omp.textContent).not.toMatch(/install/i);
+    expect(omp.title).toBe("");
+  });
+
+  it("follows the machine picked in the step", () => {
+    allowProfiles();
+    const { onAddTab } = renderBar({
+      machineChoices: buildMachineChoices({
+        projectId: PROJECT,
+        instances: [instance(ZOO5, "zoo-005", { primary: true }), instance(MAC, MAC_HOST)],
+        machines: [
+          withProviders(machine(ZOO5, "zoo-005"), [{ provider: "omp", installed: true, version: "18.20.0", canInstall: true }]),
+          withProviders(machine(MAC, MAC_HOST), [{ provider: "omp", installed: false, canInstall: false }]),
+        ],
+        instancesSupported: true,
+        canClone: false,
+        selectedPane: TABS[0],
+      }),
+    });
+    fireEvent.click(screen.getByTitle("New tab"));
+    expect(providerButton("OMP").disabled).toBe(false);
+
+    fireEvent.click(screen.getByRole("radio", { name: new RegExp(`^${MAC_HOST}`) }));
+    expect(providerButton("OMP").disabled).toBe(true);
+    expect(providerButton("OMP").title).toBe(`OMP is not installed on ${MAC_HOST}.`);
+    fireEvent.click(providerButton("Claude"));
+    expect(onAddTab).toHaveBeenCalledWith(
+      "claude", undefined, undefined, "terminal",
+      expect.objectContaining({ machineId: MAC }),
+    );
+  });
+});
+
 describe("rebooting one machine's instance", () => {
   const zoo5Inventory: CliLifecycleInventory = {
     persistent_terminal_hosting: true,

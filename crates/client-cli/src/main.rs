@@ -16,17 +16,21 @@ mod conversation;
 mod daemon_registry;
 mod host_storage;
 mod jobs;
+mod launch_status;
 mod mode;
 mod omp_activity;
 mod omp_autopilot;
+mod omp_install;
 mod omp_local;
 mod pane_host;
 mod pane_identity;
 mod pane_status;
 mod plan_review;
+mod process_info;
 mod project;
 mod project_instances;
 mod project_join;
+mod provider_availability;
 mod provider_local;
 mod summary_runner;
 mod supervisor;
@@ -461,14 +465,18 @@ async fn main() -> Result<()> {
                             existing.version.as_deref(),
                             CURRENT_VERSION,
                         );
-                        println!(
-                            "Daemon already running (pid {}, version {}).",
-                            existing.pid,
-                            existing
-                                .version
-                                .clone()
-                                .unwrap_or_else(|| "unknown".to_string())
-                        );
+                        if existing.pid == 0 {
+                            println!("Daemon already running.");
+                        } else {
+                            println!(
+                                "Daemon already running (pid {}, version {}).",
+                                existing.pid,
+                                existing
+                                    .version
+                                    .clone()
+                                    .unwrap_or_else(|| "unknown".to_string())
+                            );
+                        }
                         if older {
                             println!(
                                 "! It is older than this binary ({CURRENT_VERSION}) and is left running,"
@@ -478,6 +486,66 @@ async fn main() -> Result<()> {
                         }
                         return Ok(());
                     }
+                }
+
+                // The state file can be missing or name a dead pid (it was
+                // written by a launcher that lost a race, or cleaned away),
+                // so the lock is what finally decides: whoever holds it is
+                // the daemon. Held until this process exits or `exec`s.
+                let _daemon_lock = match acquire_daemon_lock(&config::Config::daemon_lock_path()?)?
+                {
+                    DaemonLock::Acquired(file) => file,
+                    DaemonLock::HeldBy(holder) => {
+                        match holder {
+                            Some(holder) => {
+                                println!(
+                                    "Daemon already running (pid {}, version {}).",
+                                    holder.pid,
+                                    holder.version.as_deref().unwrap_or("unknown")
+                                );
+                                // Point the state file at it, so the next
+                                // launch finds it without asking the lock.
+                                if let Some(version) = holder.version {
+                                    let _ = write_daemon_state(
+                                        &state_path,
+                                        &DaemonStateFile {
+                                            pid: holder.pid,
+                                            version,
+                                        },
+                                    );
+                                }
+                            }
+                            None => println!("Daemon already running."),
+                        }
+                        return Ok(());
+                    }
+                };
+                // Daemons an older APAS started hold no lock and never look
+                // for one, so the lock cannot keep them out. On the first Mac
+                // three ran at once, shared one machine id and knocked each
+                // other off the server for days with nothing saying so. Name
+                // them; stopping them is left to the person.
+                let others = process_info::other_daemons(
+                    &process_info::list(),
+                    my_pid,
+                    process_info::is_own,
+                );
+                if !others.is_empty() {
+                    let pids = others
+                        .iter()
+                        .map(u32::to_string)
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    tracing::warn!(
+                        %pids,
+                        "other APAS daemons of this user are running on this host; daemons \
+                         with the same machine id replace each other on the server over \
+                         and over. Stop them (kill <pid>); this daemon keeps running"
+                    );
+                    eprintln!(
+                        "! Other APAS daemons are running on this host (pid {pids}). \
+                         Stop them (kill <pid>); this daemon keeps running."
+                    );
                 }
 
                 let mut config = config::Config::load().unwrap_or_default();
@@ -522,7 +590,10 @@ async fn main() -> Result<()> {
                     version: CURRENT_VERSION.to_string(),
                 };
                 write_daemon_state(&state_path, &state)?;
-                let _state_guard = DaemonStateGuard::new(state_path, std::process::id());
+                let _state_guard = DaemonStateGuard::new(state_path.clone(), std::process::id());
+                // Declared after the guard so it stops first: a refresh after
+                // the guard removed the file would leave it behind.
+                let _state_refresher = DaemonStateRefresher::start(state_path, state);
                 mode::daemon::run(&server, &token, machine_id, project_roots).await?;
                 return Ok(());
             }
@@ -1027,7 +1098,165 @@ fn parse_version(v: &str) -> Option<u64> {
 }
 
 fn detect_running_daemon(state_path: &Path, legacy_pid_path: &Path) -> Option<RunningDaemon> {
-    detect_running_daemon_with_process_check(state_path, legacy_pid_path, is_apas_daemon_process)
+    if let Some(running) = detect_running_daemon_with_process_check(
+        state_path,
+        legacy_pid_path,
+        is_apas_daemon_process,
+    ) {
+        return Some(running);
+    }
+    // A daemon an older APAS started on this Mac wrote its state under the
+    // temp dir. Finding it there keeps this launch from starting another.
+    for dir in config::Config::legacy_daemon_state_dirs() {
+        if let Some(running) = detect_running_daemon_with_process_check(
+            &dir.join("daemon.json"),
+            &dir.join("daemon.pid"),
+            is_apas_daemon_process,
+        ) {
+            return Some(running);
+        }
+    }
+    // Last, the lock: a live daemon holds it even when no state file names
+    // it. The pid is what the holder wrote into it.
+    let lock = config::Config::daemon_lock_path().ok()?;
+    probe_daemon_lock(&lock).map(|holder| {
+        // Unknown, not "older": nothing proves it predates this binary.
+        holder.unwrap_or(RunningDaemon {
+            pid: 0,
+            version: Some("unknown".to_string()),
+        })
+    })
+}
+
+/// What [`acquire_daemon_lock`] found.
+enum DaemonLock {
+    /// This process is the daemon. Keep the file open for its whole life.
+    Acquired(fs::File),
+    /// Another process holds it; what it wrote there, when readable.
+    HeldBy(Option<RunningDaemon>),
+}
+
+fn open_daemon_lock(path: &Path) -> Result<fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    Ok(fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)?)
+}
+
+fn read_lock_holder(file: &mut fs::File) -> Option<RunningDaemon> {
+    use std::io::{Read, Seek};
+    let mut text = String::new();
+    file.seek(std::io::SeekFrom::Start(0)).ok()?;
+    file.take(256).read_to_string(&mut text).ok()?;
+    let mut lines = text.lines();
+    let pid = lines.next()?.trim().parse().ok()?;
+    let version = lines
+        .next()
+        .map(str::trim)
+        .filter(|version| !version.is_empty())
+        .map(str::to_string);
+    Some(RunningDaemon { pid, version })
+}
+
+/// Take the daemon lock, or say who holds it. The lock is an `flock`, so it
+/// is released by the kernel when the holder exits, and on `exec`, where the
+/// replacement image takes it again (its pid is unchanged, so the pid check
+/// covers that moment).
+fn acquire_daemon_lock(path: &Path) -> Result<DaemonLock> {
+    use fs2::FileExt;
+    use std::io::{Seek, Write};
+    let mut file = open_daemon_lock(path)?;
+    // A launcher probing the lock holds it for a moment; do not mistake that
+    // for a running daemon.
+    let mut attempt = 0;
+    let locked = loop {
+        match FileExt::try_lock_exclusive(&file) {
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock && attempt < 10 => {
+                attempt += 1;
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            other => break other,
+        }
+    };
+    match locked {
+        Ok(()) => {
+            file.set_len(0)?;
+            file.seek(std::io::SeekFrom::Start(0))?;
+            write!(file, "{}\n{}\n", std::process::id(), CURRENT_VERSION)?;
+            file.sync_all()?;
+            Ok(DaemonLock::Acquired(file))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+            Ok(DaemonLock::HeldBy(read_lock_holder(&mut file)))
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// `Some(holder)` when a process holds the daemon lock, `None` when nobody
+/// does (or it cannot be opened). Never keeps the lock.
+fn probe_daemon_lock(path: &Path) -> Option<Option<RunningDaemon>> {
+    use fs2::FileExt;
+    let mut file = open_daemon_lock(path).ok()?;
+    match FileExt::try_lock_exclusive(&file) {
+        Ok(()) => {
+            let _ = FileExt::unlock(&file);
+            None
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+            Some(read_lock_holder(&mut file))
+        }
+        Err(_) => None,
+    }
+}
+
+/// Keeps `daemon.json` naming this daemon. It is written once at start, and a
+/// launcher that lost a start race, or a cleaner, can remove or overwrite it;
+/// without this the next launch would have only the lock to go on.
+struct DaemonStateRefresher {
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl DaemonStateRefresher {
+    const INTERVAL: std::time::Duration = std::time::Duration::from_secs(20);
+
+    fn start(path: PathBuf, state: DaemonStateFile) -> Self {
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let thread_stop = stop.clone();
+        let spawned = std::thread::Builder::new()
+            .name("daemon-state".into())
+            .spawn(move || {
+                let tick = std::time::Duration::from_millis(500);
+                let mut waited = std::time::Duration::ZERO;
+                while !thread_stop.load(std::sync::atomic::Ordering::SeqCst) {
+                    std::thread::sleep(tick);
+                    waited += tick;
+                    if waited < Self::INTERVAL {
+                        continue;
+                    }
+                    waited = std::time::Duration::ZERO;
+                    if read_daemon_state(&path).map(|current| current.pid) != Some(state.pid) {
+                        tracing::info!(path = %path.display(), "rewriting the daemon state file");
+                        let _ = write_daemon_state(&path, &state);
+                    }
+                }
+            });
+        if let Err(error) = spawned {
+            tracing::warn!(%error, "could not start the daemon state refresher");
+        }
+        Self { stop }
+    }
+}
+
+impl Drop for DaemonStateRefresher {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
 }
 
 fn detect_running_daemon_with_process_check(
@@ -1077,28 +1306,10 @@ fn read_legacy_daemon_pid(path: &Path) -> Option<u32> {
 }
 
 fn is_apas_daemon_process(pid: u32) -> bool {
-    let cmdline_path = format!("/proc/{}/cmdline", pid);
-    let raw = match fs::read(cmdline_path) {
-        Ok(bytes) => bytes,
-        Err(_) => return false,
-    };
-    if raw.is_empty() {
-        return false;
-    }
-
-    let args: Vec<String> = raw
-        .split(|b| *b == 0)
-        .filter(|segment| !segment.is_empty())
-        .map(|segment| String::from_utf8_lossy(segment).to_string())
-        .collect();
-
-    if args.is_empty() {
-        return false;
-    }
-
-    let has_apas_binary = args.iter().any(|arg| arg.contains("apas"));
-    let has_daemon_arg = args.iter().any(|arg| arg == "daemon");
-    has_apas_binary && has_daemon_arg
+    // Portable: `/proc` on Linux, `kill(pid, 0)` plus `ps` elsewhere. Reading
+    // `/proc` alone answered "not running" on every macOS check, so every
+    // `apas` there started one more daemon.
+    process_info::is_apas_daemon(pid)
 }
 
 const CONFIG_KEYS: &str = "server, token, claude_path, codex_path, opencode_path, omp_path, cursor_agent_path, deepseek_api_base_url, deepseek_api_key, pane_host_adoption_grace_seconds, pane_host_reboot_grace_seconds, daemon_machine_id, daemon_roots, summary_enabled, summary_adapter, summary_model, summary_timeout_seconds, summary_max_input_bytes, summary_allow_cross_provider";
@@ -2210,6 +2421,48 @@ mod tests {
             assert_eq!(crate::project::read_project_id(&dir), Some(own));
             assert_eq!(registry(), vec![(own.to_string(), canonical(&dir))]);
         });
+    }
+
+    #[test]
+    fn a_second_daemon_finds_the_lock_held_and_who_holds_it() {
+        use super::{acquire_daemon_lock, probe_daemon_lock, DaemonLock, CURRENT_VERSION};
+        let dir = tempfile::tempdir().expect("temp dir");
+        let lock = dir.path().join("daemon.lock");
+        assert!(
+            probe_daemon_lock(&lock).is_none(),
+            "nobody holds a new lock"
+        );
+
+        let DaemonLock::Acquired(held) = acquire_daemon_lock(&lock).unwrap() else {
+            panic!("the first daemon takes the lock");
+        };
+        // flock is per open file, so a second open in this process conflicts
+        // exactly as a second daemon process would.
+        let DaemonLock::HeldBy(Some(holder)) = acquire_daemon_lock(&lock).unwrap() else {
+            panic!("the second daemon must not take the lock");
+        };
+        assert_eq!(holder.pid, std::process::id());
+        assert_eq!(holder.version.as_deref(), Some(CURRENT_VERSION));
+        let probed = probe_daemon_lock(&lock)
+            .expect("held")
+            .expect("holder named");
+        assert_eq!(probed.pid, std::process::id());
+
+        drop(held);
+        // A process another test forks holds a copy of the lock until its
+        // exec closes it, so the release can take a moment to be seen.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while probe_daemon_lock(&lock).is_some() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "released when the holder ends"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(matches!(
+            acquire_daemon_lock(&lock).unwrap(),
+            DaemonLock::Acquired(_)
+        ));
     }
 
     #[test]

@@ -71,6 +71,7 @@ async fn fixture() -> (
             daemon_version: Some("test".into()),
             deepseek_backend: None,
             last_seen: None,
+            providers: None,
         },
         vec![MachineProjectInfo {
             project_id: project.clone(),

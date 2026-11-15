@@ -55,6 +55,12 @@ fn cache_provider_binary_in(root: &Path, provider: &str, source: &Path) -> Resul
         }
     }
     if !native_elf(&header) {
+        if cfg!(target_os = "macos") {
+            // Deliberate: the copy guards against an executable on an NFS
+            // home being replaced under a running pane. A Mac's home is a
+            // local disk, so its Mach-O providers run where they are.
+            note_uncached_on_macos();
+        }
         return Ok(source.to_path_buf());
     }
     input.seek(SeekFrom::Start(0))?;
@@ -84,6 +90,15 @@ fn cache_provider_binary_in(root: &Path, provider: &str, source: &Path) -> Resul
         (Ok(path), Ok(())) => Ok(path),
         (Err(error), _) => Err(error),
         (Ok(_), Err(error)) => Err(error.into()),
+    }
+}
+
+fn note_uncached_on_macos() {
+    static NOTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !NOTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        tracing::info!(
+            "Claude and Codex run from their configured paths on macOS; no host-local copy is made"
+        );
     }
 }
 

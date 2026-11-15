@@ -20,6 +20,7 @@ import { AllProvidersUsage } from "@/components/UsageLimits";
 import { EffectivePolicy, LaunchProfile, PolicyEditor } from "@/components/PolicyEditor";
 import { AutonomousJobPolicyEditor } from "@/components/AutonomousJobPolicyEditor";
 import { isRetiredLaunchProfileKey } from "@/lib/providerOptions";
+import { installedProvidersSummary } from "@/lib/machineChoice";
 import {
   daemonVersionLabel,
   isMachineBehind,
@@ -463,6 +464,12 @@ export default function MachinesPage() {
                   {daemonVersionLabel(machine.daemonVersion)}
                   {machine.lastSeen ? ` • Last seen ${new Date(machine.lastSeen).toLocaleString()}` : ""}
                 </div>
+                {(() => {
+                  const installed = installedProvidersSummary(machine.providers);
+                  return installed && (
+                    <div className="text-xs text-gray-500" title={installed.title}>{installed.text}</div>
+                  );
+                })()}
               </div>
               {/* A daemon is per-machine, so the restart is targeted by machine
                   rather than through any project running on it. */}

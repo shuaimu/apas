@@ -636,6 +636,7 @@ mod tests {
             daemon_version: Some("test-daemon".to_string()),
             deepseek_backend: None,
             last_seen: None,
+            providers: None,
         }
     }
 

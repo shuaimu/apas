@@ -2070,6 +2070,7 @@ mod tests {
                 daemon_version: None,
                 deepseek_backend: None,
                 last_seen: None,
+                providers: None,
             },
             Vec::new(),
         );
@@ -2760,6 +2761,7 @@ mod tests {
                     daemon_version: None,
                     deepseek_backend: None,
                     last_seen: None,
+                    providers: None,
                 },
                 vec![MachineProjectInfo {
                     project_id: "project".to_string(),

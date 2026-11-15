@@ -247,6 +247,13 @@ fn lock_exclusive_with_timeout(lock: &File, timeout: Duration) -> Result<()> {
     }
 }
 
+/// Whether `source` is a standalone native executable for this platform: ELF
+/// on Linux, Mach-O on macOS. Only those are copied into the host-local
+/// store; a script or package launcher needs its installation directory.
+///
+/// Named for the ELF check it was. Accepting Mach-O is what lets a Mac's OMP
+/// enter the store at all: before, it ran from `~/.local/bin/omp` directly and
+/// "Reboot agent" never updated it.
 fn is_native_elf(source: &Path) -> Result<bool> {
     let mut file =
         File::open(source).with_context(|| format!("open OMP executable {}", source.display()))?;
@@ -255,7 +262,51 @@ fn is_native_elf(source: &Path) -> Result<bool> {
         return Ok(false);
     }
     let mut magic = [0; 4];
-    Ok(file.read_exact(&mut magic).is_ok() && magic == *b"\x7fELF")
+    Ok(file.read_exact(&mut magic).is_ok() && native_magic(magic, cfg!(target_os = "macos")))
+}
+
+fn native_magic(magic: [u8; 4], macos: bool) -> bool {
+    if macos {
+        // 64-bit Mach-O in either byte order, and a universal binary. A copy
+        // keeps the embedded code signature; it is written as a new file and
+        // renamed, never modified in place.
+        matches!(
+            magic,
+            [0xcf, 0xfa, 0xed, 0xfe] | [0xfe, 0xed, 0xfa, 0xcf] | [0xca, 0xfe, 0xba, 0xbe]
+        )
+    } else {
+        magic == *b"\x7fELF"
+    }
+}
+
+/// The verified host-local OMP and its version, when one has been published.
+/// Read without the launch lock: an answer for display and planning, not a
+/// launch.
+pub(crate) fn verified_copy() -> Option<(PathBuf, String)> {
+    let dir = storage_dir().ok()?;
+    let active = read_active(&dir).ok()??;
+    Some((dir.join(&active.name), active.version.to_string()))
+}
+
+/// The lock that keeps a second OMP install on this host from starting while
+/// one runs. Host-local and owner-only, beside the store it feeds.
+pub(crate) fn install_lock() -> Result<File> {
+    locked_file(&storage_dir()?.join(".install.lock"))
+}
+
+/// The version `binary --version` reports, bounded by the same timeout the
+/// store uses. `scratch` holds the output file briefly.
+pub(crate) fn probe_version(binary: &Path, scratch: &Path) -> Result<String> {
+    verify_version(binary, scratch).map(|version| version.to_string())
+}
+
+/// Whether `raw` names the same version as `expected` (`v` prefixes and
+/// `omp/` prefixes allowed).
+pub(crate) fn same_version(raw: &str, expected: &str) -> bool {
+    match (Version::from_output(raw), Version::parse(expected)) {
+        (Ok(raw), Ok(expected)) => raw == expected,
+        _ => false,
+    }
 }
 
 fn copy_binary(source: &Path, target: &Path) -> Result<()> {
@@ -1346,5 +1397,17 @@ mod tests {
         fs::write(path.join("omp"), b"partial update").unwrap();
         drop(work);
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn a_mac_omp_is_a_native_executable_there_and_not_on_linux() {
+        let macho = [0xcf, 0xfa, 0xed, 0xfe];
+        let universal = [0xca, 0xfe, 0xba, 0xbe];
+        assert!(super::native_magic(macho, true));
+        assert!(super::native_magic(universal, true));
+        assert!(!super::native_magic(*b"\x7fELF", true));
+        assert!(super::native_magic(*b"\x7fELF", false));
+        assert!(!super::native_magic(macho, false));
+        assert!(!super::native_magic(*b"#!/b", true));
     }
 }

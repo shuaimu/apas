@@ -3247,6 +3247,16 @@
         },
         "os": {
           "type": "string"
+        },
+        "providers": {
+          "description": "Which terminal providers this machine's daemon can launch. `None` means\nunknown: an older daemon reports nothing, and a viewer must not read\nthat as \"not installed\". `Some(list)` is the daemon's whole answer, so\na daemon sends the full list in every `MachineInfo` it sends (register\nand `MachineInfoUpdate`); the server keeps the latest report as it is.\nAn entry this build cannot parse, such as a provider added later, is\ndropped rather than failing the whole registration.",
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "$ref": "#/$defs/MachineProviderStatus"
+          }
         }
       },
       "required": [
@@ -3318,6 +3328,35 @@
       "required": [
         "project_id",
         "path"
+      ]
+    },
+    "MachineProviderStatus": {
+      "description": "One provider's availability on a machine, as its daemon found it.",
+      "type": "object",
+      "properties": {
+        "can_install": {
+          "description": "The daemon can install this provider by itself (today only OMP). This\nsays what the machine can do, not what the viewer may ask for: the\ncommand that performs an install authorizes its requester.",
+          "type": "boolean"
+        },
+        "installed": {
+          "description": "The daemon resolved an executable it would launch for this provider.",
+          "type": "boolean"
+        },
+        "provider": {
+          "$ref": "#/$defs/Provider"
+        },
+        "version": {
+          "description": "The version the executable reported, when the daemon asked it.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "provider",
+        "installed",
+        "can_install"
       ]
     },
     "MachineWithProjects": {

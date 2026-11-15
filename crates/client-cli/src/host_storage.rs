@@ -12,9 +12,15 @@ static WARNED_LEGACY_STORAGE: AtomicBool = AtomicBool::new(false);
 
 fn warn_legacy_storage() {
     if !WARNED_LEGACY_STORAGE.swap(true, Ordering::Relaxed) {
-        tracing::warn!(
-            "durable host-local binary storage is unavailable; using /var/tmp until /var/lib/apas/users/<uid> is provisioned"
-        );
+        if cfg!(target_os = "macos") {
+            // A Mac is not provisioned like the Linux hosts, and needs no
+            // `/var/lib` store: `/var/tmp` is local and not cleaned there.
+            tracing::info!("host-local provider copies are kept under /var/tmp");
+        } else {
+            tracing::warn!(
+                "durable host-local binary storage is unavailable; using /var/tmp until /var/lib/apas/users/<uid> is provisioned"
+            );
+        }
     }
 }
 

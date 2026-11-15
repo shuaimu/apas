@@ -39,6 +39,7 @@ import {
   type SessionInstance,
 } from "./projectInstances";
 import { noRuntimeAccessReason } from "./tabHosts";
+import { parseMachineProviders } from "./machineChoice";
 import { receiveWorkerMessage } from "./workers";
 import type { AutopilotAction, AutopilotPromptChange, PaneAutopilotSummary } from "@apas/protocol";
 import {
@@ -255,6 +256,22 @@ export interface MachineInfo {
     apiKeyConfigured: boolean;
   };
   lastSeen?: string;
+  /** Which terminal providers the machine's daemon can launch. Absent means
+   *  unknown: an older daemon reports nothing, and that must not read as
+   *  "not installed". A list is the daemon's whole answer. */
+  providers?: MachineProviderStatus[];
+}
+
+/** One provider's availability on a machine, as its daemon found it. */
+export interface MachineProviderStatus {
+  /** The wire's provider value. A provider this build does not know is kept
+   *  and simply never matches a tab it offers. */
+  provider: string;
+  /** The daemon found an executable it would launch. */
+  installed: boolean;
+  version?: string;
+  /** The daemon can install it by itself (today only OMP). */
+  canInstall: boolean;
 }
 
 export interface MachineProject {
@@ -5532,6 +5549,7 @@ export function handleServerMessage(
                 }
               : undefined,
             lastSeen: machine.last_seen as string | undefined,
+            providers: parseMachineProviders(machine.providers),
           },
           projects: projects.map((project) => ({
             projectId: project.project_id as string,

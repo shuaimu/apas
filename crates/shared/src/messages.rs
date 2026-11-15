@@ -3154,6 +3154,49 @@ pub struct MachineInfo {
     pub deepseek_backend: Option<DeepseekBackendInfo>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_seen: Option<String>,
+    /// Which terminal providers this machine's daemon can launch. `None` means
+    /// unknown: an older daemon reports nothing, and a viewer must not read
+    /// that as "not installed". `Some(list)` is the daemon's whole answer, so
+    /// a daemon sends the full list in every `MachineInfo` it sends (register
+    /// and `MachineInfoUpdate`); the server keeps the latest report as it is.
+    /// An entry this build cannot parse, such as a provider added later, is
+    /// dropped rather than failing the whole registration.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "lenient_machine_providers"
+    )]
+    pub providers: Option<Vec<MachineProviderStatus>>,
+}
+
+/// One provider's availability on a machine, as its daemon found it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct MachineProviderStatus {
+    pub provider: Provider,
+    /// The daemon resolved an executable it would launch for this provider.
+    pub installed: bool,
+    /// The version the executable reported, when the daemon asked it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    /// The daemon can install this provider by itself (today only OMP). This
+    /// says what the machine can do, not what the viewer may ask for: the
+    /// command that performs an install authorizes its requester.
+    pub can_install: bool,
+}
+
+fn lenient_machine_providers<'de, D>(
+    deserializer: D,
+) -> Result<Option<Vec<MachineProviderStatus>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = Option::<Vec<serde_json::Value>>::deserialize(deserializer)?;
+    Ok(raw.map(|entries| {
+        entries
+            .into_iter()
+            .filter_map(|entry| serde_json::from_value(entry).ok())
+            .collect()
+    }))
 }
 
 /// APAS project discovered on a machine
@@ -5075,6 +5118,7 @@ mod tests {
                 api_key_configured: true,
             }),
             last_seen: None,
+            providers: None,
         };
 
         let json = serde_json::to_string(&machine).unwrap();
@@ -5090,6 +5134,103 @@ mod tests {
         );
         assert!(backend.api_key_configured);
         assert_eq!(backend.api_key, None);
+    }
+
+    #[test]
+    fn machine_info_round_trips_provider_availability() {
+        let machine_id = Uuid::new_v4();
+        let json = serde_json::json!({
+            "machine_id": machine_id,
+            "hostname": "Shuais-MacBook-Air-2.local",
+            "os": "macos",
+            "arch": "aarch64",
+            "providers": [
+                {"provider": "claude", "installed": true, "version": "2.1.233", "can_install": false},
+                {"provider": "omp", "installed": false, "can_install": true}
+            ]
+        });
+        let machine: MachineInfo = serde_json::from_value(json).unwrap();
+        let providers = machine.providers.clone().expect("providers reported");
+        assert_eq!(
+            providers,
+            vec![
+                MachineProviderStatus {
+                    provider: Provider::Claude,
+                    installed: true,
+                    version: Some("2.1.233".to_string()),
+                    can_install: false,
+                },
+                MachineProviderStatus {
+                    provider: Provider::Omp,
+                    installed: false,
+                    version: None,
+                    can_install: true,
+                },
+            ]
+        );
+        let encoded = serde_json::to_value(&machine).unwrap();
+        assert_eq!(encoded["providers"][1]["provider"], "omp");
+        assert!(encoded["providers"][1].get("version").is_none());
+        let decoded: MachineInfo = serde_json::from_value(encoded).unwrap();
+        assert_eq!(decoded.providers, Some(providers));
+    }
+
+    #[test]
+    fn machine_info_from_an_older_daemon_reports_providers_as_unknown() {
+        let json = serde_json::json!({
+            "machine_id": Uuid::new_v4(),
+            "hostname": "zoo-005",
+            "os": "linux",
+            "arch": "x86_64",
+            "daemon_version": "26.10.9"
+        });
+        let machine: MachineInfo = serde_json::from_value(json).unwrap();
+        assert_eq!(machine.providers, None);
+        let encoded = serde_json::to_value(&machine).unwrap();
+        assert!(encoded.get("providers").is_none());
+
+        // An empty list is an answer, not an absence.
+        let mut answered = machine;
+        answered.providers = Some(Vec::new());
+        let encoded = serde_json::to_value(&answered).unwrap();
+        assert_eq!(encoded["providers"], serde_json::json!([]));
+        let decoded: MachineInfo = serde_json::from_value(encoded).unwrap();
+        assert_eq!(decoded.providers, Some(Vec::new()));
+    }
+
+    #[test]
+    fn a_provider_this_build_does_not_know_does_not_fail_registration() {
+        let register = serde_json::json!({
+            "type": "register",
+            "token": "t",
+            "machine": {
+                "machine_id": Uuid::new_v4(),
+                "hostname": "newer-host",
+                "os": "linux",
+                "arch": "x86_64",
+                "providers": [
+                    {"provider": "invented", "installed": true, "can_install": false},
+                    {"provider": "omp", "installed": true, "version": "18.20.2", "can_install": true},
+                    {"provider": "codex", "installed": "yes", "can_install": false},
+                    {"provider": "codex", "installed": true, "can_install": false, "future": 1}
+                ]
+            },
+            "projects": []
+        });
+        let DaemonToServer::Register { machine, .. } =
+            serde_json::from_value::<DaemonToServer>(register).unwrap()
+        else {
+            panic!("expected register");
+        };
+        let providers = machine.providers.expect("providers reported");
+        assert_eq!(
+            providers
+                .iter()
+                .map(|status| status.provider)
+                .collect::<Vec<_>>(),
+            vec![Provider::Omp, Provider::Codex]
+        );
+        assert_eq!(providers[0].version.as_deref(), Some("18.20.2"));
     }
 
     #[test]

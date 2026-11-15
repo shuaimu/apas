@@ -858,6 +858,7 @@ mod cluster_authorization_tests {
                 daemon_version: None,
                 deepseek_backend: None,
                 last_seen: None,
+                providers: None,
             },
             Vec::new(),
         );

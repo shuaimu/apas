@@ -7,7 +7,7 @@ import { paneKey } from "@/lib/store";
 import type { CliLifecycleInventory, CliLifecycleStatus, PaneConfig, PaneKind } from "@/lib/store";
 import { useIsLaunchProfileAllowed } from "@/lib/tabTypes";
 import { paneIsAwaitingAnswerStatus, paneIsWorkingStatus } from "@/lib/paneStatus";
-import type { MachineChoice, MachineChoiceModel } from "@/lib/machineChoice";
+import { providerOfferOn, type MachineChoice, type MachineChoiceModel, type ProviderOffer } from "@/lib/machineChoice";
 import {
   groupMachineChoices,
   machineChoiceDetail,
@@ -892,6 +892,10 @@ function AddTabButton({
     ? machineChoices?.choices.find((choice) => choice.key === selectedKey && !choice.disabledReason)
     : undefined;
   const needsMachine = showMachineStep && !selectedMachine;
+  // The machine that receives the tab: the pick, or the hidden step's
+  // default, which is still sent. What each provider needs there is said on
+  // the provider, since a machine without OMP still takes a Claude tab.
+  const targetMachine = selectedMachine ?? (showMachineStep ? undefined : machineChoices?.defaultChoice);
 
   useEffect(() => {
     if (!showMenu) return;
@@ -917,12 +921,12 @@ function AddTabButton({
     setShowMenu((value) => !value);
   };
   const handlePick = (provider: string, model?: string) => {
-    if (needsMachine) return;
+    if (needsMachine || providerOfferOn(targetMachine, provider).disabledReason) return;
     onAddTab(provider, model, isolatedWorktree || undefined, "terminal", selectedMachine);
     setIsolatedWorktree(false);
     setShowMenu(false);
   };
-  const providers = [
+  const providerEntries = [
     { provider: "claude", label: "Claude" },
     { provider: "claude", label: "Claude / DeepSeek 4.1 Flash", model: DEEPSEEK_FLASH_MODEL },
     { provider: "codex", label: "Codex" },
@@ -965,20 +969,29 @@ function AddTabButton({
           {needsMachine && (
             <p className="px-3 pt-1 text-xs text-gray-500 dark:text-gray-400">Choose where the tab runs first.</p>
           )}
-          {providers.map((entry) => (
-            <button
-              type="button"
-              key={entry.model ? `${entry.provider}/${entry.model}` : entry.provider}
-              disabled={needsMachine}
-              title={needsMachine ? "Choose where the tab runs first" : undefined}
-              onClick={() => handlePick(entry.provider, entry.model)}
-              className="w-full min-h-11 text-left px-3 py-2 text-sm hover:bg-gray-100 dark:hover:bg-gray-700 flex items-center gap-2 disabled:cursor-not-allowed disabled:opacity-50 disabled:hover:bg-transparent"
-            >
-              <span className="flex-shrink-0 text-gray-500 dark:text-gray-400"><ProviderIcon provider={entry.provider} className="w-4 h-4" /></span>
-              {entry.label}
-            </button>
-          ))}
-          {!providers.length && <p className="px-3 py-3 text-sm">No interactive provider is allowed by this project&apos;s launch policy.</p>}
+          {providerEntries.map((entry) => {
+            const offer: ProviderOffer = needsMachine ? {} : providerOfferOn(targetMachine, entry.provider);
+            const detail = offer.disabledReason ?? offer.note;
+            return (
+              <button
+                type="button"
+                key={entry.model ? `${entry.provider}/${entry.model}` : entry.provider}
+                disabled={needsMachine || Boolean(offer.disabledReason)}
+                title={needsMachine ? "Choose where the tab runs first" : offer.disabledReason ?? offer.noteTitle}
+                onClick={() => handlePick(entry.provider, entry.model)}
+                className="w-full min-h-11 text-left px-3 py-2 text-sm hover:bg-gray-100 dark:hover:bg-gray-700 flex items-center gap-2 disabled:cursor-not-allowed disabled:opacity-50 disabled:hover:bg-transparent"
+              >
+                <span className="flex-shrink-0 text-gray-500 dark:text-gray-400"><ProviderIcon provider={entry.provider} className="w-4 h-4" /></span>
+                {detail ? (
+                  <span className="min-w-0">
+                    <span className="block">{entry.label}</span>
+                    <span className="block text-xs text-gray-500 dark:text-gray-400">{detail}</span>
+                  </span>
+                ) : entry.label}
+              </button>
+            );
+          })}
+          {!providerEntries.length && <p className="px-3 py-3 text-sm">No interactive provider is allowed by this project&apos;s launch policy.</p>}
         </div>
       )}
     </div>

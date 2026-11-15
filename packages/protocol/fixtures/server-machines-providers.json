@@ -1,0 +1,41 @@
+{
+  "type": "machines",
+  "machines": [
+    {
+      "machine": {
+        "machine_id": "50000000-0000-4000-8000-000000000003",
+        "hostname": "Shuais-MacBook-Air-2.local",
+        "os": "macos",
+        "arch": "aarch64",
+        "daemon_version": "26.11.54",
+        "providers": [
+          {
+            "provider": "claude",
+            "installed": true,
+            "version": "2.1.233",
+            "can_install": false
+          },
+          {
+            "provider": "omp",
+            "installed": false,
+            "can_install": true
+          }
+        ]
+      },
+      "projects": [
+        {
+          "project_id": "30000000-0000-4000-8000-000000000001",
+          "name": "project",
+          "path": "/Users/example/project",
+          "is_running": true,
+          "git_remote": "github.com/example/project"
+        }
+      ],
+      "cluster_access": "owner",
+      "shared_provisioning_available": true,
+      "local_project_registration_available": true,
+      "project_instances_available": true,
+      "daemon_connected": true
+    }
+  ]
+}

@@ -49,6 +49,32 @@ describe("Rust protocol golden fixtures", () => {
     expect(validate(receipt)).toBe(false);
   });
 
+  it("keeps older viewers connected: their schema accepts a machine that reports its providers", async () => {
+    const { default: Ajv2020 } = await import("ajv/dist/2020.js");
+    const legacySchema = JSON.parse(readFileSync(
+      fileURLToPath(new URL("./legacy/server-to-web.pre-autopilot.schema.json", import.meta.url)), "utf8"));
+    const validate = new Ajv2020({ allErrors: true, strict: false }).compile(legacySchema);
+    const machines = JSON.parse(readFileSync(`${fixturesDirectory}/server-machines-providers.json`, "utf8"));
+    expect(machines.machines[0].machine.providers[1]).toEqual({ provider: "omp", installed: false, can_install: true });
+    // MachineInfo has never closed its properties, so the field needs no
+    // viewer capability.
+    expect(validate(machines)).toBe(true);
+  });
+
+  it("refuses a provider status that leaves out what it answers", () => {
+    const machines = JSON.parse(readFileSync(`${fixturesDirectory}/server-machines-providers.json`, "utf8"));
+    const withStatus = (status: object) => ({
+      ...machines,
+      machines: [{ ...machines.machines[0], machine: { ...machines.machines[0].machine, providers: [status] } }],
+    });
+    expect(validateServerMessage(withStatus({ provider: "omp", installed: true, version: "18.20.2", can_install: true })).valid).toBe(true);
+    expect(validateServerMessage(withStatus({ provider: "omp", can_install: true })).valid).toBe(false);
+    expect(validateServerMessage(withStatus({ provider: "omp", installed: true })).valid).toBe(false);
+    expect(validateServerMessage(withStatus({ provider: "invented", installed: true, can_install: false })).valid).toBe(false);
+    const { providers: _providers, ...unknown } = machines.machines[0].machine;
+    expect(validateServerMessage({ ...machines, machines: [{ ...machines.machines[0], machine: unknown }] }).valid).toBe(true);
+  });
+
   it("parses an autopilot start that says nothing, and refuses an invented outcome", () => {
     const start = JSON.parse(readFileSync(`${fixturesDirectory}/web-control-pane-autopilot-start.json`, "utf8"));
     expect(validateClientMessage({ ...start, action: { kind: "start", spec: {} } }).valid).toBe(true);

@@ -502,3 +502,111 @@ describe("choosing a machine for a new mobile agent", () => {
     expect(add.machine_id).toBe(ZOO5);
   });
 });
+
+describe("what each provider needs on the new agent's machine", () => {
+  const MAC_HOST = "Shuais-MacBook-Air-2.local";
+
+  function allowClaudeAndOmp() {
+    act(() => useStore.setState({
+      projectPolicies: {
+        [SID]: {
+          teamAvailable: false,
+          allowedLaunchProfiles: ["terminal:claude:official:default", "terminal:omp:official:default"],
+          version: 5,
+          projectSuspended: false,
+          noncompliantPaneIds: [],
+        },
+      },
+    }));
+  }
+
+  /** The machine list as the server pushes it, so the store's parsing runs. */
+  function receiveMachines(entries: Array<{ machineId: string; hostname: string; providers?: unknown }>) {
+    act(() => handleServerMessage(
+      {
+        type: "machines",
+        machines: entries.map(({ machineId, hostname, providers }) => ({
+          machine: { machine_id: machineId, hostname, os: "macos", arch: "aarch64", providers },
+          projects: [{ project_id: SID, path: "/work/project", is_running: true }],
+          cluster_access: "owner",
+          daemon_connected: true,
+          project_instances_available: true,
+        })),
+      },
+      useStore.setState,
+      useStore.getState,
+    ));
+  }
+
+  function seedMacOnly(providers: unknown) {
+    seed(10, [instance(ZOO5, MAC_HOST, true)]);
+    act(() => useStore.setState({
+      sessions: [{ ...useStore.getState().sessions[0], hostname: MAC_HOST, gitRemote: undefined }],
+      paneConfigs: [terminal(10, "Claude 1", ZOO5, MAC_HOST)],
+    }));
+    allowClaudeAndOmp();
+    receiveMachines([{ machineId: ZOO5, hostname: MAC_HOST, providers }]);
+  }
+
+  it("offers OMP with a note when the machine can install it", () => {
+    seedMacOnly([
+      { provider: "claude", installed: true, version: "2.1.233", can_install: false },
+      { provider: "omp", installed: false, can_install: true },
+    ]);
+    renderScreen();
+    const sheet = openInteractiveSheet();
+    expect(within(sheet).queryByRole("group", { name: "Run on" })).toBeNull();
+    const omp = within(sheet).getByRole("button", { name: /^OMP terminal/ }) as HTMLButtonElement;
+    expect(omp.disabled).toBe(false);
+    expect(within(omp).getByText("Installs OMP first")).toBeTruthy();
+    expect(omp.title).toContain("You may need to log in to OMP in its terminal.");
+    expect(within(within(sheet).getByRole("button", { name: /^Claude terminal/ })).getByText("Interactive TUI")).toBeTruthy();
+
+    fireEvent.click(omp);
+    const [add] = sent("add_pane");
+    expect(add).toMatchObject({ session_id: SID, machine_id: ZOO5, provider: "omp", kind: "terminal" });
+    expectValid(add);
+  });
+
+  it("disables OMP with the reason when the machine has not got it and cannot install it", () => {
+    seedMacOnly([
+      { provider: "claude", installed: true, can_install: false },
+      { provider: "omp", installed: false, can_install: false },
+    ]);
+    renderScreen();
+    const sheet = openInteractiveSheet();
+    const omp = within(sheet).getByRole("button", { name: /^OMP terminal/ }) as HTMLButtonElement;
+    expect(omp.disabled).toBe(true);
+    expect(within(omp).getByText(`OMP is not installed on ${MAC_HOST}.`)).toBeTruthy();
+    expect(within(omp).queryByText("Interactive TUI")).toBeNull();
+    fireEvent.click(omp);
+    expect(sent("add_pane")).toEqual([]);
+    expect((within(sheet).getByRole("button", { name: /^Claude terminal/ }) as HTMLButtonElement).disabled).toBe(false);
+  });
+
+  it("leaves the sheet as it was when the machine reports nothing", () => {
+    seedMacOnly(undefined);
+    renderScreen();
+    const sheet = openInteractiveSheet();
+    const omp = within(sheet).getByRole("button", { name: /^OMP terminal/ }) as HTMLButtonElement;
+    expect(omp.disabled).toBe(false);
+    expect(within(omp).getByText("Interactive TUI")).toBeTruthy();
+    expect(omp.title).toBe("");
+  });
+
+  it("follows the machine picked in the step", () => {
+    seed(10, [instance(ZOO5, "zoo-005", true), instance(ZOO6, MAC_HOST)]);
+    allowClaudeAndOmp();
+    receiveMachines([
+      { machineId: ZOO5, hostname: "zoo-005", providers: [{ provider: "omp", installed: true, version: "18.20.0", can_install: true }] },
+      { machineId: ZOO6, hostname: MAC_HOST, providers: [{ provider: "omp", installed: false, can_install: false }] },
+    ]);
+    renderScreen();
+    const sheet = openInteractiveSheet();
+    const omp = () => within(sheet).getByRole("button", { name: /^OMP terminal/ }) as HTMLButtonElement;
+    expect(omp().disabled).toBe(false);
+    fireEvent.click(within(within(sheet).getByRole("group", { name: "Run on" })).getByRole("radio", { name: new RegExp(`^${MAC_HOST}`) }));
+    expect(omp().disabled).toBe(true);
+    expect(within(omp()).getByText(`OMP is not installed on ${MAC_HOST}.`)).toBeTruthy();
+  });
+});

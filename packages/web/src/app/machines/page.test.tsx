@@ -285,6 +285,29 @@ describe("MachinesPage daemon restart", () => {
   });
 });
 
+describe("MachinesPage provider availability", () => {
+  it("lists each machine's installed providers quietly, with versions in the title", () => {
+    const mac = machineAt("machine-mac", "Shuais-MacBook-Air-2.local", "26.11.54");
+    mac.machine.providers = [
+      { provider: "omp", installed: false, canInstall: true },
+      { provider: "codex", installed: true, version: "0.160.0", canInstall: false },
+      { provider: "claude", installed: true, version: "2.1.233", canInstall: false },
+    ];
+    const empty = machineAt("machine-empty", "zoo-007", "26.11.54");
+    empty.machine.providers = [];
+    seedMachines([mac, empty, machineAt("machine-old", "zoo-005", "26.10.9")]);
+
+    render(<MachinesPage />);
+
+    const line = screen.getByText("Providers: Claude, Codex");
+    expect(line.getAttribute("title")).toBe("Claude 2.1.233, Codex 0.160.0");
+    expect(screen.getByText("No providers installed")).toBeTruthy();
+    // An older daemon reports nothing, which is not "none installed": its
+    // row is as it was.
+    expect(screen.getAllByText(/^Providers:|^No providers installed$/)).toHaveLength(2);
+  });
+});
+
 describe("MachinesPage", () => {
   it("renders machine identity, supported backend state, projects, and the empty state", () => {
     const actions = seedMachines();
