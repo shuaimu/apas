@@ -2761,7 +2761,9 @@ prompts and **My own text**:
   never installs Verus: without one on the machine it asks in the report
   whether to make it available or keep tests, and sets Verus up (pinned, with
   the command written into the README or `AGENTS.md` and CI) only with the
-  Verus already there. The whitepaper rule is in the prompt only,
+  Verus already there. Live since web release `20261115T194926Z` (version
+  26.11.53, built at 9f57514, 19:50 UTC on 2026-11-15); backups under
+  `/opt/apas/backups/deploy-20261115T194926Z`. The whitepaper rule is in the prompt only,
   with a `git status` check before each commit that undoes only the agent's
   own edit; a project that wants it enforced can add a commit hook.
 - **Implement from a design document**. Each iteration closes one
