@@ -402,21 +402,7 @@ fn install_locked(
         .install_dir
         .join(format!("{DOWNLOAD_PREFIX}{}", Uuid::new_v4().simple()));
     let result = (|| {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .context("start the download runtime")?;
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        runtime
-            .block_on(async {
-                tokio::time::timeout(remaining, download(request, &temporary, progress)).await
-            })
-            .map_err(|_| {
-                anyhow::anyhow!(
-                    "the download did not finish within {}",
-                    describe_duration(request.timeout)
-                )
-            })??;
+        download_on_own_thread(request, &temporary, deadline, progress)?;
         fs::set_permissions(&temporary, fs::Permissions::from_mode(0o755))?;
         if request.verify_macos_signature {
             verify_macos_signature(&temporary)?;
@@ -454,6 +440,51 @@ fn install_locked(
     })();
     let _ = fs::remove_file(&temporary);
     result
+}
+
+/// Run the download in a runtime on a thread of its own, and hand its
+/// progress lines to `progress` on the caller's thread. `progress` may block
+/// (the tab's sends to the server do, with `blocking_send`), and blocking
+/// inside a runtime panics: called from inside `block_on`, the first
+/// progress line ended every real install with "the installer stopped
+/// unexpectedly" (2026-11-15, the owner's Mac).
+fn download_on_own_thread(
+    request: &InstallRequest,
+    temporary: &Path,
+    deadline: Instant,
+    progress: &mut dyn FnMut(String),
+) -> Result<()> {
+    let (lines_tx, lines_rx) = std::sync::mpsc::channel::<String>();
+    std::thread::scope(|scope| {
+        let downloader = scope.spawn(move || -> Result<()> {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .context("start the download runtime")?;
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let mut send_line = |line: String| {
+                let _ = lines_tx.send(line);
+            };
+            runtime
+                .block_on(async {
+                    tokio::time::timeout(remaining, download(request, temporary, &mut send_line))
+                        .await
+                })
+                .map_err(|_| {
+                    anyhow::anyhow!(
+                        "the download did not finish within {}",
+                        describe_duration(request.timeout)
+                    )
+                })?
+        });
+        // Ends when the downloader drops its sender, that is when it is done.
+        for line in lines_rx {
+            progress(line);
+        }
+        downloader
+            .join()
+            .unwrap_or_else(|_| Err(anyhow::anyhow!("the download stopped unexpectedly")))
+    })
 }
 
 const DOWNLOAD_PREFIX: &str = ".omp.download.";
@@ -857,6 +888,34 @@ mod tests {
             *server.requests.lock().unwrap(),
             vec!["/v18.20.2/SHA256SUMS.txt", "/v18.20.2/omp-linux-x64"]
         );
+    }
+
+    /// The tab's progress callback sends each line with `blocking_send`,
+    /// which panics inside a runtime. Every line must reach it outside one.
+    #[test]
+    fn progress_that_blocks_like_the_tabs_does_not_stop_the_install() {
+        let dir = tempfile::tempdir().unwrap();
+        let binary = fake_omp("18.20.2");
+        let server = serve(release(&binary, &sha(&binary)));
+        let request = make_request(&server, dir.path(), &binary);
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(1024);
+        let installed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            install(request, &mut |line| {
+                tx.blocking_send(line).unwrap();
+            })
+        }))
+        .expect("progress was called inside a runtime")
+        .expect("installed");
+        assert!(installed.is_file());
+        drop(tx);
+        let mut lines = Vec::new();
+        while let Some(line) = rx.blocking_recv() {
+            lines.push(line);
+        }
+        assert!(lines
+            .iter()
+            .any(|line| line.starts_with("Downloading omp-linux-x64")));
+        assert!(lines.iter().any(|line| line == "Checksum verified."));
     }
 
     #[test]

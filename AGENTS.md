@@ -1526,6 +1526,15 @@ protocol 80 and the extension's 137, web 1,353 with lint, typecheck and build
 `openspec validate --all --strict`. Not yet seen: any of it on a Mac, a real
 OMP download and install, the providers line with a real daemon's report.
 
+**The first real install failed** on the owner's Mac with "the installer
+stopped unexpectedly". The download ran inside a runtime and called the tab's
+progress callback there, which sends with `blocking_send`; that panics inside
+a runtime, so the first progress line ended the install. The tests' callbacks
+only collected lines. The download now runs on a thread of its own and its
+lines reach the callback on the caller's thread, and a test drives `install`
+with a `blocking_send` callback (it fails on the old code with tokio's
+"Cannot block the current thread from within a runtime").
+
 ## The daemon is replaced only when asked
 
 Replacing the daemon used to be nearly free: it owned no long-lived children, so
