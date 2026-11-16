@@ -76,6 +76,11 @@ const COMMIT_RULES = `${COMMIT_RULES_LOCAL} Do not push.`;
 // so the no-tool turn that ends a run stays without a tool call. The other
 // templates still do not push. A plain push sends every commit on the branch
 // in that checkout, also ones other tabs made there.
+//
+// It changes a graphical interface only where it can look at the result
+// (owner, 2026-11-16): with a browser or computer-use tool, or a screenshot
+// it can read as an image. An agent that cannot see the interface leaves
+// that part of the design alone, specs included, and says so in the report.
 const WORKER_DIR = "docs/apas-worker";
 const WORKER_REPORT = `${WORKER_DIR}/report.md`;
 const WORKER_PROGRESS = `${WORKER_DIR}/progress.md`;
@@ -103,6 +108,11 @@ Remote rules, for git:
 - In a merge conflict keep what both sides meant; where both did the same step, keep the upstream's. Besides what git staged, stage only the files you resolved, and commit a merge without naming paths. If the conflict is only under ${WORKER_DIR}, keep both sides' entries, commit the merge and go on. Any other merge you resolved by hand is this turn's step: run the checks of step 6, commit it, push, and stop. If the conflict is in the whitepaper, or you cannot resolve it or fix a check it breaks, stop the sync: before you commit anything, end an open merge with "git add" of the files you edited, then "git merge --abort", and write one report entry naming this machine, this checkout and what happened, asking the person to bring the branch in step here. Ask it as the paragraph after step 9 says. Every step waits for that entry, and you neither merge nor push while it is open; resolve it once the person has answered it or the upstream contains this branch.
 - Push with a plain "git push" after every commit you make. Never force, never push another branch or a tag, never delete anything on the remote, and open no pull request. If a push is rejected because the upstream has moved, leave it and do not end this reply with "${NOTHING_LEFT}": the next turn merges and pushes.
 - A note or report entry about what this machine lacks names the machine, and blocks no step on another one.
+
+Screen rules, for a graphical interface:
+- A step that changes what a person sees in a graphical interface (a web page, an app's window or screen: its layout, style, text or behaviour) needs you to look at the result in this turn, with a browser or computer-use tool, or a screenshot you take and read as an image. Reading the markup or passing tests is not looking, and a screenshot you cannot see as an image does not count. Use what is here; install nothing for it.
+- If you can look, run the interface and look at every state the step changed before you commit, and fix what is wrong: this is one of the checks of step 6.
+- If you cannot look, or cannot run the interface here, do not work on that part of the design at all, its specs included: it is blocked. Write one report entry naming this machine and the parts that wait, and take another step; resolve the entry once you can look.
 
 ${END_GUARD}
 
@@ -172,7 +182,7 @@ export const AUTOPILOT_TEMPLATES: readonly AutopilotTemplate[] = [
   {
     id: "apas_worker",
     name: "APAS worker",
-    description: `Keeps the OpenSpec specs in line with your whitepaper and the code in line with the specs, one step per iteration, with Verus proofs in place of Rust tests where Verus can check them. It merges what the branch's git remote has and pushes its commits there, so run one worker per branch. It never edits the whitepaper: proposals and questions go to ${WORKER_REPORT}.`,
+    description: `Keeps the OpenSpec specs in line with your whitepaper and the code in line with the specs, one step per iteration, with Verus proofs in place of Rust tests where Verus can check them. It merges what the branch's git remote has and pushes its commits there, so run one worker per branch. It changes a graphical interface only where its agent can look at the result. It never edits the whitepaper: proposals and questions go to ${WORKER_REPORT}.`,
     prompt: APAS_WORKER_PROMPT,
     endsWithoutToolCall: true,
   },

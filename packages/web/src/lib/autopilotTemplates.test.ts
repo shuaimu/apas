@@ -89,6 +89,24 @@ describe("the built-in autopilot templates", () => {
     }
   });
 
+  it("has the APAS worker change a graphical interface only where it can look at the result", () => {
+    const { prompt, description } = DEFAULT_AUTOPILOT_TEMPLATE;
+    expect(description).toContain("It changes a graphical interface only where its agent can look at the result.");
+    const rules = prompt.indexOf("Screen rules, for a graphical interface:");
+    // The rules are read before the steps, and before the turn that calls no tool.
+    expect(rules).toBeGreaterThan(prompt.indexOf("Remote rules, for git:"));
+    expect(rules).toBeLessThan(prompt.indexOf("call no tool and reply only"));
+    // Looking means a browser, computer use or a screenshot it can read.
+    expect(prompt).toContain("needs you to look at the result in this turn, with a browser or computer-use tool, or a screenshot you take and read as an image.");
+    expect(prompt).toContain("Reading the markup or passing tests is not looking, and a screenshot you cannot see as an image does not count.");
+    expect(prompt).toContain("Use what is here; install nothing for it.");
+    // Where it can look, the look is a check made before the commit.
+    expect(prompt).toContain("look at every state the step changed before you commit, and fix what is wrong: this is one of the checks of step 6.");
+    // Where it cannot, that part of the design is left alone and the person is told.
+    expect(prompt).toContain("If you cannot look, or cannot run the interface here, do not work on that part of the design at all, its specs included: it is blocked.");
+    expect(prompt).toContain("Write one report entry naming this machine and the parts that wait, and take another step; resolve the entry once you can look.");
+  });
+
   it("gives the APAS worker three layers, and the whitepaper to the person alone", () => {
     const prompt = autopilotTemplateById("apas_worker")!.prompt;
     // Layer one: read only. Where it lives, and that nothing in it changes.
@@ -175,7 +193,7 @@ describe("the built-in autopilot templates", () => {
       // instruction around it (loopPrompt.test.ts). The APAS worker, which
       // states three layers, a report, the Verus rules and the remote
       // rules, is the longest.
-      expect(bytes(template.prompt)).toBeLessThan(AUTOPILOT_PROMPT_MAX_BYTES * 0.85);
+      expect(bytes(template.prompt)).toBeLessThan(AUTOPILOT_PROMPT_MAX_BYTES * 0.9);
     },
   );
 

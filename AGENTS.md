@@ -3050,6 +3050,17 @@ prompts and **My own text**:
   `/opt/apas/backups/deploy-20261116T031901Z`. Ten public routes and 18
   static assets answered `200`, the served bundle carries the new text, and
   the web logged no error. Gates: web 1,441 tests, typecheck and lint.
+  **It changes a graphical interface only where it can look at the result**
+  (owner, 2026-11-16). A step that changes what a person sees in a web page
+  or an app needs the agent to look at the result in that turn: with a
+  browser or computer-use tool, or a screenshot it takes and can read as an
+  image. Reading the markup or passing tests does not count, and it installs
+  nothing for it. Where it can look, it looks at every state the step
+  changed before the commit. Where it cannot, or cannot run the interface
+  there, it leaves that part of the design alone, specs included, writes one
+  report entry naming the machine and the parts that wait, and takes another
+  step; a machine that can look takes them up. Whether an agent says
+  honestly that it cannot see an image is untested.
 - **Implement from a design document**. Each iteration closes one
   gap between the design and the code, with tests and a commit. It uses
   `docs/design.md`, or else only the one document the README or `AGENTS.md`
