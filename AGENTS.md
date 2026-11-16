@@ -2095,8 +2095,8 @@ on two machines could be half open. The design record is
 comments in `crates/shared/src/messages.rs` are the binding statement of the
 wire. Nothing in `crates/client-cli` changed: daemons and CLIs need no update.
 
-**Implemented on master on 2026-11-16. Not deployed yet**; see "Verification"
-below for what was and was not exercised.
+**Rolled out on 2026-11-16** (server and web release `20261116T224049Z`); see
+"Rollout record" and "Verification" below for what was and was not exercised.
 
 **Where it is kept.** Five nullable columns on `projects`: `open_state`
 (`NULL`, `open`, `closed`), `open_state_set_by`, `open_state_set_kind`
@@ -2279,6 +2279,59 @@ deploy of a server with this change would follow those stale states at every
 registration: start projects someone stopped, and stop projects someone
 started. Roll the web back first, then the server.
 
+### Known limits
+
+- **Two machines on one shared home can take 30 seconds to start a project
+  they are asked to start in the same instant.** An Open and the follow step
+  at a registration ask every tab owner at once. In the second smoke run 3 of
+  199 project starts and 1 of 49 daemon reboots (the one where both machines
+  were rebooted together) stalled for 30.1 to 30.4 s; the first run saw none.
+  The CLI is unchanged by this work, and the cause is the one suspected in
+  the Rollout record of "A project's tabs can run on several machines": a
+  blocking lock in the shared config directory that NFS retries after 30 s.
+  Until it is fixed, a machine can read "Starting…" or refuse its tabs for
+  half a minute after an Open.
+- **A machine reads "Running" a moment before its tabs can be used.** Between
+  the daemon's answer to a start and its instance attaching (40 to 110 ms
+  normally, 30 s with the stall above), the part reads Running while input to
+  its tabs is refused as not running, and Open again sends nothing.
+- **A deferred read-then-write transaction can still be refused under a
+  registration burst** where it was not converted to `begin_write`. At this
+  release's server start one legacy-policy import logged "database is
+  locked"; the CLI sends the flags again every 5 s, so it was imported on the
+  next round.
+- The phone's "All projects" cards show the server's UTC time as local time
+  (older than this change).
+
+### Rollout record
+
+On **2026-11-16** server and web release `20261116T224049Z` (version
+26.11.71, built at 177bc7d from the committed tree) went live: the server at
+22:42:30 UTC, the web at 22:42:50 UTC. Backups are under
+`/opt/apas/backups/deploy-20261116T224049Z`. `master` was not pushed: the
+change has no CLI part, and no daemon or agent was restarted.
+
+- The three dependency graphs audited clean from their lockfiles before the
+  release, and the two npm graphs again on the host. nginx did not change.
+- The first start added the five columns; all 101 projects read not
+  recorded, and none was recorded in the minutes after.
+- **The deployment started and stopped nothing.** Both connected daemons
+  registered again by themselves; the server logged no follow step, no open
+  and no close, no error and no frame it could not parse. zoo-005 kept its
+  25 pane hosts and zoo-006 its 4.
+- Twelve addresses (the ten public routes and two `?view=` ones) answered
+  `200` with no redirect, the 19 static assets four pages reference answered
+  `200`, `/projects/by-remote` answered `401` and `/projects/workers` `403`
+  with JSON from `apas-server`, and the served bundle carries the new texts.
+- Not checked on the live site: the new controls in a signed-in browser
+  ("Keep open" on every project, a first Open and Close), an un-reloaded
+  older web bundle's buttons, and a native build staying connected. The
+  first two were exercised on the harness only.
+
+**To roll this release back**, follow "Rollout and rollback" above: web
+first, then the server binary from the backup, and clear the five columns
+while the server is stopped.
+
 ### Verification
 
 **Gates on 2026-11-16**, on the final tree: `cargo test` for shared
@@ -2327,7 +2380,11 @@ running" until its stop is done: under a second for a project just started,
 
 The smoke run found one defect, fixed afterwards: an open or close audit row
 lost to "database is locked" when its write met a registration's (see
-`Database::begin_write` above).
+`Database::begin_write` above). On the build with the fix (`os2`, 177bc7d),
+47 Closes that raced a daemon replacement, five Close-then-Open trials and
+four server restarts (three with both daemons held back and released
+together, as a deploy with a slow reconnect) lost no row: 215 audit rows for
+215 logged events, and no "database is locked" line.
 
 **Browser check** in headless Chromium at 1440 and 390 px, light and dark,
 against that server: a closed project, an open one on two machines, one with
@@ -2338,6 +2395,9 @@ not-recorded half-running project, the Machines rows, both confirmations
 phone's project screen. It found two defects that mattered, fixed
 afterwards: "Open again" offered for a machine on an older APAS that it
 cannot start, and a deleted project left as a card in another window's list.
+The fixes were seen again in the browser at 177bc7d, with a tab created
+through the Run on step of an open project, an Open confirmed from a Machines
+row and a Close from the workspace.
 
 Not exercised:
 
