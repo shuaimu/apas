@@ -1,0 +1,24 @@
+{
+  "type": "project_open_state",
+  "project_id": "30000000-0000-4000-8000-000000000001",
+  "state": "open",
+  "set_by": "owner@example.com",
+  "set_kind": "request",
+  "set_at": "2026-11-16T05:00:00Z",
+  "machines": [
+    {
+      "machine_id": "50000000-0000-4000-8000-000000000001",
+      "hostname": "zoo-005",
+      "part": "running",
+      "owns_tabs": true,
+      "connected": true
+    },
+    {
+      "machine_id": "50000000-0000-4000-8000-000000000002",
+      "hostname": "zoo-006",
+      "part": "waiting_offline",
+      "owns_tabs": true,
+      "connected": false
+    }
+  ]
+}

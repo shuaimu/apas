@@ -255,6 +255,10 @@ fn registered(project: Uuid, path: &str, git_remote: Option<&str>) -> MachinePro
         memory_kb: None,
         last_error: None,
         git_remote: git_remote.map(str::to_string),
+        open_state: None,
+        part: None,
+        part_reason: None,
+        other_hosts: Vec::new(),
     }
 }
 

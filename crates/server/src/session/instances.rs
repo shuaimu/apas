@@ -2773,6 +2773,10 @@ mod tests {
                     memory_kb: None,
                     last_error: None,
                     git_remote: None,
+                    open_state: None,
+                    part: None,
+                    part_reason: None,
+                    other_hosts: Vec::new(),
                 }],
             );
         }

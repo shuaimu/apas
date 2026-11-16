@@ -61,6 +61,7 @@ fn session_info(
         // the web list uses, so the two surfaces cannot either.
         panes: super::ws_web::pane_summaries(state, &session_id, is_active),
         instances: Vec::new(),
+        open_state: None,
     }
 }
 
@@ -1428,6 +1429,10 @@ mod tests {
                     memory_kb: None,
                     last_error: None,
                     git_remote: None,
+                    open_state: None,
+                    part: None,
+                    part_reason: None,
+                    other_hosts: Vec::new(),
                 }],
             );
             self.state.sessions.set_daemon_capabilities(

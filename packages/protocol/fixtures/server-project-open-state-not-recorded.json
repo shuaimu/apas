@@ -1,0 +1,19 @@
+{
+  "type": "project_open_state",
+  "project_id": "30000000-0000-4000-8000-000000000001",
+  "machines": [
+    {
+      "machine_id": "50000000-0000-4000-8000-000000000001",
+      "hostname": "zoo-005",
+      "part": "running",
+      "owns_tabs": true,
+      "connected": true
+    },
+    {
+      "hostname": "laptop",
+      "part": "not_started",
+      "owns_tabs": true,
+      "connected": false
+    }
+  ]
+}

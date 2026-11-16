@@ -1262,6 +1262,10 @@ impl DaemonState {
                     .clone()
                     .or_else(|| task.and_then(RunningProject::ended_because)),
                 git_remote: self.git_remotes.get(&project.path),
+                open_state: None,
+                part: None,
+                part_reason: None,
+                other_hosts: Vec::new(),
             });
         }
 

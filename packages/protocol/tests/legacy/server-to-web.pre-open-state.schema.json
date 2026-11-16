@@ -1,0 +1,5590 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ServerToWeb",
+  "oneOf": [
+    {
+      "type": "object",
+      "properties": {
+        "detail": {
+          "$ref": "#/$defs/WorkerDetail"
+        },
+        "type": {
+          "type": "string",
+          "const": "worker_snapshot"
+        }
+      },
+      "required": [
+        "type",
+        "detail"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "event": {
+          "$ref": "#/$defs/WorkerEvent"
+        },
+        "type": {
+          "type": "string",
+          "const": "worker_event"
+        }
+      },
+      "required": [
+        "type",
+        "event"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "type": {
+          "type": "string",
+          "const": "worker_inbox_changed"
+        }
+      },
+      "required": [
+        "type"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "code": {
+          "type": "string"
+        },
+        "project_id": {
+          "type": "string"
+        },
+        "resync_required": {
+          "type": "boolean"
+        },
+        "type": {
+          "type": "string",
+          "const": "worker_subscription_rejected"
+        },
+        "worker_id": {
+          "type": "string",
+          "format": "uuid"
+        }
+      },
+      "required": [
+        "type",
+        "project_id",
+        "worker_id",
+        "code",
+        "resync_required"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "detail": {
+          "$ref": "#/$defs/JobDetail"
+        },
+        "type": {
+          "type": "string",
+          "const": "job_snapshot"
+        }
+      },
+      "required": [
+        "type",
+        "detail"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "event": {
+          "$ref": "#/$defs/JobEvent"
+        },
+        "type": {
+          "type": "string",
+          "const": "job_event"
+        }
+      },
+      "required": [
+        "type",
+        "event"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "job_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "last_event_seq": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "project_id": {
+          "type": "string"
+        },
+        "state_version": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "type": {
+          "type": "string",
+          "const": "job_changed"
+        }
+      },
+      "required": [
+        "type",
+        "project_id",
+        "job_id",
+        "state_version",
+        "last_event_seq"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "code": {
+          "type": "string"
+        },
+        "job_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "message": {
+          "type": "string"
+        },
+        "project_id": {
+          "type": "string"
+        },
+        "resync_required": {
+          "type": "boolean"
+        },
+        "type": {
+          "type": "string",
+          "const": "job_subscription_rejected"
+        }
+      },
+      "required": [
+        "type",
+        "project_id",
+        "job_id",
+        "code",
+        "message",
+        "resync_required"
+      ]
+    },
+    {
+      "description": "Authentication successful",
+      "type": "object",
+      "properties": {
+        "account_status": {
+          "type": "string",
+          "default": ""
+        },
+        "cluster_role": {
+          "type": "string",
+          "default": ""
+        },
+        "mutations_allowed": {
+          "type": "boolean",
+          "default": true
+        },
+        "negotiated_capabilities": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "protocol_version": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        },
+        "server_version": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "type": {
+          "type": "string",
+          "const": "authenticated"
+        },
+        "user_email": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "user_id": {
+          "type": "string",
+          "format": "uuid"
+        }
+      },
+      "required": [
+        "type",
+        "user_id"
+      ]
+    },
+    {
+      "description": "The peer authenticated, but its protocol cannot safely mutate state.\nA mobile client may retain read-only cached/live access while guiding\nthe user to install a compatible build.",
+      "type": "object",
+      "properties": {
+        "maximum_version": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "message": {
+          "type": "string"
+        },
+        "minimum_version": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "read_only": {
+          "type": "boolean"
+        },
+        "type": {
+          "type": "string",
+          "const": "protocol_incompatible"
+        }
+      },
+      "required": [
+        "type",
+        "minimum_version",
+        "maximum_version",
+        "read_only",
+        "message"
+      ]
+    },
+    {
+      "description": "Authentication failed",
+      "type": "object",
+      "properties": {
+        "reason": {
+          "type": "string"
+        },
+        "type": {
+          "type": "string",
+          "const": "authentication_failed"
+        }
+      },
+      "required": [
+        "type",
+        "reason"
+      ]
+    },
+    {
+      "description": "Correlated acceptance or rejection for a time-sensitive coding\nmutation. `accepted` means the current authorized CLI accepted the\noperation for processing; clients never infer success from send().\nA [`MutationKind::Input`] acknowledgement is only ever a rejection,\nand settles the send it names; see there.",
+      "type": "object",
+      "properties": {
+        "accepted": {
+          "type": "boolean"
+        },
+        "error": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "mutation": {
+          "$ref": "#/$defs/MutationKind"
+        },
+        "pane_id": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        },
+        "question_pending": {
+          "description": "A fresh native bridge check permits an explicit corrected submission\nafter rejection. Missing means the question's state is uncertain.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "request_id": {
+          "type": "string"
+        },
+        "session_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "type": {
+          "type": "string",
+          "const": "mutation_ack"
+        }
+      },
+      "required": [
+        "type",
+        "request_id",
+        "session_id",
+        "mutation",
+        "accepted"
+      ]
+    },
+    {
+      "description": "Latest connected-CLI lifecycle capabilities and per-pane reboot\npreservation consequence list.",
+      "type": "object",
+      "properties": {
+        "inventory": {
+          "$ref": "#/$defs/CliLifecycleInventory",
+          "default": {
+            "panes": [],
+            "persistent_terminal_hosting": false
+          }
+        },
+        "machine_id": {
+          "description": "The instance that reported this inventory, which the server tags\nfrom the sending attachment. Each instance has its own hosting\ncapability and panes, so clients keep one inventory per (session,\nmachine). A per-session one would flip to whichever instance\nreported last, and a reboot confirmation would count another\nmachine's panes. On attach the server replays one per attached\ninstance. `None` from older servers and for an attachment that\nreported no machine, i.e. the session's only instance.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "uuid"
+        },
+        "session_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "type": {
+          "type": "string",
+          "const": "cli_lifecycle_inventory"
+        }
+      },
+      "required": [
+        "type",
+        "session_id"
+      ]
+    },
+    {
+      "description": "Authoritative progress/outcome for one lifecycle request.",
+      "type": "object",
+      "properties": {
+        "inventory": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/CliLifecycleInventory"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "machine_id": {
+          "description": "The instance the request was for (see\n`WebToServer::CliLifecycleRequest::machine_id`), so a carried\n`inventory` replaces that machine's entry. `None` as for\n[`ServerToWeb::CliLifecycleInventory`].",
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "uuid"
+        },
+        "message": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "operation": {
+          "$ref": "#/$defs/CliLifecycleOperation"
+        },
+        "phase": {
+          "$ref": "#/$defs/CliLifecyclePhase"
+        },
+        "request_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "session_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "type": {
+          "type": "string",
+          "const": "cli_lifecycle_status"
+        }
+      },
+      "required": [
+        "type",
+        "session_id",
+        "request_id",
+        "operation",
+        "phase"
+      ]
+    },
+    {
+      "description": "Session started",
+      "type": "object",
+      "properties": {
+        "pane_id": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        },
+        "pane_type": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PaneType"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "session_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "type": {
+          "type": "string",
+          "const": "session_started"
+        }
+      },
+      "required": [
+        "type",
+        "session_id"
+      ]
+    },
+    {
+      "description": "Session status update",
+      "type": "object",
+      "properties": {
+        "status": {
+          "$ref": "#/$defs/SessionStatus"
+        },
+        "type": {
+          "type": "string",
+          "const": "session_status"
+        }
+      },
+      "required": [
+        "type",
+        "status"
+      ]
+    },
+    {
+      "description": "Session attached confirmation (includes whether CLI is active)",
+      "type": "object",
+      "properties": {
+        "has_active_cli": {
+          "type": "boolean"
+        },
+        "session_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "type": {
+          "type": "string",
+          "const": "session_attached"
+        }
+      },
+      "required": [
+        "type",
+        "session_id",
+        "has_active_cli"
+      ]
+    },
+    {
+      "description": "Correlated rejection for one requested session attachment.",
+      "type": "object",
+      "properties": {
+        "message": {
+          "type": "string"
+        },
+        "reason": {
+          "$ref": "#/$defs/SessionAttachmentRejectionReason"
+        },
+        "session_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "type": {
+          "type": "string",
+          "const": "session_attachment_rejected"
+        }
+      },
+      "required": [
+        "type",
+        "session_id",
+        "reason",
+        "message"
+      ]
+    },
+    {
+      "description": "The session's attached project instances. Always the complete set\nrather than a delta, so an empty list means no instance is attached.\n\nSent only to connections that advertised\n[`PROJECT_INSTANCES_CAPABILITY`] in `Authenticate.capabilities`. Older\nnative builds reject an unknown frame and reconnect, and a replay on\nevery attach would keep them reconnecting. For an attached connection\nthat advertised it, the server sends the set right after\n`SessionAttached`, and again whenever the set changes: an instance\nattaches or detaches, or the primary hands over. A client without the\ncapability uses `SessionInfo::instances` from the session list and the\npane tags in `PaneList`, which older schemas accept.",
+      "type": "object",
+      "properties": {
+        "instances": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/SessionInstanceInfo"
+          }
+        },
+        "session_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "type": {
+          "type": "string",
+          "const": "session_instances"
+        }
+      },
+      "required": [
+        "type",
+        "session_id",
+        "instances"
+      ]
+    },
+    {
+      "description": "Output from Claude",
+      "type": "object",
+      "properties": {
+        "content": {
+          "type": "string"
+        },
+        "output_type": {
+          "$ref": "#/$defs/OutputType",
+          "default": "text"
+        },
+        "pane_id": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        },
+        "pane_type": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PaneType"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "session_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "uuid"
+        },
+        "type": {
+          "type": "string",
+          "const": "output"
+        }
+      },
+      "required": [
+        "type",
+        "content"
+      ]
+    },
+    {
+      "description": "Error message",
+      "type": "object",
+      "properties": {
+        "message": {
+          "type": "string"
+        },
+        "type": {
+          "type": "string",
+          "const": "error"
+        }
+      },
+      "required": [
+        "type",
+        "message"
+      ]
+    },
+    {
+      "description": "List of available CLI clients",
+      "type": "object",
+      "properties": {
+        "clients": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/CliClientInfo"
+          }
+        },
+        "type": {
+          "type": "string",
+          "const": "cli_clients"
+        }
+      },
+      "required": [
+        "type",
+        "clients"
+      ]
+    },
+    {
+      "description": "List of daemon-reported machines and projects",
+      "type": "object",
+      "properties": {
+        "machines": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/MachineWithProjects"
+          }
+        },
+        "type": {
+          "type": "string",
+          "const": "machines"
+        }
+      },
+      "required": [
+        "type",
+        "machines"
+      ]
+    },
+    {
+      "description": "Structured message from Claude CLI stream-json output",
+      "type": "object",
+      "properties": {
+        "created_at": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "message": {
+          "$ref": "#/$defs/ClaudeStreamMessage"
+        },
+        "pane_id": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        },
+        "pane_type": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PaneType"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "session_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "type": {
+          "type": "string",
+          "const": "stream_message"
+        }
+      },
+      "required": [
+        "type",
+        "session_id",
+        "message"
+      ]
+    },
+    {
+      "description": "List of persisted sessions",
+      "type": "object",
+      "properties": {
+        "sessions": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/SessionInfo"
+          }
+        },
+        "type": {
+          "type": "string",
+          "const": "sessions"
+        }
+      },
+      "required": [
+        "type",
+        "sessions"
+      ]
+    },
+    {
+      "description": "Project-wide authorization changed outside this socket. Clients use\nthis as a refresh hint; the server remains the authorization boundary.",
+      "type": "object",
+      "properties": {
+        "change": {
+          "$ref": "#/$defs/ProjectAccessChange"
+        },
+        "project_id": {
+          "type": "string"
+        },
+        "role": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "type": {
+          "type": "string",
+          "const": "project_access_changed"
+        }
+      },
+      "required": [
+        "type",
+        "project_id",
+        "change"
+      ]
+    },
+    {
+      "description": "Messages for a session",
+      "type": "object",
+      "properties": {
+        "catchup": {
+          "type": "boolean",
+          "default": false
+        },
+        "has_more": {
+          "type": "boolean",
+          "default": false
+        },
+        "messages": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/MessageInfo"
+          }
+        },
+        "session_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "type": {
+          "type": "string",
+          "const": "session_messages"
+        }
+      },
+      "required": [
+        "type",
+        "session_id",
+        "messages"
+      ]
+    },
+    {
+      "description": "User input/prompt from CLI (displayed in web UI)",
+      "type": "object",
+      "properties": {
+        "client_msg_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "created_at": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "pane_id": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        },
+        "pane_type": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PaneType"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "session_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "text": {
+          "type": "string"
+        },
+        "type": {
+          "type": "string",
+          "const": "user_input"
+        }
+      },
+      "required": [
+        "type",
+        "session_id",
+        "text"
+      ]
+    },
+    {
+      "description": "A provider transcript recorded a web-originated terminal message.\nUserInput only acknowledges forwarding; it is not delivery evidence.",
+      "type": "object",
+      "properties": {
+        "client_msg_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "pane_id": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "session_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "type": {
+          "type": "string",
+          "const": "terminal_conversation_recorded"
+        }
+      },
+      "required": [
+        "type",
+        "session_id",
+        "pane_id"
+      ]
+    },
+    {
+      "description": "Deadloop pause status update (legacy - use PanePaused for new code)",
+      "type": "object",
+      "properties": {
+        "is_paused": {
+          "type": "boolean"
+        },
+        "session_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "type": {
+          "type": "string",
+          "const": "deadloop_status"
+        }
+      },
+      "required": [
+        "type",
+        "session_id",
+        "is_paused"
+      ]
+    },
+    {
+      "description": "Pane pause status update",
+      "type": "object",
+      "properties": {
+        "is_paused": {
+          "type": "boolean"
+        },
+        "pane_id": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "session_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "type": {
+          "type": "string",
+          "const": "pane_paused"
+        }
+      },
+      "required": [
+        "type",
+        "session_id",
+        "pane_id",
+        "is_paused"
+      ]
+    },
+    {
+      "description": "Pane status update (e.g., \"thinking\") for status bar display.\n`session_id` lets the web client drop statuses for sessions it is\nnot currently viewing — the web is multi-attached to keep background\ntabs live, but only the foreground tab should drive the status pill.",
+      "type": "object",
+      "properties": {
+        "pane_id": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        },
+        "pane_type": {
+          "$ref": "#/$defs/PaneType",
+          "default": "deadloop"
+        },
+        "session_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "status": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "type": {
+          "type": "string",
+          "const": "pane_status"
+        }
+      },
+      "required": [
+        "type",
+        "session_id"
+      ]
+    },
+    {
+      "description": "List of pane configurations for a session",
+      "type": "object",
+      "properties": {
+        "panes": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/PaneConfig"
+          }
+        },
+        "session_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "type": {
+          "type": "string",
+          "const": "pane_list"
+        }
+      },
+      "required": [
+        "type",
+        "session_id",
+        "panes"
+      ]
+    },
+    {
+      "description": "Answer to a [`WebToServer::AddPane`] that carried a `request_id`.\n`Starting` is followed by a final `Routed` or `Failed` for the same\nrequest; see [`AddPaneStatus`].\n\nSent only to the connection that sent the request, never to the\nsession's other viewers. Only a client that understands this frame\nsends a `request_id`, and older native builds drop their socket on a\nframe their schema does not list. If that connection is gone when a\nlater result is ready, the result is dropped, and the client reports\nthe launch as unconfirmed.",
+      "type": "object",
+      "properties": {
+        "error": {
+          "description": "Why no tab was created; set with `Failed`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "machine_id": {
+          "description": "The machine the tab was routed to, or is waiting for.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "uuid"
+        },
+        "pane_id": {
+          "description": "The pane id the server allocated, once there is one. Ids are\nallocated against the whole project, so they are unique across\nmachines and concurrent requests.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        },
+        "request_id": {
+          "type": "string"
+        },
+        "session_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "status": {
+          "$ref": "#/$defs/AddPaneStatus"
+        },
+        "type": {
+          "type": "string",
+          "const": "add_pane_result"
+        }
+      },
+      "required": [
+        "type",
+        "session_id",
+        "request_id",
+        "status"
+      ]
+    },
+    {
+      "description": "Usage limits update from a CLI client",
+      "type": "object",
+      "properties": {
+        "cli_client_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "limits": {
+          "$ref": "#/$defs/UsageLimits"
+        },
+        "provider": {
+          "$ref": "#/$defs/Provider",
+          "default": "claude"
+        },
+        "type": {
+          "type": "string",
+          "const": "usage_limits"
+        }
+      },
+      "required": [
+        "type",
+        "cli_client_id",
+        "limits"
+      ]
+    },
+    {
+      "description": "Plan-review request forwarded from CLI. Phase 3.2b2.",
+      "type": "object",
+      "properties": {
+        "input": true,
+        "pane_id": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "session_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "tool_name": {
+          "type": "string"
+        },
+        "tool_use_id": {
+          "type": "string"
+        },
+        "type": {
+          "type": "string",
+          "const": "plan_review_request"
+        }
+      },
+      "required": [
+        "type",
+        "session_id",
+        "pane_id",
+        "tool_use_id",
+        "tool_name",
+        "input"
+      ]
+    },
+    {
+      "description": "On-demand diff for a pane's isolated worktree branch. Phase 1.2a.",
+      "type": "object",
+      "properties": {
+        "base": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "branch": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "diff": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "error": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "pane_id": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "session_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "type": {
+          "type": "string",
+          "const": "pane_diff"
+        }
+      },
+      "required": [
+        "type",
+        "session_id",
+        "pane_id"
+      ]
+    },
+    {
+      "description": "Forwarded from `CliToServer::PrCreated` after the CLI ran\n`gh pr create --fill`. The web shows a toast with the URL or\nthe error.",
+      "type": "object",
+      "properties": {
+        "error": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "pane_id": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "session_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "type": {
+          "type": "string",
+          "const": "pr_created"
+        },
+        "url": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "type",
+        "session_id",
+        "pane_id"
+      ]
+    },
+    {
+      "description": "Per-project and per-pane usage stats (prompt/token/cost counts) for\nthe Overview. Pushed after each turn is recorded and replayed on\nattach; the server aggregates from the day-bucketed stats table.",
+      "type": "object",
+      "properties": {
+        "session_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "stats": {
+          "$ref": "#/$defs/ProjectUsageStats"
+        },
+        "type": {
+          "type": "string",
+          "const": "project_usage_stats"
+        }
+      },
+      "required": [
+        "type",
+        "session_id",
+        "stats"
+      ]
+    },
+    {
+      "description": "Result of a web-initiated `CreateProjectInstance`, relayed from the\ndaemon's ack to the requesting user's web clients as a toast. Distinct\nfrom the generic `Error` variant (which renders in the chat log).",
+      "type": "object",
+      "properties": {
+        "error": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "machine_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "project_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "request_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "type": {
+          "type": "string",
+          "const": "project_instance_created"
+        }
+      },
+      "required": [
+        "type",
+        "machine_id"
+      ]
+    },
+    {
+      "description": "Local registration result after canonical identity and policy finalize.",
+      "type": "object",
+      "properties": {
+        "machine_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "request_id": {
+          "type": "string"
+        },
+        "result": {
+          "$ref": "#/$defs/LocalProjectRegistrationResult"
+        },
+        "type": {
+          "type": "string",
+          "const": "local_project_registered"
+        }
+      },
+      "required": [
+        "type",
+        "machine_id",
+        "request_id",
+        "result"
+      ]
+    },
+    {
+      "description": "Forwarded from `CliToServer::ProjectFlagsChanged`. Web mirrors\nthe latest Tech-Lead autonomy flags per session for the Overview\ntoggles.",
+      "type": "object",
+      "properties": {
+        "auto_approve_todos": {
+          "type": "boolean"
+        },
+        "auto_merge_prs": {
+          "type": "boolean"
+        },
+        "disallowed_tab_types": {
+          "description": "Tab types this project refuses to create, as `<kind>:<provider>`\nkeys (see `tab_type_key`). A *deny* list so that absent means\n\"everything allowed\" — see `tab_type_allowed`. Owner/admin only,\nsame gate as the flags above.",
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
+        },
+        "session_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "team_enabled": {
+          "description": "Drives whether the web shows any team surface at all. The CLI\nre-broadcasts this every 5s from `.apas`, so a web client that\nattaches mid-session hydrates without asking.",
+          "type": "boolean",
+          "default": false
+        },
+        "type": {
+          "type": "string",
+          "const": "project_flags_changed"
+        }
+      },
+      "required": [
+        "type",
+        "session_id",
+        "auto_approve_todos",
+        "auto_merge_prs"
+      ]
+    },
+    {
+      "description": "Effective cluster-governed policy for the attached project.",
+      "type": "object",
+      "properties": {
+        "noncompliant_pane_ids": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "integer",
+            "format": "uint32",
+            "minimum": 0
+          }
+        },
+        "policy": {
+          "$ref": "#/$defs/EffectiveProjectPolicy"
+        },
+        "session_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "type": {
+          "type": "string",
+          "const": "project_policy_changed"
+        }
+      },
+      "required": [
+        "type",
+        "session_id",
+        "policy"
+      ]
+    },
+    {
+      "description": "Live pty bytes for a terminal pane, fanned out to every web\nclient attached to the session.",
+      "type": "object",
+      "properties": {
+        "data_b64": {
+          "type": "string"
+        },
+        "instance_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "uuid"
+        },
+        "pane_id": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "seq": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "session_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "type": {
+          "type": "string",
+          "const": "terminal_output"
+        }
+      },
+      "required": [
+        "type",
+        "session_id",
+        "pane_id",
+        "data_b64",
+        "seq"
+      ]
+    },
+    {
+      "description": "Replayed scrollback in answer to `WebToServer::TerminalAttach`.\n\n`seq` is the sequence of the newest chunk included, so the client\ncan drop any live `TerminalOutput` it already buffered at or below\nit instead of double-rendering. `truncated` is true when the ring\nbuffer dropped older bytes, which means the replay may begin\npartway through an escape sequence — the client writes a reset\nfirst so a clipped sequence can't corrupt the emulator state.",
+      "type": "object",
+      "properties": {
+        "data_b64": {
+          "type": "string"
+        },
+        "instance_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "uuid"
+        },
+        "lifecycle": {
+          "$ref": "#/$defs/TerminalLifecycle",
+          "default": "unknown"
+        },
+        "pane_id": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "runtime": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TerminalRuntimeReconciliation"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "seq": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "session_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "status": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "truncated": {
+          "type": "boolean",
+          "default": false
+        },
+        "type": {
+          "type": "string",
+          "const": "terminal_snapshot"
+        }
+      },
+      "required": [
+        "type",
+        "session_id",
+        "pane_id",
+        "data_b64",
+        "seq"
+      ]
+    },
+    {
+      "description": "A terminal pane's child process ended.",
+      "type": "object",
+      "properties": {
+        "instance_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "uuid"
+        },
+        "pane_id": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "session_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "status": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "type": {
+          "type": "string",
+          "const": "terminal_exited"
+        }
+      },
+      "required": [
+        "type",
+        "session_id",
+        "pane_id"
+      ]
+    },
+    {
+      "description": "Live terminal lifecycle change. Snapshot carries the same fields for\nclients that attach after this event was emitted.",
+      "type": "object",
+      "properties": {
+        "instance_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "uuid"
+        },
+        "lifecycle": {
+          "$ref": "#/$defs/TerminalLifecycle",
+          "default": "unknown"
+        },
+        "pane_id": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "runtime": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TerminalRuntimeReconciliation"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "session_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "status": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "type": {
+          "type": "string",
+          "const": "terminal_state"
+        }
+      },
+      "required": [
+        "type",
+        "session_id",
+        "pane_id"
+      ]
+    },
+    {
+      "description": "Complete pane-scoped snapshot returned on list/open.",
+      "type": "object",
+      "properties": {
+        "availability": {
+          "$ref": "#/$defs/PaneWorkSummaryAvailability",
+          "default": "unknown"
+        },
+        "pane_id": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "session_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "summaries": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/PaneWorkSummary"
+          }
+        },
+        "type": {
+          "type": "string",
+          "const": "pane_work_summaries"
+        }
+      },
+      "required": [
+        "type",
+        "session_id",
+        "pane_id"
+      ]
+    },
+    {
+      "description": "Incremental generation/cache state for a single pane window.",
+      "type": "object",
+      "properties": {
+        "availability": {
+          "$ref": "#/$defs/PaneWorkSummaryAvailability",
+          "default": "unknown"
+        },
+        "pane_id": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "session_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "summary": {
+          "$ref": "#/$defs/PaneWorkSummary"
+        },
+        "type": {
+          "type": "string",
+          "const": "pane_work_summary_updated"
+        }
+      },
+      "required": [
+        "type",
+        "session_id",
+        "pane_id",
+        "summary"
+      ]
+    },
+    {
+      "description": "The answer to one [`WebToServer::ControlPaneAutopilot`], sent to the\nrequesting connection only.",
+      "type": "object",
+      "properties": {
+        "outcome": {
+          "$ref": "#/$defs/AutopilotReceiptOutcome"
+        },
+        "pane_id": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "reason": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "request_id": {
+          "type": "string"
+        },
+        "session_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "type": {
+          "type": "string",
+          "const": "pane_autopilot_receipt"
+        }
+      },
+      "required": [
+        "type",
+        "session_id",
+        "pane_id",
+        "request_id",
+        "outcome"
+      ]
+    },
+    {
+      "description": "Autopilot availability and state of one OMP terminal tab, sent only\nto viewers that negotiated [`crate::TAB_AUTOPILOT_CAPABILITY`]. A\nclient that holds none for an OMP terminal tab shows not reported.",
+      "type": "object",
+      "properties": {
+        "pane_id": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "reported_at": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "session_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "state": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PaneAutopilotState"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "support": {
+          "$ref": "#/$defs/AutopilotSupport"
+        },
+        "type": {
+          "type": "string",
+          "const": "pane_autopilot_state"
+        }
+      },
+      "required": [
+        "type",
+        "session_id",
+        "pane_id",
+        "support"
+      ]
+    },
+    {
+      "description": "The answer to one [`WebToServer::UpdateAutopilotPrompts`], sent to the\nrequesting connection only and only once: the primary instance's\nreceipt, a refusal by the server, or `Uncertain` when the primary did\nnot answer in time. The list a viewer shows changes only with\n[`Self::ProjectAutopilotPrompts`].",
+      "type": "object",
+      "properties": {
+        "outcome": {
+          "$ref": "#/$defs/AutopilotReceiptOutcome"
+        },
+        "reason": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "request_id": {
+          "type": "string"
+        },
+        "session_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "type": {
+          "type": "string",
+          "const": "autopilot_prompts_receipt"
+        }
+      },
+      "required": [
+        "type",
+        "session_id",
+        "request_id",
+        "outcome"
+      ]
+    },
+    {
+      "description": "The project's saved autopilot prompts, as the session's primary\ninstance reported them. Sent only to viewers that negotiated\n[`crate::PROJECT_AUTOPILOT_PROMPTS_CAPABILITY`]: on attach, after\n`SessionAttached`, when the server holds a list, and whenever the\nlist changes.",
+      "type": "object",
+      "properties": {
+        "default": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "prompts": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/SavedAutopilotPrompt"
+          }
+        },
+        "session_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "type": {
+          "type": "string",
+          "const": "project_autopilot_prompts"
+        },
+        "unreadable": {
+          "description": "See `CliToServer::ProjectAutopilotPrompts::unreadable`: the\ndialog says the list cannot be read and offers no save.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "type",
+        "session_id",
+        "prompts"
+      ]
+    },
+    {
+      "description": "Echo of `WebToServer::Heartbeat`. The browser's liveness loop\nuses any inbound frame (including this one) as proof the WS is\nhealthy; a missing echo within `livenessMs` triggers reconnect.",
+      "type": "object",
+      "properties": {
+        "type": {
+          "type": "string",
+          "const": "heartbeat"
+        }
+      },
+      "required": [
+        "type"
+      ]
+    }
+  ],
+  "$defs": {
+    "AddPaneStatus": {
+      "description": "Outcome of one correlated [`WebToServer::AddPane`].",
+      "oneOf": [
+        {
+          "description": "Delivered to the target machine's running instance. This is delivery,\nnot creation: the tab appears when that instance reports it in the\nproject's pane list.",
+          "type": "string",
+          "const": "routed"
+        },
+        {
+          "description": "The target machine has the project but was not running it, so its\ninstance is being started and the tab will be created when it\nattaches. Starting is asynchronous and bounded, so this is never the\nlast word: `Routed` or `Failed` follows for the same `request_id`.\nPending starts live in server memory and a server restart drops them\nwithout a reply, which a client must show as unconfirmed rather than\nresend.",
+          "type": "string",
+          "const": "starting"
+        },
+        {
+          "description": "No tab was created; `error` says why.",
+          "type": "string",
+          "const": "failed"
+        }
+      ]
+    },
+    "AutopilotCondition": {
+      "description": "What a tab on autopilot is doing. `kind` and `detail` are plain strings\nfrom [`autopilot_condition`], not enums, because a tab's extension can be\nnewer or older than the CLI, the server and the viewer that read its\nreport. A reader shows a value it does not know as it would an unknown\nstate, and never drops the report.",
+      "type": "object",
+      "properties": {
+        "detail": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "kind": {
+          "type": "string"
+        },
+        "since": {
+          "description": "RFC 3339 time the condition began.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "kind"
+      ]
+    },
+    "AutopilotEnded": {
+      "description": "A tab's last ended autopilot, kept so its reason can be shown and its\nvalues offered for a new start.",
+      "type": "object",
+      "properties": {
+        "autopilot_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "ended_at": {
+          "type": "string"
+        },
+        "iterations": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "reason": {
+          "description": "One of the `END_*` values of [`autopilot_condition`].",
+          "type": "string"
+        },
+        "spec": {
+          "$ref": "#/$defs/AutopilotSpec"
+        },
+        "started_at": {
+          "type": "string"
+        },
+        "turn_since": {
+          "description": "Whether a turn that started after the autopilot ended has run. Lists\nstop showing the reason once one has.",
+          "type": "boolean",
+          "default": false
+        }
+      },
+      "required": [
+        "autopilot_id",
+        "spec",
+        "started_at",
+        "iterations",
+        "reason",
+        "ended_at"
+      ]
+    },
+    "AutopilotLimit": {
+      "description": "One limit, as an explicit value. \"No limit\" is a value of its own and is\nnever expressed by leaving the limit out: a field that one version drops\nmust not turn a limited autopilot into an unlimited one.",
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "none"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "description": "Iterations for an iteration limit, seconds for a time limit.",
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "at_most"
+            },
+            "value": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "value"
+          ]
+        }
+      ]
+    },
+    "AutopilotReceiptOutcome": {
+      "description": "How a request was answered. `Accepted` means the tab took the request; the\ndisplayed state changes only when the tab reports it.",
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "accepted"
+          ]
+        },
+        {
+          "description": "With a reason. Nothing was started or changed.",
+          "type": "string",
+          "const": "refused"
+        },
+        {
+          "description": "Not confirmed in time. A pause or a stop stays in force until the tab\napplies it. A start or a resume may have been taken; the tab's\nreported state shows it. A client never resends by itself.",
+          "type": "string",
+          "const": "uncertain"
+        }
+      ]
+    },
+    "AutopilotRepeat": {
+      "description": "When the next iteration is due.",
+      "oneOf": [
+        {
+          "description": "Five seconds after the tab settles.",
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "after_each_turn"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "description": "This long after the previous iteration was submitted, and never\nsooner than five seconds after the tab settles.",
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "every"
+            },
+            "seconds": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "seconds"
+          ]
+        }
+      ]
+    },
+    "AutopilotSpec": {
+      "description": "One autopilot as it runs: a prompt, a timing and optional limits. This is\nthe strict form the server forwards and the tab reports back.",
+      "type": "object",
+      "properties": {
+        "end_without_tool_call": {
+          "description": "End after an iteration whose turn completes without a tool call.",
+          "type": "boolean"
+        },
+        "iteration_limit": {
+          "description": "Most iterations it may submit; the first counts.",
+          "$ref": "#/$defs/AutopilotLimit"
+        },
+        "prompt": {
+          "description": "Submitted as typed text each iteration. Slash commands, skills and\nprompt templates in it are not run.",
+          "type": "string"
+        },
+        "repeat": {
+          "$ref": "#/$defs/AutopilotRepeat"
+        },
+        "time_limit": {
+          "description": "Seconds from the start after which autopilot ends. Paused, waiting and\nholding time counts.",
+          "$ref": "#/$defs/AutopilotLimit"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "prompt",
+        "repeat",
+        "iteration_limit",
+        "time_limit",
+        "end_without_tool_call"
+      ]
+    },
+    "AutopilotSupport": {
+      "description": "Whether autopilot can be used on one OMP terminal tab.",
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "supported",
+            "unavailable_on_platform"
+          ]
+        },
+        {
+          "description": "The tab's agent was launched with autopilot support and no fresh state\nreport exists, or nothing has arrived from the tab's instance. Shown\nas not reported, never as off. Stop and Stop now stay available.",
+          "type": "string",
+          "const": "not_reported"
+        },
+        {
+          "description": "The agent was started by an APAS that had no autopilot. It is never\nrebooted automatically.",
+          "type": "string",
+          "const": "needs_agent_reboot"
+        },
+        {
+          "description": "The tab's OMP is below the minimum version or lacks a call autopilot\nuses.",
+          "type": "string",
+          "const": "unsupported_omp"
+        },
+        {
+          "description": "Added by the server for viewers, never sent by a CLI: the instance\nthat owns the tab is attached without [`OMP_TAB_AUTOPILOT_CAPABILITY`].",
+          "type": "string",
+          "const": "instance_update_required"
+        }
+      ]
+    },
+    "AutopilotView": {
+      "description": "A tab's current autopilot: on, or paused.",
+      "type": "object",
+      "properties": {
+        "autopilot_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "condition": {
+          "$ref": "#/$defs/AutopilotCondition"
+        },
+        "deadline": {
+          "description": "RFC 3339 time the time limit ends, when the autopilot has one.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "iterations": {
+          "description": "Iterations submitted so far.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "next_iteration_at": {
+          "description": "RFC 3339 time the next iteration is due, while it waits for that.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "spec": {
+          "$ref": "#/$defs/AutopilotSpec"
+        },
+        "started_at": {
+          "description": "RFC 3339.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "autopilot_id",
+        "spec",
+        "started_at",
+        "iterations",
+        "condition"
+      ]
+    },
+    "ClaudeAssistantMessage": {
+      "description": "Claude assistant message structure",
+      "type": "object",
+      "properties": {
+        "content": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ClaudeContentBlock"
+          }
+        },
+        "model": {
+          "type": "string",
+          "default": ""
+        }
+      },
+      "additionalProperties": true,
+      "required": [
+        "content"
+      ]
+    },
+    "ClaudeContentBlock": {
+      "description": "Content block types in Claude messages",
+      "oneOf": [
+        {
+          "description": "Text content from Claude",
+          "type": "object",
+          "properties": {
+            "text": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "text"
+            }
+          },
+          "required": [
+            "type",
+            "text"
+          ]
+        },
+        {
+          "description": "Tool use request from Claude",
+          "type": "object",
+          "properties": {
+            "id": {
+              "type": "string"
+            },
+            "input": true,
+            "name": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "tool_use"
+            }
+          },
+          "required": [
+            "type",
+            "id",
+            "name",
+            "input"
+          ]
+        },
+        {
+          "description": "Tool result (in user messages)\nNote: Claude CLI can send `content` as either a string or an array of\ncontent parts. We use a custom deserializer to handle both.",
+          "type": "object",
+          "properties": {
+            "content": {
+              "type": "string"
+            },
+            "is_error": {
+              "type": "boolean",
+              "default": false
+            },
+            "tool_use_id": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "tool_result"
+            }
+          },
+          "required": [
+            "type",
+            "tool_use_id",
+            "content"
+          ]
+        }
+      ]
+    },
+    "ClaudeStreamMessage": {
+      "description": "Top-level message from Claude CLI stream-json output",
+      "oneOf": [
+        {
+          "description": "System initialization message",
+          "type": "object",
+          "properties": {
+            "cwd": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "default": null
+            },
+            "model": {
+              "type": "string",
+              "default": ""
+            },
+            "session_id": {
+              "type": "string"
+            },
+            "subtype": {
+              "type": "string"
+            },
+            "tools": {
+              "type": "array",
+              "default": [],
+              "items": {
+                "type": "string"
+              }
+            },
+            "type": {
+              "type": "string",
+              "const": "system"
+            }
+          },
+          "additionalProperties": true,
+          "required": [
+            "type",
+            "subtype",
+            "session_id"
+          ]
+        },
+        {
+          "description": "Assistant (Claude) message with content blocks",
+          "type": "object",
+          "properties": {
+            "message": {
+              "$ref": "#/$defs/ClaudeAssistantMessage"
+            },
+            "session_id": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "assistant"
+            }
+          },
+          "additionalProperties": true,
+          "required": [
+            "type",
+            "message",
+            "session_id"
+          ]
+        },
+        {
+          "description": "User message (typically tool results)",
+          "type": "object",
+          "properties": {
+            "message": {
+              "$ref": "#/$defs/ClaudeUserMessage"
+            },
+            "session_id": {
+              "type": "string"
+            },
+            "tool_use_result": {
+              "default": null
+            },
+            "type": {
+              "type": "string",
+              "const": "user"
+            }
+          },
+          "additionalProperties": true,
+          "required": [
+            "type",
+            "message",
+            "session_id"
+          ]
+        },
+        {
+          "description": "Final result message",
+          "type": "object",
+          "properties": {
+            "duration_ms": {
+              "type": "integer",
+              "format": "uint64",
+              "default": 0,
+              "minimum": 0
+            },
+            "is_error": {
+              "type": "boolean",
+              "default": false
+            },
+            "result": {
+              "type": "string",
+              "default": ""
+            },
+            "session_id": {
+              "type": "string"
+            },
+            "subtype": {
+              "type": "string"
+            },
+            "total_cost_usd": {
+              "type": "number",
+              "format": "double",
+              "default": 0.0
+            },
+            "type": {
+              "type": "string",
+              "const": "result"
+            }
+          },
+          "additionalProperties": true,
+          "required": [
+            "type",
+            "subtype",
+            "session_id"
+          ]
+        }
+      ]
+    },
+    "ClaudeUserMessage": {
+      "description": "Claude user message structure (for tool results)",
+      "type": "object",
+      "properties": {
+        "content": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ClaudeContentBlock"
+          }
+        },
+        "role": {
+          "type": "string",
+          "default": ""
+        }
+      },
+      "required": [
+        "content"
+      ]
+    },
+    "CliClientInfo": {
+      "description": "Information about a CLI client",
+      "type": "object",
+      "properties": {
+        "active_session": {
+          "description": "Active session ID if the CLI has a local session running",
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "uuid"
+        },
+        "id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "last_seen": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "date-time"
+        },
+        "name": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "status": {
+          "$ref": "#/$defs/CliClientStatus"
+        },
+        "version": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "id",
+        "status"
+      ]
+    },
+    "CliClientStatus": {
+      "description": "CLI client status",
+      "type": "string",
+      "enum": [
+        "online",
+        "offline",
+        "busy"
+      ]
+    },
+    "CliLifecycleInventory": {
+      "description": "Current lifecycle capabilities and the per-pane reboot consequence list.\nEmpty/default values make the message safe while CLI versions roll out.",
+      "type": "object",
+      "properties": {
+        "panes": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/PanePreservationInfo"
+          }
+        },
+        "persistent_terminal_hosting": {
+          "type": "boolean",
+          "default": false
+        }
+      }
+    },
+    "CliLifecycleOperation": {
+      "description": "A project-level lifecycle operation.\n\nOnly reboot is a user decision. Transport recovery used to be a second\nvariant here, driven by a `Reconnect Server` button, and was withdrawn: the\nCLI already re-dials a lost transport on its own with bounded backoff, and a\nrequest to do so has to travel over the very transport that is down.",
+      "type": "string",
+      "enum": [
+        "reboot_cli"
+      ]
+    },
+    "CliLifecyclePhase": {
+      "description": "Authoritative progress for a correlated lifecycle request.",
+      "type": "string",
+      "enum": [
+        "accepted",
+        "preparing",
+        "reconnecting",
+        "handoff",
+        "reconciling",
+        "succeeded",
+        "failed",
+        "timed_out"
+      ]
+    },
+    "DeepseekBackendInfo": {
+      "description": "Machine-level DeepSeek backend status safe to expose to web UI.",
+      "type": "object",
+      "properties": {
+        "api_base_url": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "api_key": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "api_key_configured": {
+          "type": "boolean",
+          "default": false
+        }
+      }
+    },
+    "EffectiveProjectPolicy": {
+      "type": "object",
+      "properties": {
+        "allowed_launch_profiles": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "project_suspended": {
+          "type": "boolean",
+          "default": false
+        },
+        "team_available": {
+          "type": "boolean"
+        },
+        "version": {
+          "type": "integer",
+          "format": "int64"
+        }
+      },
+      "required": [
+        "team_available",
+        "allowed_launch_profiles",
+        "version"
+      ]
+    },
+    "JobAllowedActions": {
+      "type": "object",
+      "properties": {
+        "admit": {
+          "type": "boolean"
+        },
+        "answer": {
+          "type": "boolean"
+        },
+        "cancel": {
+          "type": "boolean"
+        },
+        "manage_policy": {
+          "type": "boolean"
+        },
+        "retry": {
+          "type": "boolean"
+        },
+        "retry_publication": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "admit",
+        "answer",
+        "cancel",
+        "retry",
+        "retry_publication",
+        "manage_policy"
+      ]
+    },
+    "JobDetail": {
+      "type": "object",
+      "properties": {
+        "high_watermark": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "job": {
+          "$ref": "#/$defs/JobSummary"
+        },
+        "policy_digest": {
+          "type": "string"
+        },
+        "publication": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/JobPublication"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "questions": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/JobQuestion"
+          }
+        },
+        "runs": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/JobRun"
+          }
+        },
+        "task": {
+          "$ref": "#/$defs/JobTaskSpec"
+        }
+      },
+      "required": [
+        "job",
+        "task",
+        "runs",
+        "questions",
+        "high_watermark",
+        "policy_digest"
+      ]
+    },
+    "JobEvent": {
+      "type": "object",
+      "properties": {
+        "created_at": {
+          "type": "string"
+        },
+        "detail": true,
+        "id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "job_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "kind": {
+          "$ref": "#/$defs/JobEventKind"
+        },
+        "run_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "uuid"
+        },
+        "seq": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "summary": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "job_id",
+        "seq",
+        "kind",
+        "summary",
+        "created_at"
+      ]
+    },
+    "JobEventKind": {
+      "type": "string",
+      "enum": [
+        "admitted",
+        "phase_changed",
+        "progress",
+        "subagent",
+        "question",
+        "answer_confirmed",
+        "usage",
+        "verification",
+        "publication",
+        "cancellation_requested",
+        "stopped",
+        "failed",
+        "recovery_required"
+      ]
+    },
+    "JobLimits": {
+      "type": "object",
+      "properties": {
+        "attempts": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "cpu_millis": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "elapsed_seconds": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "memory_bytes": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "model_concurrency": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "model_output_tokens": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "output_bytes": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "pids": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "spend_micro_usd": {
+          "description": "Reported-spend threshold, not a promise about the provider's final invoice.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "workspace_bytes": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "elapsed_seconds",
+        "spend_micro_usd",
+        "attempts",
+        "cpu_millis",
+        "memory_bytes",
+        "workspace_bytes",
+        "output_bytes",
+        "pids",
+        "model_concurrency",
+        "model_output_tokens"
+      ]
+    },
+    "JobPublication": {
+      "type": "object",
+      "properties": {
+        "base_sha": {
+          "type": "string"
+        },
+        "branch": {
+          "type": "string"
+        },
+        "draft": {
+          "type": "boolean"
+        },
+        "head_sha": {
+          "type": "string"
+        },
+        "number": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "observed_at": {
+          "type": "string"
+        },
+        "repository": {
+          "type": "string"
+        },
+        "state": {
+          "type": "string"
+        },
+        "url": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "repository",
+        "number",
+        "url",
+        "branch",
+        "base_sha",
+        "head_sha",
+        "draft",
+        "state",
+        "observed_at"
+      ]
+    },
+    "JobQuestion": {
+      "type": "object",
+      "properties": {
+        "answers": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "$ref": "#/$defs/JobQuestionAnswer"
+          }
+        },
+        "confirmed_at": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "created_at": {
+          "type": "string"
+        },
+        "dialog_id": {
+          "type": "string"
+        },
+        "epoch": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "questions": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/JobQuestionItem"
+          }
+        },
+        "run_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "state": {
+          "$ref": "#/$defs/JobQuestionState"
+        },
+        "tool_call_id": {
+          "type": "string"
+        },
+        "version": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "id",
+        "run_id",
+        "epoch",
+        "version",
+        "dialog_id",
+        "tool_call_id",
+        "state",
+        "questions",
+        "created_at"
+      ]
+    },
+    "JobQuestionAnswer": {
+      "type": "object",
+      "properties": {
+        "custom_input": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "id": {
+          "type": "string"
+        },
+        "selected_option_ids": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "selected_option_ids"
+      ]
+    },
+    "JobQuestionItem": {
+      "type": "object",
+      "properties": {
+        "header": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "id": {
+          "type": "string"
+        },
+        "multi": {
+          "type": "boolean"
+        },
+        "options": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/JobQuestionOption"
+          }
+        },
+        "question": {
+          "type": "string"
+        },
+        "recommended": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "id",
+        "question",
+        "options",
+        "multi"
+      ]
+    },
+    "JobQuestionOption": {
+      "type": "object",
+      "properties": {
+        "description": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "id": {
+          "type": "string"
+        },
+        "label": {
+          "type": "string"
+        },
+        "preview": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "id",
+        "label"
+      ]
+    },
+    "JobQuestionState": {
+      "type": "string",
+      "enum": [
+        "pending",
+        "answer_accepted",
+        "answer_delivered",
+        "confirmed",
+        "uncertain",
+        "cancelled"
+      ]
+    },
+    "JobRun": {
+      "type": "object",
+      "properties": {
+        "attempt": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "candidate_sha": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "ended_at": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "epoch": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "job_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "reason": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "started_at": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "state": {
+          "$ref": "#/$defs/JobState"
+        },
+        "stop_evidence": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/JobStopEvidence"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "usage": {
+          "$ref": "#/$defs/JobUsage"
+        },
+        "worker_version": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "id",
+        "job_id",
+        "attempt",
+        "epoch",
+        "state",
+        "usage"
+      ]
+    },
+    "JobState": {
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "queued",
+            "preparing",
+            "running",
+            "needs_input",
+            "verifying",
+            "publishing",
+            "review_ready",
+            "blocked",
+            "recovery_required",
+            "cancelling",
+            "cancelled",
+            "failed"
+          ]
+        },
+        {
+          "description": "Successful read-only worker inspection; never evidence of code delivery.",
+          "type": "string",
+          "const": "completed"
+        }
+      ]
+    },
+    "JobStopEvidence": {
+      "type": "object",
+      "properties": {
+        "boot_id": {
+          "type": "string"
+        },
+        "container_id": {
+          "type": "string"
+        },
+        "descendants_stopped": {
+          "type": "boolean"
+        },
+        "reason": {
+          "type": "string"
+        },
+        "stopped_at": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "boot_id",
+        "container_id",
+        "stopped_at",
+        "reason",
+        "descendants_stopped"
+      ]
+    },
+    "JobSummary": {
+      "type": "object",
+      "properties": {
+        "allowed_actions": {
+          "$ref": "#/$defs/JobAllowedActions"
+        },
+        "attention_count": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "cluster_owner_user_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "created_at": {
+          "type": "string"
+        },
+        "current_run_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "hostname": {
+          "type": "string"
+        },
+        "id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "limits": {
+          "$ref": "#/$defs/JobLimits"
+        },
+        "machine_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "project_id": {
+          "type": "string"
+        },
+        "project_name": {
+          "type": "string"
+        },
+        "reason": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "state": {
+          "$ref": "#/$defs/JobState"
+        },
+        "state_version": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "title": {
+          "type": "string"
+        },
+        "updated_at": {
+          "type": "string"
+        },
+        "usage": {
+          "$ref": "#/$defs/JobUsage"
+        }
+      },
+      "required": [
+        "id",
+        "project_id",
+        "project_name",
+        "title",
+        "state",
+        "state_version",
+        "current_run_id",
+        "cluster_owner_user_id",
+        "machine_id",
+        "hostname",
+        "created_at",
+        "updated_at",
+        "usage",
+        "limits",
+        "attention_count",
+        "allowed_actions"
+      ]
+    },
+    "JobTaskSpec": {
+      "type": "object",
+      "properties": {
+        "acceptance_criteria": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "base_ref": {
+          "type": "string"
+        },
+        "base_sha": {
+          "type": "string"
+        },
+        "instruction": {
+          "type": "string"
+        },
+        "model_profile": {
+          "type": "string"
+        },
+        "repository": {
+          "type": "string"
+        },
+        "source_url": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "verification_profile": {
+          "type": "string"
+        },
+        "verification_profile_digest": {
+          "type": "string"
+        },
+        "worker": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/WorkerExecutionContext"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "worker_profile": {
+          "type": "string"
+        },
+        "worker_profile_digest": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "instruction",
+        "acceptance_criteria",
+        "repository",
+        "base_ref",
+        "base_sha",
+        "worker_profile",
+        "worker_profile_digest",
+        "verification_profile",
+        "verification_profile_digest",
+        "model_profile"
+      ]
+    },
+    "JobUsage": {
+      "type": "object",
+      "properties": {
+        "elapsed_seconds": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "estimated": {
+          "type": "boolean"
+        },
+        "input_tokens": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "output_tokens": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "spend_micro_usd": {
+          "description": "None is unknown, not zero.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "elapsed_seconds",
+        "input_tokens",
+        "output_tokens",
+        "estimated"
+      ]
+    },
+    "LocalProjectRegistrationResult": {
+      "description": "A registration cannot simultaneously succeed and carry an error.",
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "project": {
+              "$ref": "#/$defs/MachineProjectInfo"
+            },
+            "status": {
+              "type": "string",
+              "const": "registered"
+            }
+          },
+          "required": [
+            "status",
+            "project"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "error": {
+              "type": "string"
+            },
+            "status": {
+              "type": "string",
+              "const": "failed"
+            }
+          },
+          "required": [
+            "status",
+            "error"
+          ]
+        }
+      ]
+    },
+    "MachineClusterAccess": {
+      "type": "string",
+      "enum": [
+        "owner",
+        "member"
+      ]
+    },
+    "MachineInfo": {
+      "description": "Information about a machine reported by a daemon",
+      "type": "object",
+      "properties": {
+        "arch": {
+          "type": "string"
+        },
+        "daemon_version": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "deepseek_backend": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DeepseekBackendInfo"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "hostname": {
+          "type": "string"
+        },
+        "last_seen": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "machine_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "os": {
+          "type": "string"
+        },
+        "providers": {
+          "description": "Which terminal providers this machine's daemon can launch. `None` means\nunknown: an older daemon reports nothing, and a viewer must not read\nthat as \"not installed\". `Some(list)` is the daemon's whole answer, so\na daemon sends the full list in every `MachineInfo` it sends (register\nand `MachineInfoUpdate`); the server keeps the latest report as it is.\nAn entry this build cannot parse, such as a provider added later, is\ndropped rather than failing the whole registration.",
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "$ref": "#/$defs/MachineProviderStatus"
+          }
+        }
+      },
+      "required": [
+        "machine_id",
+        "hostname",
+        "os",
+        "arch"
+      ]
+    },
+    "MachineProjectInfo": {
+      "description": "APAS project discovered on a machine",
+      "type": "object",
+      "properties": {
+        "git_remote": {
+          "description": "Canonical lowercase `host/owner/repo` of the checkout's `origin`,\nnormalized exactly like `CliToServer::SessionStart::git_remote`. A\nregistered project that has never started has no session to carry its\nremote, so without this the web files it under \"(no remote)\" instead\nof beside the repository's other projects, and `apas register` cannot\nmatch it. `None` without an origin and from older daemons.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "is_running": {
+          "type": "boolean",
+          "default": false
+        },
+        "last_error": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "memory_kb": {
+          "description": "Resident set size of the headless CLI process, in KiB. Reported by the\ndaemon from /proc/<pid>/status so the UI can spot runaway memory usage\nbefore the kernel does.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "name": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "path": {
+          "type": "string"
+        },
+        "pid": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        },
+        "preferred_machine_id": {
+          "description": "Server-persisted navigation preference within this machine's cluster.\nThis is neither a runtime placement lock nor an access grant.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "uuid"
+        },
+        "project_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "project_id",
+        "path"
+      ]
+    },
+    "MachineProviderStatus": {
+      "description": "One provider's availability on a machine, as its daemon found it.",
+      "type": "object",
+      "properties": {
+        "can_install": {
+          "description": "The daemon can install this provider by itself (today only OMP). This\nsays what the machine can do, not what the viewer may ask for: the\ncommand that performs an install authorizes its requester.",
+          "type": "boolean"
+        },
+        "installed": {
+          "description": "The daemon resolved an executable it would launch for this provider.",
+          "type": "boolean"
+        },
+        "provider": {
+          "$ref": "#/$defs/Provider"
+        },
+        "version": {
+          "description": "The version the executable reported, when the daemon asked it.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "provider",
+        "installed",
+        "can_install"
+      ]
+    },
+    "MachineWithProjects": {
+      "description": "Machine with its project list",
+      "type": "object",
+      "properties": {
+        "cluster_access": {
+          "$ref": "#/$defs/MachineClusterAccess",
+          "default": "owner"
+        },
+        "cluster_owner_user_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "daemon_connected": {
+          "description": "The machine's daemon holds a live connection to this server now.\n`MachineInfo::last_seen` is stamped on connect, heartbeat and\ndisconnect alike, so a just-disconnected daemon looks freshly seen.\nIt cannot separate \"offline\" from \"connected but too old\", which a\ndisabled machine choice has to explain differently. False from older\nservers.",
+          "type": "boolean",
+          "default": false
+        },
+        "local_project_registration_available": {
+          "type": "boolean",
+          "default": false
+        },
+        "machine": {
+          "$ref": "#/$defs/MachineInfo"
+        },
+        "project_instances_available": {
+          "description": "The machine's daemon is connected and advertises\n[`PROJECT_INSTANCES_CAPABILITY`], so a project's tabs can be started on\nit beside instances on other machines. Clients offer a machine choice\nfor new tabs only where this is true. False on a connected daemon\n(`daemon_connected`) means an older daemon: reboot it to update. False\nfrom older servers.",
+          "type": "boolean",
+          "default": false
+        },
+        "projects": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/MachineProjectInfo"
+          }
+        },
+        "shared_provisioning_available": {
+          "type": "boolean",
+          "default": false
+        }
+      },
+      "required": [
+        "machine",
+        "projects"
+      ]
+    },
+    "MessageInfo": {
+      "description": "Information about a persisted message",
+      "type": "object",
+      "properties": {
+        "content": {
+          "type": "string"
+        },
+        "created_at": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "id": {
+          "type": "string"
+        },
+        "message_type": {
+          "type": "string"
+        },
+        "pane_id": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        },
+        "pane_type": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "role": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "role",
+        "content",
+        "message_type"
+      ]
+    },
+    "MobilePaneSummary": {
+      "description": "One agent pane, as mobile needs to list it.",
+      "type": "object",
+      "properties": {
+        "autopilot": {
+          "description": "Autopilot availability and condition of an OMP terminal tab, without\nits prompt. Absent for other panes and from older servers; an older\nclient ignores it.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PaneAutopilotSummary"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "awaiting_answer": {
+          "description": "True while this pane is blocked on an unresolved agent question. This\nis neither active work nor idle time and takes presentation precedence\nover provider availability.",
+          "type": "boolean",
+          "default": false
+        },
+        "hostname": {
+          "description": "Display name for the pane's host badge; see [`PaneConfig::hostname`].",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "idle_since": {
+          "description": "Most recent working-to-idle transition observed by the server. Older\nservers omit it; clients keep those panes visible after timestamped ones.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "is_working": {
+          "description": "True while this pane is reporting work, from the same pane statuses the\nsession-level flag is derived from.",
+          "type": "boolean",
+          "default": false
+        },
+        "kind": {
+          "$ref": "#/$defs/PaneKind"
+        },
+        "label": {
+          "description": "The pane's own label when it has one; the client falls back to its kind\nand id, exactly as the session screen does.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "machine_id": {
+          "description": "Machine whose project instance runs this pane; see\n[`PaneConfig::machine_id`]. Absent from older servers, for panes\nwritten before multi-machine instances, and for panes reported by a\nCLI without [`PROJECT_INSTANCES_CAPABILITY`]. No machine owns those\nyet; [`PaneConfig::machine_id`] says where their controls go.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "uuid"
+        },
+        "mode": {
+          "description": "Historical deadloop panes remain readable but cannot accept new input.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PaneMode"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "model": {
+          "description": "Model/backend override used to associate provider-scoped availability\nwith the same usage account the pane actually consumes.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "pane_id": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "provider": {
+          "$ref": "#/$defs/Provider"
+        },
+        "usage_limited": {
+          "description": "Provider availability is not pane activity. Carry the latest explicit\nblock separately so shared/mobile snapshots do not turn it into idle.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/UsageLimited"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "pane_id",
+        "kind",
+        "provider"
+      ]
+    },
+    "MutationKind": {
+      "description": "What a [`ServerToWeb::MutationAck`] answers. Its `request_id` is the id the\nrequest carried: `request_id` on approvals, answers and interrupts, and\n`client_msg_id` on typed input.",
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "approval",
+            "question",
+            "plan_review",
+            "interrupt"
+          ]
+        },
+        {
+          "description": "The server refused a [`WebToServer::Input`] or\n[`WebToServer::TerminalConversationInput`] that carried a\n`client_msg_id`. The acknowledgement's `request_id` is that id, and its\n`pane_id` the tab the input was for: the one it named, else the legacy\npane the server resolved it to. It is only ever a refusal: `accepted`\nis false, `error` gives the reason and `question_pending` is absent.\nAccepted input is acknowledged as before, by the\n[`ServerToWeb::UserInput`] echo carrying the same `client_msg_id`, so a\nclient never waits for an accepted one.\n\nThe server sends it when it refuses the input because of the tab's\nmachine: that machine is not running the project (\"<host> is not\nrunning this project. Start it on <host> first.\"), or the sender may\nnot use it. It may send one for any other refusal of such an input\ntoo. A refusal reported only as an `Error`, and every refusal from an\nolder server, leaves the send unanswered, as before.\n\nEvery client that tracks the send settles it on this acknowledgement,\nwhatever the reason and whichever attempt it answers (the first send,\na retransmission or a replay):\n- It never sends that `client_msg_id` again: no retransmission, and no\n  replay after a reconnect, including from stored sends its other\n  connections share. The server records the id only of input it\n  delivers, so it judges every resend afresh: once the tab's machine\n  runs the project again, a resend would be delivered as new input,\n  possibly minutes after the user saw it refused. Sending the text\n  again is the user's choice, and a new send under a new id.\n- It shows `error` where it shows the send, instead of showing the\n  send as unconfirmed or still under way: its outcome is known. The\n  [`ServerToWeb::Error`] carrying the same text already told the user,\n  so a client that shows that error need not show the reason again as\n  a notice of its own.\n- It keeps the typed text recoverable, as for any send that did not\n  reach the agent.\n\nAn acknowledgement for an id the client is not tracking, because it\nalready settled that send or never sent it, changes nothing. A\n[`ServerToWeb::UserInput`] echo of a settled id can still arrive, from\nan attempt sent before the acknowledgement arrived and judged after the\ntab's machine ran the project again: the input was delivered after\nall, and the echo stands.\n\nIt goes only to the connection that sent the input, and only when that\nconnection negotiated [`PROJECT_INSTANCES_CAPABILITY`]. It comes in\naddition to the [`ServerToWeb::Error`] carrying the same text, never\ninstead of it, so a client that does not track sends by id still\nshows the refusal. The gate is what keeps older native builds\nconnected: their bundled schema lists only the four kinds above, and\nthey drop the socket on a frame it rejects.",
+          "type": "string",
+          "const": "input"
+        }
+      ]
+    },
+    "OmpGoalModeView": {
+      "description": "OMP's built-in goal mode, as OMP reports it. APAS shows it and never\nswitches it.",
+      "type": "object",
+      "properties": {
+        "goal_status": {
+          "description": "OMP's own goal status, such as budget-limited; known only after its\nfirst `goal_updated`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "objective": {
+          "description": "Cut to 500 characters by the tab.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "status": {
+          "description": "\"active\" or \"paused\".",
+          "type": "string"
+        },
+        "token_budget": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "tokens_used": {
+          "description": "Known only after OMP's first `goal_updated`.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "status"
+      ]
+    },
+    "OmpLoopModeView": {
+      "description": "OMP's built-in loop mode.",
+      "type": "object",
+      "properties": {
+        "status": {
+          "description": "\"active\" or \"paused\".",
+          "type": "string"
+        }
+      },
+      "required": [
+        "status"
+      ]
+    },
+    "OmpModesView": {
+      "description": "OMP's own self-continuing modes on a tab, however they were switched on.",
+      "type": "object",
+      "properties": {
+        "goal": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/OmpGoalModeView"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "loop": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/OmpLoopModeView"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    },
+    "OutputType": {
+      "description": "Type of output content",
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "text",
+            "system",
+            "error"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "code": {
+              "type": "object",
+              "properties": {
+                "language": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                }
+              }
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "code"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "tool_use": {
+              "type": "object",
+              "properties": {
+                "input": true,
+                "tool": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "tool",
+                "input"
+              ]
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "tool_use"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "tool_result": {
+              "type": "object",
+              "properties": {
+                "success": {
+                  "type": "boolean"
+                },
+                "tool": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "tool",
+                "success"
+              ]
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "tool_result"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "approval_request": {
+              "type": "object",
+              "properties": {
+                "description": {
+                  "type": "string"
+                },
+                "tool": {
+                  "type": "string"
+                },
+                "tool_call_id": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "tool_call_id",
+                "tool",
+                "description"
+              ]
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "approval_request"
+          ]
+        }
+      ]
+    },
+    "PaneAutopilotState": {
+      "description": "What one OMP terminal tab reports about autopilot.",
+      "type": "object",
+      "properties": {
+        "autopilot": {
+          "description": "The current autopilot, on or paused.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AutopilotView"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "last_ended": {
+          "description": "The last ended one, until another starts.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AutopilotEnded"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "omp_modes": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/OmpModesView"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "reported_by_cli": {
+          "description": "True for the one state the CLI reports itself: the pause it shows after\nthe tab's agent process has exited. No Resume, Stop or Stop now is\noffered for it.",
+          "type": "boolean"
+        }
+      }
+    },
+    "PaneAutopilotSummary": {
+      "description": "The autopilot part of a pane summary in session lists. It never carries\nthe prompt.",
+      "type": "object",
+      "properties": {
+        "condition": {
+          "description": "[`AutopilotCondition::kind`] of the current autopilot, or \"ended\" for\nan ended one whose reason lists still show.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "detail": {
+          "description": "The condition's detail, or the end reason.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "iteration_limit": {
+          "description": "Absent when there is no iteration limit.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "iterations": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "next_iteration_at": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "omp_goal": {
+          "description": "\"active\" or \"paused\" for OMP's own goal mode.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "omp_loop": {
+          "description": "\"active\" or \"paused\" for OMP's own loop mode.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "support": {
+          "$ref": "#/$defs/AutopilotSupport"
+        }
+      },
+      "required": [
+        "support"
+      ]
+    },
+    "PaneConfig": {
+      "description": "Configuration for a single pane",
+      "type": "object",
+      "properties": {
+        "backstory": {
+          "description": "Free-form additional context appended to the system prompt\n(project conventions, constraints, prior decisions). Long-ish\nis fine — claude's context window is large.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "effort": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "goal": {
+          "description": "One-line objective the pane is currently working toward, e.g.\n\"make the auth tests green\". Surfaced in the system prompt and\n(later) on the pane header.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "hostname": {
+          "description": "Hostname of `machine_id`, for display only. Hosts get renamed, so\nownership always uses `machine_id`. On an untagged pane the server\nkeeps the host it last recorded the pane under, if any: its attributed\nhost, so the tab is not shown under whichever instance happens to be\nprimary. That host is a display and routing hint (see `machine_id`),\nand never implies ownership.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "is_paused": {
+          "type": "boolean",
+          "default": false
+        },
+        "kind": {
+          "description": "Agent (headless stream-json, the default) vs Terminal (pty-hosted\ninteractive TUI). See [`PaneKind`].",
+          "$ref": "#/$defs/PaneKind",
+          "default": "agent"
+        },
+        "label": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "machine_id": {
+          "description": "Machine whose project instance runs this pane. A project can run one\ninstance per machine under one session, and a pane's process, terminal\nand controls live on exactly one of them for the pane's lifetime. The\nserver assigns this from the authenticated instance that reports the\npane, overriding whatever the pane data says, so no instance can claim\nanother machine's panes. A tagged pane's controls go only to the\ninstance attached on its machine, whichever instance is primary and\nwhether or not that one has [`PROJECT_INSTANCES_CAPABILITY`]; with\nnone attached there, they are refused as stopped on that machine.\n\n`None` = written before multi-machine instances, or reported by a CLI\nwithout [`PROJECT_INSTANCES_CAPABILITY`]. No machine owns such a pane\nuntil a capable instance reports it, which adopts it. Until then its\ncontrols go to the instance on its attributed host (`hostname`), else\nto the sole attached instance when that lacks the capability, else,\nwhen it has no attributed host, to the primary; otherwise they are\nrefused as stopped on that host. When capable instance M reports its\nroster, the server:\n- replaces every pane tagged M, so a pane tagged M that M no longer\n  reports is gone;\n- tags M on a reported pane whose roster entry is untagged (adoption\n  from the `.apas`, surfacing on the server);\n- drops and logs a reported pane whose roster entry is tagged for\n  another machine;\n- leaves alone every untagged pane M did not report.\n\nThe last rule is why \"untagged\" does not mean \"the primary's\". A\nseparate checkout can join, and become primary, while the pre-upgrade\nhost is stopped. If the primary owned untagged panes, that checkout's\nfirst, empty roster would erase every tab the host still has, with no\nstopped badge and nothing to forget.\n\nA CLI without the capability is only ever the session's sole instance,\nand nothing it reports is tagged. When it reports its roster, the\nserver:\n- takes every pane it reports, untagged and attributed to its host, in\n  place of that id's entry whatever the entry's tag: on a shared home\n  such a CLI restores and runs every pane in the `.apas`, as before\n  instances;\n- removes every untagged pane it did not report, and every pane tagged\n  with its own machine id (the one its `SessionStart` named, if any)\n  that it did not report;\n- keeps every pane tagged for another machine that it did not report,\n  listed as stopped on that machine, with its id still allocated.\n\nThe last rule is for a separate checkout, whose tabs such a CLI cannot\nsee. Replacing the whole roster would erase them while their machine is\nstopped, leaving nothing to start or forget until it ran the project\nagain, and would free their ids for another pane.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "uuid"
+        },
+        "managed": {
+          "description": "v3.5 — managed vs. unmanaged. `true` = this pane is part of the\nproject team, usually created by the Overview Start team role\nslots or by accepted worker suggestions / manual managed-worker\nflows. Such panes show up on the Overview Pane Grid and the Tech\nLead may consider them for delegation. `false` (the compatibility\ndefault and the value for user-created terminal panes) = not part of\nthe team queue and never a Tech Lead delegation target.",
+          "type": "boolean",
+          "default": false
+        },
+        "manual_mode": {
+          "description": "v3.2 — worker mode. `false` (default) = **autonomous**: the Tech\nLead may delegate to this pane via `.apas-team.jsonl`. `true` =\n**manual**: the worker only takes user chat; the Tech Lead should\nskip it when picking a delegation target. Persisted to `.apas`.",
+          "type": "boolean",
+          "default": false
+        },
+        "min_iteration_interval_minutes": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "mode": {
+          "$ref": "#/$defs/PaneMode"
+        },
+        "model": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "pane_id": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "plan_review_mode": {
+          "description": "Phase 3.2a: per-pane policy for the editable plan checkpoint.\nDefault is `Never` (today's behaviour) so existing panes keep\nrunning without prompts.",
+          "$ref": "#/$defs/PlanReviewMode",
+          "default": "never"
+        },
+        "prompt": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "provider": {
+          "$ref": "#/$defs/Provider"
+        },
+        "role": {
+          "description": "Short role label for the agent in this pane, e.g. \"backend\nimplementer\" or \"reviewer\". When set, gets prepended to claude's\nsystem prompt at spawn so the agent self-identifies. Phase 2.1.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "session_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "stop_requested": {
+          "type": "boolean",
+          "default": false
+        },
+        "worktree_path": {
+          "description": "Absolute path to an isolated git worktree this pane should run in.\nWhen `None`, the pane runs in the project's main working_dir as before\n(legacy behaviour, all panes share one tree → potential conflicts).\nPhase 1.1 of the swarm plan adds an opt-in path that puts each pane\non its own branch+worktree so parallel work doesn't race; this field\nis the persistence hook for that. The worktree itself is created\nout-of-band (CLI subcommand / web action) — apas does not touch git\njust because the field is set.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "pane_id",
+        "provider",
+        "mode",
+        "session_id"
+      ]
+    },
+    "PaneKind": {
+      "description": "How a pane hosts its agent process. Orthogonal to [`Provider`] (which\nbinary) and [`PaneMode`] (how autonomous).\n\n* [`PaneKind::Agent`] — the legacy/managed-team path: the CLI runs the provider\n  headlessly (`claude --print --output-format stream-json`,\n  `codex exec --json`) and parses structured events into\n  `CliToServer::StreamMessage`. Everything team-mode depends on —\n  usage counters, pane status, diffs, plan review, scratchpad\n  publishing, Tech Lead delegation — is built on those events. New\n  unmanaged panes are no longer created with this kind, but existing panes\n  remain compatible and managed team panes continue to use it.\n* [`PaneKind::Terminal`] — the pane instead hosts the provider's real\n  interactive TUI on a pty. Raw bytes flow over the dedicated\n  `Terminal*` messages and are rendered by xterm.js in the browser.\n  Nothing is parsed, so a terminal pane has none of the structured\n  integrations above and is never a delegation target. This is the normal\n  kind for new user-created Claude, Codex, and OpenCode panes.\n\n`#[serde(default)]` on `PaneConfig::kind` keeps `.apas` files written\nbefore this existed deserializing as `Agent`.",
+      "type": "string",
+      "enum": [
+        "agent",
+        "terminal"
+      ]
+    },
+    "PaneMode": {
+      "description": "Mode for a pane",
+      "type": "string",
+      "enum": [
+        "deadloop",
+        "interactive"
+      ]
+    },
+    "PanePreservationInfo": {
+      "type": "object",
+      "properties": {
+        "mode": {
+          "$ref": "#/$defs/PanePreservationMode"
+        },
+        "pane_id": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "runtime_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "uuid"
+        }
+      },
+      "required": [
+        "pane_id",
+        "mode"
+      ]
+    },
+    "PanePreservationMode": {
+      "description": "Whether one configured pane can retain its exact live process during a\nfull CLI replacement.",
+      "type": "string",
+      "enum": [
+        "live_adoptable",
+        "restart_required_on_cli_reboot",
+        "structured_pane_may_resume"
+      ]
+    },
+    "PaneType": {
+      "description": "Pane type for dual-pane mode (legacy - kept for backward compatibility)",
+      "oneOf": [
+        {
+          "description": "Autonomous deadloop worker (left pane)",
+          "type": "string",
+          "const": "deadloop"
+        },
+        {
+          "description": "Interactive user session (right pane)",
+          "type": "string",
+          "const": "interactive"
+        }
+      ]
+    },
+    "PaneUsageStats": {
+      "description": "Per-pane usage broken down by time window (cumulative lifetime plus the\nrolling 7-day and today windows derived from day-bucketed rows).",
+      "type": "object",
+      "properties": {
+        "last_7d": {
+          "$ref": "#/$defs/UsageCounters",
+          "default": {
+            "cache_creation_tokens": 0,
+            "cache_read_tokens": 0,
+            "cost_usd": 0.0,
+            "cost_usd_reported": false,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "prompts": 0,
+            "responses": 0
+          }
+        },
+        "last_active": {
+          "description": "Most recent activity timestamp (ISO 8601), max over the pane's buckets.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "lifetime": {
+          "$ref": "#/$defs/UsageCounters",
+          "default": {
+            "cache_creation_tokens": 0,
+            "cache_read_tokens": 0,
+            "cost_usd": 0.0,
+            "cost_usd_reported": false,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "prompts": 0,
+            "responses": 0
+          }
+        },
+        "pane_id": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "today": {
+          "$ref": "#/$defs/UsageCounters",
+          "default": {
+            "cache_creation_tokens": 0,
+            "cache_read_tokens": 0,
+            "cost_usd": 0.0,
+            "cost_usd_reported": false,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "prompts": 0,
+            "responses": 0
+          }
+        }
+      },
+      "required": [
+        "pane_id"
+      ]
+    },
+    "PaneWorkSummary": {
+      "description": "One cached summary record. Source text and intermediate notes are never\npersisted in this record.",
+      "type": "object",
+      "properties": {
+        "attempts": {
+          "type": "integer",
+          "format": "uint32",
+          "default": 0,
+          "minimum": 0
+        },
+        "error": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "generated_at": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "date-time"
+        },
+        "model": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "pane_id": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "protocol_version": {
+          "type": "integer",
+          "format": "uint32",
+          "default": 1,
+          "minimum": 0
+        },
+        "provider": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "session_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "source_digest": {
+          "type": "string",
+          "default": ""
+        },
+        "source_message_count": {
+          "type": "integer",
+          "format": "uint32",
+          "default": 0,
+          "minimum": 0
+        },
+        "source_through": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "date-time"
+        },
+        "source_through_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "status": {
+          "$ref": "#/$defs/PaneWorkSummaryStatus",
+          "default": "queued"
+        },
+        "summary": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "updated_at": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "date-time"
+        },
+        "window_end": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "window_kind": {
+          "$ref": "#/$defs/PaneWorkSummaryWindowKind",
+          "default": "completed"
+        },
+        "window_start": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "session_id",
+        "pane_id",
+        "window_start",
+        "window_end"
+      ]
+    },
+    "PaneWorkSummaryAvailability": {
+      "description": "Generation support reported alongside cached records.",
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "available"
+          ]
+        },
+        {
+          "description": "The selected session is owned by a CLI predating this capability.",
+          "type": "string",
+          "const": "cli_update_required"
+        },
+        {
+          "description": "The CLI supports the protocol but its isolated adapter is disabled.",
+          "type": "string",
+          "const": "summarizer_disabled"
+        },
+        {
+          "description": "The configured adapter is temporarily unable to accept generation.",
+          "type": "string",
+          "const": "summarizer_unavailable"
+        },
+        {
+          "description": "A legacy or partially upgraded peer did not report availability.",
+          "type": "string",
+          "const": "unknown"
+        }
+      ]
+    },
+    "PaneWorkSummaryStatus": {
+      "description": "Durable generation state for one pane/window/source digest.",
+      "type": "string",
+      "enum": [
+        "queued",
+        "generating",
+        "complete",
+        "partial",
+        "stale",
+        "failed",
+        "source_expired"
+      ]
+    },
+    "PaneWorkSummaryWindowKind": {
+      "description": "Whether the cached record covers a closed window or the still-open window.",
+      "type": "string",
+      "enum": [
+        "completed",
+        "current"
+      ]
+    },
+    "PlanReviewMode": {
+      "description": "Phase 3.2a: per-pane policy for the \"editable plan checkpoint\"\nfeature. The streaming worker reads this at every turn to decide\nwhether to gate the first tool_use behind a user-approval card.",
+      "oneOf": [
+        {
+          "description": "Hold every turn's first tool_use until the user approves.",
+          "type": "string",
+          "const": "always"
+        },
+        {
+          "description": "Hold only when the turn's first tool_use is in a \"risky\" set\n(Write/Edit/Bash). Read-only tools run through.",
+          "type": "string",
+          "const": "risky_only"
+        },
+        {
+          "description": "Today's behaviour: no gating.",
+          "type": "string",
+          "const": "never"
+        }
+      ]
+    },
+    "ProjectAccessChange": {
+      "description": "Messages sent from server to web client",
+      "type": "string",
+      "enum": [
+        "transferred",
+        "revoked",
+        "deleted"
+      ]
+    },
+    "ProjectUsageStats": {
+      "description": "Project-level usage: the per-pane breakdown plus the project totals\n(sum over all panes of every session that shares this project_id).",
+      "type": "object",
+      "properties": {
+        "last_7d": {
+          "$ref": "#/$defs/UsageCounters",
+          "default": {
+            "cache_creation_tokens": 0,
+            "cache_read_tokens": 0,
+            "cost_usd": 0.0,
+            "cost_usd_reported": false,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "prompts": 0,
+            "responses": 0
+          }
+        },
+        "last_active": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "lifetime": {
+          "$ref": "#/$defs/UsageCounters",
+          "default": {
+            "cache_creation_tokens": 0,
+            "cache_read_tokens": 0,
+            "cost_usd": 0.0,
+            "cost_usd_reported": false,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "prompts": 0,
+            "responses": 0
+          }
+        },
+        "panes": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/PaneUsageStats"
+          }
+        },
+        "today": {
+          "$ref": "#/$defs/UsageCounters",
+          "default": {
+            "cache_creation_tokens": 0,
+            "cache_read_tokens": 0,
+            "cost_usd": 0.0,
+            "cost_usd_reported": false,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "prompts": 0,
+            "responses": 0
+          }
+        }
+      }
+    },
+    "Provider": {
+      "description": "Provider for a pane",
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "codex",
+            "deepseek",
+            "opencode",
+            "cursor-agent"
+          ]
+        },
+        {
+          "description": "`claude-old` / `claude_old` aliases keep panes serialized before the\nstreaming-only switchover deserializing as the (now-only) Claude\nvariant. The legacy per-turn `--print` worker has been removed; all\n`Provider::Claude` panes use the long-lived stream-json worker.",
+          "type": "string",
+          "const": "claude"
+        },
+        {
+          "description": "Decode-only compatibility tombstone. MiniMax is not launchable.",
+          "type": "string",
+          "const": "minimax",
+          "deprecated": true
+        },
+        {
+          "description": "Decode-only compatibility tombstone. GLM is not launchable.",
+          "type": "string",
+          "const": "glm",
+          "deprecated": true
+        },
+        {
+          "description": "Decode-only compatibility tombstone. The Pi coding agent (`pi`) is not\nlaunchable; OMP replaced it. The value stays so an older `.apas`, a\nstored session or policy, and a frame from an older client still parse.",
+          "type": "string",
+          "const": "pi",
+          "deprecated": true
+        },
+        {
+          "description": "Oh My Pi (`omp`): a standalone Pi-derived agent, terminal-only in APAS.\nIt has no `--session-id`, so a pane is pinned by giving it a private\n`--session-dir` instead; see `terminal_pane::omp_session_args`.",
+          "type": "string",
+          "const": "omp"
+        }
+      ]
+    },
+    "SavedAutopilotPrompt": {
+      "description": "One prompt saved to a project, as `.apas` keeps it and the wire carries\nit.",
+      "type": "object",
+      "properties": {
+        "name": {
+          "description": "Trimmed, 1 to [`AUTOPILOT_PROMPT_NAME_MAX_CHARS`] characters, unique in\nthe project ignoring case.",
+          "type": "string"
+        },
+        "prompt": {
+          "description": "Meets the bounds of a start's prompt\n([`crate::validate_autopilot_prompt`]).",
+          "type": "string"
+        },
+        "updated_at": {
+          "description": "RFC 3339 time of the last save, set by the CLI that wrote it.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "prompt",
+        "updated_at"
+      ]
+    },
+    "SessionAttachmentRejectionReason": {
+      "description": "Why a requested session attachment was rejected. The session id carried\nalongside this value lets clients reconcile concurrent foreground and\nbackground attachment attempts without treating a global error as the\nresult of whichever navigation happens to be visible.",
+      "type": "string",
+      "enum": [
+        "project_access_required",
+        "host_machine_access_required",
+        "project_unavailable",
+        "session_not_found"
+      ]
+    },
+    "SessionInfo": {
+      "description": "Information about a persisted session",
+      "type": "object",
+      "properties": {
+        "cli_client_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "uuid"
+        },
+        "created_at": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "git_remote": {
+          "description": "Canonical `host/owner/repo` of the project's git `origin` remote. The\nweb sidebar groups projects with the same value under one repo header.\n`None`/absent means \"no remote\" (its own sidebar group).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "git_remote_url": {
+          "description": "Raw `origin` URL for this project's repo (the cloneable URL). Surfaced\nso the web can prefill the clone URL when creating a new instance.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "hostname": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "instances": {
+          "description": "The project's attached (running) instances, one per machine, so a\nproject list can name every host instead of only the primary's\n`hostname`. Omitted by older servers and when nothing is attached; in\nboth cases `hostname`/`working_dir` remain the description to show.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/SessionInstanceInfo"
+          }
+        },
+        "is_active": {
+          "description": "True if this session has an active CLI client connected",
+          "type": "boolean",
+          "default": false
+        },
+        "is_shared": {
+          "description": "True if this session is shared with the user (not owned)",
+          "type": "boolean",
+          "default": false
+        },
+        "is_working": {
+          "description": "True when at least one pane is currently reporting work. This is\nmeaningful only while `is_active` is true.",
+          "type": "boolean",
+          "default": false
+        },
+        "owner_email": {
+          "description": "Email of the session owner (only set if is_shared is true)",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "panes": {
+          "description": "The panes in this session and whether each is working.\n\n`is_working` above answers \"is anything happening here\", which cannot\nanswer \"which agent is waiting for me\": a project with one busy pane\nreads as working, hiding every idle pane in it. Both are derived from\nthe same pane statuses, so they cannot disagree.\n\nDefaulted: an older server omits it, and a client must read that as \"no\npane detail\" rather than as a session with no panes.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/MobilePaneSummary"
+          }
+        },
+        "project_id": {
+          "description": "Stable project identity from `.apas`. Web UI groups by this.\nFalls back to `id` for legacy rows that pre-date the column.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "uuid"
+        },
+        "share_role": {
+          "description": "Share role for this user on the session (\"owner\", \"admin\", or \"user\")",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "status": {
+          "type": "string"
+        },
+        "working_dir": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "id",
+        "status"
+      ]
+    },
+    "SessionInstanceInfo": {
+      "description": "One attached (running) instance of a session's project on one machine.",
+      "type": "object",
+      "properties": {
+        "hostname": {
+          "description": "Display name of `machine_id`; never used for routing.",
+          "type": "string"
+        },
+        "machine_id": {
+          "description": "`None` for an attached CLI that reported no machine: standalone and\nolder CLIs omit it, and the server's legacy inference fails closed\nwhen ambiguous. Such a CLI lacks [`PROJECT_INSTANCES_CAPABILITY`], so\nit is always the session's only instance and therefore its primary.\nRequests that name no machine reach it, and so do controls for\nuntagged panes. No machine-addressed request can target it. Listing\nit keeps the set complete: a live session never looks as if nothing\nwere attached.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "uuid"
+        },
+        "primary": {
+          "description": "True for the earliest attached instance. It supplies the session's\nlegacy single-valued `hostname`/`working_dir` and receives every\ncontrol that names no machine; when it leaves, the next earliest\nbecomes primary.",
+          "type": "boolean",
+          "default": false
+        },
+        "runtime_access": {
+          "description": "Whether the viewer this was sent to may use this instance's runtime:\ntype into its tabs, add tabs on it, reboot it. The server computes it\nper connection, because runtime access is evaluated per machine. On a\nthird-party host it needs cluster membership that covers this exact\nmachine, so one viewer can use some of a project's instances and not\nothers. Clients disable the instance's tabs and its machine choice\nwhen it is `Some(false)`, and say why. They do not offer controls that\ncan only fail with \"Access denied\". `None` means not evaluated; treat\nthe instance as usable and let the server decide.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "working_dir": {
+          "description": "The instance's checkout. Instances on a shared filesystem report the\nsame path; separate checkouts report their own.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "hostname"
+      ]
+    },
+    "SessionStatus": {
+      "description": "Session status",
+      "oneOf": [
+        {
+          "description": "Waiting for CLI client to connect",
+          "type": "string",
+          "const": "pending"
+        },
+        {
+          "description": "CLI client connected, session active",
+          "type": "string",
+          "const": "connected"
+        },
+        {
+          "description": "CLI client disconnected",
+          "type": "string",
+          "const": "disconnected"
+        },
+        {
+          "description": "Session ended",
+          "type": "string",
+          "const": "ended"
+        }
+      ]
+    },
+    "TerminalLifecycle": {
+      "description": "Last server-observable state of a pty-hosted terminal pane.\n\n`Disconnected` means the CLI transport went away while the terminal was\nlast known to be running; it does not claim the provider process exited.\n`Unknown` is the rollout-safe default for peers predating lifecycle\nreconciliation and after a server restart before the CLI reports state.",
+      "type": "string",
+      "enum": [
+        "unknown",
+        "running",
+        "disconnected",
+        "exited"
+      ]
+    },
+    "TerminalRuntimeReconciliation": {
+      "description": "Host-owned terminal continuity metadata reported during reconciliation.",
+      "type": "object",
+      "properties": {
+        "current_seq": {
+          "type": "integer",
+          "format": "uint64",
+          "default": 0,
+          "minimum": 0
+        },
+        "live_adopted": {
+          "type": "boolean",
+          "default": false
+        },
+        "oldest_seq": {
+          "type": "integer",
+          "format": "uint64",
+          "default": 0,
+          "minimum": 0
+        },
+        "runtime_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "uuid"
+        },
+        "truncated": {
+          "type": "boolean",
+          "default": false
+        }
+      }
+    },
+    "UsageCounters": {
+      "description": "Aggregated usage counters for a pane or project over one time window.\nAll token counts come from the per-turn Claude/Codex stream `result`\nusage; `prompts` counts user/loop inputs and `responses` counts completed\nturns. Fields are snake_case so the wire keys match the web store verbatim.",
+      "type": "object",
+      "properties": {
+        "cache_creation_tokens": {
+          "type": "integer",
+          "format": "uint64",
+          "default": 0,
+          "minimum": 0
+        },
+        "cache_read_tokens": {
+          "type": "integer",
+          "format": "uint64",
+          "default": 0,
+          "minimum": 0
+        },
+        "cost_usd": {
+          "description": "Sum of provider-reported cost in USD. A zero is meaningful only when\n`cost_usd_reported` is true.",
+          "type": "number",
+          "format": "double",
+          "default": 0.0
+        },
+        "cost_usd_reported": {
+          "description": "Whether at least one event in this window supplied an authoritative\ncost value. Older peers omit this and therefore read as unknown.",
+          "type": "boolean",
+          "default": false
+        },
+        "input_tokens": {
+          "type": "integer",
+          "format": "uint64",
+          "default": 0,
+          "minimum": 0
+        },
+        "output_tokens": {
+          "type": "integer",
+          "format": "uint64",
+          "default": 0,
+          "minimum": 0
+        },
+        "prompts": {
+          "type": "integer",
+          "format": "uint64",
+          "default": 0,
+          "minimum": 0
+        },
+        "responses": {
+          "type": "integer",
+          "format": "uint64",
+          "default": 0,
+          "minimum": 0
+        }
+      }
+    },
+    "UsageLimitWindow": {
+      "description": "Usage limit information for a time window (5-hour or 7-day)",
+      "type": "object",
+      "properties": {
+        "resets_at": {
+          "description": "When the limit resets (ISO 8601 timestamp)",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "utilization": {
+          "description": "Utilization as a fraction (0.0 to 1.0+)",
+          "type": "number",
+          "format": "double"
+        }
+      },
+      "required": [
+        "utilization"
+      ]
+    },
+    "UsageLimited": {
+      "description": "A provider-confirmed usage limit that is currently preventing work.\n\nThis is deliberately separate from utilization: included usage may reach\n100% while paid extra usage remains available, in which case the provider\nis not blocking requests and this field stays absent.",
+      "type": "object",
+      "properties": {
+        "model": {
+          "description": "Model family this limit applies to. Absent means the provider account\nis blocked generally. Anthropic currently uses display names such as\n\"Fable\" for model-scoped weekly limits.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "resets_at": {
+          "description": "When the provider expects work to become available again.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "window": {
+          "description": "Human-readable limiting window, such as \"weekly\" or \"5-hour\".",
+          "type": "string"
+        }
+      },
+      "required": [
+        "window"
+      ]
+    },
+    "UsageLimits": {
+      "description": "Usage limits from the provider API/logs",
+      "type": "object",
+      "properties": {
+        "fetched_at": {
+          "description": "When the usage was last fetched (ISO 8601 timestamp)",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "five_hour": {
+          "description": "5-hour rolling window usage",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/UsageLimitWindow"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "seven_day": {
+          "description": "7-day (weekly) rolling window usage",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/UsageLimitWindow"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "usage_limited": {
+          "description": "Present only when the provider says a usage limit is actively blocking\nrequests. A full utilization meter alone is not sufficient.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/UsageLimited"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    },
+    "WorkerAllowedActions": {
+      "type": "object",
+      "properties": {
+        "answer": {
+          "type": "boolean"
+        },
+        "edit_backlog": {
+          "type": "boolean"
+        },
+        "edit_mandate": {
+          "type": "boolean"
+        },
+        "pause": {
+          "type": "boolean"
+        },
+        "resume": {
+          "type": "boolean"
+        },
+        "retry": {
+          "type": "boolean"
+        },
+        "retry_publication": {
+          "type": "boolean"
+        },
+        "stop": {
+          "type": "boolean"
+        },
+        "wake": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "edit_mandate",
+        "edit_backlog",
+        "pause",
+        "stop",
+        "resume",
+        "wake",
+        "retry",
+        "answer",
+        "retry_publication"
+      ]
+    },
+    "WorkerBudget": {
+      "type": "object",
+      "properties": {
+        "accounting_uncertain": {
+          "type": "boolean"
+        },
+        "eligible_at": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "reserved_elapsed_seconds": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "reserved_runs": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "reserved_spend_micro_usd": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "runs": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "usage": {
+          "$ref": "#/$defs/JobUsage"
+        },
+        "window_started_at": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "usage",
+        "runs",
+        "reserved_elapsed_seconds",
+        "reserved_spend_micro_usd",
+        "reserved_runs",
+        "accounting_uncertain",
+        "window_started_at"
+      ]
+    },
+    "WorkerChecklistObservation": {
+      "type": "object",
+      "properties": {
+        "index": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "observation": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "index",
+        "observation"
+      ]
+    },
+    "WorkerCheckpoint": {
+      "type": "object",
+      "properties": {
+        "backlog_revision": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "base_sha": {
+          "type": "string"
+        },
+        "checklist": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/WorkerChecklistObservation"
+          }
+        },
+        "id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "mandate_revision": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "recorded_at": {
+          "type": "string"
+        },
+        "run_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "summary": {
+          "type": "string"
+        },
+        "worker_id": {
+          "type": "string",
+          "format": "uuid"
+        }
+      },
+      "required": [
+        "id",
+        "worker_id",
+        "run_id",
+        "mandate_revision",
+        "backlog_revision",
+        "base_sha",
+        "summary",
+        "checklist",
+        "recorded_at"
+      ]
+    },
+    "WorkerDesiredState": {
+      "type": "string",
+      "enum": [
+        "active",
+        "paused"
+      ]
+    },
+    "WorkerDetail": {
+      "type": "object",
+      "properties": {
+        "allowed_actions": {
+          "$ref": "#/$defs/WorkerAllowedActions"
+        },
+        "budget": {
+          "$ref": "#/$defs/WorkerBudget"
+        },
+        "checkpoint": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/WorkerCheckpoint"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "current_job": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/JobDetail"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "mandate": {
+          "$ref": "#/$defs/WorkerMandate"
+        },
+        "worker": {
+          "$ref": "#/$defs/WorkerSummary"
+        }
+      },
+      "required": [
+        "worker",
+        "mandate",
+        "budget",
+        "allowed_actions"
+      ]
+    },
+    "WorkerEvent": {
+      "type": "object",
+      "properties": {
+        "created_at": {
+          "type": "string"
+        },
+        "job_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "uuid"
+        },
+        "kind": {
+          "$ref": "#/$defs/WorkerEventKind"
+        },
+        "project_id": {
+          "type": "string"
+        },
+        "question_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "uuid"
+        },
+        "run_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "uuid"
+        },
+        "seq": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "state_version": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "summary": {
+          "type": "string"
+        },
+        "worker_id": {
+          "type": "string",
+          "format": "uuid"
+        }
+      },
+      "required": [
+        "worker_id",
+        "project_id",
+        "seq",
+        "state_version",
+        "kind",
+        "summary",
+        "created_at"
+      ]
+    },
+    "WorkerEventKind": {
+      "type": "string",
+      "enum": [
+        "approved",
+        "mandate_changed",
+        "state_changed",
+        "backlog_changed",
+        "checkpoint",
+        "run_changed",
+        "question",
+        "review",
+        "budget"
+      ]
+    },
+    "WorkerExecutionContext": {
+      "type": "object",
+      "properties": {
+        "backlog_revision": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "checkpoint": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/WorkerCheckpoint"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "items": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/WorkerItem"
+          }
+        },
+        "mandate": {
+          "$ref": "#/$defs/WorkerMandateSpec"
+        },
+        "mandate_revision": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "purpose": {
+          "$ref": "#/$defs/WorkerRunPurpose"
+        },
+        "reservation_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "schedule_generation": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "selected_item_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "uuid"
+        },
+        "worker_id": {
+          "type": "string",
+          "format": "uuid"
+        }
+      },
+      "required": [
+        "worker_id",
+        "mandate_revision",
+        "backlog_revision",
+        "schedule_generation",
+        "reservation_id",
+        "purpose",
+        "mandate",
+        "items"
+      ]
+    },
+    "WorkerItem": {
+      "type": "object",
+      "properties": {
+        "attempts": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "created_at": {
+          "type": "string"
+        },
+        "id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "item": {
+          "$ref": "#/$defs/WorkerItemDraft"
+        },
+        "job_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "uuid"
+        },
+        "origin": {
+          "$ref": "#/$defs/WorkerItemOrigin"
+        },
+        "outcome": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "revision": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "run_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "uuid"
+        },
+        "state": {
+          "$ref": "#/$defs/WorkerItemState"
+        },
+        "updated_at": {
+          "type": "string"
+        },
+        "worker_id": {
+          "type": "string",
+          "format": "uuid"
+        }
+      },
+      "required": [
+        "id",
+        "worker_id",
+        "revision",
+        "item",
+        "origin",
+        "state",
+        "attempts",
+        "created_at",
+        "updated_at"
+      ]
+    },
+    "WorkerItemDraft": {
+      "type": "object",
+      "properties": {
+        "acceptance_criteria": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "dependencies": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "format": "uuid"
+          }
+        },
+        "evidence": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "instruction": {
+          "type": "string"
+        },
+        "priority": {
+          "type": "integer",
+          "format": "int32"
+        },
+        "scope_rationale": {
+          "type": "string"
+        },
+        "title": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "title",
+        "instruction",
+        "acceptance_criteria",
+        "scope_rationale",
+        "evidence",
+        "priority",
+        "dependencies"
+      ]
+    },
+    "WorkerItemOrigin": {
+      "type": "string",
+      "enum": [
+        "human",
+        "inspection",
+        "implementation"
+      ]
+    },
+    "WorkerItemState": {
+      "type": "string",
+      "enum": [
+        "ready",
+        "selected",
+        "running",
+        "awaiting_review",
+        "done",
+        "blocked",
+        "dismissed"
+      ]
+    },
+    "WorkerLimits": {
+      "type": "object",
+      "properties": {
+        "attempts_per_item": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "elapsed_seconds_24h": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "per_run": {
+          "$ref": "#/$defs/JobLimits"
+        },
+        "runs_24h": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "spend_micro_usd_24h": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "per_run",
+        "elapsed_seconds_24h",
+        "spend_micro_usd_24h",
+        "runs_24h",
+        "attempts_per_item"
+      ]
+    },
+    "WorkerMandate": {
+      "type": "object",
+      "properties": {
+        "approved_at": {
+          "type": "string"
+        },
+        "approved_by": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "policy_digest": {
+          "type": "string"
+        },
+        "repository": {
+          "type": "string"
+        },
+        "revision": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "spec": {
+          "$ref": "#/$defs/WorkerMandateSpec"
+        },
+        "verification_profile_digest": {
+          "type": "string"
+        },
+        "worker_profile_digest": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "revision",
+        "spec",
+        "repository",
+        "worker_profile_digest",
+        "verification_profile_digest",
+        "policy_digest",
+        "approved_by",
+        "approved_at"
+      ]
+    },
+    "WorkerMandateSpec": {
+      "type": "object",
+      "properties": {
+        "base_ref": {
+          "type": "string"
+        },
+        "checklist": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "description": {
+          "type": "string"
+        },
+        "interval_seconds": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "limits": {
+          "$ref": "#/$defs/WorkerLimits"
+        },
+        "machine_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "model_profile": {
+          "type": "string"
+        },
+        "title": {
+          "type": "string"
+        },
+        "verification_profile": {
+          "type": "string"
+        },
+        "worker_profile": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "title",
+        "description",
+        "checklist",
+        "machine_id",
+        "worker_profile",
+        "verification_profile",
+        "model_profile",
+        "base_ref",
+        "interval_seconds",
+        "limits"
+      ]
+    },
+    "WorkerRunPurpose": {
+      "type": "string",
+      "enum": [
+        "inspection",
+        "implementation"
+      ]
+    },
+    "WorkerState": {
+      "type": "string",
+      "enum": [
+        "queued",
+        "preparing",
+        "inspecting",
+        "working",
+        "needs_input",
+        "verifying",
+        "publishing",
+        "idle",
+        "waiting_review",
+        "waiting_budget",
+        "pausing",
+        "paused",
+        "stopping",
+        "blocked",
+        "recovery_required"
+      ]
+    },
+    "WorkerSummary": {
+      "type": "object",
+      "properties": {
+        "active_job_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "uuid"
+        },
+        "active_run_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "uuid"
+        },
+        "attention": {
+          "type": "boolean"
+        },
+        "attention_question_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "uuid"
+        },
+        "attention_run_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "uuid"
+        },
+        "backlog_revision": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "cluster_owner_user_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "created_at": {
+          "type": "string"
+        },
+        "current_item_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "uuid"
+        },
+        "description": {
+          "type": "string"
+        },
+        "desired_state": {
+          "$ref": "#/$defs/WorkerDesiredState"
+        },
+        "high_watermark": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "hostname": {
+          "type": "string"
+        },
+        "id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "machine_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "mandate_revision": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "next_check_at": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "project_id": {
+          "type": "string"
+        },
+        "reason": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "state": {
+          "$ref": "#/$defs/WorkerState"
+        },
+        "state_version": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "title": {
+          "type": "string"
+        },
+        "updated_at": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "project_id",
+        "title",
+        "description",
+        "state",
+        "desired_state",
+        "mandate_revision",
+        "backlog_revision",
+        "state_version",
+        "high_watermark",
+        "machine_id",
+        "cluster_owner_user_id",
+        "hostname",
+        "attention",
+        "created_at",
+        "updated_at"
+      ]
+    }
+  }
+}

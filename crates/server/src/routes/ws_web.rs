@@ -1184,6 +1184,10 @@ mod machine_access_tests {
             memory_kb: None,
             last_error: None,
             git_remote: None,
+            open_state: None,
+            part: None,
+            part_reason: None,
+            other_hosts: Vec::new(),
         }
     }
 
@@ -9393,6 +9397,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                 is_working,
                                 panes: pane_summaries(&state, &session_id, is_active),
                                 instances: Vec::new(),
+                                open_state: None,
                             }
                         })
                         .collect();
@@ -9429,6 +9434,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             is_working,
                             panes: pane_summaries(&state, &session_id, is_active),
                             instances: Vec::new(),
+                            open_state: None,
                         });
                     }
                     // Every host a project runs on, not only the primary's, each
@@ -10283,6 +10289,10 @@ mod project_instance_tests {
                     memory_kb: None,
                     last_error: None,
                     git_remote: None,
+                    open_state: None,
+                    part: None,
+                    part_reason: None,
+                    other_hosts: Vec::new(),
                 }],
             );
             self.state.sessions.set_daemon_capabilities(
@@ -11777,6 +11787,10 @@ mod project_instance_tests {
             memory_kb: None,
             last_error: None,
             git_remote: None,
+            open_state: None,
+            part: None,
+            part_reason: None,
+            other_hosts: Vec::new(),
         }
     }
 
@@ -12264,6 +12278,10 @@ mod project_instance_tests {
             memory_kb: None,
             last_error: None,
             git_remote: None,
+            open_state: None,
+            part: None,
+            part_reason: None,
+            other_hosts: Vec::new(),
         };
         let mut daemon = p.daemon_with(
             p.owner,
@@ -13338,6 +13356,10 @@ mod project_instance_tests {
                 memory_kb: None,
                 last_error: None,
                 git_remote: None,
+                open_state: None,
+                part: None,
+                part_reason: None,
+                other_hosts: Vec::new(),
             }]
         };
         let refusal = |result: AddResult| {

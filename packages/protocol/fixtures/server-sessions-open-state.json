@@ -1,0 +1,42 @@
+{
+  "type": "sessions",
+  "sessions": [
+    {
+      "id": "20000000-0000-4000-8000-000000000001",
+      "project_id": "30000000-0000-4000-8000-000000000001",
+      "cli_client_id": "40000000-0000-4000-8000-000000000002",
+      "working_dir": "/workspace/project",
+      "hostname": "zoo-005",
+      "git_remote": "github.com/example/project",
+      "status": "active",
+      "created_at": "2026-11-11T12:00:00Z",
+      "is_shared": false,
+      "is_active": true,
+      "is_working": false,
+      "open_state": "open"
+    },
+    {
+      "id": "20000000-0000-4000-8000-000000000002",
+      "project_id": "30000000-0000-4000-8000-000000000002",
+      "cli_client_id": null,
+      "working_dir": "/workspace/closed",
+      "hostname": "zoo-006",
+      "status": "inactive",
+      "created_at": "2026-11-12T12:00:00Z",
+      "is_shared": false,
+      "is_active": false,
+      "open_state": "closed"
+    },
+    {
+      "id": "20000000-0000-4000-8000-000000000003",
+      "project_id": "30000000-0000-4000-8000-000000000003",
+      "cli_client_id": "40000000-0000-4000-8000-000000000003",
+      "working_dir": "/workspace/not-recorded",
+      "hostname": "zoo-005",
+      "status": "active",
+      "created_at": "2026-11-13T12:00:00Z",
+      "is_shared": false,
+      "is_active": true
+    }
+  ]
+}

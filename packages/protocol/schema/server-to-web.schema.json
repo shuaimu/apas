@@ -1729,6 +1729,68 @@
       ]
     },
     {
+      "description": "A project's open state and each machine's part in it. Always the\ncomplete report rather than a delta.\n\nSent only to viewers that negotiated\n[`crate::PROJECT_OPEN_STATE_CAPABILITY`] and may read the project:\non attach, after `SessionAttached`, and on every change of the state\nor of a machine's part. It is the confirmation an Open or a Close\ngets ([`WebToServer::StartMachineProjectCli`] and\n`StopMachineProjectCli` with `all_instances`): neither request is\nanswered with a result of its own, and a client never resends one.\nA viewer without the capability reads `SessionInfo::open_state` and\nthe machine list's entries instead, which older schemas accept.",
+      "type": "object",
+      "properties": {
+        "machines": {
+          "description": "Every machine that owns tabs of the project or runs it, with its\npart. Reported for a project that is not recorded too. Empty when\nno machine owns a tab and none runs it.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ProjectMachinePart"
+          }
+        },
+        "project_id": {
+          "description": "The project's stable `.apas` id, as in `MachineProjectInfo`.",
+          "type": "string"
+        },
+        "set_at": {
+          "description": "When the state was set, RFC3339 in UTC. Absent while the project\nis not recorded.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "set_by": {
+          "description": "Who set the state: the account's email, as `owner_email` names an\naccount to viewers elsewhere. Never an account id or a token.\nAbsent while the project is not recorded, when the system\nadministrator set it (which is not an account; `set_kind` is then\nadministrative), and when the account no longer exists.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "set_kind": {
+          "description": "Whether a person's request or an administrative stop set the\nstate. Absent while the project is not recorded.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/OpenStateSetKind"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "state": {
+          "description": "Absent while the project is not recorded: nobody has opened or\nclosed it since the server began recording, the server neither\nstarts nor stops it by itself, and it is shown as open while a\nmachine in `machines` runs it.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ProjectOpenState"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "type": {
+          "type": "string",
+          "const": "project_open_state"
+        }
+      },
+      "required": [
+        "type",
+        "project_id",
+        "machines"
+      ]
+    },
+    {
       "description": "Echo of `WebToServer::Heartbeat`. The browser's liveness loop\nuses any inbound frame (including this one) as proof the WS is\nhealthy; a missing echo within `livenessMs` triggers reconnect.",
       "type": "object",
       "properties": {
@@ -3266,6 +3328,36 @@
         "arch"
       ]
     },
+    "MachinePart": {
+      "description": "One machine's part in a project, as the server derived it from the\nroster, the machine's inventory, the attached instances, the starts in\nflight and the outcome of the last start it asked for.",
+      "oneOf": [
+        {
+          "description": "The machine runs the project and the project is not closed.",
+          "type": "string",
+          "const": "running"
+        },
+        {
+          "description": "The machine was asked to start the project and has not answered yet.",
+          "type": "string",
+          "const": "starting"
+        },
+        {
+          "description": "The project is open and this machine owns tabs of it, but its daemon\nis not connected. It is started when the daemon registers.",
+          "type": "string",
+          "const": "waiting_offline"
+        },
+        {
+          "description": "The machine owns tabs of the project and does not run them, and\nnothing is about to start it. The reason, when known, is beside this\nvalue. In an open project it is a machine that refused, failed or\nnever answered. It is also the part of a tab owner that does not run\na closed project, and of one that does not run a project that is not\nrecorded, offline or not, since nothing starts it when it returns.",
+          "type": "string",
+          "const": "not_started"
+        },
+        {
+          "description": "The project is closed and this machine still runs it. The reason,\nwhen one is known, is beside this value.",
+          "type": "string",
+          "const": "still_running"
+        }
+      ]
+    },
     "MachineProjectInfo": {
       "description": "APAS project discovered on a machine",
       "type": "object",
@@ -3297,6 +3389,42 @@
           "minimum": 0
         },
         "name": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "open_state": {
+          "description": "The project's recorded open state. Filled by the server, like\n`preferred_machine_id`, for a viewer that may read the project; a\nvalue a daemon sends is discarded. Absent while the project is not\nrecorded, for a viewer that may not read the project, and from older\nservers: the entry is then shown from `is_running`, as before.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ProjectOpenState"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "other_hosts": {
+          "description": "The other machines that own tabs of the project or run it, never this\none, so the confirmation of an Open or a Close can name them. Filled\nby the server; a value a daemon sends is discarded. Empty when there\nis none, for a viewer that may not read the project, and from older\nservers.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ProjectHostSummary"
+          }
+        },
+        "part": {
+          "description": "This machine's part in the project, so a machine list can show it\nwithout attaching to the project. Filled by the server; a value a\ndaemon sends is discarded. Reported for a project that is not\nrecorded too. Absent when this machine has no part (it owns no tabs\nof the project and does not run it), for a viewer that may not read\nthe project, and from older servers.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/MachinePart"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "part_reason": {
+          "description": "The reason beside `part`; see [`crate::ProjectMachinePart::reason`].\nFilled by the server; a value a daemon sends is discarded.",
           "type": [
             "string",
             "null"
@@ -3652,6 +3780,21 @@
           ]
         }
       }
+    },
+    "OpenStateSetKind": {
+      "description": "How a project's open state was last set.",
+      "oneOf": [
+        {
+          "description": "Someone opened or closed the project, or created it with a start.",
+          "type": "string",
+          "const": "request"
+        },
+        {
+          "description": "A suspension, an operator's or administrator's \"Stop runtime\", or the\nstart of a deletion closed it.",
+          "type": "string",
+          "const": "administrative"
+        }
+      ]
     },
     "OutputType": {
       "description": "Type of output content",
@@ -4312,6 +4455,91 @@
         "deleted"
       ]
     },
+    "ProjectHostSummary": {
+      "description": "Another machine that owns tabs of a project or runs it, in\n[`crate::MachineProjectInfo::other_hosts`], so a machine list can name the\nmachines an Open or a Close reaches without attaching to the project.",
+      "type": "object",
+      "properties": {
+        "connected": {
+          "description": "The machine's daemon holds a live connection to the server now.",
+          "type": "boolean"
+        },
+        "hostname": {
+          "description": "Display name of the machine; never used for routing.",
+          "type": "string"
+        },
+        "owns_tabs": {
+          "description": "The roster records tabs for this machine or attributes untagged tabs\nto its host.",
+          "type": "boolean"
+        },
+        "running": {
+          "description": "The machine runs the project now.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "hostname",
+        "connected",
+        "running",
+        "owns_tabs"
+      ]
+    },
+    "ProjectMachinePart": {
+      "description": "One machine's part in a project, in\n[`crate::ServerToWeb::ProjectOpenState`]. Listed for every machine that\nowns tabs of the project or runs it, and for the machine an open named\nwhile no machine owns a tab.",
+      "type": "object",
+      "properties": {
+        "connected": {
+          "description": "The machine's daemon holds a live connection to the server now.",
+          "type": "boolean"
+        },
+        "hostname": {
+          "description": "Display name of the machine; never used for routing.",
+          "type": "string"
+        },
+        "machine_id": {
+          "description": "`None` for a host the server knows only by name: untagged tabs are\nattributed to a hostname, and the server knows a machine's id only\nfrom tagged tabs or once its daemon has registered since the server\nstarted. No request can name such a host.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "uuid"
+        },
+        "owns_tabs": {
+          "description": "The roster records tabs for this machine, attributes untagged tabs to\nits host, or, while no machine owns a tab, an open named it.",
+          "type": "boolean"
+        },
+        "part": {
+          "$ref": "#/$defs/MachinePart"
+        },
+        "reason": {
+          "description": "Why the machine is [`MachinePart::NotStarted`] or, when known, why it\nis [`MachinePart::StillRunning`]: the sentence the refusing check or\nthe daemon gave. Shown as it is. Absent when no reason is known, as\nafter a server restart until that machine registers again.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "hostname",
+        "part",
+        "owns_tabs",
+        "connected"
+      ]
+    },
+    "ProjectOpenState": {
+      "description": "The recorded open state of a project.\n\nThere is a third condition, not recorded, and it is never a value: every\nfield of this type is optional and is absent for a project nobody has\nopened or closed since the server began recording. The server neither\nstarts nor stops such a project by itself, and a client shows it from\nwhat runs, as before the state existed.",
+      "oneOf": [
+        {
+          "description": "Every machine that owns tabs of the project runs them, or is started\nwhen its daemon next registers.",
+          "type": "string",
+          "const": "open"
+        },
+        {
+          "description": "No machine runs the project, or is stopped when its daemon next\nregisters.",
+          "type": "string",
+          "const": "closed"
+        }
+      ]
+    },
     "ProjectUsageStats": {
       "description": "Project-level usage: the per-pane breakdown plus the project totals\n(sum over all panes of every session that shares this project_id).",
       "type": "object",
@@ -4507,6 +4735,17 @@
           "description": "True when at least one pane is currently reporting work. This is\nmeaningful only while `is_active` is true.",
           "type": "boolean",
           "default": false
+        },
+        "open_state": {
+          "description": "The recorded open state of this session's project, filled by the\nserver on session lists and on the mobile bootstrap's session\nentries. Absent while the project is not recorded and from older\nservers: a client then shows the project from what runs, as before.\nOlder clients ignore the field, so it needs no capability.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ProjectOpenState"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "owner_email": {
           "description": "Email of the session owner (only set if is_shared is true)",

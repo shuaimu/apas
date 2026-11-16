@@ -399,3 +399,136 @@ fn autopilot_prompt_fixtures_populate_the_new_fields() {
         );
     }
 }
+
+/// The open-state fixtures carry what they exist to exercise: a recorded
+/// state with who set it, a project that is not recorded, every part a
+/// machine can have, and session and machine entries with and without the
+/// server-filled fields.
+#[test]
+fn open_state_fixtures_populate_the_new_fields() {
+    use shared::{MachinePart, OpenStateSetKind, ProjectOpenState};
+
+    let parts = |name: &str| match server(name) {
+        ServerToWeb::ProjectOpenState {
+            project_id,
+            state,
+            set_by,
+            set_kind,
+            set_at,
+            machines,
+        } => {
+            assert_eq!(project_id, "30000000-0000-4000-8000-000000000001", "{name}");
+            (state, set_by, set_kind, set_at, machines)
+        }
+        other => panic!("{name}: expected ProjectOpenState, got {other:?}"),
+    };
+
+    let (state, set_by, set_kind, set_at, machines) = parts("server-project-open-state.json");
+    assert_eq!(state, Some(ProjectOpenState::Open));
+    assert_eq!(set_by.as_deref(), Some("owner@example.com"));
+    assert_eq!(set_kind, Some(OpenStateSetKind::Request));
+    assert_eq!(set_at.as_deref(), Some("2026-11-16T05:00:00Z"));
+    assert_eq!(
+        machines.iter().map(|machine| machine.part).collect::<Vec<_>>(),
+        vec![MachinePart::Running, MachinePart::WaitingOffline]
+    );
+    assert!(machines.iter().all(|machine| machine.machine_id.is_some()));
+    assert!(machines.iter().all(|machine| machine.owns_tabs));
+    assert_eq!(
+        machines.iter().map(|machine| machine.connected).collect::<Vec<_>>(),
+        vec![true, false]
+    );
+
+    let (state, _, _, _, machines) = parts("server-project-open-state-refused.json");
+    assert_eq!(state, Some(ProjectOpenState::Open));
+    assert_eq!(
+        machines.iter().map(|machine| machine.part).collect::<Vec<_>>(),
+        vec![MachinePart::Starting, MachinePart::NotStarted]
+    );
+    assert_eq!(machines[0].reason, None);
+    assert!(machines[1]
+        .reason
+        .as_deref()
+        .is_some_and(|reason| reason.contains("older APAS")));
+
+    let (state, set_by, set_kind, set_at, machines) =
+        parts("server-project-open-state-closed.json");
+    assert_eq!(state, Some(ProjectOpenState::Closed));
+    assert_eq!(set_by, None);
+    assert_eq!(set_kind, Some(OpenStateSetKind::Administrative));
+    assert!(set_at.is_some());
+    assert_eq!(
+        machines.iter().map(|machine| machine.part).collect::<Vec<_>>(),
+        vec![MachinePart::StillRunning, MachinePart::NotStarted]
+    );
+
+    let (state, set_by, set_kind, set_at, machines) =
+        parts("server-project-open-state-not-recorded.json");
+    assert_eq!((state, set_by, set_kind, set_at), (None, None, None, None));
+    assert_eq!(machines[0].part, MachinePart::Running);
+    assert_eq!(machines[1].machine_id, None);
+    assert_eq!(machines[1].hostname, "laptop");
+    assert_eq!(machines[1].part, MachinePart::NotStarted);
+
+    let ServerToWeb::Sessions { sessions } = server("server-sessions-open-state.json") else {
+        panic!("expected Sessions");
+    };
+    assert_eq!(
+        sessions.iter().map(|session| session.open_state).collect::<Vec<_>>(),
+        vec![
+            Some(ProjectOpenState::Open),
+            Some(ProjectOpenState::Closed),
+            None
+        ]
+    );
+    // The entries from before the field still read as not recorded.
+    let ServerToWeb::Sessions { sessions } = server("server-sessions.json") else {
+        panic!("expected Sessions");
+    };
+    assert_eq!(sessions[0].open_state, None);
+
+    let ServerToWeb::Machines { machines } = server("server-machines-open-state.json") else {
+        panic!("expected Machines");
+    };
+    let projects = &machines[0].projects;
+    assert_eq!(projects.len(), 4);
+    assert_eq!(projects[0].open_state, Some(ProjectOpenState::Open));
+    assert_eq!(projects[0].part, Some(MachinePart::NotStarted));
+    assert_eq!(projects[0].part_reason, projects[0].last_error);
+    assert!(projects[0].part_reason.is_some());
+    assert_eq!(
+        projects[0]
+            .other_hosts
+            .iter()
+            .map(|host| (
+                host.hostname.as_str(),
+                host.connected,
+                host.running,
+                host.owns_tabs
+            ))
+            .collect::<Vec<_>>(),
+        vec![("zoo-005", true, true, true), ("laptop", false, false, true)]
+    );
+    assert!(projects[0]
+        .other_hosts
+        .iter()
+        .all(|host| host.hostname != machines[0].machine.hostname));
+    assert_eq!(projects[1].open_state, Some(ProjectOpenState::Closed));
+    assert_eq!(projects[1].part, None);
+    assert_eq!(projects[2].open_state, None);
+    assert_eq!(projects[2].part, Some(MachinePart::Running));
+    assert_eq!(
+        (
+            projects[3].open_state,
+            projects[3].part,
+            projects[3].part_reason.as_deref(),
+            projects[3].other_hosts.len()
+        ),
+        (None, None, None, 0)
+    );
+    let ServerToWeb::Machines { machines } = server("server-machines-instances.json") else {
+        panic!("expected Machines");
+    };
+    assert_eq!(machines[0].projects[0].open_state, None);
+    assert_eq!(machines[0].projects[0].part, None);
+}

@@ -5,8 +5,8 @@ rollout. No task touches `crates/client-cli`.
 
 ## 1. Contract
 
-- [ ] 1.1 In `crates/shared`, add `ProjectOpenState` (open, closed; absent means not recorded), `MachinePart` (running, starting, waiting_offline, not_started, still_running, with an optional reason), the capability constant `project_open_state_v1`, the optional server-filled fields `open_state` on `SessionInfo` and `open_state`, `part`, `part_reason`, `other_hosts` on `MachineProjectInfo` (all skipped when absent), and the capability-gated `ServerToWeb::ProjectOpenState { project_id, state, set_by, set_at, machines }`. Document on `StartMachineProjectCli` / `StopMachineProjectCli` that `all_instances: true` opens and closes the project and what `false` now does (design Decision 3).
-- [ ] 1.2 Regenerate the web and mobile schemas and `packages/protocol` types, add fixtures for the new frame and for session and machine entries with and without the new fields, and keep the pre-change server-to-web schema as a legacy fixture so a test proves an older native build validates every frame it is sent.
+- [x] 1.1 In `crates/shared`, add `ProjectOpenState` (open, closed; absent means not recorded), `MachinePart` (running, starting, waiting_offline, not_started, still_running, with an optional reason), the capability constant `project_open_state_v1`, the optional server-filled fields `open_state` on `SessionInfo` and `open_state`, `part`, `part_reason`, `other_hosts` on `MachineProjectInfo` (all skipped when absent), and the capability-gated `ServerToWeb::ProjectOpenState { project_id, state, set_by, set_at, machines }`. Document on `StartMachineProjectCli` / `StopMachineProjectCli` that `all_instances: true` opens and closes the project and what `false` now does (design Decision 3).
+- [x] 1.2 Regenerate the web and mobile schemas and `packages/protocol` types, add fixtures for the new frame and for session and machine entries with and without the new fields, and keep the pre-change server-to-web schema as a legacy fixture so a test proves an older native build validates every frame it is sent.
 
 ## 2. Server: record the state
 

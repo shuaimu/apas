@@ -66,6 +66,22 @@ export type PaneMode = "deadloop" | "interactive";
 export type Provider =
   ("codex" | "deepseek" | "opencode" | "cursor-agent") | "claude" | "minimax" | "glm" | "pi" | "omp";
 /**
+ * The recorded open state of a project.
+ *
+ * There is a third condition, not recorded, and it is never a value: every
+ * field of this type is optional and is absent for a project nobody has
+ * opened or closed since the server began recording. The server neither
+ * starts nor stops such a project by itself, and a client shows it from
+ * what runs, as before the state existed.
+ */
+export type ProjectOpenState = "open" | "closed";
+/**
+ * One machine's part in a project, as the server derived it from the
+ * roster, the machine's inventory, the attached instances, the starts in
+ * flight and the outcome of the last start it asked for.
+ */
+export type MachinePart = "running" | "starting" | "waiting_offline" | "not_started" | "still_running";
+/**
  * Whether autopilot can be used on one OMP terminal tab.
  */
 export type AutopilotSupport =
@@ -625,6 +641,45 @@ export type ServerToWeb =
       [k: string]: unknown;
     }
   | {
+      /**
+       * Every machine that owns tabs of the project or runs it, with its
+       * part. Reported for a project that is not recorded too. Empty when
+       * no machine owns a tab and none runs it.
+       */
+      machines: ProjectMachinePart[];
+      /**
+       * The project's stable `.apas` id, as in `MachineProjectInfo`.
+       */
+      project_id: string;
+      /**
+       * When the state was set, RFC3339 in UTC. Absent while the project
+       * is not recorded.
+       */
+      set_at?: string | null;
+      /**
+       * Who set the state: the account's email, as `owner_email` names an
+       * account to viewers elsewhere. Never an account id or a token.
+       * Absent while the project is not recorded, when the system
+       * administrator set it (which is not an account; `set_kind` is then
+       * administrative), and when the account no longer exists.
+       */
+      set_by?: string | null;
+      /**
+       * Whether a person's request or an administrative stop set the
+       * state. Absent while the project is not recorded.
+       */
+      set_kind?: OpenStateSetKind | null;
+      /**
+       * Absent while the project is not recorded: nobody has opened or
+       * closed it since the server began recording, the server neither
+       * starts nor stops it by itself, and it is shown as open while a
+       * machine in `machines` runs it.
+       */
+      state?: ProjectOpenState | null;
+      type: "project_open_state";
+      [k: string]: unknown;
+    }
+  | {
       type: "heartbeat";
       [k: string]: unknown;
     };
@@ -782,6 +837,10 @@ export type AutopilotRepeat =
       kind: "every";
       seconds: number;
     };
+/**
+ * How a project's open state was last set.
+ */
+export type OpenStateSetKind = "request" | "administrative";
 /**
  * Messages sent from web client to server
  */
@@ -1098,22 +1157,44 @@ export type WebToServer =
     }
   | {
       /**
-       * Start the project as a whole rather than on `machine_id` alone,
-       * as the project view's Start means. Tabs never move between
-       * machines, so the server starts an instance on every online machine
-       * that owns tabs of the project and advertises
-       * [`PROJECT_INSTANCES_CAPABILITY`], and on `machine_id` (the view's
-       * resolved machine) only when no machine qualifies. Each machine is
-       * authorized as a single-machine request would be.
+       * True opens the project. The server records it open, by the
+       * requester, and starts it on every connected machine that owns
+       * tabs of it, each only where the requester may use the project's
+       * runtime; with no tab owner, on `machine_id`. A tab owner that is
+       * offline is started when its daemon registers. A machine that
+       * cannot start keeps its reason as its part and does not fail the
+       * request. A suspended project, one being deleted, and a requester
+       * who may not set the state are refused, and nothing is recorded.
+       * Opening a project that is already open starts the tab owners
+       * that are not running it and changes neither the recorded opener
+       * nor a machine that runs it: it is the retry.
        *
-       * False, and absent from every older client, starts only on
-       * `machine_id`, which is what a per-machine Start on the Machines
-       * page means. The two must stay distinguishable: fanning out on the
-       * plain message would make that per-machine button start other
-       * machines too. An older server ignores the flag and starts only
-       * `machine_id`.
+       * False, and absent from every older client, names `machine_id`
+       * alone and never starts another machine. What it does depends on
+       * the recorded state:
+       * - not recorded: starts `machine_id`, as before the state
+       *   existed, and records nothing;
+       * - open: starts `machine_id`;
+       * - closed: opens the project when no other machine owns tabs of
+       *   it, and is otherwise refused.
+       *
+       * A viewer that negotiated the capability never sends false. One
+       * that did not, and sends true (an older project view), opens a
+       * recorded project as above; on a project that is not recorded its
+       * request starts every online machine that owns tabs and
+       * advertises [`PROJECT_INSTANCES_CAPABILITY`], or `machine_id`
+       * when none does, as it did before, and records nothing. Only a
+       * viewer with the capability records the state of a project nobody
+       * has recorded. An older server ignores the flag's new meaning and
+       * records nothing.
        */
       all_instances?: boolean;
+      /**
+       * With `all_instances`, the machine to start when no machine owns a
+       * tab of the project, and the machine that places a project only a
+       * registration knows. Otherwise the one machine the request is
+       * for.
+       */
       machine_id: string;
       project_id: string;
       type: "start_machine_project_cli";
@@ -1121,30 +1202,42 @@ export type WebToServer =
     }
   | {
       /**
-       * Stop the project as a whole, as the project view's Close means:
-       * every machine running it, each authorized as a single-machine
-       * request would be. That is `machine_id` (the view's resolved
-       * machine, which a Close always stops, running or not), every
-       * machine with an instance of it attached, and every machine whose
-       * connected daemon reports running it while its instance is not
-       * attached: one still starting, or reconnecting after its own
-       * connection dropped or the server restarted. Its machine entry
-       * shows the project running, which is what a client offers Close on,
-       * so stopping only the attached instances would leave that machine's
-       * agents running, and the project would come back when its instance
-       * reattached. A reporting daemon counts only when it belongs to an
-       * account one of the project's sessions runs under, so another
-       * account's checkout carrying the same project id is never stopped or
-       * named; a project with no session yet therefore stops only
-       * `machine_id`. A daemon's report lags a real stop by up to one
-       * heartbeat, so a machine that has just stopped may be sent a
-       * redundant Stop, which is harmless.
+       * True closes the project. The server records it closed, by the
+       * requester, and stops it on every connected machine that runs it,
+       * has an instance of it attached or has a start of it pending,
+       * each only where the requester may use the project's runtime. A
+       * machine the requester may not use is reported as still running,
+       * and a machine that is offline is stopped when its daemon
+       * registers still running the project. Another account's checkout
+       * that carries the same project id is never stopped or named. A
+       * requester who may not set the state is refused, and nothing is
+       * recorded.
        *
-       * False, and absent from every older client, stops only
-       * `machine_id`, as a per-machine Stop on the Machines page does. An
-       * older server ignores the flag and stops only `machine_id`.
+       * False, and absent from every older client, names `machine_id`
+       * alone and never stops another machine. What it does depends on
+       * the recorded state:
+       * - not recorded: stops `machine_id`, as before the state existed,
+       *   and records nothing;
+       * - open: closes the project when no other machine owns tabs of it
+       *   or runs it, and is otherwise refused;
+       * - closed: stops `machine_id`.
+       *
+       * A viewer that negotiated [`crate::PROJECT_OPEN_STATE_CAPABILITY`]
+       * never sends false. One that did not, and sends true (an older
+       * project view), closes a recorded project as above; on a project
+       * that is not recorded its request stops what it stopped before
+       * (`machine_id`, every attached instance, and every connected
+       * daemon of the project's own accounts that reports running it)
+       * and records nothing. An older server ignores the flag's new
+       * meaning and records nothing.
        */
       all_instances?: boolean;
+      /**
+       * With `all_instances`, a machine of the project the client
+       * resolved; which machines a Close stops is decided by the server
+       * from what runs, not from this field. Otherwise the one machine
+       * the request is for.
+       */
       machine_id: string;
       project_id: string;
       type: "stop_machine_project_cli";
@@ -1764,6 +1857,36 @@ export interface MachineProjectInfo {
    */
   memory_kb?: number | null;
   name?: string | null;
+  /**
+   * The project's recorded open state. Filled by the server, like
+   * `preferred_machine_id`, for a viewer that may read the project; a
+   * value a daemon sends is discarded. Absent while the project is not
+   * recorded, for a viewer that may not read the project, and from older
+   * servers: the entry is then shown from `is_running`, as before.
+   */
+  open_state?: ProjectOpenState | null;
+  /**
+   * The other machines that own tabs of the project or run it, never this
+   * one, so the confirmation of an Open or a Close can name them. Filled
+   * by the server; a value a daemon sends is discarded. Empty when there
+   * is none, for a viewer that may not read the project, and from older
+   * servers.
+   */
+  other_hosts?: ProjectHostSummary[];
+  /**
+   * This machine's part in the project, so a machine list can show it
+   * without attaching to the project. Filled by the server; a value a
+   * daemon sends is discarded. Reported for a project that is not
+   * recorded too. Absent when this machine has no part (it owns no tabs
+   * of the project and does not run it), for a viewer that may not read
+   * the project, and from older servers.
+   */
+  part?: MachinePart | null;
+  /**
+   * The reason beside `part`; see [`crate::ProjectMachinePart::reason`].
+   * Filled by the server; a value a daemon sends is discarded.
+   */
+  part_reason?: string | null;
   path: string;
   pid?: number | null;
   /**
@@ -1772,6 +1895,31 @@ export interface MachineProjectInfo {
    */
   preferred_machine_id?: string | null;
   project_id: string;
+  [k: string]: unknown;
+}
+/**
+ * Another machine that owns tabs of a project or runs it, in
+ * [`crate::MachineProjectInfo::other_hosts`], so a machine list can name the
+ * machines an Open or a Close reaches without attaching to the project.
+ */
+export interface ProjectHostSummary {
+  /**
+   * The machine's daemon holds a live connection to the server now.
+   */
+  connected: boolean;
+  /**
+   * Display name of the machine; never used for routing.
+   */
+  hostname: string;
+  /**
+   * The roster records tabs for this machine or attributes untagged tabs
+   * to its host.
+   */
+  owns_tabs: boolean;
+  /**
+   * The machine runs the project now.
+   */
+  running: boolean;
   [k: string]: unknown;
 }
 /**
@@ -1817,6 +1965,14 @@ export interface MobileSessionSummary {
   last_user_input_at?: string | null;
   latest_summary?: string | null;
   latest_update_at?: string | null;
+  /**
+   * The recorded open state of this session's project, filled by the
+   * server on session lists and on the mobile bootstrap's session
+   * entries. Absent while the project is not recorded and from older
+   * servers: a client then shows the project from what runs, as before.
+   * Older clients ignore the field, so it needs no capability.
+   */
+  open_state?: ProjectOpenState | null;
   /**
    * Email of the session owner (only set if is_shared is true)
    */
@@ -2681,6 +2837,14 @@ export interface SessionInfo {
    */
   is_working?: boolean;
   /**
+   * The recorded open state of this session's project, filled by the
+   * server on session lists and on the mobile bootstrap's session
+   * entries. Absent while the project is not recorded and from older
+   * servers: a client then shows the project from what runs, as before.
+   * Older clients ignore the field, so it needs no capability.
+   */
+  open_state?: ProjectOpenState | null;
+  /**
    * Email of the session owner (only set if is_shared is true)
    */
   owner_email?: string | null;
@@ -3322,6 +3486,43 @@ export interface SavedAutopilotPrompt {
    * RFC 3339 time of the last save, set by the CLI that wrote it.
    */
   updated_at: string;
+  [k: string]: unknown;
+}
+/**
+ * One machine's part in a project, in
+ * [`crate::ServerToWeb::ProjectOpenState`]. Listed for every machine that
+ * owns tabs of the project or runs it, and for the machine an open named
+ * while no machine owns a tab.
+ */
+export interface ProjectMachinePart {
+  /**
+   * The machine's daemon holds a live connection to the server now.
+   */
+  connected: boolean;
+  /**
+   * Display name of the machine; never used for routing.
+   */
+  hostname: string;
+  /**
+   * `None` for a host the server knows only by name: untagged tabs are
+   * attributed to a hostname, and the server knows a machine's id only
+   * from tagged tabs or once its daemon has registered since the server
+   * started. No request can name such a host.
+   */
+  machine_id?: string | null;
+  /**
+   * The roster records tabs for this machine, attributes untagged tabs to
+   * its host, or, while no machine owns a tab, an open named it.
+   */
+  owns_tabs: boolean;
+  part: MachinePart;
+  /**
+   * Why the machine is [`MachinePart::NotStarted`] or, when known, why it
+   * is [`MachinePart::StillRunning`]: the sentence the refusing check or
+   * the daemon gave. Shown as it is. Absent when no reason is known, as
+   * after a server restart until that machine registers again.
+   */
+  reason?: string | null;
   [k: string]: unknown;
 }
 export interface MobileTaskLaunchRequest {

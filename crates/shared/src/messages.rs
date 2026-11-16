@@ -1789,54 +1789,102 @@ pub enum WebToServer {
         machine_id: Option<Uuid>,
     },
 
-    /// Start APAS CLI for a daemon project
+    /// Open a project, or start it on one machine.
+    ///
+    /// With `all_instances: true` this is **Open**: the server records the
+    /// project open and starts it on every machine that owns its tabs. With
+    /// `all_instances: false` it names one machine and never reaches
+    /// another. The wire shape is what it was before the open state existed.
+    /// Neither form is answered with a result of its own: a refusal of the
+    /// whole request arrives as `Error`, and a viewer that negotiated
+    /// [`crate::PROJECT_OPEN_STATE_CAPABILITY`] is told the outcome, machine
+    /// by machine, in [`ServerToWeb::ProjectOpenState`]. A client never
+    /// resends it.
     StartMachineProjectCli {
+        /// With `all_instances`, the machine to start when no machine owns a
+        /// tab of the project, and the machine that places a project only a
+        /// registration knows. Otherwise the one machine the request is
+        /// for.
         machine_id: Uuid,
         project_id: String,
-        /// Start the project as a whole rather than on `machine_id` alone,
-        /// as the project view's Start means. Tabs never move between
-        /// machines, so the server starts an instance on every online machine
-        /// that owns tabs of the project and advertises
-        /// [`PROJECT_INSTANCES_CAPABILITY`], and on `machine_id` (the view's
-        /// resolved machine) only when no machine qualifies. Each machine is
-        /// authorized as a single-machine request would be.
+        /// True opens the project. The server records it open, by the
+        /// requester, and starts it on every connected machine that owns
+        /// tabs of it, each only where the requester may use the project's
+        /// runtime; with no tab owner, on `machine_id`. A tab owner that is
+        /// offline is started when its daemon registers. A machine that
+        /// cannot start keeps its reason as its part and does not fail the
+        /// request. A suspended project, one being deleted, and a requester
+        /// who may not set the state are refused, and nothing is recorded.
+        /// Opening a project that is already open starts the tab owners
+        /// that are not running it and changes neither the recorded opener
+        /// nor a machine that runs it: it is the retry.
         ///
-        /// False, and absent from every older client, starts only on
-        /// `machine_id`, which is what a per-machine Start on the Machines
-        /// page means. The two must stay distinguishable: fanning out on the
-        /// plain message would make that per-machine button start other
-        /// machines too. An older server ignores the flag and starts only
-        /// `machine_id`.
+        /// False, and absent from every older client, names `machine_id`
+        /// alone and never starts another machine. What it does depends on
+        /// the recorded state:
+        /// - not recorded: starts `machine_id`, as before the state
+        ///   existed, and records nothing;
+        /// - open: starts `machine_id`;
+        /// - closed: opens the project when no other machine owns tabs of
+        ///   it, and is otherwise refused.
+        ///
+        /// A viewer that negotiated the capability never sends false. One
+        /// that did not, and sends true (an older project view), opens a
+        /// recorded project as above; on a project that is not recorded its
+        /// request starts every online machine that owns tabs and
+        /// advertises [`PROJECT_INSTANCES_CAPABILITY`], or `machine_id`
+        /// when none does, as it did before, and records nothing. Only a
+        /// viewer with the capability records the state of a project nobody
+        /// has recorded. An older server ignores the flag's new meaning and
+        /// records nothing.
         #[serde(default)]
         all_instances: bool,
     },
 
-    /// Stop APAS CLI for a daemon project
+    /// Close a project, or stop it on one machine.
+    ///
+    /// With `all_instances: true` this is **Close**: the server records the
+    /// project closed and stops it on every machine that runs it. With
+    /// `all_instances: false` it names one machine and never reaches
+    /// another. A close deletes nothing: no tab, roster entry, history or
+    /// registration is removed, and the tabs come back when the project is
+    /// opened again. The wire shape and the way the request is answered are
+    /// as for [`Self::StartMachineProjectCli`].
     StopMachineProjectCli {
+        /// With `all_instances`, a machine of the project the client
+        /// resolved; which machines a Close stops is decided by the server
+        /// from what runs, not from this field. Otherwise the one machine
+        /// the request is for.
         machine_id: Uuid,
         project_id: String,
-        /// Stop the project as a whole, as the project view's Close means:
-        /// every machine running it, each authorized as a single-machine
-        /// request would be. That is `machine_id` (the view's resolved
-        /// machine, which a Close always stops, running or not), every
-        /// machine with an instance of it attached, and every machine whose
-        /// connected daemon reports running it while its instance is not
-        /// attached: one still starting, or reconnecting after its own
-        /// connection dropped or the server restarted. Its machine entry
-        /// shows the project running, which is what a client offers Close on,
-        /// so stopping only the attached instances would leave that machine's
-        /// agents running, and the project would come back when its instance
-        /// reattached. A reporting daemon counts only when it belongs to an
-        /// account one of the project's sessions runs under, so another
-        /// account's checkout carrying the same project id is never stopped or
-        /// named; a project with no session yet therefore stops only
-        /// `machine_id`. A daemon's report lags a real stop by up to one
-        /// heartbeat, so a machine that has just stopped may be sent a
-        /// redundant Stop, which is harmless.
+        /// True closes the project. The server records it closed, by the
+        /// requester, and stops it on every connected machine that runs it,
+        /// has an instance of it attached or has a start of it pending,
+        /// each only where the requester may use the project's runtime. A
+        /// machine the requester may not use is reported as still running,
+        /// and a machine that is offline is stopped when its daemon
+        /// registers still running the project. Another account's checkout
+        /// that carries the same project id is never stopped or named. A
+        /// requester who may not set the state is refused, and nothing is
+        /// recorded.
         ///
-        /// False, and absent from every older client, stops only
-        /// `machine_id`, as a per-machine Stop on the Machines page does. An
-        /// older server ignores the flag and stops only `machine_id`.
+        /// False, and absent from every older client, names `machine_id`
+        /// alone and never stops another machine. What it does depends on
+        /// the recorded state:
+        /// - not recorded: stops `machine_id`, as before the state existed,
+        ///   and records nothing;
+        /// - open: closes the project when no other machine owns tabs of it
+        ///   or runs it, and is otherwise refused;
+        /// - closed: stops `machine_id`.
+        ///
+        /// A viewer that negotiated [`crate::PROJECT_OPEN_STATE_CAPABILITY`]
+        /// never sends false. One that did not, and sends true (an older
+        /// project view), closes a recorded project as above; on a project
+        /// that is not recorded its request stops what it stopped before
+        /// (`machine_id`, every attached instance, and every connected
+        /// daemon of the project's own accounts that reports running it)
+        /// and records nothing. An older server ignores the flag's new
+        /// meaning and records nothing.
         #[serde(default)]
         all_instances: bool,
     },
@@ -2828,6 +2876,48 @@ pub enum ServerToWeb {
         unreadable: bool,
     },
 
+    /// A project's open state and each machine's part in it. Always the
+    /// complete report rather than a delta.
+    ///
+    /// Sent only to viewers that negotiated
+    /// [`crate::PROJECT_OPEN_STATE_CAPABILITY`] and may read the project:
+    /// on attach, after `SessionAttached`, and on every change of the state
+    /// or of a machine's part. It is the confirmation an Open or a Close
+    /// gets ([`WebToServer::StartMachineProjectCli`] and
+    /// `StopMachineProjectCli` with `all_instances`): neither request is
+    /// answered with a result of its own, and a client never resends one.
+    /// A viewer without the capability reads `SessionInfo::open_state` and
+    /// the machine list's entries instead, which older schemas accept.
+    ProjectOpenState {
+        /// The project's stable `.apas` id, as in `MachineProjectInfo`.
+        project_id: String,
+        /// Absent while the project is not recorded: nobody has opened or
+        /// closed it since the server began recording, the server neither
+        /// starts nor stops it by itself, and it is shown as open while a
+        /// machine in `machines` runs it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        state: Option<crate::ProjectOpenState>,
+        /// Who set the state: the account's email, as `owner_email` names an
+        /// account to viewers elsewhere. Never an account id or a token.
+        /// Absent while the project is not recorded, when the system
+        /// administrator set it (which is not an account; `set_kind` is then
+        /// administrative), and when the account no longer exists.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        set_by: Option<String>,
+        /// Whether a person's request or an administrative stop set the
+        /// state. Absent while the project is not recorded.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        set_kind: Option<crate::OpenStateSetKind>,
+        /// When the state was set, RFC3339 in UTC. Absent while the project
+        /// is not recorded.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        set_at: Option<String>,
+        /// Every machine that owns tabs of the project or runs it, with its
+        /// part. Reported for a project that is not recorded too. Empty when
+        /// no machine owns a tab and none runs it.
+        machines: Vec<crate::ProjectMachinePart>,
+    },
+
     /// Echo of `WebToServer::Heartbeat`. The browser's liveness loop
     /// uses any inbound frame (including this one) as proof the WS is
     /// healthy; a missing echo within `livenessMs` triggers reconnect.
@@ -2961,6 +3051,13 @@ pub struct SessionInfo {
     /// both cases `hostname`/`working_dir` remain the description to show.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub instances: Vec<SessionInstanceInfo>,
+    /// The recorded open state of this session's project, filled by the
+    /// server on session lists and on the mobile bootstrap's session
+    /// entries. Absent while the project is not recorded and from older
+    /// servers: a client then shows the project from what runs, as before.
+    /// Older clients ignore the field, so it needs no capability.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub open_state: Option<crate::ProjectOpenState>,
 }
 
 /// One attached (running) instance of a session's project on one machine.
@@ -3229,6 +3326,32 @@ pub struct MachineProjectInfo {
     /// match it. `None` without an origin and from older daemons.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub git_remote: Option<String>,
+    /// The project's recorded open state. Filled by the server, like
+    /// `preferred_machine_id`, for a viewer that may read the project; a
+    /// value a daemon sends is discarded. Absent while the project is not
+    /// recorded, for a viewer that may not read the project, and from older
+    /// servers: the entry is then shown from `is_running`, as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub open_state: Option<crate::ProjectOpenState>,
+    /// This machine's part in the project, so a machine list can show it
+    /// without attaching to the project. Filled by the server; a value a
+    /// daemon sends is discarded. Reported for a project that is not
+    /// recorded too. Absent when this machine has no part (it owns no tabs
+    /// of the project and does not run it), for a viewer that may not read
+    /// the project, and from older servers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub part: Option<crate::MachinePart>,
+    /// The reason beside `part`; see [`crate::ProjectMachinePart::reason`].
+    /// Filled by the server; a value a daemon sends is discarded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub part_reason: Option<String>,
+    /// The other machines that own tabs of the project or run it, never this
+    /// one, so the confirmation of an Open or a Close can name them. Filled
+    /// by the server; a value a daemon sends is discarded. Empty when there
+    /// is none, for a viewer that may not read the project, and from older
+    /// servers.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub other_hosts: Vec<crate::ProjectHostSummary>,
 }
 
 /// A registration cannot simultaneously succeed and carry an error.

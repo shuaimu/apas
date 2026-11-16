@@ -1,0 +1,23 @@
+{
+  "type": "project_open_state",
+  "project_id": "30000000-0000-4000-8000-000000000001",
+  "state": "closed",
+  "set_kind": "administrative",
+  "set_at": "2026-11-16T06:30:00Z",
+  "machines": [
+    {
+      "machine_id": "50000000-0000-4000-8000-000000000001",
+      "hostname": "zoo-005",
+      "part": "still_running",
+      "owns_tabs": true,
+      "connected": true
+    },
+    {
+      "machine_id": "50000000-0000-4000-8000-000000000002",
+      "hostname": "zoo-006",
+      "part": "not_started",
+      "owns_tabs": true,
+      "connected": true
+    }
+  ]
+}

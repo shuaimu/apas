@@ -1,0 +1,66 @@
+{
+  "type": "machines",
+  "machines": [
+    {
+      "machine": {
+        "machine_id": "50000000-0000-4000-8000-000000000002",
+        "hostname": "zoo-006",
+        "os": "linux",
+        "arch": "x86_64",
+        "daemon_version": "26.11.64"
+      },
+      "projects": [
+        {
+          "project_id": "30000000-0000-4000-8000-000000000001",
+          "name": "project",
+          "path": "/workspace/project",
+          "is_running": false,
+          "last_error": "zoo-006 could not start the project: the checkout is missing.",
+          "git_remote": "github.com/example/project",
+          "open_state": "open",
+          "part": "not_started",
+          "part_reason": "zoo-006 could not start the project: the checkout is missing.",
+          "other_hosts": [
+            {
+              "hostname": "zoo-005",
+              "connected": true,
+              "running": true,
+              "owns_tabs": true
+            },
+            {
+              "hostname": "laptop",
+              "connected": false,
+              "running": false,
+              "owns_tabs": true
+            }
+          ]
+        },
+        {
+          "project_id": "30000000-0000-4000-8000-000000000002",
+          "name": "closed",
+          "path": "/workspace/closed",
+          "is_running": false,
+          "open_state": "closed"
+        },
+        {
+          "project_id": "30000000-0000-4000-8000-000000000003",
+          "name": "not-recorded",
+          "path": "/workspace/not-recorded",
+          "is_running": true,
+          "part": "running"
+        },
+        {
+          "project_id": "30000000-0000-4000-8000-000000000004",
+          "name": "registered-only",
+          "path": "/workspace/registered-only",
+          "is_running": false
+        }
+      ],
+      "cluster_access": "owner",
+      "shared_provisioning_available": true,
+      "local_project_registration_available": true,
+      "project_instances_available": true,
+      "daemon_connected": true
+    }
+  ]
+}

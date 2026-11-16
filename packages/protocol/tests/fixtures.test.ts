@@ -100,6 +100,109 @@ describe("Rust protocol golden fixtures", () => {
     }
   });
 
+  it("keeps an older native build connected: its schema accepts every frame it can be sent, with the open-state fields", async () => {
+    const { default: Ajv2020 } = await import("ajv/dist/2020.js");
+    const legacySchema = JSON.parse(readFileSync(
+      fileURLToPath(new URL("./legacy/server-to-web.pre-open-state.schema.json", import.meta.url)), "utf8"));
+    const validate = new Ajv2020({ allErrors: true, strict: false }).compile(legacySchema);
+    const read = (name: string) => JSON.parse(readFileSync(`${fixturesDirectory}/${name}`, "utf8"));
+
+    // The fields ride on entries that schema has never closed, so they need
+    // no viewer capability and the server strips nothing for older viewers.
+    for (const name of ["SessionInfo", "MachineProjectInfo", "MachineWithProjects"]) {
+      expect(legacySchema.$defs[name], name).toBeDefined();
+      expect(legacySchema.$defs[name].additionalProperties, name).toBeUndefined();
+      expect(legacySchema.$defs[name].unevaluatedProperties, name).toBeUndefined();
+    }
+    for (const field of ["open_state", "part", "part_reason", "other_hosts"]) {
+      expect(legacySchema.$defs.MachineProjectInfo.properties[field], field).toBeUndefined();
+    }
+    expect(legacySchema.$defs.SessionInfo.properties.open_state).toBeUndefined();
+
+    const sessions = read("server-sessions-open-state.json");
+    expect(sessions.sessions.map((session: { open_state?: string }) => session.open_state))
+      .toEqual(["open", "closed", undefined]);
+    expect(validate(sessions), JSON.stringify(validate.errors)).toBe(true);
+
+    const machines = read("server-machines-open-state.json");
+    const [open, closed, notRecorded, registeredOnly] = machines.machines[0].projects;
+    expect([open.open_state, open.part, open.other_hosts.length]).toEqual(["open", "not_started", 2]);
+    expect(open.part_reason).toBe(open.last_error);
+    expect([closed.open_state, closed.part]).toEqual(["closed", undefined]);
+    expect([notRecorded.open_state, notRecorded.part]).toEqual([undefined, "running"]);
+    expect(Object.keys(registeredOnly).some((key) => ["open_state", "part", "part_reason", "other_hosts"].includes(key))).toBe(false);
+    expect(validate(machines), JSON.stringify(validate.errors)).toBe(true);
+    // A machine entry also travels in a registration result.
+    const registration = {
+      type: "local_project_registered", request_id: "register-1", machine_id: machines.machines[0].machine.machine_id,
+      result: { status: "registered", project: open },
+    };
+    expect(validateServerMessage(registration).errors).toEqual([]);
+    expect(validate(registration), JSON.stringify(validate.errors)).toBe(true);
+
+    // The one frame that schema cannot read is the new one, which is why the
+    // server sends it only to viewers that negotiated project_open_state_v1.
+    // Every other frame in the fixtures is one an older viewer can be sent.
+    const newFrames: string[] = [];
+    for (const name of readdirSync(fixturesDirectory).filter((value) => value.startsWith("server-") && value.endsWith(".json"))) {
+      const frame = read(name);
+      if (frame.type === "project_open_state") {
+        newFrames.push(name);
+        expect(validate(frame), name).toBe(false);
+      } else {
+        expect(validate(frame), `${name}: ${JSON.stringify(validate.errors)}`).toBe(true);
+      }
+    }
+    expect(newFrames.sort()).toEqual([
+      "server-project-open-state-closed.json",
+      "server-project-open-state-not-recorded.json",
+      "server-project-open-state-refused.json",
+      "server-project-open-state.json",
+    ]);
+
+    // A build older still, from before autopilot, reads the entries too.
+    const older = new Ajv2020({ allErrors: true, strict: false }).compile(JSON.parse(readFileSync(
+      fileURLToPath(new URL("./legacy/server-to-web.pre-autopilot.schema.json", import.meta.url)), "utf8")));
+    expect(older(sessions), JSON.stringify(older.errors)).toBe(true);
+    expect(older(machines), JSON.stringify(older.errors)).toBe(true);
+    expect(older(read("server-project-open-state.json"))).toBe(false);
+  });
+
+  it("reads a not-recorded project as a frame without a state, and refuses an invented state or part", () => {
+    const read = (name: string) => JSON.parse(readFileSync(`${fixturesDirectory}/${name}`, "utf8"));
+    const open = read("server-project-open-state.json");
+    expect(open.state).toBe("open");
+    expect(open.machines.map((machine: { part: string }) => machine.part)).toEqual(["running", "waiting_offline"]);
+    const notRecorded = read("server-project-open-state-not-recorded.json");
+    expect("state" in notRecorded || "set_by" in notRecorded || "set_kind" in notRecorded || "set_at" in notRecorded).toBe(false);
+    expect(notRecorded.machines[1].machine_id).toBeUndefined();
+    expect(validateServerMessage(notRecorded).errors).toEqual([]);
+
+    expect(validateServerMessage({ ...open, state: "not_recorded" }).valid).toBe(false);
+    expect(validateServerMessage({ ...open, set_kind: "automatic" }).valid).toBe(false);
+    const withPart = (part: string) => ({ ...open, machines: [{ ...open.machines[0], part }] });
+    for (const part of ["running", "starting", "waiting_offline", "not_started", "still_running"]) {
+      expect(validateServerMessage(withPart(part)).errors, part).toEqual([]);
+    }
+    expect(validateServerMessage(withPart("paused")).valid).toBe(false);
+    const { machines: _machines, ...withoutMachines } = open;
+    expect(validateServerMessage(withoutMachines).valid).toBe(false);
+    const { owns_tabs: _ownsTabs, ...withoutOwnership } = open.machines[0];
+    expect(validateServerMessage({ ...open, machines: [withoutOwnership] }).valid).toBe(false);
+
+    // The entry fields share those vocabularies.
+    const machines = read("server-machines-open-state.json");
+    const withProject = (project: object) => ({
+      ...machines, machines: [{ ...machines.machines[0], projects: [{ ...machines.machines[0].projects[0], ...project }] }],
+    });
+    expect(validateServerMessage(withProject({})).errors).toEqual([]);
+    expect(validateServerMessage(withProject({ open_state: "ajar" })).valid).toBe(false);
+    expect(validateServerMessage(withProject({ part: "paused" })).valid).toBe(false);
+    expect(validateServerMessage(withProject({ other_hosts: [{ hostname: "zoo-005" }] })).valid).toBe(false);
+    const sessions = read("server-sessions-open-state.json");
+    expect(validateServerMessage({ ...sessions, sessions: [{ ...sessions.sessions[0], open_state: "ajar" }] }).valid).toBe(false);
+  });
+
   it("parses each saved-prompt change and refuses an invented one", () => {
     const save = JSON.parse(readFileSync(`${fixturesDirectory}/web-update-autopilot-prompts-save.json`, "utf8"));
     const { replace: _replace, ...withoutReplace } = save.change;
