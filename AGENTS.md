@@ -3045,7 +3045,11 @@ prompts and **My own text**:
   prompt is a copy: neither gains these rules until the template is chosen
   again. The wording went through two rounds of independent review, with the
   git behaviour tried in throwaway repositories; it has not run on a real
-  tab.
+  tab. Live since web-only release `20261116T031901Z` (version 26.11.62,
+  built at cbc5f0e, 03:21 UTC on 2026-11-16); backups under
+  `/opt/apas/backups/deploy-20261116T031901Z`. Ten public routes and 18
+  static assets answered `200`, the served bundle carries the new text, and
+  the web logged no error. Gates: web 1,441 tests, typecheck and lint.
 - **Implement from a design document**. Each iteration closes one
   gap between the design and the code, with tests and a commit. It uses
   `docs/design.md`, or else only the one document the README or `AGENTS.md`
