@@ -10,6 +10,7 @@ import {
   keepOpenNote,
   machinePartLabel,
   NOTHING_SENT_TEXT,
+  olderApasReason,
   openStateNegotiated,
   parseMachinePart,
   parseOpenState,
@@ -273,7 +274,7 @@ describe("buildProjectOpenModel", () => {
     expect(result.stoppedFirstHosts).toEqual(["zoo-005", "zoo-006"]);
   });
 
-  it("offers Open and Close for a project nobody has recorded that runs on one of two machines", () => {
+  it("offers Keep open, saying what starts, and Close for a project nobody has recorded that runs on one of two machines", () => {
     const result = model({
       report: report(undefined, [part(ZOO5, "zoo-005", "running"), part(ZOO6, "zoo-006", "not_started")]),
       session: { isActive: true },
@@ -282,16 +283,145 @@ describe("buildProjectOpenModel", () => {
     expect(result.notice.map((line) => [line.kind, line.text]))
       .toEqual([["not_started", "zoo-006 is not running this project."]]);
     expect(result.machines[1].label).toBe("Not running");
-    expect(result.openAction).toMatchObject({ kind: "open", label: "Open" });
+    // It runs somewhere, so the offer reads "Keep open" (the state beside it
+    // already reads "Open"), as on every not-recorded project that runs.
+    expect(result.openAction).toMatchObject({
+      kind: "keep_open",
+      label: "Keep open",
+      note: keepOpenNote(["zoo-005", "zoo-006"]),
+    });
+    // What starts is said truthfully: confirming starts zoo-006.
     expect(result.openAction?.confirmation).toEqual({
-      title: "Open mako?",
+      title: "Keep mako open?",
       body: [
         "zoo-005 already runs it.",
         "Its tabs start on zoo-006.",
         "Its tabs start again on zoo-005 and zoo-006 after those machines have been away.",
       ],
     });
+    expect(result.openAction?.confirmation.body.join(" ")).not.toContain("Nothing starts now");
     expect(result.closeAction?.kind).toBe("close");
+  });
+
+  describe("a machine whose daemon cannot run the project beside other machines", () => {
+    const OLDER = "zoo-006 runs an older APAS that cannot run this project beside other machines. Reboot zoo-006 to update it.";
+    // What the machine list says of zoo-006: connected, and "Older APAS".
+    const older = (project: Partial<MachineProject> | null = {}) =>
+      machine(ZOO6, "zoo-006", project, { projectInstancesAvailable: false });
+
+    it("words the reason as the server does", () => {
+      expect(olderApasReason("zoo-006")).toBe(OLDER);
+    });
+
+    it("is not offered Open again, and keeps its reason shown", () => {
+      const result = model({
+        report: report("open", [part(ZOO5, "zoo-005", "running"), part(ZOO6, "zoo-006", "not_started", { reason: OLDER })]),
+        session: { openState: "open", isActive: true },
+        machines: [machine(ZOO5, "zoo-005", { isRunning: true }), older()],
+      });
+      // The server refuses zoo-006 every time until it is rebooted: an Open
+      // would start nothing, so none is offered.
+      expect(result.openAction).toBeUndefined();
+      expect(result.closeAction?.kind).toBe("close");
+      expect(result.machines[1]).toMatchObject({ cannotStart: OLDER, label: `Not started: ${OLDER}` });
+      expect(result.notice).toEqual([{
+        key: ZOO6,
+        machineId: ZOO6,
+        hostname: "zoo-006",
+        kind: "not_started",
+        text: "zoo-006 is not running this project.",
+        reason: OLDER,
+      }]);
+    });
+
+    it("says why before the server has, and names no start for it", () => {
+      // After a server restart the reason is unknown until zoo-006 registers.
+      const result = model({
+        report: report("open", [part(ZOO5, "zoo-005", "running"), part(ZOO6, "zoo-006", "not_started")]),
+        session: { openState: "open", isActive: true },
+        machines: [machine(ZOO5, "zoo-005", { isRunning: true }), older()],
+        fromMachineId: ZOO6,
+      });
+      expect(result.openAction).toBeUndefined();
+      expect(result.notice[0]).toMatchObject({ kind: "not_started", reason: OLDER });
+      expect(result.thisMachine).toMatchObject({ part: "not_started", label: `Not started: ${OLDER}`, reason: OLDER });
+    });
+
+    it("stays startable when the viewer's machine list does not have it: the server decides", () => {
+      const result = model({
+        report: report("open", [part(ZOO5, "zoo-005", "running"), part(ZOO6, "zoo-006", "not_started", { reason: OLDER })]),
+        session: { openState: "open", isActive: true },
+        machines: [machine(ZOO5, "zoo-005", { isRunning: true })],
+      });
+      expect(result.machines[1].cannotStart).toBeUndefined();
+      expect(result.openAction).toMatchObject({ kind: "open_again", label: "Open again" });
+      expect(result.openAction?.confirmation.body).toEqual(["zoo-005 already runs it.", "Its tabs start on zoo-006."]);
+    });
+
+    it("is started when it is the project's only machine, as the server runs it alone", () => {
+      const result = model({
+        report: report("open", [part(ZOO6, "zoo-006", "not_started")]),
+        session: { openState: "open", isActive: false },
+        machines: [older({ openState: "open" })],
+        target: { machineId: ZOO6, projectId: PROJECT, hostname: "zoo-006" },
+      });
+      expect(result.machines[0].cannotStart).toBeUndefined();
+      expect(result.openAction?.kind).toBe("open_again");
+      expect(result.openAction?.confirmation.body).toEqual(["Its tabs start on zoo-006."]);
+    });
+
+    it("is named as not started, with the reason, when an Open is offered for other machines", () => {
+      // Closed: Open starts zoo-005 and leaves zoo-006 as it is.
+      const closed = model({
+        report: report("closed", [part(ZOO5, "zoo-005", "not_started"), part(ZOO6, "zoo-006", "not_started")]),
+        session: { openState: "closed", isActive: false },
+        machines: [machine(ZOO5, "zoo-005"), older()],
+      });
+      expect(closed.openAction).toMatchObject({ kind: "open", label: "Open" });
+      expect(closed.openAction?.confirmation.body).toEqual([
+        "Its tabs start on zoo-005.",
+        `zoo-006 is not started. ${OLDER}`,
+      ]);
+      // A closed project's tab owner has not failed at anything.
+      expect(closed.machines[1].label).toBe("Not running");
+      expect(closed.notice).toEqual([]);
+
+      // Open, with a third machine that can be started.
+      const again = model({
+        report: report("open", [
+          part(LAPTOP, "laptop", "not_started", { reason: "The daemon did not answer the start." }),
+          part(ZOO5, "zoo-005", "running"),
+          part(ZOO6, "zoo-006", "not_started", { reason: OLDER }),
+        ]),
+        session: { openState: "open", isActive: true },
+        machines: [machine(LAPTOP, "laptop"), machine(ZOO5, "zoo-005", { isRunning: true }), older()],
+      });
+      expect(again.openAction?.kind).toBe("open_again");
+      expect(again.openAction?.confirmation.body).toEqual([
+        "zoo-005 already runs it.",
+        "Its tabs start on laptop.",
+        `zoo-006 is not started. ${OLDER}`,
+      ]);
+    });
+
+    it("is not started by keeping a not-recorded project open, and the confirmation says so", () => {
+      const result = model({
+        report: report(undefined, [part(ZOO5, "zoo-005", "running"), part(ZOO6, "zoo-006", "not_started")]),
+        session: { isActive: true },
+        machines: [machine(ZOO5, "zoo-005", { isRunning: true }), older()],
+      });
+      expect(result.openAction).toMatchObject({ kind: "keep_open", label: "Keep open" });
+      expect(result.openAction?.confirmation).toEqual({
+        title: "Keep mako open?",
+        body: [
+          "This records the project as open. Nothing starts now.",
+          "Its tabs start again on zoo-005 and zoo-006 after those machines have been away.",
+          `zoo-006 is not started. ${OLDER}`,
+        ],
+      });
+      expect(result.notice.map((line) => [line.text, line.reason]))
+        .toEqual([["zoo-006 is not running this project.", OLDER]]);
+    });
   });
 
   it("says an offline tab owner of an unrecorded project is not running it, and keeps the project open", () => {

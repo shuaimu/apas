@@ -5,6 +5,7 @@ import { ResourceUseRollup } from "./ResourceUseRollup";
 import { UsageStatsRollup } from "./UsageStatsRollup";
 import { AllowedTabTypesCard } from "./AllowedTabTypesCard";
 import { OverviewSection } from "./OverviewElements";
+import type { TabHost } from "@/lib/tabHosts";
 
 /**
  * The interactive half of a project's Overview, in the order the project is
@@ -17,6 +18,10 @@ interface OverviewViewProps {
   onOpenDiff: (paneId: number) => void;
   onOpenRole: (paneId: number) => void;
   onRemovePane: (paneId: number) => void;
+  /** Where each tab runs, and whether anything runs the project: a tab card
+   *  then says "Not running on <host>" as the sidebar's dots do. */
+  tabHosts?: Map<number, TabHost>;
+  projectRunning?: boolean;
 }
 
 export function OverviewView({
@@ -24,6 +29,8 @@ export function OverviewView({
   onOpenDiff,
   onOpenRole,
   onRemovePane,
+  tabHosts,
+  projectRunning,
 }: OverviewViewProps) {
   return (
     <section aria-label="Interactive project" className="flex min-w-0 flex-col gap-8">
@@ -38,6 +45,8 @@ export function OverviewView({
           onOpenDiff={onOpenDiff}
           onOpenRole={onOpenRole}
           onRemovePane={onRemovePane}
+          tabHosts={tabHosts}
+          projectRunning={projectRunning}
         />
       </OverviewSection>
 

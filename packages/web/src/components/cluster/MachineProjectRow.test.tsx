@@ -325,6 +325,89 @@ describe("MachineProjectRow", () => {
     expect(button("Close mako (listed on zoo-006)")).toBeTruthy();
   });
 
+  it("tints the Not started chip amber, with no grey text class beside it", () => {
+    renderRow({
+      machines: [machine(ZOO6, "zoo-006", {
+        openState: "open",
+        part: "not_started",
+        partReason: "The project's policy does not allow it on zoo-006.",
+        otherHosts: [other("zoo-005", true)],
+      })],
+      from: ZOO6,
+    });
+    const chip = screen.getByTestId("machine-part");
+    expect(chip.textContent).toBe("Not started");
+    const classes = chip.className.split(/\s+/);
+    expect(classes).toContain("text-amber-800");
+    // Two text colours on one element are settled by the stylesheet's
+    // order, and grey won: the chip must carry the amber alone.
+    expect(classes.filter((name) => /^(dark:)?text-(gray|amber|green)-/.test(name)))
+      .toEqual(["text-amber-800", "dark:text-amber-200"]);
+    // A chip without a tone keeps the plain grey.
+    expect(screen.getByTestId("project-open-state").className).toContain("text-gray-600");
+  });
+
+  it("offers Keep open, not Open beside an Open chip, for a not-recorded project that runs on one of its two machines", () => {
+    const half = [
+      machine(ZOO5, "zoo-005", { isRunning: true, part: "running", otherHosts: [other("zoo-006", false)] }),
+      machine(ZOO6, "zoo-006", { part: "not_started", otherHosts: [other("zoo-005", true)] }),
+    ];
+    for (const [from, host] of [[ZOO5, "zoo-005"], [ZOO6, "zoo-006"]] as const) {
+      const { onOpen } = renderRow({ machines: half, from });
+      expect(state()).toBe("Open");
+      expect(screen.queryByRole("button", { name: `Open mako (listed on ${host})` })).toBeNull();
+      const keep = button(`Keep mako open (listed on ${host})`);
+      expect(keep.textContent).toContain("Keep open");
+      fireEvent.click(keep);
+      // Confirming starts zoo-006, and the confirmation says so.
+      expect(dialogLines("Keep mako open?")).toEqual([
+        "zoo-005 already runs it.",
+        "Its tabs start on zoo-006.",
+        "Its tabs start again on zoo-005 and zoo-006 after those machines have been away.",
+      ]);
+      confirm("Keep open");
+      expect(onOpen).toHaveBeenCalledTimes(1);
+      expect(button(`Close mako (listed on ${host})`)).toBeTruthy();
+      cleanup();
+    }
+  });
+
+  it("offers no Open again for a machine whose daemon is too old to start beside the others", () => {
+    const reason = "zoo-006 runs an older APAS that cannot run this project beside other machines. Reboot zoo-006 to update it.";
+    const machines = [
+      machine(ZOO5, "zoo-005", { openState: "open", isRunning: true, part: "running", otherHosts: [other("zoo-006", false)] }),
+      // What the machine list says of an "Older APAS" daemon.
+      machine(ZOO6, "zoo-006", { openState: "open", part: "not_started", partReason: reason, otherHosts: [other("zoo-005", true)] }, { projectInstancesAvailable: false }),
+    ];
+    for (const [from, host] of [[ZOO5, "zoo-005"], [ZOO6, "zoo-006"]] as const) {
+      renderRow({ machines, from });
+      expect(state()).toBe("Open");
+      // The server refuses zoo-006 until it is rebooted: nothing to offer.
+      expect(screen.queryByRole("button", { name: /^(Open|Keep)/ })).toBeNull();
+      expect(button(`Close mako (listed on ${host})`)).toBeTruthy();
+      cleanup();
+    }
+    renderRow({ machines, from: ZOO6 });
+    expect(part()).toBe("Not started");
+    expect(screen.getByTestId("part-reason").textContent).toBe(`Not started: ${reason}`);
+  });
+
+  it("says a closed project's Open does not start a machine whose daemon is too old, and why", () => {
+    const reason = "zoo-006 runs an older APAS that cannot run this project beside other machines. Reboot zoo-006 to update it.";
+    renderRow({
+      machines: [
+        machine(ZOO5, "zoo-005", { openState: "closed", part: "not_started", otherHosts: [other("zoo-006", false)] }),
+        machine(ZOO6, "zoo-006", { openState: "closed", part: "not_started", otherHosts: [other("zoo-005", false)] }, { projectInstancesAvailable: false }),
+      ],
+      from: ZOO5,
+    });
+    fireEvent.click(button("Open mako (listed on zoo-005)"));
+    expect(dialogLines("Open mako?")).toEqual([
+      "Its tabs start on zoo-005.",
+      `zoo-006 is not started. ${reason}`,
+    ]);
+  });
+
   it("keeps the daemon's error when it differs from the server's reason", () => {
     renderRow({
       machines: [machine(ZOO6, "zoo-006", { openState: "open", part: "not_started", lastError: "The checkout is missing." })],

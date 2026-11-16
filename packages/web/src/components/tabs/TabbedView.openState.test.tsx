@@ -308,6 +308,52 @@ describe("a closed project", () => {
   });
 });
 
+describe("the tabs of a closed project", () => {
+  const CLOSED = "This project is closed. Open it to start its tabs.";
+
+  it("say the project is closed, not that one machine is not running it", async () => {
+    seed({ instances: [], activePaneId: 11, session: { openState: "closed" } });
+    report("closed", [part(ZOO5, "zoo-005", "not_started"), part(ZOO6, "zoo-006", "not_started")]);
+    const { container } = await renderView();
+
+    expect(projectButtons()).toEqual(["Open"]);
+    // The banner under the toolbar, and each tab's tooltip.
+    expect(screen.getAllByRole("status").some((element) => element.textContent?.includes(CLOSED))).toBe(true);
+    for (const id of [10, 11]) {
+      expect((container.querySelector(`[data-tab-id="${id}"]`) as HTMLElement).getAttribute("title")).toBe(CLOSED);
+    }
+    expect(document.body.textContent).not.toContain("Open the project again to start it there.");
+    // Forgetting a machine's tabs is still offered to the owner.
+    expect(screen.getByRole("button", { name: "Forget zoo-006's tabs" })).toBeTruthy();
+  });
+
+  it("read Not running on the Overview's cards, as the sidebar's dots do", async () => {
+    seed({ instances: [], session: { openState: "closed" } });
+    report("closed", [part(ZOO5, "zoo-005", "not_started"), part(ZOO6, "zoo-006", "not_started")]);
+    await renderView();
+
+    fireEvent.click(screen.getByRole("button", { name: "Project overview" }));
+    const panels = await screen.findByRole("region", { name: "Interactive project" });
+    const first = within(panels).getByTitle("Open Claude 1");
+    const second = within(panels).getByTitle("Open Claude 2");
+    expect(within(first).getByText("Not running on zoo-005")).toBeTruthy();
+    expect(within(second).getByText("Not running on zoo-006")).toBeTruthy();
+    expect(within(first).getByRole("img", { name: "not running" })).toBeTruthy();
+    expect(within(panels).queryByText("Idle")).toBeNull();
+  });
+
+  it("keep their real status on the Overview while their machine runs the project", async () => {
+    seed({ instances: [instance(ZOO5, "zoo-005", true)], session: { openState: "open" } });
+    report("open", [part(ZOO5, "zoo-005", "running"), part(ZOO6, "zoo-006", "not_started")]);
+    await renderView();
+
+    fireEvent.click(screen.getByRole("button", { name: "Project overview" }));
+    const panels = await screen.findByRole("region", { name: "Interactive project" });
+    expect(within(within(panels).getByTitle("Open Claude 1")).getByText("Idle")).toBeTruthy();
+    expect(within(within(panels).getByTitle("Open Claude 2")).getByText("Not running on zoo-006")).toBeTruthy();
+  });
+});
+
 describe("an open project", () => {
   it("offers Close and not Open while every machine that owns its tabs runs it", async () => {
     seed({ session: { openState: "open" } });
@@ -381,6 +427,34 @@ describe("an open project", () => {
     expectValid(open);
   });
 
+  it("offers no Open again for a machine whose daemon is too old to start beside the others, and keeps its reason", async () => {
+    const reason = "zoo-006 runs an older APAS that cannot run this project beside other machines. Reboot zoo-006 to update it.";
+    seed({
+      instances: [instance(ZOO5, "zoo-005", true)],
+      activePaneId: 11,
+      session: { openState: "open" },
+      // The machine list marks zoo-006 "Older APAS".
+      machines: [
+        machine(ZOO5, "zoo-005", { running: true }),
+        { ...machine(ZOO6, "zoo-006"), projectInstancesAvailable: false },
+      ],
+    });
+    report("open", [part(ZOO5, "zoo-005", "running"), part(ZOO6, "zoo-006", "not_started", { reason })]);
+    await renderView(11);
+
+    // The server refuses zoo-006 every time until it is rebooted: an Open
+    // again would promise a start and change nothing.
+    expect(projectButtons()).toEqual(["Close"]);
+    expect(notice()?.textContent).toBe(`zoo-006 is not running this project. ${reason}`);
+
+    // Its tab says the same, and nothing tells the user to open the project
+    // again to start it there.
+    const sentence = `zoo-006 is not running this project. ${reason}`;
+    expect(screen.getByTestId("terminal-pane-11").getAttribute("data-input-disabled")).toBe(sentence);
+    expect(document.body.textContent).not.toContain("Open the project again to start it there.");
+    expect(sent("start_machine_project_cli")).toEqual([]);
+  });
+
   it("says a tab on that machine cannot be used until the project is opened again", async () => {
     seed({ instances: [instance(ZOO5, "zoo-005", true)], activePaneId: 11, session: { openState: "open" } });
     report("open", [part(ZOO5, "zoo-005", "running"), part(ZOO6, "zoo-006", "not_started")]);
@@ -450,20 +524,23 @@ describe("a project nobody has recorded", () => {
     expect(screen.getByTestId("project-open-state").textContent).toBe("Open");
   });
 
-  it("names the machine that is not running it and offers Open and Close", async () => {
+  it("names the machine that is not running it and offers Keep open, which says what starts, and Close", async () => {
     seed({ instances: [instance(ZOO5, "zoo-005", true)] });
     report(undefined, [part(ZOO5, "zoo-005", "running"), part(ZOO6, "zoo-006", "not_started")]);
     await renderView();
 
     expect(notice()?.textContent).toBe("zoo-006 is not running this project.");
-    expect(projectButtons()).toEqual(["Open", "Close"]);
-    fireEvent.click(screen.getByRole("button", { name: "Open" }));
+    // The offer reads "Keep open" on every not-recorded project that runs.
+    expect(projectButtons()).toEqual(["Keep open", "Close"]);
+    fireEvent.click(screen.getByRole("button", { name: "Keep open" }));
+    expect(screen.getByRole("dialog", { name: "Keep apas open?" })).toBeTruthy();
+    // Confirming starts zoo-006: nothing says "Nothing starts now".
     expect(dialogLines()).toEqual([
       "zoo-005 already runs it.",
       "Its tabs start on zoo-006.",
       "Its tabs start again on zoo-005 and zoo-006 after those machines have been away.",
     ]);
-    confirmDialog("Open");
+    confirmDialog("Keep open");
     expect(sent("start_machine_project_cli")).toEqual([{
       type: "start_machine_project_cli",
       machine_id: ZOO5,
@@ -731,6 +808,46 @@ describe("deleting a project", () => {
     expect(ws.send).toHaveBeenCalledTimes(1);
   });
 
+  it("leaves the project's workspace when its deletion is done, and says which project is gone", async () => {
+    seed({ session: { openState: "open", shareRole: "owner" } });
+    report("open", [part(ZOO5, "zoo-005", "running"), part(ZOO6, "zoo-006", "running")]);
+    await renderView();
+    expect(screen.getByRole("button", { name: "Delete project…" })).toBeTruthy();
+
+    // What the Delete project dialog does once the server reports it done:
+    // it marked the deletion as its request went out, then forgets the
+    // project.
+    act(() => {
+      useStore.getState().setProjectDeleting(SID, true);
+      useStore.getState().forgetProject(SID);
+    });
+
+    // No tab bar and no controls of the deleted project are left.
+    expect(screen.queryByRole("button", { name: "Delete project…" })).toBeNull();
+    expect(projectButtons()).toEqual([]);
+    expect(screen.queryByTestId("terminal-pane-10")).toBeNull();
+    // It does not read like a project that is still there and empty.
+    expect(screen.getByRole("status").textContent).toContain("apas was deleted.");
+    expect(screen.getByText("Pick another project from the list.")).toBeTruthy();
+    expect(screen.queryByText("No messages yet")).toBeNull();
+    expect(screen.queryByText("Waiting for activity...")).toBeNull();
+  });
+
+  it("sends no terminal frame for a project whose deletion this window started", async () => {
+    seed({ session: { openState: "open", shareRole: "owner" } });
+    report("open", [part(ZOO5, "zoo-005", "running"), part(ZOO6, "zoo-006", "running")]);
+    await renderView();
+    act(() => useStore.getState().setProjectDeleting(SID, true));
+    ws.send.mockClear();
+    // The terminal on screen resizes as the project's notices come and go.
+    act(() => {
+      useStore.getState().sendTerminalResize(10, 120, 40);
+      useStore.getState().sendTerminalInput(10, "x");
+      useStore.getState().attachTerminal(10);
+    });
+    expect(ws.send).not.toHaveBeenCalled();
+  });
+
   it("is not offered to a user who is not the owner", async () => {
     seed({ session: { openState: "open", isShared: true, shareRole: "user", ownerEmail: "owner@example.com" } });
     report("open", [part(ZOO5, "zoo-005", "running"), part(ZOO6, "zoo-006", "running")]);
@@ -792,6 +909,37 @@ describe("a new tab on a machine that is not running the project", () => {
     expect(add).toMatchObject({ type: "add_pane", session_id: SID, machine_id: ZOO6 });
     expectValid(add);
     expect(sent("start_machine_project_cli")).toEqual([]);
+  });
+
+  it("says the project starts on that machine first when the project is open already", async () => {
+    // Open, with tabs on zoo-005 only; zoo-006 has it registered.
+    seed({
+      instances: [instance(ZOO5, "zoo-005", true)],
+      panes: [terminal(10, "Claude 1", ZOO5, "zoo-005")],
+      session: { openState: "open" },
+    });
+    act(() => useStore.setState({
+      projectPolicies: {
+        [SID]: {
+          teamAvailable: false,
+          allowedLaunchProfiles: ["terminal:claude:official:default"],
+          version: 3,
+          projectSuspended: false,
+          noncompliantPaneIds: [],
+        },
+      },
+    }));
+    report("open", [part(ZOO5, "zoo-005", "running")]);
+    await renderView();
+    expect(screen.getByTestId("project-open-state").textContent).toBe("Open");
+
+    fireEvent.click(screen.getByTitle("New tab"));
+    const step = screen.getByRole("group", { name: "Run on" });
+    // The project is open: the tab does not open it.
+    expect(within(step).queryByRole("group", { name: "Opens the project" })).toBeNull();
+    const starts = within(step).getByRole("group", { name: "Starts the project first" });
+    expect(within(starts).getByText("Registered · the project starts there, then the tab opens")).toBeTruthy();
+    expect(step.textContent).not.toContain("opens the project");
   });
 
   // "Clone here" ends in a tab request on a machine that is not running

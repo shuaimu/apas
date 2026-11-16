@@ -2,7 +2,7 @@
 
 import { useCallback, useId, useRef, useEffect, useState } from "react";
 import type { ReactNode } from "react";
-import { Bot, ChevronDown, LoaderCircle, RefreshCw, Repeat } from "lucide-react";
+import { Bot, ChevronDown, LoaderCircle, RefreshCw, Repeat, Trash2 } from "lucide-react";
 import { paneKey } from "@/lib/store";
 import type { CliLifecycleInventory, CliLifecycleStatus, PaneConfig, PaneKind } from "@/lib/store";
 import { useIsLaunchProfileAllowed } from "@/lib/tabTypes";
@@ -759,14 +759,19 @@ export function TabBar({
             </button>
           );
         })()}
+        {/* An icon here: with its words the project controls took a third
+            of the bar, and three tabs already scrolled at 1440 px. The
+            cluster panel and the access dialog keep the words. */}
         {projectControls?.onDelete && (
           <button
             type="button"
             onClick={projectControls.onDelete}
-            className="px-2 h-8 my-1 text-xs font-medium rounded text-gray-500 transition-colors hover:bg-red-50 hover:text-red-700 dark:text-gray-400 dark:hover:bg-red-950/40 dark:hover:text-red-300 whitespace-nowrap"
-            title="Delete this project. It asks for the project's name first."
+            aria-label={DELETE_PROJECT_LABEL}
+            title={DELETE_PROJECT_LABEL}
+            data-testid="delete-project-control"
+            className="flex h-8 w-8 my-1 shrink-0 items-center justify-center rounded text-gray-500 transition-colors hover:bg-red-50 hover:text-red-700 dark:text-gray-400 dark:hover:bg-red-950/40 dark:hover:text-red-300"
           >
-            {DELETE_PROJECT_LABEL}
+            <Trash2 className="h-4 w-4" aria-hidden="true" />
           </button>
         )}
         {showRebootButton && onRebootCli && (

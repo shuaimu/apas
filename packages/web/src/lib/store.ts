@@ -1042,8 +1042,24 @@ interface AppState {
   pendingPaneSelection: { sessionId: string; paneId: number } | null;
   openSessionPane: (sessionId: string, paneId: number) => void;
   clearPendingPaneSelection: () => void;
-  /** Remove all browser-side projections for a project after access loss. */
-  forgetProject: (projectId: string) => void;
+  /** Remove all browser-side projections for a project after access loss.
+   *  `deleted`: the server reported the project deleted. A deletion this
+   *  window started (`deletingProjects`) is known as one without it. */
+  forgetProject: (projectId: string, options?: { deleted?: boolean }) => void;
+  /** Projects whose deletion this window asked the server for and that are
+   *  not forgotten yet. The server refuses everything sent for a project
+   *  that is being deleted, so no terminal frame is sent for one: the
+   *  terminal of the tab on screen would otherwise have each resize answered
+   *  with "Access denied". */
+  deletingProjects: Record<string, true>;
+  /** Called by the Delete project dialog: `true` as its one request goes
+   *  out, `false` when the server did not accept it. */
+  setProjectDeleting: (projectId: string, deleting: boolean) => void;
+  /** The project this window was showing when it was deleted. The workspace
+   *  is left then (no session is selected), and says which project is gone
+   *  instead of reading like an empty one. `null` once another project is
+   *  shown, and after leaving a project for any other reason. */
+  departedProject: { projectId: string; name?: string } | null;
   /** How many times each project was forgotten since the page loaded: the
    *  server reported it deleted, or this account's access to it ended. A
    *  page that keeps a project list of its own, loaded over HTTP, watches its
@@ -1460,6 +1476,20 @@ function releaseAddPaneRequest(requestId: string) {
   clearAddPaneTimer(requestId);
   addPaneGenerations.delete(requestId);
   pendingCloneAdds.delete(requestId);
+}
+
+/**
+ * Whether the project of the session on screen is one whose deletion this
+ * window started (`deletingProjects`). The server refuses whatever is sent
+ * for such a project, so its terminal frames are not sent.
+ */
+function sessionProjectIsBeingDeleted(
+  state: Pick<AppState, "sessionId" | "sessions" | "deletingProjects">,
+): boolean {
+  const { sessionId } = state;
+  if (!sessionId) return false;
+  const projectId = state.sessions.find((session) => session.id === sessionId)?.projectId ?? sessionId;
+  return state.deletingProjects[projectId] === true;
 }
 
 function withoutAddPaneRequests(
@@ -2154,6 +2184,8 @@ export const useStore = create<AppState>((set, get) => ({
   sessionInstances: {},
   projectOpenStates: {},
   projectForgets: {},
+  deletingProjects: {},
+  departedProject: null,
   addPaneRequests: loadAddPaneRequests(),
   paneAutopilot: {},
   autopilotRequests: {},
@@ -2278,6 +2310,8 @@ export const useStore = create<AppState>((set, get) => ({
       sessions: [],
       sessionInstances: {},
       projectOpenStates: {},
+      deletingProjects: {},
+      departedProject: null,
       addPaneRequests: withoutAddPaneRequests(get().addPaneRequests, () => true),
       paneAutopilot: {},
       autopilotRequests: withoutAutopilotRequests(get().autopilotRequests, () => true),
@@ -2710,6 +2744,7 @@ export const useStore = create<AppState>((set, get) => ({
       if (cached) {
         set({
           sessionId,
+          departedProject: null,
           cliClientId: newCliClientId,
           teamRecords: state.teamRecordsBySession.get(sessionId) ?? [],
           messages: cached.messages,
@@ -2738,6 +2773,7 @@ export const useStore = create<AppState>((set, get) => ({
       } else {
         set({
           sessionId,
+          departedProject: null,
           cliClientId: newCliClientId,
           teamRecords: state.teamRecordsBySession.get(sessionId) ?? [],
           messages: [],
@@ -2786,13 +2822,25 @@ export const useStore = create<AppState>((set, get) => ({
     }
   },
 
-  forgetProject: (projectId: string) => {
+  setProjectDeleting: (projectId: string, deleting: boolean) => {
     set((state) => {
-      const removedSessionIds = new Set(
-        state.sessions
-          .filter((session) => (session.projectId ?? session.id) === projectId)
-          .map((session) => session.id),
-      );
+      if (deleting === (state.deletingProjects[projectId] === true)) return {};
+      const deletingProjects = { ...state.deletingProjects };
+      if (deleting) deletingProjects[projectId] = true;
+      else delete deletingProjects[projectId];
+      return { deletingProjects };
+    });
+  },
+
+  forgetProject: (projectId: string, options?: { deleted?: boolean }) => {
+    set((state) => {
+      const removedSessions = state.sessions
+        .filter((session) => (session.projectId ?? session.id) === projectId);
+      const removedSessionIds = new Set(removedSessions.map((session) => session.id));
+      const deleted = options?.deleted === true || state.deletingProjects[projectId] === true;
+      const deletingProjects = Object.fromEntries(
+        Object.entries(state.deletingProjects).filter(([id]) => id !== projectId),
+      ) as Record<string, true>;
       const sessionCache = new Map(state.sessionCache);
       const teamRecordsBySession = new Map(state.teamRecordsBySession);
       const paneWorkSummaries = Object.fromEntries(
@@ -2859,6 +2907,7 @@ export const useStore = create<AppState>((set, get) => ({
         cliLifecycleLatestBySession,
         sessionInstances,
         projectOpenStates,
+        deletingProjects,
         projectForgets: {
           ...state.projectForgets,
           [projectId]: (state.projectForgets[projectId] ?? 0) + 1,
@@ -2873,6 +2922,15 @@ export const useStore = create<AppState>((set, get) => ({
           : {}),
         ...(activeRemoved
           ? {
+              // The workspace says which project is gone, when it was
+              // deleted; leaving for another reason says nothing of it.
+              departedProject: deleted
+                ? {
+                    projectId,
+                    name: removedSessions.find((session) => session.id === state.sessionId)
+                      ?.workingDir?.split("/").filter(Boolean).pop(),
+                  }
+                : null,
               sessionId: null,
               cliClientId: null,
               isAttached: false,
@@ -3108,6 +3166,7 @@ export const useStore = create<AppState>((set, get) => ({
     localStorage.setItem("apas_session_id", sessionId);
     set({
       sessionId,
+      departedProject: null,
       messages: [],
       paneMessages: {},
       paneHasMore: {},
@@ -3965,6 +4024,7 @@ export const useStore = create<AppState>((set, get) => ({
   attachTerminal: (paneId: number) => {
     const { ws, sessionId } = get();
     if (!sessionId || !ws || ws.readyState !== WebSocket.OPEN) return;
+    if (sessionProjectIsBeingDeleted(get())) return;
     ws.send(JSON.stringify({
       type: "terminal_attach",
       session_id: sessionId,
@@ -3976,6 +4036,7 @@ export const useStore = create<AppState>((set, get) => ({
   sendTerminalInput: (paneId: number, data: string) => {
     const { ws, sessionId, paneConfigs } = get();
     if (!sessionId || !ws || ws.readyState !== WebSocket.OPEN) return;
+    if (sessionProjectIsBeingDeleted(get())) return;
     // A retired provider's tab (a saved Pi tab) has no terminal to type into.
     const pane = paneConfigs.find((candidate) => candidate.pane_id === paneId);
     if (pane && isRetiredProviderModel(pane.provider, pane.model)) return;
@@ -4048,6 +4109,7 @@ export const useStore = create<AppState>((set, get) => ({
   sendTerminalResize: (paneId: number, cols: number, rows: number) => {
     const { ws, sessionId } = get();
     if (!sessionId || !ws || ws.readyState !== WebSocket.OPEN) return;
+    if (sessionProjectIsBeingDeleted(get())) return;
     ws.send(JSON.stringify({
       type: "terminal_resize",
       session_id: sessionId,
@@ -6445,7 +6507,7 @@ export function handleServerMessage(
           ),
         }));
       } else {
-        get().forgetProject(projectId);
+        get().forgetProject(projectId, { deleted: change === "deleted" });
       }
       get().listSessions();
       break;

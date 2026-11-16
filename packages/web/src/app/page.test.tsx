@@ -96,12 +96,18 @@ vi.mock("@/components/mobile/MobileCodeHome", () => ({
     selectedView,
     onSelectedViewChange,
     onOpenSession,
+    forgottenProjects,
   }: {
     selectedView: "all" | "idle" | "machines";
     onSelectedViewChange: (view: "all" | "idle" | "machines") => void;
     onOpenSession: (sessionId: string, projectName: string) => void;
+    forgottenProjects?: Record<string, number>;
   }) => (
-    <div data-testid="mobile-code-home" data-selected-view={selectedView}>
+    <div
+      data-testid="mobile-code-home"
+      data-selected-view={selectedView}
+      data-forgotten-projects={JSON.stringify(forgottenProjects ?? null)}
+    >
       <button onClick={() => onSelectedViewChange("idle")}>Show idle sessions</button>
       <button onClick={() => onOpenSession("mobile-session", "mobile-project")}>Open mobile session</button>
     </div>
@@ -361,6 +367,18 @@ describe("Home responsive shell", () => {
 
     fireEvent.click(screen.getByText("Back to mobile home"));
     expect((await screen.findByTestId("mobile-code-home")).getAttribute("data-selected-view")).toBe("idle");
+  });
+
+  it("tells the phone's project list which projects the store forgot", async () => {
+    // The list keeps a snapshot of its own, loaded over HTTP: without this
+    // a project deleted in another window stayed in it as a live card.
+    setMobileWidth();
+    seedAuthenticatedState("project-a", { projectForgets: { "deleted-project": 1 } });
+
+    render(<Home />);
+
+    expect((await screen.findByTestId("mobile-code-home")).getAttribute("data-forgotten-projects"))
+      .toBe(JSON.stringify({ "deleted-project": 1 }));
   });
 
   it("preserves the existing sidebar and pane view on desktop", async () => {

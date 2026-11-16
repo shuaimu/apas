@@ -42,7 +42,12 @@ export const overviewQuietDangerButton = `${quietButtonShape} hover:bg-red-50 ho
 
 /** A small label for a kind or a state, such as "Claude". Add `truncate` and
  *  a maximum width where the text is not fixed. */
-export const overviewChip = "shrink-0 rounded bg-gray-100 px-1.5 py-0.5 text-[11px] font-medium text-gray-600 dark:bg-gray-700 dark:text-gray-300";
+/** A chip without a text colour, for one that sets its own. Two text-colour
+ *  classes on one element do not layer by their order in `className`: the
+ *  stylesheet's order decides, and gray came after amber. */
+export const overviewChipShape = "shrink-0 rounded bg-gray-100 px-1.5 py-0.5 text-[11px] font-medium dark:bg-gray-700";
+
+export const overviewChip = `${overviewChipShape} text-gray-600 dark:text-gray-300`;
 
 export const overviewMuted = "text-xs text-gray-500 dark:text-gray-400";
 

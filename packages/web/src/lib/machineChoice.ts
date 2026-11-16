@@ -43,6 +43,10 @@ export interface MachineChoice {
    *  is not running the project. Absent means the request starts that
    *  machine alone, as an older server does. */
   alsoStarts?: string[];
+  /** With `alsoStarts`: the project is recorded open already, so a tab there
+   *  does not open it. The project starts on this machine, and on
+   *  `alsoStarts`, the other tab owners that are not running it. */
+  projectOpen?: boolean;
 }
 
 export interface MachineChoiceInput {
@@ -77,7 +81,14 @@ export interface MachineChoiceInput {
      *  (`ProjectMachinePartInfo.partUnconfirmed`): the machine may be
      *  starting already, and is not named as one an Open starts. */
     partUnconfirmed?: boolean;
+    /** The server will not start the machine
+     *  (`ProjectOpenMachine.cannotStart`); it is not named either. */
+    cannotStart?: string;
   }[];
+  /** The project is recorded open (`ProjectOpenModel.recorded` and its
+   *  state): a tab on a machine that is not running it starts the project
+   *  there, and the step does not say it opens the project. */
+  projectOpen?: boolean;
 }
 
 export interface MachineChoiceModel {
@@ -172,10 +183,11 @@ export function buildMachineChoices(input: MachineChoiceInput): MachineChoiceMod
       ...(input.openStateSupported ? {
         alsoStarts: (input.projectMachines ?? [])
           .filter((other) => other.ownsTabs && other.connected && other.part === "not_started"
-            && !other.partUnconfirmed
+            && !other.partUnconfirmed && !other.cannotStart
             && !(other.machineId ? other.machineId === machineId : sameHost(other.hostname, hostname)))
           .map((other) => other.hostname)
           .sort((a, b) => a.localeCompare(b)),
+        ...(input.projectOpen ? { projectOpen: true } : {}),
       } : {}),
     });
   }

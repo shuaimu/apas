@@ -6,6 +6,7 @@ import type { MachineProject, MachineWithProjects } from "@/lib/store";
 import {
   overviewButton,
   overviewChip,
+  overviewChipShape,
   overviewMuted,
 } from "@/components/overview/OverviewElements";
 import { machineProjectName } from "@/lib/clusterView";
@@ -200,7 +201,8 @@ export function MachineProjectRow({
         {showPart && (
           <span
             data-testid="machine-part"
-            className={`${overviewChip} ${partTone}`}
+            // A toned chip carries its tone as its only text colour.
+            className={partTone ? `${overviewChipShape} ${partTone}` : overviewChip}
             title={running && project.pid ? `pid ${project.pid}` : undefined}
           >
             {partChip}

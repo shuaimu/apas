@@ -8,6 +8,8 @@ import {
   overviewMuted,
   overviewQuietButton,
 } from "@/components/overview/OverviewElements";
+import type { ProjectOpenModel } from "@/lib/projectOpenState";
+import { hostList } from "@/lib/tabHosts";
 import { clusterProjectOpenModel, type ClusterOpenStateSource } from "./clusterOpenState";
 import type { ClusterProject } from "./types";
 
@@ -35,13 +37,32 @@ export function sortClusterProjects(projects: ClusterProject[]): ClusterProject[
     || (a.project_name || a.id).localeCompare(b.project_name || b.id));
 }
 
-/** The row's second line, as one string so it can be read as one. */
-export function projectFacts(project: ClusterProject, userId: string | null | undefined): string {
+/**
+ * The row's second line, as one string so it can be read as one.
+ *
+ * Without `open`, the machine is the one host the server recorded for the
+ * project's session, and "1 active session" says that a CLI of the project
+ * is attached now; a project has one session however many machines run it.
+ * Beside a known Open or Closed both mislead: a project open on two machines
+ * read "zoo-005 · 1 active session". With `open` (the project's open-state
+ * model) the line names instead the machines that run the project, or, when
+ * none does, the machines that have its tabs.
+ */
+export function projectFacts(
+  project: ClusterProject,
+  userId: string | null | undefined,
+  open?: Pick<ProjectOpenModel, "runningHosts" | "machines"> | null,
+): string {
+  const where = !open
+    ? project.hostname || ""
+    : open.runningHosts.length > 0
+      ? `Running on ${hostList(open.runningHosts)}`
+      : hostList(open.machines.map((machine) => machine.hostname)) || project.hostname || "";
   return [
     project.owner_user_id === userId ? "" : `Owner ${project.owner_email}`,
-    project.hostname || "",
+    where,
     project.member_count > 0 ? plural(project.member_count, "member", "members") : "",
-    project.active_session_count > 0 ? plural(project.active_session_count, "active session", "active sessions") : "",
+    !open && project.active_session_count > 0 ? plural(project.active_session_count, "active session", "active sessions") : "",
   ].filter(Boolean).join(" · ");
 }
 
@@ -58,6 +79,14 @@ export function projectRowLabel(project: ClusterProject, projects: ClusterProjec
   return shared && project.hostname ? `Manage ${name} on ${project.hostname}` : `Manage ${name}`;
 }
 
+/**
+ * Whether a CLI of the project is attached to the server now: the cluster
+ * list's `connected`, which is about the project's session and not about any
+ * machine. It is shown only while nothing is known about the project's open
+ * state. Beside "Closed" it read "Offline" for a project whose machines were
+ * all connected, a second state that contradicted the first; the open state
+ * and the machines named in the row's second line say what it said.
+ */
 export function ConnectionChip({ connected }: { connected: boolean }) {
   return (
     <span className={`${overviewChip} inline-flex items-center gap-1`}>
@@ -134,10 +163,10 @@ export function ProjectList({
         {shown.length === 0 && <p className={`px-4 py-3 ${overviewMuted}`}>No project matches the filter.</p>}
         {shown.map((project) => {
           const selected = project.id === selectedId;
-          const facts = projectFacts(project, userId);
           const open = openState
             ? clusterProjectOpenModel({ id: project.id, name: project.project_name }, openState)
             : null;
+          const facts = projectFacts(project, userId, open);
           return (
             <button
               key={project.id}
@@ -152,7 +181,7 @@ export function ProjectList({
                 <span className="min-w-0 truncate text-sm font-medium text-gray-900 dark:text-gray-100">
                   {project.project_name || "Unnamed project"}
                 </span>
-                <ConnectionChip connected={project.connected} />
+                {!open && <ConnectionChip connected={project.connected} />}
                 {open && <OpenStateChip label={open.stateLabel} derived={openState?.supported === true && !open.recorded} />}
                 {project.lifecycle_status === "suspended" && <SuspendedChip />}
               </span>

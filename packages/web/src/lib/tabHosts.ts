@@ -8,10 +8,12 @@ import {
   instanceHostSummary,
   LEGACY_MACHINE_KEY,
   projectPlacement,
+  sameHost,
   type PaneMachineFields,
   type SessionInstance,
 } from "./projectInstances";
 import type { MachineChoice } from "./machineChoice";
+import type { ProjectOpenModel } from "./projectOpenState";
 
 /**
  * What the tab bar and the mobile pane chips say about where each tab runs.
@@ -29,12 +31,47 @@ import type { MachineChoice } from "./machineChoice";
  * and an offline one by nothing a viewer can do. A machine this viewer
  * cannot see reads as connected, which is what the server assumes until it
  * knows better.
+ *
+ * With `reason`, why that machine is not running the project is known (the
+ * server's sentence for it, or that its daemon is too old to be started
+ * beside the others). The reason then follows the fact, and a connected
+ * machine is not said to start by opening the project again: with a known
+ * reason that is often untrue, and the reason says what to do.
  */
-export function stoppedOnHostReason(hostname: string | undefined, offline = false): string {
-  if (!hostname) return "This tab's machine is not running this project.";
-  return offline
-    ? `${hostname} is not running this project because it is offline.`
+export function stoppedOnHostReason(hostname: string | undefined, offline = false, reason?: string): string {
+  const why = reason ? ` ${reason}` : "";
+  if (!hostname) return `This tab's machine is not running this project.${why}`;
+  if (offline) return `${hostname} is not running this project because it is offline.${why}`;
+  return reason
+    ? `${hostname} is not running this project. ${reason}`
     : `${hostname} is not running this project. Open the project again to start it there.`;
+}
+
+/**
+ * Why a tab cannot be used while its project is recorded closed and its
+ * machine is not running it. Not the server's wording on purpose: the server
+ * refuses such a tab as "<host> is not running this project. Open the project
+ * again to start it there.", which names one machine although the whole
+ * project is closed, and "again" beside a button that reads "Open".
+ */
+export const PROJECT_CLOSED_TAB_REASON = "This project is closed. Open it to start its tabs.";
+
+/**
+ * The same for one tab of a closed project, by what is known of its machine.
+ * Opening does not start every tab at once: a machine that is offline starts
+ * when it reconnects, and one with a known reason is not started at all, so
+ * neither is promised. A machine the server reports as still running the
+ * closed project keeps the machine's own sentence: that tab is refused
+ * because of the machine, not because the project is closed.
+ */
+export function closedProjectTabReason(
+  hostname: string | undefined,
+  offline: boolean,
+  reason?: string,
+): string {
+  if (reason) return `This project is closed. ${reason}`;
+  if (offline && hostname) return `This project is closed, and ${hostname} is offline.`;
+  return PROJECT_CLOSED_TAB_REASON;
 }
 
 /**
@@ -121,6 +158,14 @@ export interface TabHostsInput {
   projectIds: string[];
   /** The viewer owns the project. */
   isOwner: boolean;
+  /**
+   * The project's open state (`buildProjectOpenModel`), where the caller has
+   * it. A tab whose machine is not running a project that is recorded closed
+   * is refused with `PROJECT_CLOSED_TAB_REASON`, and one whose machine has a
+   * known reason for not running it with that reason. Without it every such
+   * tab reads as the server refuses it.
+   */
+  project?: Pick<ProjectOpenModel, "state" | "recorded" | "machines">;
 }
 
 /** Whether the viewer owns the project, the way the sidebar decides it. */
@@ -130,7 +175,18 @@ export function sessionIsOwned(session: Pick<SessionInfo, "shareRole" | "isShare
 }
 
 export function describeTabHosts(input: TabHostsInput): TabHosts {
-  const { panes, instances, machines, instancesSupported, projectIds, isOwner } = input;
+  const { panes, instances, machines, instancesSupported, projectIds, isOwner, project } = input;
+  const projectClosed = project?.recorded === true && project.state === "closed";
+  // Why a machine is not running the project, where that is known.
+  const partOf = (machineId: string | undefined, hostname: string | undefined) =>
+    project?.machines.find((candidate) => machineId && candidate.machineId
+      ? candidate.machineId === machineId
+      : sameHost(candidate.hostname, hostname));
+  const reasonFor = (machineId: string | undefined, hostname: string | undefined) => {
+    const machine = partOf(machineId, hostname);
+    if (!machine || (machine.part !== "not_started" && machine.part !== "waiting_offline")) return undefined;
+    return machine.reason ?? machine.cannotStart;
+  };
   const placement = projectPlacement(panes, instances, machines);
   const tabs = new Map<number, TabHost>();
   // With nothing attached, an older server and a stopped single-machine
@@ -174,7 +230,13 @@ export function describeTabHosts(input: TabHostsInput): TabHosts {
         ? noRuntimeAccessReason(hostname ?? place.instance?.hostname ?? "that machine")
         : state === "disconnected"
           ? reconnectingOnHostReason(hostname ?? entry?.machine.hostname ?? "This tab's machine")
-          : stoppedOnHostReason(hostname, state === "offline");
+          // The whole project is closed: that, not this one machine, is
+          // why the tab cannot be used. A machine that still runs a closed
+          // project usually has its instance attached and is not here; one
+          // the server reports as still running keeps the machine's sentence.
+          : projectClosed && partOf(place.machineId, hostname)?.part !== "still_running"
+            ? closedProjectTabReason(hostname, state === "offline", reasonFor(place.machineId, hostname))
+            : stoppedOnHostReason(hostname, state === "offline", reasonFor(place.machineId, hostname));
 
     let stopped: StoppedMachineActions | undefined;
     if ((state === "stopped" || state === "offline" || state === "disconnected") && place.machineId && hostname) {
@@ -238,6 +300,26 @@ export function tabHostDescription(host: Pick<TabHost, "hostname" | "state">): s
   }
 }
 
+/**
+ * How a tab that is not running reads in a list of tabs, in place of
+ * "Idle": "Not running on zoo-005" for a tab whose machine is not running
+ * the project, "No access to zoo-006" for one this viewer may not use, and
+ * "Not running" when nothing runs the project and nothing is known per tab
+ * (a closed project on one machine). The sidebar's pane dots say the same.
+ * `undefined` for a tab that runs: its own status is then the thing to show.
+ */
+export function tabNotRunningLabel(
+  host: Pick<TabHost, "hostname" | "state"> | undefined,
+  projectRunning = true,
+): string | undefined {
+  if (host && host.state !== "running") {
+    return host.state === "no_access"
+      ? `No access${host.hostname ? ` to ${host.hostname}` : ""}`
+      : `Not running${host.hostname ? ` on ${host.hostname}` : ""}`;
+  }
+  return !host && !projectRunning ? "Not running" : undefined;
+}
+
 /** A project row's host line. */
 export interface ProjectHostLabel {
   /** The primary host, or the recorded host when nothing is attached. */
@@ -296,12 +378,16 @@ export interface MachineChoiceGroup {
  * project: the server starts every machine that owns its tabs, then adds the
  * tab. Against a server that records no open state it starts that machine
  * alone, as it always did, and the group keeps its old name. The choices say
- * which (`MachineChoice.alsoStarts`). A machine to clone onto is the same
- * once its checkout exists: its group keeps the name "Clone here", and its
- * line says that the tab opens the project (`machineChoiceDetail`).
+ * which (`MachineChoice.alsoStarts`). A project that is recorded open
+ * already is not opened by the tab: the project starts on that machine (and
+ * on any other tab owner that is not running it), and the group reads
+ * "Starts the project first" (`MachineChoice.projectOpen`). A machine to
+ * clone onto is the same once its checkout exists: its group keeps the name
+ * "Clone here", and its line says what the tab does (`machineChoiceDetail`).
  */
 export function groupMachineChoices(choices: MachineChoice[]): MachineChoiceGroup[] {
-  const opensProject = choices.some((choice) => choice.kind === "registered" && choice.alsoStarts !== undefined);
+  const opensProject = choices.some((choice) =>
+    choice.kind === "registered" && choice.alsoStarts !== undefined && !choice.projectOpen);
   const groups: MachineChoiceGroup[] = [
     { key: "instance", label: "Running", choices: [] },
     { key: "registered", label: opensProject ? "Opens the project" : "Starts the project first", choices: [] },
@@ -324,11 +410,23 @@ export function machineChoiceDetail(choice: MachineChoice): string {
       return choice.primary ? "Running this project · primary" : "Running this project";
     case "registered":
       if (choice.alsoStarts === undefined) return "Registered · the project starts there, then the tab opens";
+      // The project is open already: the tab starts it on this machine, and
+      // on the other tab owners that are not running it.
+      if (choice.projectOpen) {
+        return choice.alsoStarts.length > 0
+          ? `Registered · the project starts there and on ${hostList(choice.alsoStarts)}, then the tab opens`
+          : "Registered · the project starts there, then the tab opens";
+      }
       return choice.alsoStarts.length > 0
         ? `Registered · opens the project, which also starts its tabs on ${hostList(choice.alsoStarts)}, then the tab opens`
         : "Registered · opens the project, then the tab opens";
     case "clone":
       if (choice.alsoStarts === undefined) return "Not there yet · clone the repository, then start it";
+      if (choice.projectOpen) {
+        return choice.alsoStarts.length > 0
+          ? `Not there yet · clones the repository, the project starts there and on ${hostList(choice.alsoStarts)}, then the tab opens`
+          : "Not there yet · clones the repository, the project starts there, then the tab opens";
+      }
       return choice.alsoStarts.length > 0
         ? `Not there yet · clones the repository and opens the project, which also starts its tabs on ${hostList(choice.alsoStarts)}, then the tab opens`
         : "Not there yet · clones the repository and opens the project, then the tab opens";
@@ -361,16 +459,29 @@ export function confirmationText(copy: ConfirmationCopy): string {
  *  server that records open states the new tab opens the project, which
  *  starts every other connected machine that owns its tabs: the confirmation
  *  says so and names them, before anything is cloned. Absent, the server
- *  starts the clone's machine alone and nothing is added. */
-export function cloneHereCopy(hostname: string, gitRemote: string, alsoStarts?: string[]): ConfirmationCopy {
+ *  starts the clone's machine alone and nothing is added.
+ *
+ *  `projectOpen` is the choice's too: the project is recorded open already,
+ *  so the tab does not open it. The first paragraph says the project starts
+ *  on the clone's machine; only the other machines that start are added. */
+export function cloneHereCopy(
+  hostname: string,
+  gitRemote: string,
+  alsoStarts?: string[],
+  projectOpen = false,
+): ConfirmationCopy {
   const name = cloneInstanceName(gitRemote);
   return {
     title: `Clone this project onto ${hostname}?`,
     body: [
       `${hostname} clones ${gitRemote} into ~/apas_projects/${name} (auto-suffixed, as ${name}-2 and so on, if that folder exists) as another checkout of this project, with no new branch. The project then starts there and the new tab opens on ${hostname}.`,
-      ...(alsoStarts === undefined ? [] : [alsoStarts.length > 0
-        ? `The new tab opens the project, which also starts its tabs on ${hostList(alsoStarts)}.`
-        : "The new tab opens the project."]),
+      ...(alsoStarts === undefined
+        ? []
+        : projectOpen
+          ? (alsoStarts.length > 0 ? [`The project also starts on ${hostList(alsoStarts)}.`] : [])
+          : [alsoStarts.length > 0
+            ? `The new tab opens the project, which also starts its tabs on ${hostList(alsoStarts)}.`
+            : "The new tab opens the project."]),
       "Cloning a large repository can take a few minutes.",
     ],
   };

@@ -99,7 +99,7 @@ function useMobileViewport(): boolean {
 
 export default function Home() {
   const router = useRouter();
-  const { connected, connect, disconnect, sessionId, isAuthenticated, logout, token, userId, userEmail, serverVersion, cliClientId, cliClients, sessions, usageLimits, attachSession, listSessions, rebootDaemon, machines, machineListReceived, listMachines, setUserEmail, setClusterIdentity } = useStore();
+  const { connected, connect, disconnect, sessionId, isAuthenticated, logout, token, userId, userEmail, serverVersion, cliClientId, cliClients, sessions, usageLimits, attachSession, listSessions, rebootDaemon, machines, machineListReceived, listMachines, projectForgets, setUserEmail, setClusterIdentity } = useStore();
   const isMobileViewport = useMobileViewport();
   const [isCheckingAuth, setIsCheckingAuth] = useState(true);
   const [sidebarOpen, setSidebarOpen] = useState(false);
@@ -281,6 +281,7 @@ export default function Home() {
               liveMachines={machines}
               machineListReceived={machineListReceived}
               onRefreshMachines={listMachines}
+              forgottenProjects={projectForgets}
               usageLimits={usageLimits}
             />
           ) : (

@@ -59,7 +59,8 @@ export function ProjectPanel({
   onBack,
 }: {
   detail: ClusterProjectDetail | null;
-  /** The list's row for the project, for whether it is connected. */
+  /** The list's row for the project, for whether it is connected. Shown
+   *  only when the project's open state is not known. */
   summary?: ClusterProject;
   usage: UsageWindows | null;
   loading: boolean;
@@ -190,7 +191,9 @@ function ProjectDetail({
       <h3 className="break-words text-sm font-semibold text-gray-900 dark:text-gray-100">{name}</h3>
       <div className="select-all break-all font-mono text-[11px] text-gray-500 dark:text-gray-400">{project.id}</div>
       <div className="flex flex-wrap items-center gap-2">
-        {summary && <ConnectionChip connected={summary.connected} />}
+        {/* Only while nothing is known about the open state: see
+            `ConnectionChip`. */}
+        {summary && !open && <ConnectionChip connected={summary.connected} />}
         {open && <OpenStateChip label={open.stateLabel} derived={openState?.supported === true && !open.recorded} />}
         {suspended && <SuspendedChip />}
       </div>

@@ -30,6 +30,7 @@ import { useSessionAutopilotStatuses } from "@/lib/useAutopilot";
 import type { AutopilotListStatus } from "@/lib/autopilot";
 import { providerModelDisplayName } from "@/lib/launchProfileLabels";
 import { formatRelativeTime } from "@/lib/formatRelativeTime";
+import { tabNotRunningLabel, type TabHost } from "@/lib/tabHosts";
 import { OverviewEmpty, overviewCard, overviewChip, overviewQuietButton, overviewQuietDangerButton } from "./OverviewElements";
 
 interface PaneGridProps {
@@ -37,6 +38,12 @@ interface PaneGridProps {
   onOpenDiff: (paneId: number) => void;
   onOpenRole: (paneId: number) => void;
   onRemovePane: (paneId: number) => void;
+  /** Where each tab runs (`describeTabHosts`). A tab whose machine is not
+   *  running the project reads "Not running on <host>", not "Idle". */
+  tabHosts?: Map<number, TabHost>;
+  /** Whether anything runs the project. When nothing does and nothing is
+   *  known per tab, every card reads "Not running". Assumed when absent. */
+  projectRunning?: boolean;
 }
 
 const OVERVIEW_AGENT_OPTION_VALUES = new Set([
@@ -57,6 +64,8 @@ export function PaneGrid({
   onOpenDiff,
   onOpenRole,
   onRemovePane,
+  tabHosts,
+  projectRunning = true,
 }: PaneGridProps) {
   const paneConfigs = useStore((s) => s.paneConfigs);
   const paneStatuses = useStore((s) => s.paneStatuses);
@@ -101,6 +110,7 @@ export function PaneGrid({
             key={pane.pane_id}
             pane={pane}
             status={status ?? null}
+            notRunning={tabNotRunningLabel(tabHosts?.get(pane.pane_id), projectRunning)}
             isPaused={isPaused}
             autopilot={autopilotStatuses.get(pane.pane_id)}
             messages={messages}
@@ -126,6 +136,9 @@ function latest(a?: Date, b?: Date): Date | undefined {
 interface PaneCardProps {
   pane: PaneConfig;
   status: string | null;
+  /** "Not running on zoo-005": the tab cannot be doing anything, whatever
+   *  status it last reported. Absent for a tab that runs. */
+  notRunning?: string;
   isPaused: boolean;
   /** The tab's autopilot, when it has one to show: its condition, or why it
    *  paused or ended. Shown beside the status, never in its place. */
@@ -142,6 +155,7 @@ interface PaneCardProps {
 function PaneCard({
   pane,
   status,
+  notRunning,
   isPaused,
   autopilot,
   messages,
@@ -162,20 +176,24 @@ function PaneCard({
     : mappedAgentValue;
   const isUnsupported = isRetiredProviderModel(pane.provider, pane.model)
     || currentAgentValue === "unsupported";
-  const isAwaitingAnswer = paneIsAwaitingAnswerStatus(status) && !isPaused;
-  const isThinking = !!status && !isPaused && !isAwaitingAnswer;
+  // A tab that is not running awaits nothing and thinks nothing: its last
+  // reported status is stale.
+  const isAwaitingAnswer = !notRunning && paneIsAwaitingAnswerStatus(status) && !isPaused;
+  const isThinking = !notRunning && !!status && !isPaused && !isAwaitingAnswer;
   // The dot's label is the tab's state in a word; the status line beside it
   // carries what the tab itself reports.
   const modeIndicator = readOnlyHistory
     ? { label: "earlier bot history", dot: "bg-gray-300 dark:bg-gray-600" }
     : isUnsupported
     ? { label: "unsupported provider", dot: "bg-red-500" }
+    : notRunning
+    ? { label: "not running", dot: "bg-gray-300 dark:bg-gray-600" }
     : isAwaitingAnswer
     ? { label: "pending answer", dot: "bg-amber-500" }
     : isThinking
       ? { label: "thinking", dot: "bg-blue-500 animate-pulse" }
       : { label: "idle", dot: "bg-gray-300 dark:bg-gray-600" };
-  const statusText = status || (isPaused ? "Paused" : "Idle");
+  const statusText = notRunning ?? (status || (isPaused ? "Paused" : "Idle"));
   const statusColor = isAwaitingAnswer
     ? "text-amber-700 dark:text-amber-300"
     : isThinking

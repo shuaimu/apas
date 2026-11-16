@@ -1250,6 +1250,38 @@ describe("Projects view: open state and deletion", () => {
     expect(within(panel).getByTestId("project-open-state").textContent).toBe("Open");
   });
 
+  it("shows no Connected or Offline chip beside a known Open or Closed, in the list or the panel", async () => {
+    // The cluster list's `connected` says whether a CLI of the project is
+    // attached now. Beside "Closed" it read "Offline" while the project's
+    // machine was connected.
+    seedMachines([hosting({ openState: "closed", part: "not_started" })]);
+    capable();
+    render(<MachinesPage />);
+    openView("Projects");
+
+    const row = await screen.findByRole("button", { name: "Manage mako-soumojit" });
+    expect(within(row).getByTestId("project-open-state").textContent).toBe("Closed");
+    expect(within(row).queryByText(/^(Connected|Offline)$/)).toBeNull();
+    fireEvent.click(row);
+    const panel = screen.getByRole("region", { name: "Selected project" });
+    expect((await within(panel).findByTestId("project-open-state")).textContent).toBe("Closed");
+    expect(within(panel).queryByText(/^(Connected|Offline)$/)).toBeNull();
+  });
+
+  it("keeps the Connected or Offline chip while nothing is known about the open state", async () => {
+    seedMachines();
+    capable();
+    render(<MachinesPage />);
+    openView("Projects");
+
+    const row = await screen.findByRole("button", { name: "Manage mako-soumojit" });
+    expect(within(row).queryByTestId("project-open-state")).toBeNull();
+    expect(within(row).getByText(/^(Connected|Offline)$/)).toBeTruthy();
+    fireEvent.click(row);
+    const panel = screen.getByRole("region", { name: "Selected project" });
+    expect(await within(panel).findByText(/^(Connected|Offline)$/)).toBeTruthy();
+  });
+
   it("takes the state from the session list when no machine lists the project", async () => {
     seedMachines();
     capable();
@@ -1640,6 +1672,55 @@ describe("Projects view: open state and deletion", () => {
     // The wait is over: a later report loads nothing.
     reportDeleted("project-a");
     expect(listLoads()).toBe(loads + 1);
+  });
+
+  // A second window of the same account, on the Projects view, with no
+  // deletion of its own: the list is loaded over HTTP and kept the deleted
+  // project's row, and its open panel, until someone pressed Refresh.
+  it("drops a project that was deleted from another window, without a reload", async () => {
+    const server = deletionApi(200);
+    seedMachines([hosting({ openState: "closed", part: "not_started" })]);
+    capable();
+    act(() => { useStore.setState({ userId: "owner-1", listSessions: vi.fn() }); });
+    render(<MachinesPage />);
+    openView("Projects");
+    fireEvent.click(await screen.findByRole("button", { name: "Manage mako-soumojit" }));
+    expect(await screen.findByRole("button", { name: "Delete project…" })).toBeTruthy();
+    const loads = listLoads();
+
+    // Another project's end says nothing about this list.
+    reportDeleted("project-z");
+    expect(listLoads()).toBe(loads);
+
+    server.gone = true;
+    reportDeleted("project-a");
+    expect(listLoads()).toBe(loads + 1);
+    expect(await screen.findByText("No projects are hosted in your cluster yet.")).toBeTruthy();
+    await waitFor(() => expect(screen.queryByRole("button", { name: "Delete project…" })).toBeNull());
+    expect(address()).toBe("/machines?view=projects");
+    // This window asked for no deletion.
+    expect(deleteRequests()).toBe(0);
+    expect(statusAsks()).toBe(0);
+  });
+
+  it("keeps a project the store forgot whose row the list still has, with its panel", async () => {
+    // Access as a project user ended, but this cluster still hosts it.
+    deletionApi(200);
+    seedMachines([hosting({ openState: "closed", part: "not_started" })]);
+    capable();
+    act(() => { useStore.setState({ userId: "owner-1", listSessions: vi.fn() }); });
+    render(<MachinesPage />);
+    openView("Projects");
+    fireEvent.click(await screen.findByRole("button", { name: "Manage mako-soumojit" }));
+    expect(await screen.findByRole("button", { name: "Delete project…" })).toBeTruthy();
+    const loads = listLoads();
+
+    reportDeleted("project-a");
+    await waitFor(() => expect(listLoads()).toBe(loads + 1));
+    await pause();
+    expect(screen.getByRole("button", { name: "Manage mako-soumojit" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Delete project…" })).toBeTruthy();
+    expect(new URL(window.location.href).searchParams.get("selected")).toBe("project-a");
   });
 
   it("keeps the project when the store forgets it and the list still has it", async () => {

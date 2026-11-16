@@ -424,6 +424,7 @@ export function TabbedView({
   const pausedPanes = useStore((s) => s.pausedPanes);
   const loadingMorePane = useStore((s) => s.loadingMorePane);
   const isAttached = useStore((s) => s.isAttached);
+  const departedProject = useStore((s) => s.departedProject);
   const isDualPane = useStore((s) => s.isDualPane);
   const hasMoreMessages = useStore((s) => s.hasMoreMessages);
   const isLoadingMore = useStore((s) => s.isLoadingMore);
@@ -587,19 +588,6 @@ export function TabbedView({
     return resolveMachineProjectTarget(currentSession, machines);
   }, [currentSession, machines, sessionId]);
 
-  // Where each tab runs, and why a tab cannot be used: its machine is not
-  // running the project, or this viewer may not use that machine. Empty for an
-  // older server and for a single-machine project with nothing attached, so
-  // the tab bar is then what it always was.
-  const tabHosts = useMemo(() => describeTabHosts({
-    panes: effectiveTabs,
-    instances,
-    machines,
-    instancesSupported,
-    projectIds: [currentSession?.projectId, sessionId].filter((id): id is string => Boolean(id)),
-    isOwner: sessionIsOwned(currentSession),
-  }), [currentSession, effectiveTabs, instances, instancesSupported, machines, sessionId]);
-
   // The project's open state as the server reports it: the state to show,
   // the Open and Close to offer with their confirmations, and the machines
   // that are not following. From a server that records no state it is
@@ -633,6 +621,22 @@ export function TabbedView({
     sessionId,
   ]);
 
+  // Where each tab runs, and why a tab cannot be used: its machine is not
+  // running the project, or this viewer may not use that machine. Empty for an
+  // older server and for a single-machine project with nothing attached, so
+  // the tab bar is then what it always was. The project's open state words
+  // the reason: a closed project is said to be closed, and a machine with a
+  // known reason for not running it is given that reason.
+  const tabHosts = useMemo(() => describeTabHosts({
+    panes: effectiveTabs,
+    instances,
+    machines,
+    instancesSupported,
+    projectIds: [currentSession?.projectId, sessionId].filter((id): id is string => Boolean(id)),
+    isOwner: sessionIsOwned(currentSession),
+    project: projectOpenModel,
+  }), [currentSession, effectiveTabs, instances, instancesSupported, machines, projectOpenModel, sessionId]);
+
   const selectedTabConfig = activeTabId != null
     ? effectiveTabs.find((tab) => tab.pane_id === activeTabId)
     : undefined;
@@ -649,6 +653,7 @@ export function TabbedView({
     fallbackMachineId: bootTarget?.machineId,
     openStateSupported,
     projectMachines: projectOpenModel.machines,
+    projectOpen: projectOpenModel.recorded && projectOpenModel.state === "open",
   }), [
     bootTarget?.machineId,
     currentSession,
@@ -657,6 +662,8 @@ export function TabbedView({
     machines,
     openStateSupported,
     projectOpenModel.machines,
+    projectOpenModel.recorded,
+    projectOpenModel.state,
     selectedTabConfig,
     sessionId,
   ]);
@@ -912,7 +919,7 @@ export function TabbedView({
       const gitRemote = currentSession?.gitRemote;
       if (!target.machineId || !gitRemote) {
         result = { success: false, error: "This project has no repository to clone." };
-      } else if (!confirm(confirmationText(cloneHereCopy(target.hostname, gitRemote, target.alsoStarts)))) {
+      } else if (!confirm(confirmationText(cloneHereCopy(target.hostname, gitRemote, target.alsoStarts, target.projectOpen)))) {
         return;
       } else {
         result = cloneAndAddPane(
@@ -1166,11 +1173,24 @@ export function TabbedView({
           </div>
         )}
         <div className="flex-1 flex items-center justify-center text-gray-400">
-          <div className="text-center px-6">
-            <p className="text-lg">No messages yet</p>
-            <p className="text-sm mt-1">Waiting for activity...</p>
-            <p className="text-xs mt-3 md:hidden">Tap ☰ at the top-left to pick a project.</p>
-          </div>
+          {departedProject ? (
+            // The project on screen was deleted and its workspace was left.
+            // Say so: the lines below read like an empty project that is
+            // still there.
+            <div role="status" className="text-center px-6">
+              <p className="text-lg text-gray-600 dark:text-gray-300">
+                {departedProject.name ? `${departedProject.name} was deleted.` : "This project was deleted."}
+              </p>
+              <p className="text-sm mt-1">Pick another project from the list.</p>
+              <p className="text-xs mt-3 md:hidden">Tap ☰ at the top-left to pick a project.</p>
+            </div>
+          ) : (
+            <div className="text-center px-6">
+              <p className="text-lg">No messages yet</p>
+              <p className="text-sm mt-1">Waiting for activity...</p>
+              <p className="text-xs mt-3 md:hidden">Tap ☰ at the top-left to pick a project.</p>
+            </div>
+          )}
         </div>
       </div>
     );
@@ -1237,6 +1257,10 @@ export function TabbedView({
           }}
           onOpenRole={setRoleModalPaneId}
           onRemovePane={handleCloseTab}
+          tabHosts={tabHosts.tabs}
+          // Only the session list saying so makes a project "not running";
+          // before it arrives nothing is claimed.
+          projectRunning={currentSession?.isActive !== false}
         />
       )}
     >

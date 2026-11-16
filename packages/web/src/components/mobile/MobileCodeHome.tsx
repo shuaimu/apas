@@ -44,6 +44,7 @@ import { PaneStatusDots } from "@/components/PaneStatusDots";
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || "https://apas.mpaxos.com";
 const EMPTY_USAGE_LIMITS = new Map<string, UsageLimitsByProvider>();
+const NO_FORGOTTEN_PROJECTS: Record<string, number> = {};
 const MOBILE_CLUSTER_STORAGE_KEY = "apas_mobile_cluster_owner";
 
 // "machines" is a third selection rather than a screen: the home already
@@ -272,6 +273,12 @@ export interface MobileCodeHomeProps {
   /// Ask for a machine list now, so the first paint does not wait for the next
   /// heartbeat.
   onRefreshMachines?: () => void;
+  /// The store's `projectForgets`: how many times each project was forgotten
+  /// since the page loaded, because the server reported it deleted or this
+  /// account's access to it ended. The session list this screen loads over
+  /// HTTP is a snapshot, and the live list simply stops naming such a
+  /// project, so without this its card stayed, "Idle", until a reload.
+  forgottenProjects?: Record<string, number>;
   /// Live provider availability keyed by the CLI account hosting each session.
   usageLimits?: Map<string, UsageLimitsByProvider>;
   /// The connected server's own version, so a fleet that is uniformly behind a
@@ -295,9 +302,15 @@ export function MobileCodeHome({
   liveMachines,
   machineListReceived,
   onRefreshMachines,
+  forgottenProjects = NO_FORGOTTEN_PROJECTS,
   usageLimits = EMPTY_USAGE_LIMITS,
 }: MobileCodeHomeProps) {
   const [remoteSessions, setRemoteSessions] = useState<MobileSessionSummary[] | null>(null);
+  // The forget counts when the snapshot above was asked for. A project
+  // forgotten since then is not in it any more, whatever it says.
+  const [remoteSessionsForgets, setRemoteSessionsForgets] = useState<Record<string, number>>(NO_FORGOTTEN_PROJECTS);
+  const forgottenNow = useRef(forgottenProjects);
+  useEffect(() => { forgottenNow.current = forgottenProjects; }, [forgottenProjects]);
   const [localView, setLocalView] = useState<MobileHomeView>("all");
   const filter = selectedView ?? localView;
   const selectView = (nextView: MobileHomeView) => {
@@ -406,6 +419,9 @@ export function MobileCodeHome({
 
   const refresh = useCallback(async (signal?: AbortSignal) => {
     if (!active || !token) return;
+    // Taken before the request: a project forgotten while it is under way
+    // may still be in its answer.
+    const forgetsAtRequest = forgottenNow.current;
     try {
       const response = await fetch(`${API_URL}/mobile/v1/bootstrap`, {
         headers: { Authorization: `Bearer ${token}` },
@@ -419,6 +435,7 @@ export function MobileCodeHome({
           instances: parseSessionInstances((session as { instances?: unknown }).instances),
         }))
         : []);
+      setRemoteSessionsForgets(forgetsAtRequest);
       setBootstrapMachines(Array.isArray(bootstrap.machines) ? bootstrap.machines : []);
       setLoadError(null);
     } catch (error) {
@@ -442,10 +459,17 @@ export function MobileCodeHome({
     const legacyById = new Map(legacySessions.map((session) => [session.id, session]));
     if (!remoteSessions) return legacySessions.map(adaptSession);
     const remoteIds = new Set(remoteSessions.map((session) => session.id));
-    return [...remoteSessions.map((session) => {
+    // A project the store forgot after this snapshot was asked for is gone
+    // (deleted, or no longer this account's to see). Only the live list can
+    // bring it back, as when a machine recreates a deleted project.
+    const forgotten = (session: MobileSessionSummary) => {
+      const projectId = session.project_id || session.id;
+      return (forgottenProjects[projectId] ?? 0) > (remoteSessionsForgets[projectId] ?? 0);
+    };
+    return [...remoteSessions.flatMap((session): MobileSessionSummary[] => {
       const live = legacyById.get(session.id);
-      if (!live) return session;
-      return {
+      if (!live) return forgotten(session) ? [] : [session];
+      return [{
         ...session,
         status: live.status || session.status,
         is_active: live.isActive ?? session.is_active,
@@ -463,9 +487,9 @@ export function MobileCodeHome({
         // Likewise the state: absent in the live list means nobody has
         // recorded one, whatever an earlier snapshot said.
         open_state: live.openState,
-      };
+      }];
     }), ...legacySessions.filter((session) => !remoteIds.has(session.id)).map(adaptSession)];
-  }, [legacySessions, remoteSessions]);
+  }, [forgottenProjects, legacySessions, remoteSessions, remoteSessionsForgets]);
 
   const registeredProjects = useMemo(() => {
     const sessionProjectIds = new Set([

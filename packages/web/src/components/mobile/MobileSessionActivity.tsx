@@ -43,13 +43,12 @@ import {
   openStateNegotiated,
   selectProjectOpenReport,
   type ProjectOpenAction,
-  type ProjectOpenNoticeLine,
 } from "@/lib/projectOpenState";
 import {
   refusedDeliveries,
   unconfirmedDeliveries,
 } from "@/lib/terminalDelivery";
-import { instancesNegotiated, primaryInstance, sameHost, selectSessionInstances } from "@/lib/projectInstances";
+import { instancesNegotiated, primaryInstance, selectSessionInstances } from "@/lib/projectInstances";
 import { buildMachineChoices, providerOfferOn, sessionCanCloneJoin, type MachineChoice, type ProviderOffer } from "@/lib/machineChoice";
 import {
   cloneHereCopy,
@@ -61,6 +60,7 @@ import {
   projectHostLabel,
   sessionIsOwned,
   tabHostStateLabel,
+  tabNotRunningLabel,
   type ConfirmationCopy,
   type TabHost,
 } from "@/lib/tabHosts";
@@ -187,18 +187,6 @@ function openProjectActionLabel(action: ProjectOpenAction | undefined): string {
     : action?.kind === "keep_open" ? "Keep project open" : "Open project";
 }
 
-/** The server's reason why the selected tab's machine is not in line with the
- *  project's state, from the model's notice. `undefined` when it gave none. */
-function stoppedActionsReason(
-  notice: ProjectOpenNoticeLine[],
-  host: TabHost | undefined,
-): string | undefined {
-  if (!host || host.state === "running" || host.state === "no_access") return undefined;
-  return notice.find((line) => host.machineId && line.machineId
-    ? line.machineId === host.machineId
-    : sameHost(line.hostname, host.hostname))?.reason;
-}
-
 function displayProjectName(workingDir?: string, gitRemote?: string): string {
   return gitRemote?.split("/").pop()
     || workingDir?.replace(/\/$/, "").split("/").pop()
@@ -236,17 +224,15 @@ function overviewTabRow(
   status: string | null | undefined,
   host: TabHost | undefined,
   autopilot: AutopilotListStatus["kind"] | undefined,
+  projectRunning = true,
 ): { dot: string; detail: string } {
   const gray = "bg-gray-300 dark:bg-gray-600";
   if (pane.mode === "deadloop") return { dot: gray, detail: "Earlier bot · Read-only" };
-  const where = host?.hostname;
-  const state = host && host.state !== "running"
-    ? {
-        dot: gray,
-        text: host.state === "no_access"
-          ? `No access${where ? ` to ${where}` : ""}`
-          : `Not running${where ? ` on ${where}` : ""}`,
-      }
+  // A project nothing runs, with nothing known per tab, reads "Not running"
+  // as on the desktop Overview and the sidebar's dots, not "Idle".
+  const notRunning = tabNotRunningLabel(host, projectRunning);
+  const state = notRunning
+    ? { dot: gray, text: notRunning }
     : paneIsAwaitingAnswerStatus(status)
       ? { dot: "bg-amber-500", text: PANE_STATUS_PENDING_ANSWER }
       : status
@@ -548,19 +534,6 @@ export function MobileSessionActivity({ connected, onBack, onReconnect }: Mobile
   const renameTargetExists = renameTarget !== null
     && paneConfigs.some((pane) => pane.pane_id === renameTarget.pane_id);
 
-  // Where each pane runs, and why one cannot be used: its machine is not
-  // running the project, or this viewer may not use that machine. The same
-  // rules the desktop tab bar applies.
-  const tabHosts = useMemo(() => describeTabHosts({
-    panes: paneConfigs,
-    instances,
-    machines,
-    instancesSupported,
-    projectIds: [session?.projectId, sessionId].filter((id): id is string => Boolean(id)),
-    isOwner: sessionIsOwned(session),
-  }), [instances, instancesSupported, machines, paneConfigs, session, sessionId]);
-  const selectedHost = selectedPaneId === null ? undefined : tabHosts.tabs.get(selectedPaneId);
-  const selectedRefusal = selectedHost?.refusal;
   // The project's open state, as the desktop project view models it: the
   // state to show, the Open to offer with its confirmation, and the machines
   // that are not following. This screen offers no Close and no Delete. From
@@ -593,6 +566,22 @@ export function MobileSessionActivity({ connected, onBack, onReconnect }: Mobile
     sessionId,
     sessionProjectName,
   ]);
+  // Where each pane runs, and why one cannot be used: its machine is not
+  // running the project, or this viewer may not use that machine. The same
+  // rules the desktop tab bar applies, worded by the project's open state: a
+  // closed project is said to be closed, and a machine with a known reason
+  // for not running it is given that reason.
+  const tabHosts = useMemo(() => describeTabHosts({
+    panes: paneConfigs,
+    instances,
+    machines,
+    instancesSupported,
+    projectIds: [session?.projectId, sessionId].filter((id): id is string => Boolean(id)),
+    isOwner: sessionIsOwned(session),
+    project: projectOpenModel,
+  }), [instances, instancesSupported, machines, paneConfigs, projectOpenModel, session, sessionId]);
+  const selectedHost = selectedPaneId === null ? undefined : tabHosts.tabs.get(selectedPaneId);
+  const selectedRefusal = selectedHost?.refusal;
   // A new agent on a machine that is not running the project opens the
   // project; the machine step names the other machines that start with it.
   const machineChoices = useMemo(() => buildMachineChoices({
@@ -605,7 +594,8 @@ export function MobileSessionActivity({ connected, onBack, onReconnect }: Mobile
     fallbackMachineId: machineProjectTarget?.machineId,
     openStateSupported,
     projectMachines: projectOpenModel.machines,
-  }), [instances, instancesSupported, machineProjectTarget?.machineId, machines, openStateSupported, projectOpenModel.machines, selectedPane, session, sessionId]);
+    projectOpen: projectOpenModel.recorded && projectOpenModel.state === "open",
+  }), [instances, instancesSupported, machineProjectTarget?.machineId, machines, openStateSupported, projectOpenModel.machines, projectOpenModel.recorded, projectOpenModel.state, selectedPane, session, sessionId]);
   // The user's pick, else the default (the selected pane's machine), derived
   // so a default that arrives while the sheet is open still counts. A pick
   // that disappears while the sheet is open (an instance detaches) is no pick.
@@ -905,7 +895,7 @@ export function MobileSessionActivity({ connected, onBack, onReconnect }: Mobile
         setActionError("This project has no repository to clone.");
         return;
       }
-      setCloneTarget({ choice: target, option, copy: cloneHereCopy(target.hostname, gitRemote, target.alsoStarts) });
+      setCloneTarget({ choice: target, option, copy: cloneHereCopy(target.hostname, gitRemote, target.alsoStarts, target.projectOpen) });
       return;
     }
     if (!target && machineChoices.showChoice) {
@@ -1033,8 +1023,6 @@ export function MobileSessionActivity({ connected, onBack, onReconnect }: Mobile
   const openRequest = projectOpenModel.request;
   const canOpenProject = connected && openAction !== undefined && openRequest !== null;
   const openProjectLabel = openProjectActionLabel(openAction);
-  // The server's reason for the selected tab's machine, when it gave one.
-  const selectedMachineReason = stoppedActionsReason(projectOpenModel.notice, selectedHost);
   const canCompose = selectedPaneId !== null && !selectedIsBot && !selectedIsRetired;
   const canSend = canCompose && connected && sessionIsRunning && !selectedRefusal;
   const hostLabel = projectHostLabel(instances, session.hostname);
@@ -1080,7 +1068,7 @@ export function MobileSessionActivity({ connected, onBack, onReconnect }: Mobile
             {paneConfigs.length ? (
               <ul className={`${overviewCard} divide-y divide-gray-100 overflow-hidden dark:divide-gray-700/60`}>
                 {paneConfigs.map((pane) => {
-                  const row = overviewTabRow(pane, paneStatuses[paneKey(pane.pane_id)], tabHosts.tabs.get(pane.pane_id), autopilotStatuses.get(pane.pane_id)?.kind);
+                  const row = overviewTabRow(pane, paneStatuses[paneKey(pane.pane_id)], tabHosts.tabs.get(pane.pane_id), autopilotStatuses.get(pane.pane_id)?.kind, sessionIsRunning);
                   return (
                     <li key={pane.pane_id}>
                       <button
@@ -1246,7 +1234,7 @@ export function MobileSessionActivity({ connected, onBack, onReconnect }: Mobile
           say which machine it needs and offer it. */}
       {selectedRefusal && !workspace.active && !terminalIsOpen && (
         <div role="status" className="mx-4 mt-3 shrink-0 rounded-xl border border-amber-300 bg-amber-50 px-3 py-2 text-xs text-amber-900 dark:border-amber-900 dark:bg-amber-950/40 dark:text-amber-200">
-          <p className="flex items-start gap-2"><AlertTriangle aria-hidden="true" className="mt-px h-4 w-4 shrink-0" /> {selectedRefusal}{selectedMachineReason ? ` ${selectedMachineReason}` : ""}</p>
+          <p className="flex items-start gap-2"><AlertTriangle aria-hidden="true" className="mt-px h-4 w-4 shrink-0" /> {selectedRefusal}</p>
           {stoppedActions?.canForget && (
             <div className="mt-2 flex flex-wrap gap-2">
               {stoppedActions.canForget && (

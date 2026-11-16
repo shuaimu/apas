@@ -741,17 +741,37 @@ describe("opening and closing a project on several machines", () => {
     expect(onOpen).toHaveBeenCalledTimes(1);
   });
 
-  it("offers Open and Close for a project nobody has recorded that runs on one of two machines", () => {
-    controlsFor({
+  it("offers Keep open and Close for a project nobody has recorded that runs on one of two machines, saying what starts", () => {
+    const { onOpen } = controlsFor({
       machines: [part(ZOO5, "zoo-005", "running"), part(ZOO6, "zoo-006", "not_started")],
     });
-    expect(projectButtons()).toEqual(["Open", "Close"]);
-    fireEvent.click(screen.getByRole("button", { name: "Open" }));
+    // "Keep open", as on every not-recorded project that runs somewhere.
+    expect(projectButtons()).toEqual(["Keep open", "Close"]);
+    fireEvent.click(screen.getByRole("button", { name: "Keep open" }));
+    expect(screen.getByRole("dialog", { name: "Keep apas open?" })).toBeTruthy();
+    // It starts zoo-006, and says so; nothing claims that nothing starts.
     expect(dialogLines()).toEqual([
       "zoo-005 already runs it.",
       "Its tabs start on zoo-006.",
       "Its tabs start again on zoo-005 and zoo-006 after those machines have been away.",
     ]);
+    fireEvent.click(within(screen.getByRole("dialog")).getByRole("button", { name: "Keep open" }));
+    expect(onOpen).toHaveBeenCalledTimes(1);
+  });
+
+  it("offers no Open again for a machine whose daemon is too old to be started beside the others", () => {
+    const reason = "zoo-006 runs an older APAS that cannot run this project beside other machines. Reboot zoo-006 to update it.";
+    const { model } = controlsFor(
+      {
+        state: "open",
+        machines: [part(ZOO5, "zoo-005", "running"), part(ZOO6, "zoo-006", "not_started", { reason })],
+      },
+      // The machine list marks zoo-006 "Older APAS".
+      { machines: [machine(ZOO5, "zoo-005"), { ...machine(ZOO6, "zoo-006"), projectInstancesAvailable: false }] },
+    );
+    expect(projectButtons()).toEqual(["Close"]);
+    expect(model.notice.map((line) => `${line.text} ${line.reason}`))
+      .toEqual([`zoo-006 is not running this project. ${reason}`]);
   });
 
   it("offers Close again while a machine still runs a closed project", () => {
@@ -795,6 +815,13 @@ describe("opening and closing a project on several machines", () => {
     expect(onDelete).toHaveBeenCalledTimes(1);
     // Deleting is its own dialog, which the project view owns.
     expect(screen.queryByRole("dialog")).toBeNull();
+    // In the tab bar it is an icon, so the project controls leave the tabs
+    // their room: its name and tooltip carry the words, and no text does.
+    const control = screen.getByRole("button", { name: "Delete project…" });
+    expect(control.getAttribute("aria-label")).toBe("Delete project…");
+    expect(control.getAttribute("title")).toBe("Delete project…");
+    expect(control.textContent).toBe("");
+    expect(control.querySelector("svg")?.getAttribute("aria-hidden")).toBe("true");
     owner.unmount();
 
     controlsFor(report);

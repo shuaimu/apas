@@ -2178,7 +2178,11 @@ not running opens the project as the requester, after its own checks pass, and
 the Run on step says so ("Opens the project", naming the other machines whose
 tabs start; "Clone here" says it too). Opens, closes and the starts and stops
 sent at a registration (source "registration") are written to the audit
-history, so the cluster's Activity view shows them.
+history, so the cluster's Activity view shows them. An audit write takes
+SQLite's write lock before it reads (`Database::begin_write`): a deferred
+transaction that reads first is refused at once when another connection
+writes, whatever `busy_timeout` is, and the smoke run lost a close's audit
+row that way. Use `begin_write` for any new read-then-write transaction.
 
 **What each machine is doing is computed by the server** and sent as
 `ProjectOpenState { project_id, state, set_by, set_at, machines }` to viewers
@@ -2192,6 +2196,12 @@ the email of whoever opened or closed the project, and every viewer who may
 read the project sees it. The web builds every control and sentence from one
 model, `lib/projectOpenState.ts`; it shows the reported state after a request
 and resends nothing ("Not connected to the server. Nothing was sent.").
+"Open again" appears only where it can start a machine: a connected machine on
+an older APAS beside other tab owners is not one (rebooting it is the remedy,
+and its registration then starts it). Where the web disables a tab itself it
+says "This project is closed. Open it to start its tabs." for a closed
+project, and a machine's known reason in place of "Open the project again to
+start it there.".
 
 **What a person can no longer do per machine**, by the owner's rule that an
 open project runs every agent it owns:
@@ -2209,7 +2219,7 @@ open project runs every agent it owns:
   closes it.
 
 **Delete project is its own control.** The project's owner finds **Delete
-project…** beside Close in the workspace's project controls, in the cluster
+project…** (a trash icon) beside Close in the workspace's project controls, in the cluster
 page's project panel and in the project-access dialog's danger zone; all three
 open one `DeleteProjectDialog`. It says what is erased (the project on the
 APAS server) and what stays (the folder and its files on every machine, which
@@ -2271,22 +2281,81 @@ started. Roll the web back first, then the server.
 
 ### Verification
 
-**Gates on 2026-11-16**, on the tree with every review fix: `cargo test` for
-shared (116 + 5 + 1) and server (567), the protocol's 149 tests and typecheck,
-native (146 tests and typecheck), web typecheck, lint (0 errors) and the
-production build, `openspec validate --all --strict` and the runbook check.
-The web suite passed 1,670 of 1,671 in the full run; the one failure is the
-worker Overview layout test ("lays the Overview out as one page"), which this
-change does not touch, fails on a loaded host and passed alone. `crates/client-cli`
-has no diff.
+**Gates on 2026-11-16**, on the final tree: `cargo test` for shared
+(116 + 5 + 1) and server (584), the protocol's 149 tests and typecheck, native
+(146 tests and typecheck), the web suite (1,730 tests) with typecheck, lint
+(0 errors) and the production build, `openspec validate --all --strict` and
+the runbook check. `crates/client-cli` has no diff. One web test this change
+does not touch, the worker Overview's "lays the Overview out as one page",
+fails in the full suite on a loaded host and passes alone.
 
 **Review.** Five independent reviews (races, authority, older clients, the
 spec, the web), each finding checked by a second reader, confirmed 24
-findings; all were fixed in two rounds, each fix with a test that fails
-without it and checked again by a reader who had not written it. The three
-that mattered: a Close followed at once by an Open left the project open and
-running nowhere; "Clone here" opened the project without saying so; and the
-rollback rule above, which the first design lacked.
+findings; all were fixed, each fix with a test that fails without it and
+checked again by a reader who had not written it. The three that mattered: a
+Close followed at once by an Open left the project open and running nowhere;
+"Clone here" opened the project without saying so; and the rollback rule
+above, which the first design lacked.
+
+**Two-host smoke** on zoo-005 and zoo-006 with isolated servers and daemons
+(harness build `os1`, 1c928fd), beside the production daemons, which it never
+touched. Nine scenarios, 166 checks, each confirmed from the raw logs by a
+second reader:
+
+- Open with one machine offline: it was started when its daemon registered,
+  with no request; also across a server restart, and after a killed daemon.
+- Close with one daemon frozen: the stop was taken when it was released.
+- Close during a daemon replacement, at eight delays: the project it resumed
+  was stopped at registration every time.
+- Close then Open with no wait, five trials: open and running on both
+  machines every time, each tab taking input.
+- An older daemon registering first after a server restart, beside another
+  tab owner: sent no start, reported with the older-APAS sentence, and the
+  capable instance's session was not rejected.
+- An older client's per-machine buttons on a not-recorded, an open and a
+  closed two-machine project: every cell of the table, both refusal
+  sentences word for word, nothing recorded for a not-recorded project.
+- Closing deletes nothing: roster, tab ids, tags, history files and `.apas`
+  equal after a close and the open that follows.
+- A viewer without `project_open_state_v1` got no new frame type, and every
+  frame it got validates against the pre-change schema.
+
+A follow-start was logged 5 to 9 ms after the registration and the machine
+ran the project 40 to 150 ms later. After a Close a machine reads "Still
+running" until its stop is done: under a second for a project just started,
+16 to 25 s otherwise.
+
+The smoke run found one defect, fixed afterwards: an open or close audit row
+lost to "database is locked" when its write met a registration's (see
+`Database::begin_write` above).
+
+**Browser check** in headless Chromium at 1440 and 390 px, light and dark,
+against that server: a closed project, an open one on two machines, one with
+a machine offline, one with a machine refused (an older daemon), a
+not-recorded half-running project, the Machines rows, both confirmations
+(one Open and one Close confirmed), the Delete dialog from its three places
+(one deletion confirmed on a disposable project), the Run on step and the
+phone's project screen. It found two defects that mattered, fixed
+afterwards: "Open again" offered for a machine on an older APAS that it
+cannot start, and a deleted project left as a card in another window's list.
+
+Not exercised:
+
+- on real hosts: a tab request that opens the project, a tabless project and
+  its stand-in machine, a second account (a member's close, a suspended
+  opener, a closer with wider authority), the administrative closes
+  (suspension, Stop runtime, a deletion's start), the phone's task launch,
+  persistent pane hosts (every run used direct PTYs), separate checkouts,
+  and the rollback statement;
+- two cells of the table only as no-ops: a one-machine Stop of a closed
+  project on a machine that still runs it, and a one-machine Start of an
+  open project for a tab owner that is not running;
+- in a browser: a viewer who is not the owner, a shared cluster's member
+  view, "Nothing was sent" for an Open, a Close or a Delete, a real phone
+  and iOS;
+- the phone's "All projects" list never says "Open" (an open project shows
+  its activity), and the phone's "Manage project" sheet of a closed project
+  stays at "Waiting for this project's settings…": both left as they are.
 
 ## Pane work summaries: which summarizer
 

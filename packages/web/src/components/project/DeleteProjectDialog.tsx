@@ -143,9 +143,15 @@ export function DeleteProjectDialog({
     requestOut.current = true;
     setError(null);
     setPhase("sending");
+    // From here the server refuses whatever is sent for the project: this
+    // window stops sending its terminal frames (the tab on screen resizes as
+    // the project's notices come and go). The mark ends when the project is
+    // forgotten, or below when the server did not accept the deletion.
+    useStore.getState().setProjectDeleting(project.id, true);
     try {
       await requestProjectDeletion(project.id, token);
     } catch (cause) {
+      useStore.getState().setProjectDeleting(project.id, false);
       // Refused, or it never got an answer. Either way this dialog sends
       // nothing more unless the user asks again.
       requestOut.current = false;

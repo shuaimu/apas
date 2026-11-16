@@ -1070,6 +1070,28 @@ describe("the Overview's tab rows", () => {
     expect(screen.queryByRole("region", { name: "Project overview" })).toBeNull();
     expect(notice()).toBeTruthy();
   });
+
+  // Nothing runs the project and nothing is known per tab: the rows say so,
+  // as the desktop Overview and the sidebar's dots do, and never "Idle".
+  it("read Not running for a project nothing runs", () => {
+    seed([tab(7, "OMP 1"), tab(8, "OMP 2")], 8, { instances: [] });
+    act(() => {
+      useStore.setState((state) => ({
+        sessions: state.sessions.map((session) => ({ ...session, status: "inactive", isActive: false })),
+      }));
+    });
+    renderScreen();
+    fireEvent.click(screen.getByRole("button", { name: "Project overview" }));
+
+    const panel = screen.getByRole("region", { name: "Interactive project" });
+    const details = within(panel).getAllByRole("button")
+      .map((row) => Array.from(row.querySelectorAll("span > span")).map((part) => part.textContent));
+    expect(details.map((parts) => parts[0])).toEqual(["OMP 1", "OMP 2"]);
+    for (const parts of details) {
+      expect(parts[1]).toMatch(/^Not running/);
+      expect(parts[1]).not.toContain("Idle");
+    }
+  });
 });
 
 describe("the tab's chip", () => {

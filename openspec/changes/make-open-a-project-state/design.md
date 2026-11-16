@@ -400,10 +400,28 @@ For other viewers and for native launches, the table in Decision 3 applies.
   project because it is offline." while it is not (both were "… Start it on
   \<host\> first."). Native composes the old sentence itself and is updated
   in its next build.
+  Those are the server's refusals. Where the web disables a tab's controls
+  itself it says more when it knows more: for a project recorded closed,
+  "This project is closed. Open it to start its tabs." (", and \<host\> is
+  offline." or the machine's reason in place of the second sentence when
+  opening would not start that tab at once); and for a machine with a known
+  reason, "\<host\> is not running this project." followed by that reason,
+  without the advice to open the project again.
+- "Open again" is offered only where it can start a machine. A connected
+  machine whose daemon cannot run the project beside the other tab owners
+  (Decision 4) is not such a machine: rebooting it is the remedy, and its
+  registration then starts it. A confirmation that starts other machines
+  says of this one that it is not started and why.
 - Pane dots keep "Not running on \<host\>" for such a tab and "Not running"
   for a closed project that runs nowhere. Tabs of a machine that still runs
   a closed project keep their real status, and Close is offered again.
+- In the Run on step, a machine that is not running a project recorded open
+  is listed under "Starts the project first" ("the project starts there,
+  then the tab opens"); "Opens the project" is for a closed project and one
+  nobody has recorded.
 - The Open of a not-recorded project that already runs reads "Keep open",
+  also when it starts a machine that is not running it (its confirmation
+  then says which),
   with "Its tabs start again on \<hosts\> after those machines have been
   away."
 

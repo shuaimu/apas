@@ -51,6 +51,7 @@ beforeEach(() => {
     token: "test-token",
     forgetProject: forgetProject as never,
     listSessions: listSessions as never,
+    deletingProjects: {},
   });
 });
 
@@ -147,6 +148,44 @@ describe("DeleteProjectDialog", () => {
     expect(listSessions).toHaveBeenCalledTimes(1);
     expect(onDeleted).toHaveBeenCalledWith(PROJECT.id);
     expect(calls(DELETE_URL)).toHaveLength(1);
+  });
+
+  // The server refuses whatever is sent for a project that is being
+  // deleted. The store sends no terminal frame for a marked project.
+  it("marks the project as being deleted as its request goes out, and keeps the mark while the server deletes", async () => {
+    let accept: (value: unknown) => void = () => {};
+    fetchMock
+      .mockReturnValueOnce(new Promise((resolve) => { accept = resolve; }))
+      .mockResolvedValue(response(200, { status: "deleting" }));
+    open();
+    expect(useStore.getState().deletingProjects).toEqual({});
+    typeName("mako");
+    expect(useStore.getState().deletingProjects).toEqual({});
+    fireEvent.click(deleteButton());
+    expect(useStore.getState().deletingProjects).toEqual({ [PROJECT.id]: true });
+
+    await act(async () => { accept(response(202)); });
+    expect((await screen.findByRole("status")).textContent).toContain("Deleting…");
+    expect(useStore.getState().deletingProjects).toEqual({ [PROJECT.id]: true });
+  });
+
+  it("takes the mark back when the server did not accept the deletion", async () => {
+    fetchMock.mockResolvedValueOnce(response(403, { error: "Only the project owner can delete it" }));
+    open();
+    typeName("mako");
+    fireEvent.click(deleteButton());
+    expect(useStore.getState().deletingProjects).toEqual({ [PROJECT.id]: true });
+    await screen.findByRole("alert");
+    expect(useStore.getState().deletingProjects).toEqual({});
+
+    // A request that got no answer: the same.
+    cleanup();
+    fetchMock.mockRejectedValueOnce(new Error("Failed to fetch"));
+    open();
+    typeName("mako");
+    fireEvent.click(deleteButton());
+    await screen.findByRole("alert");
+    expect(useStore.getState().deletingProjects).toEqual({});
   });
 
   it("shows a refusal, claims no deletion, and sends nothing again by itself", async () => {

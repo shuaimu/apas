@@ -229,6 +229,22 @@ describe("a closed project on the phone", () => {
     expect(sent("start_machine_project_cli")).toHaveLength(1);
   });
 
+  it("says on a tab that the project is closed, not that one machine is not running it", () => {
+    seed({ instances: [], selectedPaneId: 11 });
+    act(() => useStore.setState((current) => ({
+      sessions: current.sessions.map((item) => ({ ...item, openState: "closed" as const })),
+    })));
+    report("closed", [part(ZOO5, "zoo-005", "not_started"), part(ZOO6, "zoo-006", "not_started")]);
+    renderScreen();
+    expect(stateChip()).toBe("Closed");
+    const banner = screen.getAllByRole("status").find((element) =>
+      element.textContent?.includes("This project is closed.")) as HTMLElement;
+    expect(banner.textContent).toContain("This project is closed. Open it to start its tabs.");
+    expect(document.body.textContent).not.toContain("is not running this project");
+    // The Open that the sentence points at is in the pane-actions sheet.
+    expect(within(openActions()).getByRole("button", { name: "Open project" })).toBeTruthy();
+  });
+
   it("says of an offline tab owner that its tabs start when it reconnects", () => {
     seed({ instances: [], offline: [ZOO6] });
     report("closed", [
@@ -312,10 +328,15 @@ describe("an open project on the phone", () => {
     renderScreen();
     expect(stateChip()).toBe("Open");
 
-    // The selected tab is zoo-006's: its banner gives the refusal and why.
+    // The selected tab is zoo-006's: its banner says the machine is not
+    // running the project, then why. It does not also say that opening the
+    // project again starts it there, which the reason contradicts.
     const banner = screen.getAllByRole("status").find((element) =>
-      element.textContent?.includes("zoo-006 is not running this project. Open the project again to start it there.")) as HTMLElement;
-    expect(banner.textContent).toContain("Reboot zoo-006 to update it.");
+      element.textContent?.includes("zoo-006 is not running this project.")) as HTMLElement;
+    expect(banner.textContent?.trim()).toBe(
+      "zoo-006 is not running this project. zoo-006 runs an older APAS that cannot run this project beside other machines. Reboot zoo-006 to update it.Forget zoo-006's tabs",
+    );
+    expect(banner.textContent).not.toContain("Open the project again to start it there.");
     expect(within(banner).queryByRole("button", { name: /^Start on/ })).toBeNull();
 
     const sheet = openActions();
@@ -331,6 +352,27 @@ describe("an open project on the phone", () => {
     // The whole project again; never zoo-006 alone.
     expect(starts).toEqual([OPEN_FRAME]);
     expectValid(starts[0]);
+  });
+
+  it("does not offer to open again for a machine whose daemon is too old to start beside the others", () => {
+    const reason = "zoo-006 runs an older APAS that cannot run this project beside other machines. Reboot zoo-006 to update it.";
+    seed({ instances: [instance(ZOO5, "zoo-005", true)], selectedPaneId: 11 });
+    // The machine list marks zoo-006 "Older APAS".
+    act(() => useStore.setState((current) => ({
+      machines: current.machines.map((entry) => entry.machine.machineId === ZOO6
+        ? { ...entry, projectInstancesAvailable: false }
+        : entry),
+    })));
+    report("open", [part(ZOO5, "zoo-005", "running"), part(ZOO6, "zoo-006", "not_started", { reason })]);
+    renderScreen();
+
+    const sheet = openActions();
+    // The server refuses zoo-006 every time until it is rebooted.
+    expect(within(sheet).queryByRole("button", { name: /open project|keep project open/i })).toBeNull();
+    expect(within(sheet).getByRole("status", { name: "Machines not following this project" }).textContent)
+      .toBe(`zoo-006 is not running this project. ${reason}`);
+    expect(document.body.textContent).not.toContain("Open the project again to start it there.");
+    expect(sent("start_machine_project_cli")).toEqual([]);
   });
 
   it("does not offer to open again for a machine that is offline, and says its tabs start when it reconnects", () => {
@@ -403,16 +445,22 @@ describe("a project nobody has recorded, on the phone", () => {
     expect(screen.queryByRole("button", { name: /open project|keep project open/i })).toBeNull();
   });
 
-  it("offers Open project for one that runs on one of its two machines", () => {
+  it("offers Keep project open for one that runs on one of its two machines, and says what starts", () => {
     seed({ instances: [instance(ZOO5, "zoo-005", true)] });
     report(undefined, [part(ZOO5, "zoo-005", "running"), part(ZOO6, "zoo-006", "not_started")]);
     renderScreen();
     const sheet = openActions();
     expect(within(sheet).getByRole("status", { name: "Machines not following this project" }).textContent)
       .toBe("zoo-006 is not running this project.");
-    fireEvent.click(within(sheet).getByRole("button", { name: "Open project" }));
-    expect(lines(screen.getByRole("dialog", { name: "Open mako?" })))
+    // "Keep open", as on every not-recorded project that runs somewhere.
+    expect(within(sheet).queryByRole("button", { name: "Open project" })).toBeNull();
+    fireEvent.click(within(sheet).getByRole("button", { name: "Keep project open" }));
+    const confirm = screen.getByRole("dialog", { name: "Keep mako open?" });
+    // Confirming starts zoo-006, and the sheet says so.
+    expect(lines(confirm))
       .toEqual(["zoo-005 already runs it.", "Its tabs start on zoo-006.", KEEP_OPEN]);
+    fireEvent.click(within(confirm).getByRole("button", { name: "Keep project open" }));
+    expect(sent("start_machine_project_cli")).toEqual([OPEN_FRAME]);
   });
 });
 

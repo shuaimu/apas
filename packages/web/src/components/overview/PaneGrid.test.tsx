@@ -418,3 +418,59 @@ describe("PaneGrid existing-pane selectors", () => {
     expect(promotePaneToManaged).not.toHaveBeenCalled();
   });
 });
+
+describe("PaneGrid tabs that are not running", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+    act(() => {
+      useStore.setState(initialStore, true);
+    });
+  });
+
+  const grid = (props: Partial<Parameters<typeof PaneGrid>[0]>) => render(
+    <PaneGrid onOpenPane={vi.fn()} onOpenDiff={vi.fn()} onOpenRole={vi.fn()} onRemovePane={vi.fn()} {...props} />,
+  );
+  const panes = [
+    pane({ pane_id: 1, label: "claude-005", role: undefined, managed: false }),
+    pane({ pane_id: 2, label: "claude-006", role: undefined, managed: false }),
+  ];
+
+  it("says Not running on its machine instead of Idle, as the sidebar's dots do", () => {
+    // A status the tab reported before its machine stopped is stale.
+    seedPaneGrid(panes, vi.fn(), { "2": "Thinking" });
+    grid({
+      tabHosts: new Map([
+        [1, { hostname: "zoo-005", state: "running", badge: true }],
+        [2, { hostname: "zoo-006", state: "stopped", badge: true }],
+      ]),
+    });
+    expect(within(card("claude-005")).getByText("Idle")).toBeTruthy();
+    expect(within(card("claude-005")).getByRole("img", { name: "idle" })).toBeTruthy();
+    expect(within(card("claude-006")).getByText("Not running on zoo-006")).toBeTruthy();
+    expect(within(card("claude-006")).getByRole("img", { name: "not running" })).toBeTruthy();
+    expect(within(card("claude-006")).queryByText("Thinking")).toBeNull();
+    expect(within(card("claude-006")).queryByText("Idle")).toBeNull();
+  });
+
+  it("says Not running on every card of a project that runs nowhere", () => {
+    seedPaneGrid(panes);
+    // A closed project on one machine: nothing is known per tab.
+    grid({ projectRunning: false });
+    for (const label of ["claude-005", "claude-006"]) {
+      expect(within(card(label)).getByText("Not running")).toBeTruthy();
+      expect(within(card(label)).queryByText("Idle")).toBeNull();
+    }
+  });
+
+  it("says a tab this viewer may not use has no access, and keeps Idle without any report", () => {
+    seedPaneGrid(panes);
+    const view = grid({ tabHosts: new Map([[2, { hostname: "zoo-006", state: "no_access", badge: true }]]) });
+    expect(within(card("claude-006")).getByText("No access to zoo-006")).toBeTruthy();
+    expect(within(card("claude-005")).getByText("Idle")).toBeTruthy();
+    view.unmount();
+
+    grid({});
+    expect(within(card("claude-005")).getByText("Idle")).toBeTruthy();
+    expect(within(card("claude-006")).getByText("Idle")).toBeTruthy();
+  });
+});

@@ -17,7 +17,7 @@ impl Database {
         expires_at: &str,
     ) -> Result<SharedClusterInvitation> {
         let normalized_email = invitee_email.trim().to_ascii_lowercase();
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.begin_write().await?;
         let owner_status =
             sqlx::query_scalar::<_, String>("SELECT account_status FROM users WHERE id = ?")
                 .bind(cluster_owner_user_id)
@@ -179,7 +179,7 @@ impl Database {
         token_hash: &str,
         invitee_user_id: &str,
     ) -> Result<Option<ClusterMembership>> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.begin_write().await?;
         let invitation = sqlx::query_as::<_, (String, String, String, String)>(
             r#"SELECT sci.id, sci.cluster_owner_user_id, sci.invitee_user_id, sci.created_at
                FROM shared_cluster_invitations sci
@@ -331,7 +331,7 @@ impl Database {
         let normalized_email = member_email.trim().to_ascii_lowercase();
         let (allowed_machine_ids, default_launch_profile) =
             Self::membership_policy_json(allowed_machine_ids, default_launch_profile)?;
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.begin_write().await?;
         let member = sqlx::query_as::<_, (String, String)>(
             "SELECT id, account_status FROM users WHERE lower(email) = ?",
         )
@@ -821,7 +821,7 @@ impl Database {
         request_id: &str,
         requester_user_id: &str,
     ) -> Result<Option<ProjectProvisioningRequest>> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.begin_write().await?;
         let request = sqlx::query_as::<_, ProjectProvisioningRequest>(
             r#"SELECT request_id, requester_user_id, cluster_owner_user_id, machine_id,
                       request_fingerprint, git_remote, clone_url, instance_name, branch,

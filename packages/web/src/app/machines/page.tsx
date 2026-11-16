@@ -153,10 +153,15 @@ export default function MachinesPage() {
   // Deletions the server accepted whose end the Delete dialog did not hear
   // of: the project, and the cluster whose list has it.
   const unconfirmedDeletions = useRef(new Map<string, string>());
+  // Projects of the loaded list that the store has just forgotten: deleted
+  // from another window, or no longer this account's to see. The next load
+  // of the list says which, and takes each out of this set.
+  const forgottenListed = useRef(new Set<string>());
   // What the page holds now, for what runs after a wait or after the Delete
   // dialog is gone: the selection, the view and the cluster may have changed.
   const pageNow = useRef<{
     selectedClusterId: string;
+    clusterProjects: ClusterProject[];
     closeGoneProject: (projectId: string) => void;
     loadCluster: () => Promise<ClusterProject[] | null>;
   } | null>(null);
@@ -344,6 +349,15 @@ export default function MachinesPage() {
           if (mounted.current) pageNow.current?.closeGoneProject(projectId);
         }
       }
+      // A project the store forgot that this list no longer has is gone:
+      // its panel closes. One the list still has (a share that ended on a
+      // project this cluster still hosts) stays as it is.
+      for (const projectId of [...forgottenListed.current]) {
+        forgottenListed.current.delete(projectId);
+        if (!projectPage.items.some((project) => project.id === projectId) && mounted.current) {
+          pageNow.current?.closeGoneProject(projectId);
+        }
+      }
       setClusterPolicy(policy);
       setPolicyLoad("loaded");
       setProfiles(launchProfiles.filter((profile) => !isRetiredLaunchProfileKey(profile.key)));
@@ -479,7 +493,7 @@ export default function MachinesPage() {
   };
 
   useEffect(() => {
-    pageNow.current = { selectedClusterId, closeGoneProject, loadCluster };
+    pageNow.current = { selectedClusterId, clusterProjects, closeGoneProject, loadCluster };
   });
 
   // The end of a deletion can arrive after its dialog is gone: the dialog
@@ -503,11 +517,18 @@ export default function MachinesPage() {
     void now.loadCluster();
   }, []);
   // The server says once, on the socket, that a deletion is done, and the
-  // store then forgets the project.
+  // store then forgets the project. That is also how this page hears of a
+  // deletion made in another window: its list is loaded over HTTP and would
+  // keep the project's row until someone pressed Refresh.
   useEffect(() => useStore.subscribe((state, previous) => {
     if (state.projectForgets === previous.projectForgets) return;
-    const forgotten = [...unconfirmedDeletions.current.keys()].some((projectId) =>
-      (state.projectForgets[projectId] ?? 0) > (previous.projectForgets[projectId] ?? 0));
+    const isForgotten = (projectId: string) =>
+      (state.projectForgets[projectId] ?? 0) > (previous.projectForgets[projectId] ?? 0);
+    const listed = (pageNow.current?.clusterProjects ?? [])
+      .map((project) => project.id)
+      .filter(isForgotten);
+    for (const projectId of listed) forgottenListed.current.add(projectId);
+    const forgotten = listed.length > 0 || [...unconfirmedDeletions.current.keys()].some(isForgotten);
     if (forgotten) void pageNow.current?.loadCluster();
   }), []);
   // A page that was not connected then missed it, and asks when it is

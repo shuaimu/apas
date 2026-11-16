@@ -257,6 +257,41 @@ describe("buildMachineChoices", () => {
     ]);
   });
 
+  it("does not name a machine the server will not start among those a tab starts", () => {
+    // zoo-006's daemon cannot run the project beside other machines
+    // (`ProjectOpenMachine.cannotStart`): an Open sends it nothing.
+    const result = model({
+      openStateSupported: true,
+      machines: [machine("laptop", { registered: true }), machine("zoo-005", { registered: true })],
+      projectMachines: [
+        { machineId: "zoo-005", hostname: "zoo-005", part: "not_started", ownsTabs: true, connected: true },
+        { machineId: "zoo-006", hostname: "zoo-006", part: "not_started", ownsTabs: true, connected: true, cannotStart: "zoo-006 runs an older APAS." },
+      ],
+    });
+    expect(result.choices.map((choice) => [choice.hostname, choice.alsoStarts])).toEqual([
+      ["laptop", ["zoo-005"]],
+      ["zoo-005", []],
+    ]);
+  });
+
+  it("marks a choice that starts a machine of a project that is open already", () => {
+    const input = {
+      openStateSupported: true,
+      instances: [instance("zoo-005", "zoo-005", { primary: true })],
+      machines: [machine("zoo-005", { registered: true }), machine("zoo-006", { registered: true }), machine("laptop")],
+    };
+    const open = model({ ...input, projectOpen: true });
+    expect(open.choices.map((choice) => [choice.hostname, choice.kind, choice.projectOpen])).toEqual([
+      ["zoo-005", "instance", undefined],
+      ["zoo-006", "registered", true],
+      ["laptop", "clone", true],
+    ]);
+    // Closed, not recorded, or a server that records nothing: not marked.
+    expect(model(input).choices.every((choice) => choice.projectOpen === undefined)).toBe(true);
+    expect(model({ ...input, openStateSupported: false, projectOpen: true }).choices
+      .every((choice) => choice.projectOpen === undefined)).toBe(true);
+  });
+
   it("keeps the step hidden when the only eligible machine already runs the project", () => {
     // Also with a registered machine that cannot take the tab: only eligible
     // choices count.

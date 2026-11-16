@@ -14,6 +14,8 @@ mod models;
 mod open_state;
 mod shared_cluster;
 pub mod workers;
+#[cfg(test)]
+mod write_lock_tests;
 
 pub use models::*;
 pub use open_state::ProjectOpenStateRecord;
@@ -96,6 +98,34 @@ impl Database {
             .await?;
 
         Ok(Self { pool })
+    }
+
+    /// Begin a transaction that holds the database's write lock from the
+    /// start, for work that reads before it writes.
+    ///
+    /// `pool.begin()` is a deferred transaction: it takes nothing until its
+    /// first statement. When that statement is a read, the transaction holds
+    /// a snapshot by the time it asks for the write lock, and SQLite then
+    /// answers `SQLITE_BUSY` at once, whatever `busy_timeout` is, if another
+    /// connection is writing at that moment or has committed since the
+    /// snapshot. The busy handler only waits for a transaction that holds
+    /// nothing yet. An audit row written by `record_audit` was lost this way
+    /// while a daemon registered.
+    ///
+    /// sqlx 0.7 cannot issue `BEGIN IMMEDIATE` through its transaction guard,
+    /// so the lock is taken by making a write the first statement, as
+    /// `rotate_mobile_refresh_token` does with its own update and
+    /// `set_job_policy` does with the same kind of statement as here. It
+    /// matches no row and changes nothing; SQLite takes the write lock when
+    /// a writing statement starts, before it looks at any row. It waits for
+    /// another writer up to `busy_timeout`, and every later read in the
+    /// transaction sees what that writer committed.
+    pub(crate) async fn begin_write(&self) -> Result<sqlx::Transaction<'static, sqlx::Sqlite>> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("UPDATE schema_migrations SET name = name WHERE 0")
+            .execute(&mut *tx)
+            .await?;
+        Ok(tx)
     }
 
     pub async fn run_migrations(&self) -> Result<()> {
@@ -2069,7 +2099,7 @@ impl Database {
         allow_any_user: bool,
         reason: &str,
     ) -> Result<bool> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.begin_write().await?;
         let owner = sqlx::query_scalar::<_, String>(
             "SELECT user_id FROM mobile_device_sessions WHERE id = ?",
         )
@@ -2827,7 +2857,7 @@ impl Database {
         target_user_id: &str,
         status: AccountStatus,
     ) -> Result<bool> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.begin_write().await?;
         let current: Option<(String, String)> =
             sqlx::query_as("SELECT cluster_role, account_status FROM users WHERE id = ?")
                 .bind(target_user_id)
@@ -3058,7 +3088,7 @@ impl Database {
         target_id: &str,
         details: Option<serde_json::Value>,
     ) -> Result<()> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.begin_write().await?;
         Self::insert_audit_tx(
             &mut tx,
             actor_user_id,
@@ -3451,7 +3481,7 @@ impl Database {
         project_id: &str,
         user_id: &str,
     ) -> Result<bool> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.begin_write().await?;
         let lifecycle =
             sqlx::query_scalar::<_, String>("SELECT lifecycle_status FROM projects WHERE id = ?")
                 .bind(project_id)
@@ -3529,7 +3559,7 @@ impl Database {
         new_owner_user_id: &str,
         policy: OwnershipTransferPolicy,
     ) -> Result<bool> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.begin_write().await?;
         let project = sqlx::query_as::<_, (String, String)>(
             "SELECT owner_user_id, lifecycle_status FROM projects WHERE id = ?",
         )
@@ -3648,7 +3678,7 @@ impl Database {
     }
 
     pub async fn leave_project(&self, user_id: &str, project_id: &str) -> Result<bool> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.begin_write().await?;
         let project = sqlx::query_as::<_, (String, String)>(
             "SELECT owner_user_id, lifecycle_status FROM projects WHERE id = ?",
         )
@@ -4246,7 +4276,7 @@ impl Database {
             .as_ref()
             .map(serde_json::to_string)
             .transpose()?;
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.begin_write().await?;
         let next_version = sqlx::query_scalar::<_, i64>(
             r#"
             SELECT MAX(version) + 1 FROM (
@@ -4319,7 +4349,7 @@ impl Database {
     ) -> Result<shared::EffectiveProjectPolicy> {
         Self::validate_launch_profiles(&allowed_launch_profiles)?;
         let profiles_json = serde_json::to_string(&allowed_launch_profiles)?;
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.begin_write().await?;
         let next_version = sqlx::query_scalar::<_, i64>(
             r#"
             SELECT MAX(version) + 1 FROM (
@@ -4556,7 +4586,7 @@ impl Database {
             .as_ref()
             .map(serde_json::to_string)
             .transpose()?;
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.begin_write().await?;
         let next_version = sqlx::query_scalar::<_, i64>(
             r#"
             SELECT MAX(version) + 1 FROM (
@@ -4941,7 +4971,7 @@ impl Database {
     }
 
     pub async fn redeem_project_invitation(&self, code: &str, user_id: &str) -> Result<bool> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.begin_write().await?;
         let invitation = sqlx::query_as::<_, (String, Option<String>, String)>(
             "SELECT session_id, project_id, created_by FROM invitation_codes WHERE code = ?",
         )

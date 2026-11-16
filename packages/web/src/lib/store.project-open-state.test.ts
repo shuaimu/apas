@@ -337,3 +337,99 @@ describe("no request names one machine alone", () => {
     }
   });
 });
+
+describe("a project that is being deleted from this window", () => {
+  const OTHER = "20000000-0000-4000-8000-0000000000ff";
+
+  function showProject() {
+    useStore.setState({
+      sessions: [
+        { id: SID, projectId: PROJECT, status: "active", isActive: true, workingDir: "/work/os-delete" },
+        { id: OTHER, projectId: OTHER, status: "active", isActive: true, workingDir: "/work/other" },
+      ],
+    });
+  }
+  const terminalFrames = (ws: MockWs) => sentFrames(ws)
+    .filter((frame) => String(frame.type).startsWith("terminal_"))
+    .map((frame) => [frame.type, frame.session_id]);
+
+  it("sends no terminal frame for it from the moment its deletion is asked for", async () => {
+    const ws = await openSocket();
+    showProject();
+    const { attachTerminal, sendTerminalInput, sendTerminalResize } = useStore.getState();
+    sendTerminalResize(7, 80, 24);
+    expect(terminalFrames(ws)).toEqual([["terminal_resize", SID]]);
+    ws.send.mockClear();
+
+    // The server answers each of these with "Access denied" once it has
+    // begun the deletion: the terminal on screen resizes as notices change.
+    useStore.getState().setProjectDeleting(PROJECT, true);
+    sendTerminalResize(7, 100, 30);
+    sendTerminalInput(7, "x");
+    attachTerminal(7);
+    expect(terminalFrames(ws)).toEqual([]);
+
+    // Another project's terminals are untouched.
+    useStore.setState({ sessionId: OTHER });
+    sendTerminalResize(3, 80, 24);
+    expect(terminalFrames(ws)).toEqual([["terminal_resize", OTHER]]);
+  });
+
+  it("sends them again when the server did not accept the deletion", async () => {
+    const ws = await openSocket();
+    showProject();
+    useStore.getState().setProjectDeleting(PROJECT, true);
+    useStore.getState().setProjectDeleting(PROJECT, false);
+    expect(useStore.getState().deletingProjects).toEqual({});
+    useStore.getState().sendTerminalResize(7, 80, 24);
+    expect(terminalFrames(ws)).toEqual([["terminal_resize", SID]]);
+  });
+
+  it("leaves its workspace when the deletion is done, saying which project is gone", async () => {
+    await openSocket();
+    showProject();
+    useStore.getState().setProjectDeleting(PROJECT, true);
+    // What the Delete project dialog does when the server reports it done.
+    useStore.getState().forgetProject(PROJECT);
+    expect(useStore.getState()).toMatchObject({
+      sessionId: null,
+      isAttached: false,
+      paneConfigs: [],
+      deletingProjects: {},
+      departedProject: { projectId: PROJECT, name: "os-delete" },
+    });
+    expect(useStore.getState().sessions.map((session) => session.id)).toEqual([OTHER]);
+  });
+
+  it("says the same when the server reports a deletion made in another window", async () => {
+    const ws = await openSocket();
+    showProject();
+    deliver(ws, { type: "project_access_changed", project_id: PROJECT, change: "deleted" });
+    expect(useStore.getState().sessionId).toBeNull();
+    expect(useStore.getState().departedProject).toEqual({ projectId: PROJECT, name: "os-delete" });
+  });
+
+  it("says nothing of a deletion when the project is left for another reason, or was not on screen", async () => {
+    const ws = await openSocket();
+    showProject();
+    deliver(ws, { type: "project_access_changed", project_id: PROJECT, change: "revoked" });
+    expect(useStore.getState().sessionId).toBeNull();
+    expect(useStore.getState().departedProject).toBeNull();
+
+    // A project that is not the one on screen: the workspace stays.
+    showProject();
+    useStore.setState({ sessionId: OTHER, departedProject: null });
+    deliver(ws, { type: "project_access_changed", project_id: PROJECT, change: "deleted" });
+    expect(useStore.getState().sessionId).toBe(OTHER);
+    expect(useStore.getState().departedProject).toBeNull();
+  });
+
+  it("forgets which project is gone once another project is shown", async () => {
+    await openSocket();
+    showProject();
+    useStore.getState().forgetProject(PROJECT, { deleted: true });
+    expect(useStore.getState().departedProject).not.toBeNull();
+    useStore.getState().commitSessionAttachment(OTHER, true);
+    expect(useStore.getState()).toMatchObject({ sessionId: OTHER, departedProject: null });
+  });
+});
