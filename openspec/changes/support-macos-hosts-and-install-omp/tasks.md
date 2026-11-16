@@ -11,6 +11,9 @@
 - [x] 2.5 Provider availability reported at registration and on change; OMP `can_install` from the launch's own decision
 - [x] 2.6 Pinned, verified OMP install with lock, timeouts, progress in the tab and cleanup of stale partial downloads; tests against a local fake release server
 
+- [x] 2.7 The OMP extension runs on macOS: no start-time requirement on any platform, launch id and pid kept, liveness from the provider's process group, the extension reports only as the direct child of the process that started it, a silent extension logged; `process_start` still written on Linux for daemons not yet rebooted
+- [x] 2.8 `scripts/macos-check/check.sh` type-checks the CLI for macOS on Linux
+
 ## 3. Web
 
 - [x] 3.1 "Installs OMP first" and "<Provider> is not installed on <host>." on the provider choice, desktop and phone
@@ -20,4 +23,5 @@
 
 - [x] 4.1 cargo test (shared, server, CLI), static musl CLI build, protocol and extension tests, web suite, typecheck and lint, `openspec validate --strict`
 - [ ] 4.2 On the owner's Mac after the CLI update: one daemon, no reconnect loop, an OMP tab installs OMP and starts, a failed launch shows its reason
+- [ ] 4.4 On the owner's Mac after a daemon reboot and one agent reboot: live status, a question answered from the web, autopilot start and stop
 - [ ] 4.3 A real download of the pinned assets checked against the pins (the review compared the pins with the published checksums and the GitHub digests, without installing)

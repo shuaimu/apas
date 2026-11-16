@@ -148,14 +148,17 @@ impl TerminalRuntimeHandle {
         }
     }
 
-    /// Process group that owns this pane's provider TUI.
+    /// Process group that owns this pane's provider TUI. Its id is the pid
+    /// of the provider the PTY owner started.
     ///
-    /// On Linux the transcript watcher uses this to identify the exact codex
-    /// rollout among several panes running in the same working directory.
-    #[cfg(target_os = "linux")]
+    /// On every Unix the OMP file checks use it: a report, a question or an
+    /// autopilot file counts only when it names this pid. On Linux the
+    /// transcript watcher also uses it to identify the exact codex rollout
+    /// among several panes running in the same working directory.
     pub fn process_group_id(&self) -> Option<i32> {
         match self {
             Self::Direct(handle) => handle.process_group_id(),
+            #[cfg(unix)]
             Self::Hosted(handle) => handle.process_group_id(),
         }
     }
@@ -689,7 +692,6 @@ impl HostedTerminalHandle {
         self.descriptor.runtime_id
     }
 
-    #[cfg(target_os = "linux")]
     pub fn process_group_id(&self) -> Option<i32> {
         self.process_group_id
     }
@@ -1189,7 +1191,6 @@ impl TerminalHandle {
         self.child.lock().ok().and_then(|child| child.process_id())
     }
 
-    #[cfg(target_os = "linux")]
     pub fn process_group_id(&self) -> Option<i32> {
         self.provider_pid().and_then(|pid| i32::try_from(pid).ok())
     }

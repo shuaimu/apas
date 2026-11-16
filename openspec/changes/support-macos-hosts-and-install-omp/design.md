@@ -20,8 +20,8 @@ The CLI grew on Linux. A MacBook Air joined the owner's cluster and ran into the
 
 ## Risks
 
-- None of the macOS-only code was compiled or run: no macOS target is installed on the build hosts and there is no Mac here. Linux runs the same portable code paths in tests where possible.
-- On macOS, OMP tabs get status from the transcript only, questions are answered in the terminal, and autopilot is unavailable (the extension's process identity is Linux-only). This is logged, not fixed.
+- No macOS code has run anywhere but on the owner's Mac. Since 2026-11-15 the CLI is type-checked for macOS on the Linux build host (`scripts/macos-check/check.sh`), which finds compile errors only.
+- OMP tabs on macOS first shipped without live status, web-answered questions and autopilot, because the extension proved its process identity through `/proc`. The owner dropped the start-time check on 2026-11-15 ("we should trust the user env"), so the extension now runs on macOS: launch id and pid still have to match, and the provider has to be running. `process.ppid` under OMP's runtime on macOS is unverified; a silent extension is logged after 60 seconds.
 - The machine id derives from user@hostname; a Mac's hostname can change (Bonjour `-2`, DHCP), making it a new machine. Logged only.
 - Any user with runtime access to a project on a machine can trigger an OMP install there.
 - "Reboot to update" on a Mac needs git and a Rust toolchain.

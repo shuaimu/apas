@@ -201,7 +201,27 @@ function autopilotVersionProblem(version) {
 export default function apasActivity(omp) {
   const runtime = process.env.APAS_OMP_RUNTIME;
   const launchId = process.env.APAS_OMP_LAUNCH;
-  if (!runtime || !launchId || process.platform !== "linux") return;
+  // Only the process APAS itself started for the tab reports: its parent is
+  // the process that set these variables. A wrapper script's child, or a
+  // subagent run as its own process, inherits them and has another parent,
+  // so it registers nothing here and can neither report for the tab nor take
+  // its autopilot requests. This used to be "am I my own process group
+  // leader", read from /proc, which kept the extension off macOS. The same
+  // code now runs on Linux and macOS. Read once: a parent that goes away
+  // later takes the terminal with it.
+  const parent = process.env.APAS_OMP_PARENT;
+  if (!runtime || !launchId || typeof process.geteuid !== "function" ||
+      typeof parent !== "string" || !/^[1-9][0-9]*$/.test(parent) || process.ppid !== Number(parent)) return;
+  // The process start time is not part of this tab's identity any more
+  // (owner's decision, 2026-11-15: the user's own environment is trusted).
+  // Nothing here compares it. It is still written where /proc gives it,
+  // because a daemon that has not been rebooted since can sit above this
+  // extension, and its older CLI rejects a file without the exact value.
+  // Read here, and again from processStart() only after a read that failed
+  // although /proc is there.
+  let processStarted;
+  let startReadsLeft = 3;
+  processStart();
   const launchPath = join(runtime, "omp-launch.json");
   const reportPath = join(runtime, "omp-activity.json");
   const temporary = join(runtime, `omp-activity.tmp-${process.pid}-${launchId}`);
@@ -237,7 +257,7 @@ export default function apasActivity(omp) {
   }
 
   function sameScope(left, right) {
-    return right && ["launch_id", "pid", "process_start", "session_id", "transcript_path"]
+    return right && ["launch_id", "pid", "session_id", "transcript_path"]
       .every(key => left[key] === right[key]);
   }
 
@@ -450,11 +470,23 @@ export default function apasActivity(omp) {
       stat.uid === process.geteuid() && (stat.mode & 0o077) === 0;
   }
 
+  // For older CLIs only; see where processStarted is declared. Undefined
+  // wherever /proc cannot be read, macOS among them. A host without /proc is
+  // asked once; a read that failed for another reason is repeated at the
+  // next two uses, so one bad moment at load does not leave every file of
+  // this process without the value.
   function processStart() {
-    const stat = readFileSync(`/proc/${process.pid}/stat`, "utf8");
-    const fields = stat.slice(stat.lastIndexOf(") ") + 2).trim().split(/\s+/);
-    if (Number(fields[2]) !== process.pid) return undefined;
-    return fields[19];
+    if (processStarted !== undefined || startReadsLeft <= 0) return processStarted;
+    startReadsLeft--;
+    try {
+      const stat = readFileSync(`/proc/${process.pid}/stat`, "utf8");
+      const start = stat.slice(stat.lastIndexOf(") ") + 2).trim().split(/\s+/)[19];
+      if (/^[0-9]+$/.test(start ?? "")) processStarted = start;
+      else startReadsLeft = 0;
+    } catch (error) {
+      if (error?.code === "ENOENT" || error?.code === "ENOTDIR") startReadsLeft = 0;
+    }
+    return processStarted;
   }
 
   function identity(ctx) {
@@ -473,12 +505,11 @@ export default function apasActivity(omp) {
     } catch (error) {
       if (error.code !== "ENOENT") return;
     }
-    const start = processStart();
-    if (!start) return;
+    const started = processStart();
     return {
       launch_id: launchId,
       pid: process.pid,
-      process_start: start,
+      ...(started ? { process_start: started } : {}),
       session_id: ctx.sessionManager.getSessionId(),
       transcript_path: join(sessionDir, basename(file)),
     };
@@ -489,14 +520,12 @@ export default function apasActivity(omp) {
     clearTimeout(ackCleanup);
     try {
       const ack = privateJson(ackPath, MAX_ACK_BYTES);
-      if (ack.launch_id === launchId && ack.pid === process.pid && ack.process_start === processStart()) unlinkSync(ackPath);
+      if (ack.launch_id === launchId && ack.pid === process.pid) unlinkSync(ackPath);
     } catch {}
     if (!owned) return;
     try {
       const report = privateJson(reportPath, MAX_ACK_BYTES);
-      if (report.launch_id === launchId && report.pid === process.pid && report.process_start === processStart()) {
-        unlinkSync(reportPath);
-      }
+      if (report.launch_id === launchId && report.pid === process.pid) unlinkSync(reportPath);
     } catch {}
     owned = false;
     lastBody = undefined;
@@ -651,7 +680,6 @@ export default function apasActivity(omp) {
     let root; // the main agent's context: managed timers and OMP calls
     let support; // unknown until OMP's version has been read
     let unsupported;
-    let processStarted;
     let ap; // the current autopilot, on or paused
     let ended; // the last ended one, as it is reported
     let endedByChange = false;
@@ -691,8 +719,8 @@ export default function apasActivity(omp) {
       try {
         if (!privateFile(runtime, true) || !privateFile(launchPath)) return;
         if (privateJson(launchPath, MAX_ACK_BYTES).launch_id !== launchId) return;
-        processStarted ??= processStart();
-        if (processStarted) return { launch_id: launchId, pid: process.pid, process_start: processStarted };
+        const started = processStart();
+        return { launch_id: launchId, pid: process.pid, ...(started ? { process_start: started } : {}) };
       } catch {}
     }
 

@@ -19,7 +19,7 @@ use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tokio::sync::mpsc as tokio_mpsc;
 use uuid::Uuid;
 
@@ -1579,7 +1579,9 @@ fn spawn_in_own_process_group(_command: &mut Command) {}
 /// that unrepresentable.
 #[cfg(unix)]
 fn leads_own_process_group(pid: u32) -> bool {
-    pid != 0 && unsafe { libc::getpgid(pid as i32) } == pid as i32
+    // A leader that exited and is not reaped yet still counts: its group can
+    // have live members, and they are what the signal is for.
+    i32::try_from(pid).is_ok_and(crate::process_info::leads_own_group)
 }
 
 #[cfg(not(unix))]
@@ -2011,25 +2013,7 @@ fn spawn_terminal_pane(
         previous.shutdown();
     }
     crate::launch_status::clear(session_id, pane_id);
-    if matches!(provider, Provider::Omp) {
-        note_omp_platform_limits();
-    }
     Ok(())
-}
-
-/// OMP's APAS extension identifies its provider through `/proc`, so off
-/// Linux it reports nothing: the tab's state comes from its transcript only,
-/// OMP's questions are answered in the terminal, and autopilot is refused.
-/// Said once per process, so it is not a silent difference.
-fn note_omp_platform_limits() {
-    static NOTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-    if !cfg!(target_os = "linux") && !NOTED.swap(true, Ordering::Relaxed) {
-        tracing::info!(
-            os = std::env::consts::OS,
-            "OMP tabs on this platform: status comes from the transcript only, questions are \
-             answered in the terminal, and autopilot is unavailable"
-        );
-    }
 }
 
 /// Launch an already selected executable, without cache selection or fallback.
@@ -4021,6 +4005,9 @@ async fn run_inner(
             // last relayed of it.
             let mut autopilot_relays: HashMap<u32, crate::omp_autopilot::PaneAutopilotRelay> =
                 HashMap::new();
+            // Says once when an OMP tab's extension never reported.
+            let mut silent_extensions: HashMap<u32, crate::omp_activity::SilentExtensionWatch> =
+                HashMap::new();
             // Per-pane claude transcript watch state (growth + idle tracking
             // for in-TUI session-switch detection).
             let mut claude_watch: HashMap<u32, ClaudeWatchState> = HashMap::new();
@@ -4051,11 +4038,10 @@ async fn run_inner(
                         .filter_map(|(id, m)| {
                             let sid = sessions.as_ref()?.get(id).copied()?;
                             let runtime = runtimes.as_ref().and_then(|runtimes| runtimes.get(id));
-                            #[cfg(target_os = "linux")]
+                            // The provider's pid on every Unix: the OMP
+                            // file checks need it on macOS as on Linux.
                             let process_group_id =
                                 runtime.and_then(TerminalRuntimeHandle::process_group_id);
-                            #[cfg(not(target_os = "linux"))]
-                            let process_group_id = None;
                             Some((
                                 *id,
                                 m.provider.clone(),
@@ -4070,6 +4056,11 @@ async fn run_inner(
                 pi_readers.retain(|id, _| panes.iter().any(|(pane_id, ..)| pane_id == id));
                 omp_questions.retain(|id, _| panes.iter().any(|(pane_id, ..)| pane_id == id));
                 autopilot_relays.retain(|id, _| {
+                    panes
+                        .iter()
+                        .any(|(pane_id, provider, ..)| pane_id == id && *provider == Provider::Omp)
+                });
+                silent_extensions.retain(|id, _| {
                     panes
                         .iter()
                         .any(|(pane_id, provider, ..)| pane_id == id && *provider == Provider::Omp)
@@ -4144,6 +4135,8 @@ async fn run_inner(
                         None
                     };
                     if provider == Provider::Omp {
+                        let runtime_dir =
+                            crate::omp_activity::pane_runtime_dir(session_id, pane_id);
                         // Relayed before anything below can skip the pane: a
                         // tab reports its autopilot whether or not it has a
                         // session file yet.
@@ -4153,12 +4146,33 @@ async fn run_inner(
                             &server_tx_for_turns,
                             session_id,
                             pane_id,
-                            crate::omp_activity::pane_runtime_dir(session_id, pane_id).as_deref(),
+                            runtime_dir.as_deref(),
                             process_group_id,
                             lifecycle,
                             connection_generation,
                             server_link_for_turns.controls_autopilot(),
                         );
+                        // The extension turns itself off without a word when
+                        // OMP is not the direct child of the process that
+                        // started it. Nothing else would show that.
+                        if silent_extensions.entry(pane_id).or_default().observe(
+                            runtime_dir.as_deref(),
+                            process_group_id,
+                            lifecycle == Some(shared::TerminalLifecycle::Running),
+                            omp_report.is_some(),
+                            std::time::Instant::now(),
+                        ) {
+                            tracing::warn!(
+                                pane_id,
+                                pid = ?process_group_id,
+                                "this OMP tab's APAS extension has reported nothing since its \
+                                 agent started: its status comes from the transcript only, its \
+                                 questions are answered in the terminal, and its autopilot \
+                                 reads as not reported. The extension reports only when OMP is \
+                                 the direct child of the process that started it \
+                                 (APAS_OMP_PARENT)"
+                            );
+                        }
                     }
                     let live_working = omp_report
                         .as_ref()
@@ -10569,9 +10583,9 @@ mod tests {
             );
         }
         // An OMP tab whose agent process is not running: nothing there could
-        // apply even a stop. Where no tab can run autopilot at all, that is
-        // what a request is told.
-        let cannot = if cfg!(target_os = "linux") {
+        // apply even a stop. Where no tab can run autopilot at all (not a
+        // Unix), that is what a request is told.
+        let cannot = if cfg!(unix) {
             "This tab's agent is not running. Reboot it first; its autopilot comes back paused."
         } else {
             "Autopilot is not available for tabs on this machine."
@@ -10587,7 +10601,7 @@ mod tests {
     /// runtimes: a provider that ends by itself is relayed as the pause this
     /// CLI reports on the tab's behalf, and one this CLI stopped is not.
     #[test]
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     fn the_watcher_relays_a_pause_only_for_an_agent_that_ended_by_itself() {
         use crate::omp_autopilot as autopilot;
         use shared::{autopilot_condition, AutopilotSupport, TerminalLifecycle};
@@ -10680,21 +10694,16 @@ mod tests {
             .unwrap();
             let pid = handle.process_group_id().unwrap();
             let deadline = Instant::now() + Duration::from_secs(10);
-            let process_start = loop {
-                match crate::omp_activity::process_start(pid) {
-                    Some(start) => break start,
-                    None => {
-                        assert!(Instant::now() < deadline, "the agent never led its group");
-                        thread::sleep(Duration::from_millis(5));
-                    }
-                }
-            };
+            while !crate::omp_activity::provider_alive(pid) {
+                assert!(Instant::now() < deadline, "the agent never led its group");
+                thread::sleep(Duration::from_millis(5));
+            }
             let report = autopilot::StateReport {
                 v: autopilot::FORMAT_VERSION,
                 counter: 1,
                 launch_id: launch.launch_id,
                 pid,
-                process_start,
+                process_start: None,
                 session_id: "01a1d594-4d99-729d-a0a1-0d838bc273a9".into(),
                 support: "supported".into(),
                 unsupported_reason: None,
@@ -13921,12 +13930,9 @@ fn control_pane_autopilot(
     {
         return crate::omp_autopilot::Receipt::refused(reason);
     }
-    #[cfg(target_os = "linux")]
     let group = runtime
         .as_ref()
         .and_then(TerminalRuntimeHandle::process_group_id);
-    #[cfg(not(target_os = "linux"))]
-    let group = None;
     crate::omp_autopilot::exchange(session_id, pane_id, group, request_id, command)
 }
 
@@ -15956,10 +15962,7 @@ async fn run_server_connection(
                                                         shared::TerminalLifecycle::Running
                                                             | shared::TerminalLifecycle::Disconnected
                                                     ));
-                                                    #[cfg(target_os = "linux")]
                                                     let group = runtime.as_ref().and_then(TerminalRuntimeHandle::process_group_id);
-                                                    #[cfg(not(target_os = "linux"))]
-                                                    let group = None;
                                                     let authorized = target_session == session_id && provider_matches && live;
                                                     let result = if authorized {
                                                         crate::omp_activity::submit_answer(

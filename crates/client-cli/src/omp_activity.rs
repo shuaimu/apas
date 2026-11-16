@@ -12,6 +12,15 @@ use crate::transcript::TranscriptActivity;
 
 const RUNTIME_ENV: &str = "APAS_OMP_RUNTIME";
 const LAUNCH_ENV: &str = "APAS_OMP_LAUNCH";
+/// The pid of the process that spawns the provider. The extension reports
+/// only from a process whose parent this is, which is how a wrapper's child
+/// or a subagent run as its own process stays silent although it inherited
+/// the tab's environment. It replaces the extension's "am I my own process
+/// group leader" test, which needed `/proc`.
+const PARENT_ENV: &str = "APAS_OMP_PARENT";
+/// Recorded in the launch file beside the autopilot marker by a CLI whose
+/// extension needs no `/proc`. See [`crate::omp_autopilot::has_autopilot`].
+pub(crate) const PORTABLE_LAUNCH_FEATURE: &str = "portable_v1";
 const LAUNCH_FILE: &str = "omp-launch.json";
 const REPORT_FILE: &str = "omp-activity.json";
 const EXTENSION_FILE: &str = "omp-activity.mjs";
@@ -24,15 +33,31 @@ const ANSWER_LOCK_FILE: &str = "omp-question.lock";
 const MAX_QUESTION_BYTES: u64 = 128 * 1024;
 const ANSWER_TIMEOUT: Duration = Duration::from_secs(2);
 
-#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Serialize, Deserialize)]
 struct QuestionScope {
     launch_id: Uuid,
     pid: i32,
-    process_start: String,
+    /// Never compared. It is kept only to be echoed back exactly as the tab
+    /// wrote it: an extension from before 2026-11-15 compares the scope of an
+    /// answer request with its own, this field included.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    process_start: Option<String>,
     session_id: String,
     transcript_path: PathBuf,
     tool_call_id: String,
     dialog_id: Uuid,
+}
+
+/// Everything but `process_start`, which nothing may require.
+impl PartialEq for QuestionScope {
+    fn eq(&self, other: &Self) -> bool {
+        self.launch_id == other.launch_id
+            && self.pid == other.pid
+            && self.session_id == other.session_id
+            && self.transcript_path == other.transcript_path
+            && self.tool_call_id == other.tool_call_id
+            && self.dialog_id == other.dialog_id
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -140,7 +165,7 @@ fn read_question(runtime: &Path, pid: i32) -> Option<QuestionReport> {
         || scope.pid != pid
         || scope.session_id.is_empty()
         || scope.tool_call_id.is_empty()
-        || process_start(pid).as_deref() != Some(scope.process_start.as_str())
+        || !provider_alive(pid)
         || !valid_questions(&report.questions)
     {
         return None;
@@ -379,7 +404,10 @@ pub(crate) fn read_launch(runtime_dir: &Path) -> Option<Launch> {
 struct Report {
     launch_id: Uuid,
     pid: i32,
-    process_start: String,
+    /// Written by the extension where it can read `/proc`, for CLIs from
+    /// before 2026-11-15, which required it. Never compared here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    process_start: Option<String>,
     session_id: String,
     transcript_path: PathBuf,
     activity: TranscriptActivity,
@@ -411,12 +439,7 @@ pub fn prepare(
     })();
     match prepared {
         Ok((runtime_dir, extension, launch)) => {
-            env.retain(|(key, _)| key != RUNTIME_ENV && key != LAUNCH_ENV);
-            env.push((
-                RUNTIME_ENV.into(),
-                runtime_dir.to_string_lossy().into_owned(),
-            ));
-            env.push((LAUNCH_ENV.into(), launch.launch_id.to_string()));
+            set_launch_env(env, &runtime_dir, &launch);
             Some(extension)
         }
         Err(error) => {
@@ -426,6 +449,20 @@ pub fn prepare(
     }
 }
 
+/// What the extension reads from its environment, replacing anything the
+/// caller inherited from a tab it runs in itself.
+fn set_launch_env(env: &mut Vec<(String, String)>, runtime_dir: &Path, launch: &Launch) {
+    env.retain(|(key, _)| key != RUNTIME_ENV && key != LAUNCH_ENV && key != PARENT_ENV);
+    env.push((
+        RUNTIME_ENV.into(),
+        runtime_dir.to_string_lossy().into_owned(),
+    ));
+    env.push((LAUNCH_ENV.into(), launch.launch_id.to_string()));
+    // This runs in the process that spawns the provider: the pane host for a
+    // hosted tab, the project CLI for a direct PTY.
+    env.push((PARENT_ENV.into(), std::process::id().to_string()));
+}
+
 pub(crate) fn install(runtime_dir: &Path, session_dir: &Path) -> Result<(PathBuf, Launch)> {
     if !private_metadata(runtime_dir, true) {
         bail!("insecure OMP runtime directory {}", runtime_dir.display());
@@ -433,7 +470,10 @@ pub(crate) fn install(runtime_dir: &Path, session_dir: &Path) -> Result<(PathBuf
     let launch = Launch {
         launch_id: Uuid::new_v4(),
         session_dir: fs::canonicalize(session_dir)?,
-        features: vec![crate::omp_autopilot::LAUNCH_FEATURE.to_string()],
+        features: vec![
+            crate::omp_autopilot::LAUNCH_FEATURE.to_string(),
+            PORTABLE_LAUNCH_FEATURE.to_string(),
+        ],
     };
     // Invalidate the old generation before an old provider can publish another report.
     write_private_atomic(
@@ -482,7 +522,7 @@ fn read_activity(runtime_dir: &Path, pid: i32) -> Option<OmpActivityReport> {
     if report.launch_id != launch.launch_id
         || report.pid != pid
         || report.session_id.is_empty()
-        || process_start(pid).as_deref() != Some(report.process_start.as_str())
+        || !provider_alive(pid)
     {
         return None;
     }
@@ -562,26 +602,93 @@ pub(crate) fn private_owner(_metadata: &fs::Metadata) -> bool {
     false
 }
 
-#[cfg(target_os = "linux")]
-pub(crate) fn process_start(pid: i32) -> Option<String> {
-    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    let (_, fields) = stat.rsplit_once(") ")?;
-    let mut fields = fields.split_whitespace();
-    // Field 3 is state; field 5 must be the provider's dedicated process group.
-    if matches!(fields.next()?, "Z" | "X" | "x") {
-        return None;
-    }
-    fields.next()?;
-    if fields.next()?.parse::<i32>().ok()? != pid {
-        return None;
-    }
-    // Fields 6..21 precede starttime (22), which disambiguates PID reuse.
-    Some(fields.nth(16)?.to_owned())
+/// Whether the provider this CLI launched as `pid` is still running and
+/// still leads its own process group, as the direct child of a PTY does.
+///
+/// Not a trust check. It only keeps a file a dead provider left behind from
+/// being read as current, on Linux and macOS alike. It used to be a
+/// comparison of the file's `process_start` with `/proc/<pid>/stat`, which
+/// also guarded against a reused pid; the owner dropped that on 2026-11-15
+/// (the user's own environment is trusted), and with it the need for
+/// `/proc`.
+///
+/// A provider that exited while one of its descendants keeps the PTY open is
+/// not reaped until the PTY closes (both PTY owners wait for that), and on
+/// Linux such a zombie still leads its group. Where `/proc` can be read it is
+/// told apart and does not count as running; where it cannot, it counts
+/// until the PTY closes.
+#[cfg(unix)]
+pub(crate) fn provider_alive(pid: i32) -> bool {
+    crate::process_info::leads_own_group(pid) && !crate::process_info::exited_unreaped(pid)
 }
 
-#[cfg(not(target_os = "linux"))]
-pub(crate) fn process_start(_pid: i32) -> Option<String> {
-    None
+#[cfg(not(unix))]
+pub(crate) fn provider_alive(_pid: i32) -> bool {
+    false
+}
+
+/// How long a tab's agent may run without its extension reporting anything
+/// before the CLI says so. A real OMP reports within a few seconds of
+/// starting; the margin is for a slow start on a large conversation.
+const SILENT_EXTENSION_AFTER: Duration = Duration::from_secs(60);
+
+/// Notices a tab whose extension never reported, once per provider process.
+///
+/// The extension turns itself off without a word when it is not the direct
+/// child of the process that started it (`APAS_OMP_PARENT`), for example
+/// behind a launcher that forks. The tab then looks healthy and quietly has
+/// transcript status only, questions answered in the terminal only, and an
+/// autopilot that reads "not reported". This is the one place that says so.
+#[derive(Default)]
+pub(crate) struct SilentExtensionWatch {
+    pid: Option<i32>,
+    running_since: Option<Instant>,
+    settled: bool,
+}
+
+impl SilentExtensionWatch {
+    /// One poll of the tab. True at most once per provider process: when it
+    /// has been running for [`SILENT_EXTENSION_AFTER`], was launched with an
+    /// extension that needs no `/proc`, and no report of it was ever read.
+    pub(crate) fn observe(
+        &mut self,
+        runtime_dir: Option<&Path>,
+        pid: Option<i32>,
+        running: bool,
+        reported: bool,
+        now: Instant,
+    ) -> bool {
+        if self.pid != pid {
+            *self = Self {
+                pid,
+                ..Self::default()
+            };
+        }
+        if self.settled || pid.is_none() {
+            return false;
+        }
+        if reported {
+            self.settled = true;
+            return false;
+        }
+        if !running {
+            self.running_since = None;
+            return false;
+        }
+        let since = *self.running_since.get_or_insert(now);
+        if now.duration_since(since) < SILENT_EXTENSION_AFTER {
+            return false;
+        }
+        self.settled = true;
+        // An extension from before 2026-11-15 is silent off Linux by design,
+        // and its tab already asks for an agent reboot.
+        runtime_dir.and_then(read_launch).is_some_and(|launch| {
+            launch
+                .features
+                .iter()
+                .any(|feature| feature == PORTABLE_LAUNCH_FEATURE)
+        })
+    }
 }
 
 pub(crate) fn write_private_atomic(path: &Path, body: &[u8]) -> Result<()> {
@@ -605,7 +712,7 @@ pub(crate) fn write_private_atomic(path: &Path, body: &[u8]) -> Result<()> {
     result
 }
 
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use std::os::unix::fs::{symlink, PermissionsExt};
@@ -624,8 +731,11 @@ mod tests {
     impl Fixture {
         fn new() -> Self {
             let root = tempfile::tempdir().unwrap();
-            let runtime = root.path().join("runtime");
-            let session_dir = root.path().join("sessions");
+            // The CLI hands back canonical transcript paths, and a temporary
+            // directory is behind a symlink on macOS (/var/folders).
+            let base = fs::canonicalize(root.path()).unwrap();
+            let runtime = base.join("runtime");
+            let session_dir = base.join("sessions");
             crate::pane_host::ensure_private_dir(&runtime).unwrap();
             fs::create_dir(&session_dir).unwrap();
             let (_, launch) = install(&runtime, &session_dir).unwrap();
@@ -640,7 +750,9 @@ mod tests {
             let report = Report {
                 launch_id: launch.launch_id,
                 pid,
-                process_start: process_start(pid).unwrap(),
+                // The shape a tab without `/proc` writes. The tests that
+                // need the field set it themselves.
+                process_start: None,
                 session_id: "parent".into(),
                 transcript_path: transcript.clone(),
                 activity: TranscriptActivity::PendingAnswer,
@@ -740,10 +852,13 @@ mod tests {
         fixture.write_question(&question);
         assert!(read_question(&fixture.runtime, fixture.report.pid).is_none());
         question.scope.pid -= 1;
-        question.scope.process_start.push('0');
-        fixture.write_question(&question);
-        assert!(read_question(&fixture.runtime, fixture.report.pid).is_none());
-        question.scope.process_start = fixture.report.process_start.clone();
+        // The start time is not part of the identity: whatever it says, and
+        // whether it is there at all, the question is read.
+        for process_start in [Some("1".to_string()), None] {
+            question.scope.process_start = process_start;
+            fixture.write_question(&question);
+            assert!(read_question(&fixture.runtime, fixture.report.pid).is_some());
+        }
         let nested = fixture.session_dir.join("subagents");
         fs::create_dir(&nested).unwrap();
         question.scope.transcript_path = nested.join("child.jsonl");
@@ -962,14 +1077,308 @@ mod tests {
         fixture.publish();
         assert_eq!(fixture.activity(), None);
         fixture.report.pid -= 1;
-        fixture.report.process_start.push('0');
         fixture.publish();
-        assert_eq!(fixture.activity(), None);
-        fixture.report.process_start = process_start(fixture.report.pid).unwrap();
-        fixture.publish();
+        assert_eq!(fixture.activity(), Some(TranscriptActivity::PendingAnswer));
         fixture.provider.kill().unwrap();
         fixture.provider.wait().unwrap();
         assert_eq!(fixture.activity(), None);
+    }
+
+    #[test]
+    fn a_report_with_another_launch_id_is_rejected() {
+        let mut fixture = Fixture::new();
+        fixture.publish();
+        assert_eq!(fixture.activity(), Some(TranscriptActivity::PendingAnswer));
+        // A file left by an earlier launch of the same tab.
+        fixture.report.launch_id = Uuid::new_v4();
+        fixture.publish();
+        assert_eq!(fixture.activity(), None);
+        let mut question = fixture.publish_question();
+        assert!(read_question(&fixture.runtime, fixture.report.pid).is_none());
+        question.scope.launch_id = read_launch(&fixture.runtime).unwrap().launch_id;
+        fixture.write_question(&question);
+        assert!(read_question(&fixture.runtime, fixture.report.pid).is_some());
+    }
+
+    /// The subagent case: a live process that inherited the tab's environment
+    /// and reports under its own pid is not the provider this CLI started.
+    #[test]
+    fn a_report_whose_pid_is_not_the_providers_is_rejected() {
+        let mut fixture = Fixture::new();
+        let mut subagent = Command::new("sleep")
+            .arg("60")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let provider = fixture.report.pid;
+        assert!(provider_alive(subagent.id() as i32));
+        fixture.report.pid = subagent.id() as i32;
+        fixture.publish();
+        let mut question = fixture.publish_question();
+        let rejected = (
+            read_activity(&fixture.runtime, provider).is_none(),
+            read_question(&fixture.runtime, provider).is_none(),
+        );
+        fixture.report.pid = provider;
+        fixture.publish();
+        question.scope.pid = provider;
+        fixture.write_question(&question);
+        let accepted = (
+            read_activity(&fixture.runtime, provider).is_some(),
+            read_question(&fixture.runtime, provider).is_some(),
+        );
+        subagent.kill().unwrap();
+        subagent.wait().unwrap();
+        assert_eq!(rejected, (true, true));
+        assert_eq!(accepted, (true, true));
+    }
+
+    #[test]
+    fn a_report_with_a_missing_or_different_process_start_is_accepted() {
+        let mut fixture = Fixture::new();
+        // No field at all: what a tab writes where there is no `/proc`.
+        fixture.publish();
+        let written: serde_json::Value =
+            serde_json::from_slice(&fs::read(fixture.runtime.join(REPORT_FILE)).unwrap()).unwrap();
+        assert!(written.get("process_start").is_none());
+        assert_eq!(fixture.activity(), Some(TranscriptActivity::PendingAnswer));
+        // Any value: an extension from before the check was dropped writes
+        // the provider's real start time, and it is not compared either.
+        fixture.report.process_start = Some("not-this-process".into());
+        fixture.publish();
+        assert_eq!(fixture.activity(), Some(TranscriptActivity::PendingAnswer));
+        // A null reads as absent.
+        let mut odd = serde_json::to_value(&fixture.report).unwrap();
+        odd["process_start"] = serde_json::Value::Null;
+        write_private_atomic(
+            &fixture.runtime.join(REPORT_FILE),
+            &serde_json::to_vec(&odd).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(fixture.activity(), Some(TranscriptActivity::PendingAnswer));
+    }
+
+    #[test]
+    fn a_report_from_a_provider_that_is_no_longer_running_is_not_current() {
+        let mut fixture = Fixture::new();
+        fixture.report.process_start = Some("12345".into());
+        fixture.publish();
+        fixture.publish_question();
+        let pid = fixture.report.pid;
+        assert!(provider_alive(pid));
+        assert!(read_activity(&fixture.runtime, pid).is_some());
+        assert!(read_question(&fixture.runtime, pid).is_some());
+        fixture.provider.kill().unwrap();
+        fixture.provider.wait().unwrap();
+        // Both files are still there, with the right launch id and pid.
+        assert!(fixture.runtime.join(REPORT_FILE).exists());
+        assert!(fixture.runtime.join(QUESTION_FILE).exists());
+        assert!(!provider_alive(pid));
+        assert!(read_activity(&fixture.runtime, pid).is_none());
+        assert!(read_question(&fixture.runtime, pid).is_none());
+    }
+
+    /// A provider that died while a descendant keeps the PTY open is not
+    /// reaped until the PTY closes. On Linux it still leads its process
+    /// group meanwhile, and its last files must not read as current.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn a_provider_that_exited_and_is_not_reaped_yet_is_not_running() {
+        let mut fixture = Fixture::new();
+        fixture.publish();
+        fixture.publish_question();
+        let pid = fixture.report.pid;
+        assert!(read_activity(&fixture.runtime, pid).is_some());
+        fixture.provider.kill().unwrap();
+        // Wait for the exit without reaping it, as nothing reaps a provider
+        // whose PTY is still open.
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        let waited = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                pid as libc::id_t,
+                &mut info,
+                libc::WEXITED | libc::WNOWAIT,
+            )
+        };
+        assert_eq!(waited, 0);
+        // Still there for the process table, and still its group's leader.
+        assert!(crate::process_info::alive(pid as u32));
+        assert!(crate::process_info::leads_own_group(pid));
+        assert!(!provider_alive(pid));
+        assert!(read_activity(&fixture.runtime, pid).is_none());
+        assert!(read_question(&fixture.runtime, pid).is_none());
+        fixture.provider.wait().unwrap();
+        assert!(!provider_alive(pid));
+    }
+
+    #[test]
+    fn a_live_process_that_does_not_lead_its_own_group_is_not_a_provider() {
+        // A PTY's direct child leads its own group. This one stays in the
+        // test's group, as a wrapper script's child stays in the wrapper's.
+        let mut child = Command::new("sleep").arg("60").spawn().unwrap();
+        let alive = provider_alive(child.id() as i32);
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert!(!alive);
+        assert!(!provider_alive(0));
+        assert!(!provider_alive(-1));
+    }
+
+    /// An extension from before the check was dropped compares the scope of
+    /// an answer request with its own, `process_start` included, so the CLI
+    /// hands the field back exactly as it read it and adds none of its own.
+    #[test]
+    fn an_answer_request_echoes_process_start_exactly_as_the_tab_wrote_it() {
+        for process_start in [Some("4242424242".to_string()), None] {
+            let fixture = Fixture::new();
+            let mut question = fixture.publish_question();
+            question.scope.process_start = process_start.clone();
+            fixture.write_question(&question);
+            let runtime = fixture.runtime.clone();
+            let scope = question.scope.clone();
+            let responder = std::thread::spawn(move || {
+                let deadline = Instant::now() + Duration::from_secs(3);
+                let request = loop {
+                    if let Some(request) = read_private_json_bounded::<serde_json::Value>(
+                        &runtime.join(SUBMISSION_FILE),
+                        MAX_QUESTION_BYTES,
+                    ) {
+                        break request;
+                    }
+                    assert!(Instant::now() < deadline, "no answer request was written");
+                    std::thread::sleep(Duration::from_millis(1));
+                };
+                // The acknowledgement's own value is not compared: a tab that
+                // cannot read `/proc` at that moment leaves it out.
+                let ack = AnswerAck {
+                    scope: QuestionScope {
+                        process_start: None,
+                        ..scope
+                    },
+                    nonce: serde_json::from_value(request["nonce"].clone()).unwrap(),
+                    request_id: "answer-request".into(),
+                    accepted: true,
+                    error: None,
+                };
+                write_private_atomic(&runtime.join(ACK_FILE), &serde_json::to_vec(&ack).unwrap())
+                    .unwrap();
+                request
+            });
+            let result = submit_answer_at(
+                &fixture.runtime,
+                fixture.report.pid,
+                7,
+                &question_tool_use_id(7, &question.scope.session_id, &question.scope.tool_call_id),
+                question.scope.dialog_id,
+                "answer-request",
+                &answers(),
+                false,
+                Duration::from_secs(3),
+            );
+            let request = responder.join().unwrap();
+            assert!(result.is_ok(), "{result:?}");
+            assert_eq!(
+                request
+                    .get("process_start")
+                    .and_then(|value| value.as_str()),
+                process_start.as_deref()
+            );
+            assert_eq!(
+                request.as_object().unwrap().contains_key("process_start"),
+                process_start.is_some()
+            );
+        }
+    }
+
+    #[test]
+    fn a_running_tab_whose_extension_never_reported_is_noticed_once() {
+        let fixture = Fixture::new();
+        let runtime = Some(fixture.runtime.as_path());
+        let pid = Some(fixture.report.pid);
+        let start = Instant::now();
+        let after = |seconds: u64| start + Duration::from_secs(seconds);
+        let late = SILENT_EXTENSION_AFTER.as_secs();
+
+        let mut watch = SilentExtensionWatch::default();
+        assert!(!watch.observe(runtime, pid, true, false, after(0)));
+        assert!(!watch.observe(runtime, pid, true, false, after(late - 1)));
+        assert!(watch.observe(runtime, pid, true, false, after(late)));
+        // Once per provider process.
+        assert!(!watch.observe(runtime, pid, true, false, after(late * 3)));
+        // The tab's next agent is watched afresh.
+        let next = pid.map(|pid| pid + 1);
+        assert!(!watch.observe(runtime, next, true, false, after(late * 3)));
+        assert!(watch.observe(runtime, next, true, false, after(late * 4)));
+
+        // One report is enough, whatever follows: a tab that left its
+        // session directory stops reporting and is not a silent extension.
+        let mut watch = SilentExtensionWatch::default();
+        assert!(!watch.observe(runtime, pid, true, true, after(0)));
+        assert!(!watch.observe(runtime, pid, true, false, after(late * 2)));
+
+        // Only time spent running counts, and a tab without a provider or
+        // one that is not running is never noticed.
+        let mut watch = SilentExtensionWatch::default();
+        assert!(!watch.observe(runtime, pid, true, false, after(0)));
+        assert!(!watch.observe(runtime, pid, false, false, after(late)));
+        assert!(!watch.observe(runtime, pid, true, false, after(late + 1)));
+        assert!(watch.observe(runtime, pid, true, false, after(late * 2 + 1)));
+        let mut watch = SilentExtensionWatch::default();
+        assert!(!watch.observe(runtime, None, true, false, after(0)));
+        assert!(!watch.observe(runtime, None, true, false, after(late)));
+
+        // A launch record from before the extension ran without `/proc`:
+        // off Linux that extension is silent by design.
+        let mut record: serde_json::Value =
+            serde_json::from_slice(&fs::read(fixture.runtime.join(LAUNCH_FILE)).unwrap()).unwrap();
+        record["features"] = serde_json::json!(["autopilot_v1"]);
+        write_private_atomic(
+            &fixture.runtime.join(LAUNCH_FILE),
+            &serde_json::to_vec(&record).unwrap(),
+        )
+        .unwrap();
+        let mut watch = SilentExtensionWatch::default();
+        assert!(!watch.observe(runtime, pid, true, false, after(0)));
+        assert!(!watch.observe(runtime, pid, true, false, after(late)));
+        let mut watch = SilentExtensionWatch::default();
+        assert!(!watch.observe(None, pid, true, false, after(0)));
+        assert!(!watch.observe(None, pid, true, false, after(late)));
+    }
+
+    #[test]
+    fn the_provider_is_told_which_process_spawned_it() {
+        let fixture = Fixture::new();
+        let launch = read_launch(&fixture.runtime).unwrap();
+        // A CLI that itself runs inside an OMP tab inherited that tab's values.
+        let mut env = vec![
+            (RUNTIME_ENV.to_string(), "/elsewhere".to_string()),
+            (LAUNCH_ENV.to_string(), Uuid::new_v4().to_string()),
+            (PARENT_ENV.to_string(), "1".to_string()),
+            ("KEPT".to_string(), "yes".to_string()),
+        ];
+        set_launch_env(&mut env, &fixture.runtime, &launch);
+        let value = |name: &str| {
+            let mut values = env.iter().filter(|(key, _)| key == name);
+            let value = values.next().map(|(_, value)| value.clone());
+            assert!(values.next().is_none(), "{name} is set twice");
+            value
+        };
+        assert_eq!(value(PARENT_ENV), Some(std::process::id().to_string()));
+        assert_eq!(value(LAUNCH_ENV), Some(launch.launch_id.to_string()));
+        assert_eq!(
+            value(RUNTIME_ENV),
+            Some(fixture.runtime.to_string_lossy().into_owned())
+        );
+        assert_eq!(value("KEPT"), Some("yes".to_string()));
+        // A spawned child sees this process as its parent, which is the
+        // comparison the extension makes.
+        let output = Command::new("sh")
+            .args(["-c", "test \"$PPID\" = \"$APAS_OMP_PARENT\""])
+            .envs(env.iter().map(|(key, value)| (key, value)))
+            .status()
+            .unwrap();
+        assert!(output.success());
     }
 
     #[test]
@@ -979,10 +1388,19 @@ mod tests {
         let fixture = Fixture::new();
         let launch = read_launch(&fixture.runtime).unwrap();
         assert_eq!(launch.launch_id, fixture.report.launch_id);
-        assert_eq!(launch.features, [autopilot::LAUNCH_FEATURE]);
+        assert_eq!(
+            launch.features,
+            [autopilot::LAUNCH_FEATURE, PORTABLE_LAUNCH_FEATURE]
+        );
         let record: serde_json::Value =
             serde_json::from_slice(&fs::read(fixture.runtime.join(LAUNCH_FILE)).unwrap()).unwrap();
-        assert_eq!(record["features"], serde_json::json!(["autopilot_v1"]));
+        // An extension reads only `launch_id` and `session_dir` from this
+        // record, and an older CLI looks for "autopilot_v1" among the
+        // features, so a second one changes nothing for either.
+        assert_eq!(
+            record["features"],
+            serde_json::json!(["autopilot_v1", "portable_v1"])
+        );
 
         // An unapplied pause or stop is among them: it is not carried over.
         let files = [

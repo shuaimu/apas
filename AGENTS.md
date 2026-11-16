@@ -1516,10 +1516,14 @@ there never showed an agent (change
 - The daemon merges the login shell's PATH (`-lic`) with its own and logs
   which tmux it found. The pane host checks its controller with
   `getpeereid`. A socket path over 104 bytes fails with that reason.
-- **Not on macOS, logged once:** OMP status comes from the transcript only,
-  OMP questions are answered in the terminal, and autopilot is unavailable
-  (the extension's process identity is Linux-only). Claude and Codex run
-  from their configured paths; provider copies stay in `/var/tmp`.
+- **OMP tabs work on macOS as on Linux** since the start-time check was
+  dropped (see "OMP activity is not conversation text"): live status,
+  questions answered from the web, and autopilot. A Mac tab whose agent was
+  started before that update keeps transcript status and terminal-only
+  questions, and its Autopilot control reads "Reboot this tab's agent to use
+  autopilot. Rebooting ends its turn in progress." Reboot the agent once.
+  Claude and Codex run from their configured paths; provider copies stay in
+  `/var/tmp`.
 - The machine id is derived from user@hostname, so a Mac whose hostname
   changes (a Bonjour `-2`, DHCP) appears as a new machine. "Reboot to update"
   needs git and a Rust toolchain on the Mac.
@@ -1531,8 +1535,22 @@ shows once on the Machines page without reconnecting; start the project again
 from the web. Do not use Reboot to update there: the new image can read the
 old `daemon.json`, find another old daemon alive, and exit.
 
-None of the macOS-only code was compiled or run before it shipped: the build
-hosts have no macOS target and there was no Mac to test on.
+None of the macOS-only code was compiled or run before it first shipped, and
+three bugs reached the owner's Mac that way (the installer's progress
+callback, the pane host's non-blocking connections, and this section's own
+first limits). Since 2026-11-15 the CLI type-checks for macOS on the Linux
+build host: `scripts/macos-check/check.sh` runs `cargo check -p apas
+--all-targets --target aarch64-apple-darwin` with four stub C headers so
+ring's build script finishes. Nothing is linked or run, so it finds compile
+errors only. **Run it before pushing a CLI change that touches `cfg`-gated or
+Unix-specific code.** Nothing has run on a Mac except by the owner. The OMP
+extension's tests simulate a host without `/proc`, and a real OMP 18.20.0 and
+18.20.2 ran it on Linux, also with its own `/proc` entry unreadable. First
+checks on the Mac, after a daemon reboot and one agent reboot:
+`omp-activity.json` appears in the tab's runtime directory within seconds; a
+question is answered from the web; autopilot starts and stops. If the
+extension stays silent, the daemon's log says so once per agent after 60
+seconds.
 
 ## Machines report their providers; OMP is installed when missing
 
@@ -1598,6 +1616,24 @@ only collected lines. The download now runs on a thread of its own and its
 lines reach the callback on the caller's thread, and a test drives `install`
 with a `blocking_send` callback (it fails on the old code with tokio's
 "Cannot block the current thread from within a runtime").
+
+**The second failure** was the pane host: its listener is non-blocking, and
+on macOS an accepted connection inherits that, so the host dropped its
+controller at once ("pane-host controller disconnected: failed to fill whole
+buffer"). Fixed at 9fc277b by making each accepted connection blocking.
+
+**The shared installed CLI was updated by accident on 2026-11-16 at 01:59
+UTC.** While working on the extension change, an agent's shell command
+contained `apas` inside backquotes and ran it in the repository on zoo-005.
+That is a normal launch: it pulled pushed `master` (834a71e) into
+`~/.local/share/apas/source`, built it and replaced `~/.local/bin/apas`
+(26.11.60) on the NFS home zoo-005 and zoo-006 share, and found the project
+already registered. No daemon was restarted and `.apas` did not change; both
+daemons kept running their old image (zoo-005's holds it open as an `.nfs`
+file). The effect is the one any machine's update has on the others: new pane
+hosts on both machines start from the new binary under daemons still on
+26.11.49. Never put a command name in backquotes inside a double-quoted shell
+string.
 
 ## The daemon is replaced only when asked
 
@@ -2188,7 +2224,7 @@ otherwise have had to volunteer.
   Like Codex, two panes sharing a cwd are inherently ambiguous; sessions from
   another directory are never selected.
 - **omp** — no `--session-id` exists, so the pane is pinned by its own
-  `--session-dir` instead (see "Terminal panes" below). New Linux panes report
+  `--session-dir` instead (see "Terminal panes" below). New panes report
   their exact transcript through the pane-local activity extension below.
   Already-running panes use the newest flat `.jsonl` in their private directory.
   `PiTranscriptReader` reads it. The reader keeps the name of the Pi session
@@ -2216,7 +2252,8 @@ running tools. The watcher now reconciles Working, Pending answer, and Idle
 independently of its chat cursor, including on restore and reconnect. Replaying
 old conversation is never needed to recover activity.
 
-New Linux OMP launches explicitly load APAS's embedded `--extension` in both
+New OMP launches, on Linux and macOS, explicitly load APAS's embedded
+`--extension` in both
 direct and hosted PTYs. It observes provider lifecycle events, preserves
 Working when `agent_end.willContinue` schedules continuation, and reports an
 unresolved `ask` as Pending answer. Reporting starts before OMP creates its
@@ -2227,9 +2264,42 @@ still carry executable tools and is not a substitute.
 
 The extension writes `omp-activity.json` by private temp-and-rename under the
 same host-local `apas/panes/<project>/<pane>` runtime tree as Claude's hook.
-Its launch generation, provider PID/start time, and exact session-directory
-scope must match; stale reports and inherited subagent environments cannot
-report for the parent. Activity reports contain no conversation or
+Its launch id, provider pid and exact session-directory scope must match, and
+that provider must still be running; a file left by an earlier launch and a
+subagent that inherited the tab's environment cannot report for the tab. The
+files stay owner-only (0700 directory, 0600 files, no symlinks).
+
+**The process start time is no longer checked** (owner, 2026-11-15: "we
+should trust the user env (if there is a malicious process on the server, we
+cannot protect ourselves anyway)"). The launch id and pid checks stay because
+they are for correctness, not security. What the start time also told, that
+the writer is alive, now comes from `provider_alive`: the pid leads its own
+process group (`getpgid(pid) == pid`), the same on Linux and macOS.
+
+- The extension reports only from the process APAS started: `prepare()` sets
+  `APAS_OMP_PARENT` to the spawning process's pid and the extension requires
+  `process.ppid` to equal it. A wrapper script's child or a subagent process
+  stays silent. Anything that starts OMP with the built extension by hand,
+  the check harnesses included, must export `APAS_OMP_PARENT=$PPID`.
+- A silent extension is logged, once per agent process: when a tab launched
+  with `portable_v1` has been running for 60 seconds and no report of it was
+  ever read, the daemon warns that the tab has transcript status only,
+  terminal-only questions and an autopilot that reads "not reported".
+- `process_start` is still written on Linux and never read by this CLI. A new
+  pane host runs the installed binary, so a new extension can sit under a
+  daemon that has not been rebooted, and that older CLI requires the exact
+  value. Do not remove the field until no such daemon is left.
+- The launch record carries `"features": ["autopilot_v1", "portable_v1"]`.
+  Off Linux, a record without `portable_v1` belongs to an extension that
+  turned itself off, so its tab asks for an agent reboot.
+- A provider that died while one of its descendants keeps the terminal open
+  is not reaped until the terminal closes. On Linux the CLI reads its state
+  from `/proc/<pid>/stat` and does not count it as running. Where `/proc`
+  cannot be read it counts as running until the terminal closes, and its last
+  report can read Working until then; autopilot state is bounded by the
+  90-second staleness rule.
+
+Activity reports contain no conversation or
 credentials. The separate autopilot state report (`omp-autopilot.json`) does
 carry the autopilot's prompt; see "Autopilot on OMP terminal tabs".
 No global OMP settings or extensions are replaced.
@@ -2325,7 +2395,7 @@ replacement for the TUI.
 `AnswerOmpQuestion` carries the session, pane, opaque tool ID, dialog generation,
 request ID, and typed answers or cancellation. The server checks live runtime
 access and claims the exact pending question. The CLI validates the launch,
-provider PID/start time, native session, transcript scope, and current dialog
+the provider's pid and that it is still running, native session, transcript scope, and current dialog
 before using bounded, owner-only local files under the pane's activity runtime.
 Its two-second exchange waits for native acceptance, not just a successful
 write. Acceptance means submitted; only OMP's recorded `tool_result` confirms
@@ -3113,8 +3183,9 @@ reported offers Stop and Stop now only.
   (`omp_autopilot.rs` lists them): the CLI's heartbeat, a start-or-resume
   request the tab takes by renaming it, a pause-or-stop request the tab never
   deletes, the tab's acknowledgements, its state report, and a lock. Every
-  file carries the launch id; reports also carry OMP's pid and start time, and
-  the CLI trusts nothing else. A start that the tab has not taken within two
+  file carries the launch id; reports also carry OMP's pid, and the CLI reads
+  them only while that provider is running. A report may carry a
+  `process_start`; this CLI does not read it. A start that the tab has not taken within two
   seconds is withdrawn and answered "not taken", never left to fire later.
 - **The journal** is `apas-autopilot` custom entries in the OMP session, so an
   autopilot belongs to its conversation. The CLI's transcript reader pairs

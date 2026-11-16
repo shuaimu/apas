@@ -33,8 +33,9 @@
 //!   removes an acknowledged request the next time it holds the lock.
 //!
 //! Written by the extension (temp file and rename), read by the CLI with the
-//! same trust checks as `omp-activity.json` (private file, launch id, pid,
-//! process start):
+//! same checks as `omp-activity.json` (private file, launch id, pid of the
+//! provider this CLI started, and that provider still running). A file may
+//! carry a `process_start`; nothing reads it (owner's decision, 2026-11-15):
 //!
 //! - [`ACK_FILE`]: [`AckFile`], the results of the last [`ACK_KEEP`] requests.
 //! - [`STATE_FILE`]: [`StateReport`], rewritten on every change and at least
@@ -43,7 +44,10 @@
 //!
 //! `omp-launch.json` gains `"features": ["autopilot_v1"]` when the provider
 //! is spawned by a CLI that has autopilot. A launch record without it means
-//! the agent needs a reboot before it can run autopilot.
+//! the agent needs a reboot before it can run autopilot. A CLI whose
+//! extension needs no `/proc` adds `"portable_v1"`; off Linux a record
+//! without that one needs the reboot too, because the extension it was
+//! written for turned itself off there.
 //!
 //! Every file is at most [`MAX_BYTES`].
 //!
@@ -57,8 +61,8 @@
 #![allow(dead_code)]
 
 use crate::omp_activity::{
-    pane_runtime_dir, private_owner, process_start, read_launch, read_private_json_bounded,
-    write_private_atomic, Launch,
+    pane_runtime_dir, private_owner, provider_alive, read_launch, read_private_json_bounded,
+    write_private_atomic, Launch, PORTABLE_LAUNCH_FEATURE,
 };
 use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
@@ -197,7 +201,10 @@ pub struct AckFile {
     pub v: u32,
     pub launch_id: Uuid,
     pub pid: i32,
-    pub process_start: String,
+    /// Written where the tab can read `/proc`, for CLIs from before
+    /// 2026-11-15, which required it. Never compared.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process_start: Option<String>,
     #[serde(default)]
     pub acks: Vec<Ack>,
 }
@@ -215,7 +222,9 @@ pub struct StateReport {
     pub counter: u64,
     pub launch_id: Uuid,
     pub pid: i32,
-    pub process_start: String,
+    /// As in [`AckFile`]: optional, and never compared.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process_start: Option<String>,
     #[serde(default)]
     pub session_id: String,
     /// "supported", or "unsupported_omp" when the tab's OMP is below the
@@ -347,7 +356,9 @@ pub fn refusal_before_exchange(
     if !omp_terminal_tab {
         return Some("This tab is not an OMP terminal tab of this project.".into());
     }
-    if !cfg!(target_os = "linux") {
+    // The files between the CLI and the tab need a Unix runtime (owner-only
+    // modes, flock). Linux and macOS are the same here.
+    if !cfg!(unix) {
         return Some(UNAVAILABLE_ON_PLATFORM_REASON.into());
     }
     if !agent_running {
@@ -412,7 +423,19 @@ fn exchange_at(
 }
 
 fn has_autopilot(launch: &Launch) -> bool {
-    launch.features.iter().any(|name| name == LAUNCH_FEATURE)
+    has_autopilot_where(launch, cfg!(target_os = "linux"))
+}
+
+/// Whether the extension written for `launch` can run autopilot on this
+/// host. An extension from before 2026-11-15 ran only where it could read
+/// `/proc` and turned itself off elsewhere, yet its launch record carries
+/// the autopilot marker all the same. So where there is no `/proc`, the
+/// record must also say that its extension needs none. Without this a Mac
+/// tab started before the update would read "not reported" for ever, with
+/// no hint that its agent needs a reboot.
+fn has_autopilot_where(launch: &Launch, old_extension_runs_here: bool) -> bool {
+    let has = |feature: &str| launch.features.iter().any(|name| name == feature);
+    has(LAUNCH_FEATURE) && (old_extension_runs_here || has(PORTABLE_LAUNCH_FEATURE))
 }
 
 /// The launch a request is written for. The launch record is all a request
@@ -598,17 +621,13 @@ fn pending_stop(runtime: &Path, launch_id: Uuid, acks: &[Ack]) -> Option<StopReq
 }
 
 /// The extension's request results, when the file belongs to this launch's
-/// live process. Without the provider's pid nothing can be trusted.
+/// live process. Without the provider's pid nothing can be attributed.
 fn read_acks(runtime: &Path, launch_id: Uuid, pid: Option<i32>) -> Vec<Ack> {
     let Some(pid) = pid.filter(|pid| *pid > 0) else {
         return Vec::new();
     };
     read_private_json_bounded::<AckFile>(&runtime.join(ACK_FILE), MAX_BYTES)
-        .filter(|file| {
-            file.launch_id == launch_id
-                && file.pid == pid
-                && process_start(pid).as_deref() == Some(file.process_start.as_str())
-        })
+        .filter(|file| file.launch_id == launch_id && file.pid == pid && provider_alive(pid))
         .map(|file| file.acks)
         .unwrap_or_default()
 }
@@ -694,10 +713,7 @@ fn lock_exchange(runtime: &Path, wait: Duration) -> Result<ExchangeLock> {
 fn read_state(runtime: &Path, launch_id: Uuid, pid: Option<i32>) -> Option<StateReport> {
     let pid = pid.filter(|pid| *pid > 0)?;
     let report: StateReport = read_private_json_bounded(&runtime.join(STATE_FILE), MAX_BYTES)?;
-    (report.launch_id == launch_id
-        && report.pid == pid
-        && process_start(pid).as_deref() == Some(report.process_start.as_str()))
-    .then_some(report)
+    (report.launch_id == launch_id && report.pid == pid && provider_alive(pid)).then_some(report)
 }
 
 /// What one `CliToServer::PaneAutopilotState` carries.
@@ -807,8 +823,8 @@ impl PaneAutopilotRelay {
         if agent != AgentProcess::ExitedByItself {
             self.exited = None;
         } else if self.exited.is_none() {
-            // Built from what was last relayed: the tab's files fail the
-            // trust checks once its process is gone.
+            // Built from what was last relayed: the tab's files are no
+            // longer read once its process is gone.
             self.exited = self
                 .relayed
                 .take()
@@ -828,7 +844,7 @@ impl PaneAutopilotRelay {
                 });
         }
 
-        let (support, state) = if !cfg!(target_os = "linux") {
+        let (support, state) = if !cfg!(unix) {
             (AutopilotSupport::UnavailableOnPlatform, None)
         } else if let Some(exited) = &self.exited {
             // In place of "not reported", and exempt from the stale bound.
@@ -1020,7 +1036,7 @@ pub fn run_controller_heartbeat(
     }
 }
 
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(all(test, unix))]
 mod tests {
     use super::AgentProcess::{ExitedByItself, Launched, NotLaunched};
     use super::*;
@@ -1054,7 +1070,6 @@ mod tests {
         runtime: PathBuf,
         launch_id: Uuid,
         provider: Child,
-        process_start: String,
     }
 
     impl Tab {
@@ -1069,13 +1084,11 @@ mod tests {
                 .process_group(0)
                 .spawn()
                 .unwrap();
-            let process_start = process_start(provider.id() as i32).unwrap();
             Self {
                 root,
                 runtime,
                 launch_id: launch.launch_id,
                 provider,
-                process_start,
             }
         }
 
@@ -1107,7 +1120,8 @@ mod tests {
                 v: FORMAT_VERSION,
                 launch_id: self.launch_id,
                 pid: self.pid(),
-                process_start: self.process_start.clone(),
+                // The shape a tab without `/proc` writes.
+                process_start: None,
                 acks,
             }
         }
@@ -1171,7 +1185,7 @@ mod tests {
                 counter,
                 launch_id: self.launch_id,
                 pid: self.pid(),
-                process_start: self.process_start.clone(),
+                process_start: None,
                 session_id: "01a1d594-4d99-729d-a0a1-0d838bc273a9".into(),
                 support: "supported".into(),
                 unsupported_reason: None,
@@ -1689,7 +1703,16 @@ mod tests {
         tab.write_acks(&trusted);
         assert_eq!(read(&tab).len(), 1);
 
-        // Another launch, another process, a reused pid.
+        // A start time is not part of the identity: an older extension's
+        // value, whatever it says, reads like none at all.
+        tab.write_acks(&AckFile {
+            process_start: Some("not-this-process".into()),
+            ..trusted.clone()
+        });
+        assert_eq!(read(&tab).len(), 1);
+
+        // Another launch (a file left behind), another process (a subagent
+        // that inherited the tab's environment).
         for forged in [
             AckFile {
                 launch_id: Uuid::new_v4(),
@@ -1697,10 +1720,6 @@ mod tests {
             },
             AckFile {
                 pid: tab.pid() + 1,
-                ..trusted.clone()
-            },
-            AckFile {
-                process_start: format!("{}0", tab.process_start),
                 ..trusted.clone()
             },
         ] {
@@ -1736,6 +1755,132 @@ mod tests {
             Receipt::of(ack("stop-1", "deferred", None)).outcome,
             AutopilotReceiptOutcome::Uncertain
         );
+    }
+
+    #[test]
+    fn files_of_a_provider_that_is_no_longer_running_are_not_read_as_current() {
+        let mut tab = Tab::new();
+        // Both shapes: with the start time an older extension wrote, and
+        // without one.
+        for process_start in [Some("12345".to_string()), None] {
+            tab.write_acks(&AckFile {
+                process_start: process_start.clone(),
+                ..tab.acks(vec![ack("stop-1", "accepted", None)])
+            });
+            tab.write_state(&StateReport {
+                process_start,
+                ..tab.report(1, None)
+            });
+            assert_eq!(
+                read_acks(&tab.runtime, tab.launch_id, Some(tab.pid())).len(),
+                1
+            );
+            assert!(read_state(&tab.runtime, tab.launch_id, Some(tab.pid())).is_some());
+        }
+        tab.provider.kill().unwrap();
+        tab.provider.wait().unwrap();
+        // The files are still there, with this launch's id and that pid.
+        assert!(tab.path(ACK_FILE).exists() && tab.path(STATE_FILE).exists());
+        assert!(read_acks(&tab.runtime, tab.launch_id, Some(tab.pid())).is_empty());
+        assert_eq!(
+            read_state(&tab.runtime, tab.launch_id, Some(tab.pid())),
+            None
+        );
+        // So a stop for it is never read as applied.
+        assert_eq!(
+            tab.exchange("stop-1", &stop(false)).outcome,
+            AutopilotReceiptOutcome::Uncertain
+        );
+        let mut relay = PaneAutopilotRelay::default();
+        assert_eq!(
+            relay
+                .poll(Some(&tab.runtime), Some(tab.pid()), Launched, 1)
+                .unwrap()
+                .support,
+            AutopilotSupport::NotReported
+        );
+    }
+
+    #[test]
+    fn what_a_tab_writes_reads_with_or_without_a_start_time() {
+        let tab = Tab::new();
+        for process_start in [None, Some("8731264")] {
+            let mut state = serde_json::json!({
+                "v": 1, "counter": 4, "launch_id": tab.launch_id, "pid": tab.pid(),
+                "session_id": "s", "support": "supported",
+            });
+            let mut acks = serde_json::json!({
+                "v": 1, "launch_id": tab.launch_id, "pid": tab.pid(),
+                "acks": [{"request_id": "r", "outcome": "accepted", "at_ms": 1}],
+            });
+            if let Some(process_start) = process_start {
+                state["process_start"] = process_start.into();
+                acks["process_start"] = process_start.into();
+            }
+            write_private_atomic(&tab.path(STATE_FILE), &serde_json::to_vec(&state).unwrap())
+                .unwrap();
+            write_private_atomic(&tab.path(ACK_FILE), &serde_json::to_vec(&acks).unwrap()).unwrap();
+            let report = read_state(&tab.runtime, tab.launch_id, Some(tab.pid())).unwrap();
+            assert_eq!(report.process_start.as_deref(), process_start);
+            assert_eq!(
+                read_acks(&tab.runtime, tab.launch_id, Some(tab.pid())).len(),
+                1
+            );
+        }
+        // This build's own serialization leaves the field out when it has
+        // none, so the two shapes above are the only ones.
+        let written = serde_json::to_value(tab.report(1, None)).unwrap();
+        assert!(written.get("process_start").is_none());
+    }
+
+    #[test]
+    fn where_the_old_extension_did_not_run_its_launch_record_needs_a_reboot() {
+        let tab = Tab::new();
+        // What this build writes carries both markers and counts everywhere.
+        let launch = tab.launch();
+        assert_eq!(launch.features, [LAUNCH_FEATURE, PORTABLE_LAUNCH_FEATURE]);
+        assert!(has_autopilot_where(&launch, true));
+        assert!(has_autopilot_where(&launch, false));
+        assert!(has_autopilot(&launch));
+
+        // A record from before the start-time check was dropped: its
+        // extension ran on Linux and turned itself off anywhere else.
+        let mut record: serde_json::Value =
+            serde_json::from_slice(&fs::read(tab.path("omp-launch.json")).unwrap()).unwrap();
+        record["features"] = serde_json::json!([LAUNCH_FEATURE]);
+        write_private_atomic(
+            &tab.path("omp-launch.json"),
+            &serde_json::to_vec(&record).unwrap(),
+        )
+        .unwrap();
+        let old = tab.launch();
+        assert!(has_autopilot_where(&old, true));
+        assert!(!has_autopilot_where(&old, false));
+        // On this host: such a tab goes on working on Linux, and asks for
+        // its agent to be rebooted elsewhere, without a request or a
+        // heartbeat written for it.
+        let mut relay = PaneAutopilotRelay::default();
+        let support = relay
+            .poll(Some(&tab.runtime), Some(tab.pid()), Launched, 1)
+            .unwrap()
+            .support;
+        if cfg!(target_os = "linux") {
+            assert_eq!(support, AutopilotSupport::NotReported);
+            assert!(autopilot_launch(&tab.runtime).is_some());
+        } else {
+            assert_eq!(support, AutopilotSupport::NeedsAgentReboot);
+            assert!(autopilot_launch(&tab.runtime).is_none());
+            assert_eq!(
+                tab.exchange("stop-1", &stop(false)),
+                Receipt::refused(NEEDS_AGENT_REBOOT_REASON)
+            );
+            assert!(!tab.path(STOP_FILE).exists() && !tab.path(LOCK_FILE).exists());
+        }
+        // The portable marker alone is not the autopilot marker.
+        let mut only_portable = tab.launch();
+        only_portable.features = vec![PORTABLE_LAUNCH_FEATURE.to_string()];
+        assert!(!has_autopilot_where(&only_portable, true));
+        assert!(!has_autopilot_where(&only_portable, false));
     }
 
     #[test]
@@ -1960,6 +2105,14 @@ mod tests {
         assert_eq!(read(&tab), Some(trusted.clone()));
         assert_eq!(mode(&tab.path(STATE_FILE)), 0o600);
 
+        // A start time is not part of the identity.
+        let with_start = StateReport {
+            process_start: Some("not-this-process".into()),
+            ..trusted.clone()
+        };
+        tab.write_state(&with_start);
+        assert_eq!(read(&tab), Some(with_start));
+
         for forged in [
             StateReport {
                 launch_id: Uuid::new_v4(),
@@ -1967,10 +2120,6 @@ mod tests {
             },
             StateReport {
                 pid: tab.pid() + 1,
-                ..trusted.clone()
-            },
-            StateReport {
-                process_start: format!("{}0", tab.process_start),
                 ..trusted.clone()
             },
         ] {

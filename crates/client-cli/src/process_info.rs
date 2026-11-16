@@ -32,6 +32,34 @@ pub fn alive(pid: u32) -> bool {
     std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
+/// Whether `pid` exists and leads its own process group, as the direct child
+/// of a PTY does. A zombie still does on Linux; see [`exited_unreaped`].
+pub fn leads_own_group(pid: i32) -> bool {
+    // SAFETY: getpgid only reads the process table.
+    pid > 0 && unsafe { libc::getpgid(pid) } == pid
+}
+
+/// Whether `pid` has exited and only waits to be reaped (a zombie).
+///
+/// Linux keeps such a process in its process group, so [`alive`] and
+/// [`leads_own_group`] both still say yes. `/proc` tells them apart. Where
+/// `/proc` cannot be read this answers `false`: nothing may depend on it,
+/// and macOS does not need it, since its `getpgid` fails for a zombie.
+pub fn exited_unreaped(pid: i32) -> bool {
+    cfg!(target_os = "linux") && proc_exited_unreaped(Path::new("/proc"), pid)
+}
+
+fn proc_exited_unreaped(root: &Path, pid: i32) -> bool {
+    let Ok(stat) = std::fs::read_to_string(root.join(pid.to_string()).join("stat")) else {
+        return false;
+    };
+    // The command name (field 2) may hold spaces and parentheses; the state
+    // is the first field after its closing parenthesis.
+    stat.rsplit_once(") ")
+        .and_then(|(_, fields)| fields.split_whitespace().next())
+        .is_some_and(|state| matches!(state, "Z" | "X" | "x"))
+}
+
 /// The argument vector of `pid`, or `None` when it is gone or unreadable.
 pub fn args(pid: u32) -> Option<Vec<String>> {
     if cfg!(target_os = "linux") {
@@ -319,6 +347,32 @@ mod tests {
         assert!(!is_apas_daemon(pid));
         assert!(!alive(0));
         assert!(!alive(u32::MAX));
+    }
+
+    #[test]
+    fn an_exited_process_nobody_reaped_is_told_from_a_running_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let write = |pid: i32, stat: &str| {
+            let at = dir.path().join(pid.to_string());
+            std::fs::create_dir_all(&at).unwrap();
+            std::fs::write(at.join("stat"), stat).unwrap();
+        };
+        // A command name with spaces and a parenthesis does not shift the state.
+        write(11, "11 (omp) S) Z 1 11 11 0 -1 4194304 0 0\n");
+        write(12, "12 (omp (x) R) S 1 12 12 0 -1 4194304 0 0\n");
+        write(13, "13 (omp) X 1 13 13 0\n");
+        write(14, "garbage");
+        assert!(proc_exited_unreaped(dir.path(), 11));
+        assert!(!proc_exited_unreaped(dir.path(), 12));
+        assert!(proc_exited_unreaped(dir.path(), 13));
+        assert!(!proc_exited_unreaped(dir.path(), 14));
+        // No /proc entry, or no /proc at all: not known to have exited.
+        assert!(!proc_exited_unreaped(dir.path(), 15));
+        assert!(!proc_exited_unreaped(Path::new("/nonexistent-proc"), 11));
+        assert!(!exited_unreaped(std::process::id() as i32));
+        assert!(leads_own_group(unsafe { libc::getpgrp() }));
+        assert!(!leads_own_group(0));
+        assert!(!leads_own_group(-1));
     }
 
     #[test]

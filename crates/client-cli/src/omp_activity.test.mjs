@@ -24,7 +24,14 @@ const answers = [
   { id: "note", selectedOptions: [], customInput: "  literal free text\nwith spacing  " },
 ];
 
-async function fixture(t, { mode = "tui", kind = "main", capability = true, version = "18.20.0", journal = [], prepare, importAfter } = {}) {
+// `host` is the machine the fake OMP process runs on. By default it is Linux
+// with a readable /proc, started by the process APAS_OMP_PARENT names, as a
+// tab's agent is. `procfs: false` makes every read under /proc fail, as on
+// macOS; `procErrors` makes the next reads under /proc fail with those error
+// codes, in order, on a host that has one; `parent: null` leaves the variable
+// out.
+async function fixture(t, { mode = "tui", kind = "main", capability = true, version = "18.20.0", journal = [], prepare, importAfter, host = {} } = {}) {
+  const { platform = "linux", procfs = true, procErrors = [], ppid = 4141, parent = String(ppid), euid = true } = host;
   const root = fs.mkdtempSync(path.join(tmpdir(), "apas-omp-bridge-"));
   const runtime = path.join(root, "runtime");
   const sessions = path.join(root, "sessions");
@@ -44,7 +51,7 @@ async function fixture(t, { mode = "tui", kind = "main", capability = true, vers
     statuses: new Map(), branches: new Map([[session, structuredClone(journal)]]),
     jobs: { running: [], recent: [], delivery: { queued: 0, delivering: false, pendingJobIds: [] } },
     modes: { plan: { status: "inactive" }, vibe: { status: "inactive" }, goal: { status: "inactive" }, loop: { status: "inactive" } },
-    throws: {},
+    throws: {}, procReads: [],
   };
   const controller = { writer: crypto.randomUUID(), counter: 0, at: undefined, alive: false, report: {} };
   class FakeDate extends Date {
@@ -65,8 +72,11 @@ async function fixture(t, { mode = "tui", kind = "main", capability = true, vers
     return handle;
   }
   const proc = Object.assign(new EventEmitter(), {
-    platform: "linux", pid: process.pid, geteuid: () => process.geteuid(),
-    env: { APAS_OMP_RUNTIME: runtime, APAS_OMP_LAUNCH: launch.launch_id },
+    platform, pid: process.pid, ppid, ...(euid ? { geteuid: () => process.geteuid() } : {}),
+    env: {
+      APAS_OMP_RUNTIME: runtime, APAS_OMP_LAUNCH: launch.launch_id,
+      ...(parent === null ? {} : { APAS_OMP_PARENT: parent }),
+    },
   });
   const native = (items, options) => new Promise((resolve, reject) => {
     natives.push({ items, options, resolve, reject });
@@ -120,6 +130,11 @@ async function fixture(t, { mode = "tui", kind = "main", capability = true, vers
     "node:fs": {
       ...fs,
       readFileSync(file, ...args) {
+        if (typeof file === "string" && file.startsWith("/proc/") && (!procfs || procErrors.length)) {
+          omp.procReads.push(file);
+          const code = procfs ? procErrors.shift() : "ENOENT";
+          throw Object.assign(new Error(`${code}: cannot open '${file}'`), { code });
+        }
         if (file === `/proc/${proc.pid}/stat`) {
           const fields = Array(20).fill("0");
           fields[0] = "S"; fields[2] = String(proc.pid); fields[19] = "4242";
@@ -342,7 +357,7 @@ test("stale dialog, session, process generation and tool identity cannot answer"
   const { result } = await f.start();
   for (const override of [
     { dialog_id: crypto.randomUUID() }, { launch_id: crypto.randomUUID() },
-    { session_id: "sibling" }, { tool_call_id: "other-call" }, { process_start: "old" },
+    { session_id: "sibling" }, { tool_call_id: "other-call" },
     { transcript_path: "/tmp/unrelated.jsonl" }, { pid: process.pid + 1 },
   ]) {
     f.request(override);
@@ -354,6 +369,159 @@ test("stale dialog, session, process generation and tool identity cannot answer"
   await f.tick();
   assert.equal(await result, undefined);
   assert.equal(f.read("omp-question-ack.json").accepted, true);
+});
+
+// The start time is no longer part of a tab's identity (2026-11-15).
+for (const [name, edit] of [
+  ["another process_start", request => ({ ...request, process_start: "old" })],
+  ["no process_start", ({ process_start, ...request }) => request],
+]) {
+  test(`an answer request with ${name} is accepted`, async t => {
+    const f = await fixture(t);
+    const { result } = await f.start();
+    assert.equal(f.read("omp-question.json").process_start, "4242");
+    const request = edit(f.request());
+    f.write("omp-question-submit.json", request);
+    await f.tick();
+    assert.deepEqual(plain(await result), { kind: "submit", results: answers });
+    const ack = f.read("omp-question-ack.json");
+    assert.equal(ack.accepted, true);
+    assert.equal(ack.nonce, request.nonce);
+  });
+}
+
+// Where /proc cannot be read the extension works the same and writes no
+// process_start. macOS is one such host; a Linux without /proc is another.
+for (const [name, host] of [
+  ["on macOS", { platform: "darwin", procfs: false }],
+  ["on a Linux whose /proc is unreadable", { platform: "linux", procfs: false }],
+]) {
+  test(`${name}: activity, a web answer and its acknowledgement carry no process_start`, async t => {
+    const f = await fixture(t, { host });
+    assert.ok(f.events().includes("agent_start"));
+    assert.deepEqual(Object.keys(f.read("omp-activity.json")).sort(),
+      ["activity", "launch_id", "pid", "session_id", "transcript_path"]);
+    assert.equal(f.read("omp-activity.json").activity, "idle");
+    f.omp.idle = false;
+    await f.emit("agent_start");
+    assert.equal(f.read("omp-activity.json").activity, "working");
+
+    const { result } = await f.start();
+    const report = f.read("omp-question.json");
+    assert.deepEqual(Object.keys(report).sort(),
+      ["dialog_id", "launch_id", "pid", "questions", "session_id", "tool_call_id", "transcript_path"]);
+    assert.equal(report.pid, process.pid);
+    assert.equal(report.launch_id, f.launch.launch_id);
+    assert.equal(f.read("omp-activity.json").activity, "pending_answer");
+    // The launch id and the pid still decide.
+    for (const override of [{ launch_id: crypto.randomUUID() }, { pid: process.pid + 1 }]) {
+      f.request(override);
+      await f.tick();
+      assert.equal(f.read("omp-question-ack.json").accepted, false);
+    }
+    const request = f.request();
+    assert.equal("process_start" in request, false);
+    await f.tick();
+    assert.deepEqual(plain(await result), { kind: "submit", results: answers });
+    const ack = f.read("omp-question-ack.json");
+    assert.equal(ack.accepted, true);
+    assert.equal(ack.nonce, request.nonce);
+    assert.equal("process_start" in ack, false);
+    assert.equal(ack.pid, process.pid);
+
+    // The report is removed at shutdown although it names no start time.
+    await f.emit("tool_execution_end", { toolName: "ask", toolCallId: "call-native" });
+    await f.emit("session_shutdown");
+    assert.equal(f.exists("omp-activity.json"), false);
+    assert.equal(f.exists("omp-question-ack.json"), false);
+    // Nothing but the one compatibility read at load asked /proc anything.
+    assert.deepEqual(f.omp.procReads, [`/proc/${process.pid}/stat`]);
+  });
+
+  test(`${name}: autopilot starts, acknowledges, reports and stops without process_start`, async t => {
+    const f = await tab(t, { host });
+    assert.equal(f.state().support, "supported");
+    const id = await start(f);
+    assert.equal(f.exists("omp-autopilot-request.json"), false);
+    const { acks, ...scope } = f.read("omp-autopilot-ack.json");
+    assert.deepEqual(scope, { v: 1, launch_id: f.launch.launch_id, pid: process.pid });
+    assert.deepEqual(plain(acks), [{ request_id: id, outcome: "accepted", at_ms: f.clock.wall }]);
+    assert.deepEqual(f.omp.calls.map(call => call.text), [prompt]);
+    const { autopilot, counter, ...report } = f.state();
+    assert.deepEqual(report, {
+      v: 1, launch_id: f.launch.launch_id, pid: process.pid, session_id: "native-session", support: "supported",
+    });
+    assert.ok(counter > 0);
+    assert.equal(autopilot.condition.kind, "running");
+    assert.equal(autopilot.iterations, 1);
+
+    await run(f, { tools: 1 });
+    await f.advance(5000);
+    assert.equal(f.omp.calls.length, 2);
+    const stopped = await stop(f, "stop");
+    assert.equal(f.result(stopped).outcome, "accepted");
+    assert.equal(f.state().autopilot, undefined);
+    assert.equal(f.state().last_ended.reason, "stopped");
+    assert.equal("process_start" in f.state(), false);
+    assert.equal("process_start" in f.read("omp-autopilot-ack.json"), false);
+    assert.deepEqual(f.omp.procReads, [`/proc/${process.pid}/stat`]);
+  });
+}
+
+// The value is for older CLIs only, but they reject every file without it.
+test("a start time that could not be read at load is read again at the next uses, three times at most", async t => {
+  // One bad read at load on a host that has /proc: the first file carries it.
+  const f = await fixture(t, { host: { procErrors: ["EMFILE"] } });
+  assert.equal(f.read("omp-activity.json").process_start, "4242");
+  assert.deepEqual(f.omp.procReads, [`/proc/${process.pid}/stat`]);
+  // A /proc that is there and stays unreadable is given up on.
+  const g = await fixture(t, { host: { procErrors: Array(10).fill("EACCES") } });
+  assert.equal("process_start" in g.read("omp-activity.json"), false);
+  g.omp.idle = false;
+  await g.emit("agent_start");
+  assert.equal(g.read("omp-activity.json").activity, "working");
+  assert.equal("process_start" in g.read("omp-activity.json"), false);
+  await g.start();
+  assert.equal("process_start" in g.read("omp-question.json"), false);
+  assert.equal(g.omp.procReads.length, 3);
+});
+
+// A wrapper script's child and a subagent run as its own process inherit the
+// tab's environment. Their parent is not the process that started the tab's
+// agent, so they stay silent, as a process that did not lead its own group
+// did before.
+for (const [name, host] of [
+  ["a process whose parent is not the one APAS named", { ppid: 4142, parent: "4141" }],
+  ["a process started without APAS_OMP_PARENT", { parent: null }],
+  ["a process whose APAS_OMP_PARENT is not a pid", { ppid: 0, parent: "0" }],
+  ["a process on macOS whose parent is another process", { platform: "darwin", procfs: false, ppid: 4142, parent: "4141" }],
+]) {
+  test(`${name} registers nothing, writes nothing and takes no request`, async t => {
+    const f = await tab(t, { host });
+    assert.deepEqual(f.events(), []);
+    const request = f.command({ kind: "start", spec: spec() });
+    f.stop("stop");
+    await f.advance(5000);
+    f.omp.idle = false;
+    await f.emit("agent_start");
+    await f.advance(5000);
+    // The start is still there for the tab's real agent to take, or for the
+    // CLI to withdraw. Nothing was reported, acknowledged or submitted.
+    assert.equal(f.read("omp-autopilot-request.json").request_id, request);
+    assert.deepEqual(fs.readdirSync(f.runtime).sort(),
+      ["apas-controller.json", "omp-autopilot-request.json", "omp-autopilot-stop.json", "omp-launch.json"]);
+    assert.equal(f.omp.calls.length, 0);
+    assert.equal(f.managed.size, 0);
+    assert.deepEqual(f.omp.procReads, []);
+  });
+}
+
+test("without process.geteuid, as off Unix, the extension stays off", async t => {
+  const f = await fixture(t);
+  assert.ok(f.events().length > 0);
+  const g = await fixture(t, { host: { platform: "win32", procfs: false, euid: false } });
+  assert.deepEqual(g.events(), []);
+  assert.deepEqual(fs.readdirSync(g.runtime), ["omp-launch.json"]);
 });
 
 test("native terminal wins a queued web answer and leaves no false acceptance", async t => {
