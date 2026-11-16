@@ -1226,6 +1226,17 @@ Every function it had is still there.
   embedded` / `reasonLabels`, and the Overview's period switch
   (`components/overview/UsagePeriodControl.tsx`). `PolicyEditor` keeps unsaved
   choices until the policy's version or profile list changes.
+- **Rolled out on 2026-11-16** with web-only release `20261116T012002Z`
+  (version 26.11.59, built at 9ad158b from the committed tree), live since
+  01:23 UTC; backups under `/opt/apas/backups/deploy-20261116T012002Z`. The
+  server was not restarted. Both dependency graphs audited clean on the host.
+  Twelve addresses (the ten public routes and two `?view=` ones) answered
+  `200` with no redirect, and 18 referenced static assets answered `200`.
+  Gates: web 1,439 tests, typecheck and lint. Checked before the release in
+  the read-only viewer on the owner's real cluster at 1440 and 390 px and in
+  dark mode. Not exercised on the live site: any write from the new page
+  (Start, Stop, Reboot, a key change, sharing and policy edits), since the
+  viewer forwards none, and a shared cluster's member view in a browser.
 
 **Cluster sharing is owner-administered and immediate.** The owner adds an
 existing active APAS account directly; the ordinary web flow has no invitation
