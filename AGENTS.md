@@ -3061,6 +3061,13 @@ prompts and **My own text**:
   report entry naming the machine and the parts that wait, and takes another
   step; a machine that can look takes them up. Whether an agent says
   honestly that it cannot see an image is untested.
+  Live since web-only release `20261116T043732Z` (version 26.11.64, built
+  at 2922967, 04:38 UTC on 2026-11-16); backups under
+  `/opt/apas/backups/deploy-20261116T043732Z`. The server was not restarted
+  and both dependency graphs audited clean on the host. Ten public routes
+  and 13 static assets answered `200`, the served bundle carries the new
+  text, and the web logged no error. Gates: web 1,442 tests, typecheck and
+  lint.
 - **Implement from a design document**. Each iteration closes one
   gap between the design and the code, with tests and a commit. It uses
   `docs/design.md`, or else only the one document the README or `AGENTS.md`
