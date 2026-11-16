@@ -912,7 +912,7 @@ export function TabbedView({
       const gitRemote = currentSession?.gitRemote;
       if (!target.machineId || !gitRemote) {
         result = { success: false, error: "This project has no repository to clone." };
-      } else if (!confirm(confirmationText(cloneHereCopy(target.hostname, gitRemote)))) {
+      } else if (!confirm(confirmationText(cloneHereCopy(target.hostname, gitRemote, target.alsoStarts)))) {
         return;
       } else {
         result = cloneAndAddPane(

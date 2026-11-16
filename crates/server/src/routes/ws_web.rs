@@ -977,7 +977,10 @@ pub(crate) fn older_daemon_beside_instance_refusal(
 /// `project_open_state_v1` and so told its user what opening does.
 ///
 /// The project's open-state lock is held from reading the state to the last
-/// frame sent.
+/// frame sent to a daemon. What the requester is told is sent once the lock
+/// is released: a requester that does not read its socket makes each answer
+/// wait for seconds, and must not hold up the project's next open, close or
+/// follow step meanwhile.
 async fn start_machine_project(
     state: &AppState,
     connection_id: &Uuid,
@@ -989,11 +992,46 @@ async fn start_machine_project(
     // A project only registered on the requester's machine is placed first,
     // or no Start of it would ever pass the access checks below.
     place_registered_project(state, user_id, &machine_id, project_id).await;
-    let _open_state = state.sessions.project_open_state_guard(project_id).await;
+    let mut refusals = Vec::new();
+    {
+        let _open_state = state.sessions.project_open_state_guard(project_id).await;
+        start_machine_project_locked(
+            state,
+            connection_id,
+            user_id,
+            machine_id,
+            project_id,
+            all_instances,
+            &mut refusals,
+        )
+        .await;
+    }
+    send_refusals(state, connection_id, refusals).await;
+}
+
+/// Tell the requester what a Start or a Stop refused, in order, after the
+/// project's open-state lock has been released.
+async fn send_refusals(state: &AppState, connection_id: &Uuid, refusals: Vec<String>) {
+    for message in refusals {
+        send_policy_error(state, connection_id, message).await;
+    }
+}
+
+/// [`start_machine_project`] under the project's open-state lock. Each
+/// refusal for the requester is added to `refusals` instead of being sent.
+async fn start_machine_project_locked(
+    state: &AppState,
+    connection_id: &Uuid,
+    user_id: &Uuid,
+    machine_id: Uuid,
+    project_id: &str,
+    all_instances: bool,
+    refusals: &mut Vec<String>,
+) {
     let record = match crate::open_state::read_open_state(state, project_id).await {
         Ok(record) => record,
         Err(message) => {
-            send_policy_error(state, connection_id, message).await;
+            refusals.push(message);
             return;
         }
     };
@@ -1012,6 +1050,7 @@ async fn start_machine_project(
                 machine_id,
                 project_id,
                 false,
+                refusals,
             )
             .await
         }
@@ -1023,6 +1062,7 @@ async fn start_machine_project(
                 machine_id,
                 project_id,
                 true,
+                refusals,
             )
             .await
         }
@@ -1034,6 +1074,7 @@ async fn start_machine_project(
                 machine_id,
                 project_id,
                 knows_open_state,
+                refusals,
             )
             .await
         }
@@ -1046,28 +1087,30 @@ async fn start_machine_project(
                 project_id,
                 recorded,
                 record.as_ref().and_then(|record| record.stand_in_machine()),
+                refusals,
             )
             .await
         }
     }
 }
 
-/// Tell a requester whose client shows no machine parts which machines an
-/// open or a close left as they are, as the requests always did: one `Error`
-/// each, naming the host when several machines were looked at.
-async fn report_machine_refusals(
+/// Note for a requester whose client shows no machine parts which machines
+/// an open or a close left as they are, as the requests always told it: one
+/// `Error` each, naming the host when several machines were looked at.
+fn report_machine_refusals(
     state: &AppState,
-    connection_id: &Uuid,
+    refusals: &mut Vec<String>,
     several: bool,
-    refusals: &[crate::open_state::MachineRefusal],
+    left: &[crate::open_state::MachineRefusal],
 ) {
-    for refusal in refusals {
-        send_policy_error(
+    for refusal in left {
+        refusals.push(machine_refusal(
             state,
-            connection_id,
-            machine_refusal(state, refusal.machine_id, several, true, &refusal.legacy),
-        )
-        .await;
+            refusal.machine_id,
+            several,
+            true,
+            &refusal.legacy,
+        ));
     }
 }
 
@@ -1084,16 +1127,17 @@ async fn open_project_for_viewer(
     machine_id: Uuid,
     project_id: &str,
     knows_open_state: bool,
+    refusals: &mut Vec<String>,
 ) {
     if !crate::open_state::may_set_open_state(state, user_id, project_id).await {
-        send_policy_error(state, connection_id, "Machine not found").await;
+        refusals.push("Machine not found".into());
         return;
     }
     if !state
         .sessions
         .web_supports_capability(connection_id, shared::PROJECT_POLICY_CAPABILITY)
     {
-        send_policy_error(state, connection_id, crate::open_state::POLICY_INCOMPATIBLE).await;
+        refusals.push(crate::open_state::POLICY_INCOMPATIBLE.into());
         return;
     }
     match crate::open_state::open_project_locked(
@@ -1107,11 +1151,10 @@ async fn open_project_for_viewer(
     .await
     {
         Ok(outcome) if !knows_open_state => {
-            report_machine_refusals(state, connection_id, outcome.targets > 1, &outcome.refused)
-                .await
+            report_machine_refusals(state, refusals, outcome.targets > 1, &outcome.refused)
         }
         Ok(_) => {}
-        Err(message) => send_policy_error(state, connection_id, message).await,
+        Err(message) => refusals.push(message),
     }
 }
 
@@ -1131,31 +1174,27 @@ async fn start_one_machine_of_recorded_project(
     project_id: &str,
     recorded: shared::ProjectOpenState,
     stand_in: Option<Uuid>,
+    refusals: &mut Vec<String>,
 ) {
     if !has_machine_project_runtime_access(state, user_id, &machine_id, project_id).await {
-        send_policy_error(state, connection_id, "Machine not found").await;
+        refusals.push("Machine not found".into());
         return;
     }
     if !state
         .sessions
         .web_supports_capability(connection_id, shared::PROJECT_POLICY_CAPABILITY)
     {
-        send_policy_error(state, connection_id, crate::open_state::POLICY_INCOMPATIBLE).await;
+        refusals.push(crate::open_state::POLICY_INCOMPATIBLE.into());
         return;
     }
     if recorded == shared::ProjectOpenState::Closed
         && crate::open_state::other_machines_own_tabs(state, project_id, &machine_id).await
     {
-        send_policy_error(
-            state,
-            connection_id,
-            crate::open_state::CLOSED_WITH_TABS_ELSEWHERE,
-        )
-        .await;
+        refusals.push(crate::open_state::CLOSED_WITH_TABS_ELSEWHERE.into());
         return;
     }
     if !state.sessions.is_daemon_connected(&machine_id) {
-        send_policy_error(state, connection_id, "Daemon is offline").await;
+        refusals.push("Daemon is offline".into());
         return;
     }
     if recorded == shared::ProjectOpenState::Closed {
@@ -1170,10 +1209,8 @@ async fn start_one_machine_of_recorded_project(
         )
         .await
         {
-            Ok(outcome) => {
-                report_machine_refusals(state, connection_id, false, &outcome.refused).await
-            }
-            Err(message) => send_policy_error(state, connection_id, message).await,
+            Ok(outcome) => report_machine_refusals(state, refusals, false, &outcome.refused),
+            Err(message) => refusals.push(message),
         }
         return;
     }
@@ -1189,13 +1226,13 @@ async fn start_one_machine_of_recorded_project(
             .or_else(|| older_daemon_beside_instance_refusal(state, project_id, &machine_id))
     };
     if let Some(refusal) = refusal {
-        send_policy_error(state, connection_id, refusal).await;
+        refusals.push(refusal);
         return;
     }
     let daemon_policy = match start_policy(state, project_id).await {
         Ok(policy) => policy,
         Err(message) => {
-            send_policy_error(state, connection_id, message).await;
+            refusals.push(message);
             return;
         }
     };
@@ -1217,7 +1254,7 @@ async fn start_one_machine_of_recorded_project(
         crate::open_state::send_recorded_start(state, project_id, &machine_id, &daemon_policy).await
     };
     if !sent {
-        send_policy_error(state, connection_id, "Daemon is offline").await;
+        refusals.push("Daemon is offline".into());
     }
 }
 
@@ -1241,11 +1278,12 @@ async fn start_unrecorded_machine_project(
     machine_id: Uuid,
     project_id: &str,
     all_instances: bool,
+    refusals: &mut Vec<String>,
 ) {
     // Checked before the fan-out is even computed: it reads the project's
     // roster, and its refusals name the hosts it found.
     if all_instances && !may_act_on_every_instance(state, user_id, project_id).await {
-        send_policy_error(state, connection_id, "Machine not found").await;
+        refusals.push("Machine not found".into());
         return;
     }
     let fanned_out = if all_instances {
@@ -1267,12 +1305,13 @@ async fn start_unrecorded_machine_project(
         if has_machine_project_runtime_access(state, user_id, &target, project_id).await {
             authorized.push(target);
         } else {
-            send_policy_error(
+            refusals.push(machine_refusal(
                 state,
-                connection_id,
-                machine_refusal(state, target, several, true, "Machine not found"),
-            )
-            .await;
+                target,
+                several,
+                true,
+                "Machine not found",
+            ));
         }
     }
     if authorized.is_empty() {
@@ -1284,7 +1323,7 @@ async fn start_unrecorded_machine_project(
         .sessions
         .web_supports_capability(connection_id, shared::PROJECT_POLICY_CAPABILITY)
     {
-        send_policy_error(state, connection_id, incompatible).await;
+        refusals.push(incompatible.into());
         return;
     }
     let mut compatible = Vec::new();
@@ -1300,14 +1339,7 @@ async fn start_unrecorded_machine_project(
         };
         match refusal {
             None => compatible.push(target),
-            Some(refusal) => {
-                send_policy_error(
-                    state,
-                    connection_id,
-                    machine_refusal(state, target, several, true, &refusal),
-                )
-                .await
-            }
+            Some(refusal) => refusals.push(machine_refusal(state, target, several, true, &refusal)),
         }
     }
     if compatible.is_empty() {
@@ -1316,7 +1348,7 @@ async fn start_unrecorded_machine_project(
     let daemon_policy = match start_policy(state, project_id).await {
         Ok(policy) => policy,
         Err(message) => {
-            send_policy_error(state, connection_id, message).await;
+            refusals.push(message);
             return;
         }
     };
@@ -1343,12 +1375,13 @@ async fn start_unrecorded_machine_project(
             .await
         {
             state.sessions.clear_machine_outcome(project_id, &target);
-            send_policy_error(
+            refusals.push(machine_refusal(
                 state,
-                connection_id,
-                machine_refusal(state, target, several, true, "Daemon is offline"),
-            )
-            .await;
+                target,
+                several,
+                true,
+                "Daemon is offline",
+            ));
         }
     }
 }
@@ -1370,7 +1403,8 @@ async fn start_unrecorded_machine_project(
 ///
 /// A close sends `StopProjectCli` and nothing else: no tab is closed or
 /// forgotten and nothing is deleted. The project's open-state lock is held
-/// from reading the state to the last frame sent.
+/// from reading the state to the last frame sent to a daemon; what the
+/// requester is told is sent once it is released, as for a Start.
 async fn stop_machine_project(
     state: &AppState,
     connection_id: &Uuid,
@@ -1379,11 +1413,38 @@ async fn stop_machine_project(
     project_id: &str,
     all_instances: bool,
 ) {
-    let _open_state = state.sessions.project_open_state_guard(project_id).await;
+    let mut refusals = Vec::new();
+    {
+        let _open_state = state.sessions.project_open_state_guard(project_id).await;
+        stop_machine_project_locked(
+            state,
+            connection_id,
+            user_id,
+            machine_id,
+            project_id,
+            all_instances,
+            &mut refusals,
+        )
+        .await;
+    }
+    send_refusals(state, connection_id, refusals).await;
+}
+
+/// [`stop_machine_project`] under the project's open-state lock. Each
+/// refusal for the requester is added to `refusals` instead of being sent.
+async fn stop_machine_project_locked(
+    state: &AppState,
+    connection_id: &Uuid,
+    user_id: &Uuid,
+    machine_id: Uuid,
+    project_id: &str,
+    all_instances: bool,
+    refusals: &mut Vec<String>,
+) {
     let record = match crate::open_state::read_open_state(state, project_id).await {
         Ok(record) => record,
         Err(message) => {
-            send_policy_error(state, connection_id, message).await;
+            refusals.push(message);
             return;
         }
     };
@@ -1395,30 +1456,16 @@ async fn stop_machine_project(
         // A project nobody recorded, and one machine of a closed project:
         // stop that machine, as before.
         (None, false) | (Some(shared::ProjectOpenState::Closed), false) => {
-            stop_unrecorded_machine_project(
-                state,
-                connection_id,
-                user_id,
-                machine_id,
-                project_id,
-                false,
-            )
-            .await
+            stop_unrecorded_machine_project(state, user_id, machine_id, project_id, false, refusals)
+                .await
         }
         (None, true) if !knows_open_state => {
-            stop_unrecorded_machine_project(
-                state,
-                connection_id,
-                user_id,
-                machine_id,
-                project_id,
-                true,
-            )
-            .await
+            stop_unrecorded_machine_project(state, user_id, machine_id, project_id, true, refusals)
+                .await
         }
         (_, true) => {
             if !crate::open_state::may_set_open_state(state, user_id, project_id).await {
-                send_policy_error(state, connection_id, "Machine not found").await;
+                refusals.push("Machine not found".into());
                 return;
             }
             match crate::open_state::close_project_locked(
@@ -1427,33 +1474,29 @@ async fn stop_machine_project(
             .await
             {
                 Ok(outcome) if !knows_open_state => {
-                    report_machine_refusals(
-                        state,
-                        connection_id,
-                        outcome.targets > 1,
-                        &outcome.refused,
-                    )
-                    .await
+                    report_machine_refusals(state, refusals, outcome.targets > 1, &outcome.refused)
                 }
                 Ok(_) => {}
-                Err(message) => send_policy_error(state, connection_id, message).await,
+                Err(message) => refusals.push(message),
             }
         }
         (Some(shared::ProjectOpenState::Open), false) => {
             let Some(record) = record else {
                 return;
             };
-            if !has_machine_project_runtime_access(state, user_id, &machine_id, project_id).await {
-                send_policy_error(state, connection_id, "Machine not found").await;
+            // Closing the project takes the authority to set its state as
+            // well as the use of this machine. While the machine is connected
+            // the second implies the first; while it is away it does not, and
+            // an account the project-wide Close would refuse must not record
+            // a close through the machine's own Stop.
+            if !has_machine_project_runtime_access(state, user_id, &machine_id, project_id).await
+                || !crate::open_state::may_set_open_state(state, user_id, project_id).await
+            {
+                refusals.push("Machine not found".into());
                 return;
             }
             if crate::open_state::other_machines_own_or_run(state, &record, &machine_id).await {
-                send_policy_error(
-                    state,
-                    connection_id,
-                    crate::open_state::RUNS_ON_OTHER_MACHINES,
-                )
-                .await;
+                refusals.push(crate::open_state::RUNS_ON_OTHER_MACHINES.into());
                 return;
             }
             // No other machine owns tabs or runs it, so stopping this
@@ -1463,10 +1506,8 @@ async fn stop_machine_project(
             )
             .await
             {
-                Ok(outcome) => {
-                    report_machine_refusals(state, connection_id, false, &outcome.refused).await
-                }
-                Err(message) => send_policy_error(state, connection_id, message).await,
+                Ok(outcome) => report_machine_refusals(state, refusals, false, &outcome.refused),
+                Err(message) => refusals.push(message),
             }
         }
     }
@@ -1487,15 +1528,15 @@ async fn stop_machine_project(
 /// allow it: that one is refused by its id, as an unknown machine is.
 async fn stop_unrecorded_machine_project(
     state: &AppState,
-    connection_id: &Uuid,
     user_id: &Uuid,
     machine_id: Uuid,
     project_id: &str,
     all_instances: bool,
+    refusals: &mut Vec<String>,
 ) {
     // As for a project-wide Start: its refusals name the hosts it found.
     if all_instances && !may_act_on_every_instance(state, user_id, project_id).await {
-        send_policy_error(state, connection_id, "Machine not found").await;
+        refusals.push("Machine not found".into());
         return;
     }
     let targets = if all_instances {
@@ -1511,12 +1552,13 @@ async fn stop_unrecorded_machine_project(
             // the machine the request named can be any machine at all.
             let nameable = relation != StopRelation::Named
                 || (several && may_name_machine(state, &session_ids, user_id, &target).await);
-            send_policy_error(
+            refusals.push(machine_refusal(
                 state,
-                connection_id,
-                machine_refusal(state, target, several, nameable, "Machine not found"),
-            )
-            .await;
+                target,
+                several,
+                nameable,
+                "Machine not found",
+            ));
             continue;
         }
         // A start still pending there is over.
@@ -1533,12 +1575,13 @@ async fn stop_unrecorded_machine_project(
             .await
         {
             // Runtime access there means the requester can see the machine.
-            send_policy_error(
+            refusals.push(machine_refusal(
                 state,
-                connection_id,
-                machine_refusal(state, target, several, true, "Daemon is offline"),
-            )
-            .await;
+                target,
+                several,
+                true,
+                "Daemon is offline",
+            ));
         }
     }
 }
@@ -3579,6 +3622,10 @@ async fn answer_add_pane_launch(
 /// the primary instance, the only target an older client knows. A machine
 /// where the project is registered but not running is started first and
 /// the pane waits for its instance; see [`add_pane_on_machine`].
+///
+/// A request that names no machine starts nothing. In a project recorded
+/// closed it follows the closed row of design Decision 3 all the same, for
+/// the primary instance's machine; see [`admit_pane_where_it_runs`].
 async fn handle_add_pane(
     state: &AppState,
     connection_id: &Uuid,
@@ -3632,25 +3679,46 @@ async fn handle_add_pane(
         Some(machine_id) => add_pane_on_machine(state, request, machine_id).await,
         None => {
             let primary = state.sessions.primary_instance(&session_id);
+            let target_machine = primary.as_ref().and_then(|primary| primary.machine_id);
+            // The primary can be attached in a project recorded closed, as
+            // any instance can; the closed row of design Decision 3 applies
+            // to a tab that names no machine as it does to one that names
+            // the primary's. The web names none for an instance of an older
+            // CLI that reported no machine.
+            if let Some(instance) = &primary {
+                let knows_open_state = state.sessions.web_supports_capability(
+                    &request.connection_id,
+                    shared::PROJECT_OPEN_STATE_CAPABILITY,
+                );
+                if let Err(error) = admit_pane_where_it_runs(
+                    state,
+                    &request,
+                    instance,
+                    InstanceTarget::Primary,
+                    knows_open_state,
+                )
+                .await
+                {
+                    answer_add_pane_launch(state, &request, target_machine, Err(error)).await;
+                    return;
+                }
+            }
             let result =
                 launch_new_pane(state, &request, primary.as_ref(), InstanceTarget::Primary).await;
-            let target_machine = primary.and_then(|primary| primary.machine_id);
             answer_add_pane_launch(state, &request, target_machine, result).await;
         }
     }
 }
 
-/// Check a new pane against `instance`, which `target` names for the CLI
-/// capability checks, allocate its id, and send it there. The pane is tagged
-/// with the instance's machine when its CLI can share the project; an older
-/// CLI reports its panes untagged, and they stay untagged. Returns the
-/// machine and pane id it was delivered with.
-async fn launch_new_pane(
+/// Why `request`'s pane cannot be created on `instance`, which `target`
+/// names for the CLI capability checks: the requester's access to that
+/// instance, and the pane's launch policy.
+async fn new_pane_refusal(
     state: &AppState,
     request: &NewPaneRequest,
     instance: Option<&InstanceAttachment>,
     target: InstanceTarget,
-) -> Result<(Option<Uuid>, u32), String> {
+) -> Result<(), String> {
     let session_id = request.session_id;
     if let Some(instance) = instance {
         if let Some(refusal) =
@@ -3672,7 +3740,23 @@ async fn launch_new_pane(
         request.web_policy_capable,
         Some(target),
     )
-    .await?;
+    .await
+}
+
+/// Check a new pane against `instance`, which `target` names for the CLI
+/// capability checks, allocate its id, and send it there. The pane is tagged
+/// with the instance's machine when its CLI can share the project; an older
+/// CLI reports its panes untagged, and they stay untagged. Returns the
+/// machine and pane id it was delivered with.
+async fn launch_new_pane(
+    state: &AppState,
+    request: &NewPaneRequest,
+    instance: Option<&InstanceAttachment>,
+    target: InstanceTarget,
+) -> Result<(Option<Uuid>, u32), String> {
+    let session_id = request.session_id;
+    new_pane_refusal(state, request, instance, target).await?;
+    let spec = &request.spec;
     let tag = instance
         .filter(|instance| instance.capable)
         .and_then(|instance| instance.machine_id);
@@ -3721,6 +3805,165 @@ async fn launch_new_pane(
     })
 }
 
+/// Admit a pane for `instance` of the project, which is attached, so nothing
+/// needs starting for it. `target` names that instance for the CLI
+/// capability checks: the machine the request names, or the primary for a
+/// request that names none. Only a project recorded closed is touched: the
+/// closed row of design Decision 3 applies, as it does when the machine
+/// needs a start. The tab is refused when the viewer did not negotiate the
+/// open state and other machines own tabs, and otherwise the project is
+/// opened as the requester. A project that is open or not recorded is left
+/// exactly as it is.
+///
+/// A pane that instance would refuse anyway opens nothing: it fails with its
+/// own reason when it is launched, and the project stays closed. Nor does a
+/// requester who could not start this machine, or whose project-wide Open
+/// would be refused, open the project through a tab: that tab is refused.
+///
+/// The instance's machine is the one it reported, else the one the legacy
+/// inference names for the session's only instance
+/// ([`instance_access_machine`]). An instance no machine can be named for
+/// follows the same row with no machine named; see
+/// [`crate::open_state::admit_new_work_on_unnamed_machine`].
+async fn admit_pane_where_it_runs(
+    state: &AppState,
+    request: &NewPaneRequest,
+    instance: &InstanceAttachment,
+    target: InstanceTarget,
+    knows_open_state: bool,
+) -> Result<(), String> {
+    let project_id = state
+        .sessions
+        .project_for_session(&request.session_id)
+        .unwrap_or_else(|| request.session_id.to_string());
+    let _open_state = state.sessions.project_open_state_guard(&project_id).await;
+    if !crate::open_state::is_recorded_closed(state, &project_id).await {
+        return Ok(());
+    }
+    if new_pane_refusal(state, request, Some(instance), target)
+        .await
+        .is_err()
+    {
+        return Ok(());
+    }
+    let machine_id = instance_access_machine(state, &request.session_id, instance);
+    // Opening the project for this tab takes what starting this machine for
+    // it takes: the use of the project's runtime on the machine, which a
+    // project role alone does not give. Refused as the same request is once
+    // the instance has left ([`start_target`]).
+    if let Some(machine_id) = machine_id {
+        if !has_machine_project_runtime_access(state, &request.user_id, &machine_id, &project_id)
+            .await
+        {
+            let host = machine_label(state, machine_id);
+            return Err(format!(
+                "Access denied: you cannot use {host} for this project"
+            ));
+        }
+    }
+    // It also takes the authority to set the project's state, as the
+    // project-wide Open does. The machine's own check still passes while its
+    // daemon's channel is away; this one counts connected machines only, and
+    // otherwise takes the project's owner or a placement holder. Refused as
+    // that account's Open is.
+    if !crate::open_state::may_set_open_state(state, &request.user_id, &project_id).await {
+        return Err("Machine not found".to_string());
+    }
+    match machine_id {
+        Some(machine_id) => {
+            crate::open_state::admit_start_for_new_work(
+                state,
+                &request.user_id,
+                &project_id,
+                machine_id,
+                knows_open_state,
+                "tab",
+                false,
+            )
+            .await
+        }
+        None => {
+            crate::open_state::admit_new_work_on_unnamed_machine(
+                state,
+                &request.user_id,
+                &project_id,
+                instance.hostname.as_deref(),
+                knows_open_state,
+                "tab",
+            )
+            .await
+        }
+    }
+}
+
+/// Begin starting `machine_id`'s instance for a new pane, after the checks
+/// of [`start_target`] have passed. The caller holds the project's
+/// open-state lock. `Err` is why the pane fails: the open state refuses it,
+/// or the machine's daemon is gone.
+async fn start_instance_for_pane(
+    state: &AppState,
+    request: &NewPaneRequest,
+    machine_id: Uuid,
+    target: StartTarget,
+    knows_open_state: bool,
+) -> Result<InstanceStartWait, String> {
+    let session_id = request.session_id;
+    crate::open_state::admit_start_for_new_work(
+        state,
+        &request.user_id,
+        &target.project_id,
+        machine_id,
+        knows_open_state,
+        "tab",
+        true,
+    )
+    .await?;
+    let wait =
+        state
+            .sessions
+            .wait_for_instance_start(session_id, machine_id, Some(&target.project_id));
+    if let InstanceStartWait::Waiting {
+        start: Some(start_request),
+        ..
+    } = &wait
+    {
+        // Kept before the frame goes out, so the daemon's answer finds it.
+        state.sessions.record_machine_start_asked(
+            &target.project_id,
+            machine_id,
+            Some(*start_request),
+        );
+        let sent = state
+            .sessions
+            .send_to_daemon(
+                &machine_id,
+                ServerToDaemon::StartProjectCli {
+                    project_id: target.project_id.clone(),
+                    policy: Some(target.policy),
+                    request_id: Some(*start_request),
+                },
+            )
+            .await;
+        if !sent {
+            state
+                .sessions
+                .clear_machine_outcome(&target.project_id, &machine_id);
+            // Every pane that joined this start fails with it.
+            state
+                .sessions
+                .fail_instance_start(session_id, machine_id, *start_request);
+            return Err(format!("{} is offline", machine_label(state, machine_id)));
+        }
+        tracing::info!(
+            %session_id,
+            %machine_id,
+            request_id = %start_request,
+            "starting the project's instance for a new pane"
+        );
+    }
+    Ok(wait)
+}
+
 /// `AddPane` naming `machine_id`. The instance attached there receives the
 /// pane. A machine where the project is registered but not running has its
 /// instance started, and the pane follows when that instance attaches. Any
@@ -3735,13 +3978,34 @@ async fn launch_new_pane(
 /// viewer it starts this machine only, and is refused for a closed project
 /// that has tabs on other machines. The correlated answer keeps its meaning,
 /// for the chosen machine only.
+///
+/// A machine that already has an instance attached needs no start, and the
+/// same rule is applied to it when the project is recorded closed; see
+/// [`admit_pane_where_it_runs`].
 async fn add_pane_on_machine(state: &AppState, request: NewPaneRequest, machine_id: Uuid) {
     let session_id = request.session_id;
-    let wait = if state
-        .sessions
-        .instance_on_machine(&session_id, &machine_id)
-        .is_some()
+    let knows_open_state = state.sessions.web_supports_capability(
+        &request.connection_id,
+        shared::PROJECT_OPEN_STATE_CAPABILITY,
+    );
+    let wait = if let Some(instance) = state.sessions.instance_on_machine(&session_id, &machine_id)
     {
+        // An instance can be attached in a project recorded closed: a close
+        // left the machine running, could not reach its daemon, or its stop
+        // is still taking effect. The closed row of design Decision 3
+        // applies then too.
+        if let Err(error) = admit_pane_where_it_runs(
+            state,
+            &request,
+            &instance,
+            InstanceTarget::Machine(machine_id),
+            knows_open_state,
+        )
+        .await
+        {
+            answer_add_pane_launch(state, &request, Some(machine_id), Err(error)).await;
+            return;
+        }
         // Running: wait only for a start of it the server has not finished,
         // since a pane sent sooner could reach the instance before the
         // project's policy, without which its CLI refuses every new pane.
@@ -3759,76 +4023,25 @@ async fn add_pane_on_machine(state: &AppState, request: NewPaneRequest, machine_
         // The machine may be started for this pane. From a viewer that
         // negotiated the open state that opens the project, as the requester;
         // from any other it reaches this machine only, and a closed project
-        // with tabs on other machines refuses it. Held until this machine's
-        // start has been sent. A refusal has recorded and started nothing.
-        let _open_state = state
-            .sessions
-            .project_open_state_guard(&target.project_id)
-            .await;
-        let knows_open_state = state.sessions.web_supports_capability(
-            &request.connection_id,
-            shared::PROJECT_OPEN_STATE_CAPABILITY,
-        );
-        if let Err(error) = crate::open_state::admit_start_for_new_work(
-            state,
-            &request.user_id,
-            &target.project_id,
-            machine_id,
-            knows_open_state,
-            "tab",
-        )
-        .await
-        {
-            answer_add_pane_launch(state, &request, Some(machine_id), Err(error)).await;
-            return;
-        }
-        let wait = state.sessions.wait_for_instance_start(
-            session_id,
-            machine_id,
-            Some(&target.project_id),
-        );
-        if let InstanceStartWait::Waiting {
-            start: Some(start_request),
-            ..
-        } = &wait
-        {
-            // Kept before the frame goes out, so the daemon's answer finds it.
-            state.sessions.record_machine_start_asked(
-                &target.project_id,
-                machine_id,
-                Some(*start_request),
-            );
-            let sent = state
+        // with tabs on other machines refuses it. A refusal has recorded and
+        // started nothing.
+        let started = {
+            // Held until this machine's start has been sent. The requester
+            // is answered once it is released: an answer waits for seconds
+            // on a requester that does not read its socket.
+            let _open_state = state
                 .sessions
-                .send_to_daemon(
-                    &machine_id,
-                    ServerToDaemon::StartProjectCli {
-                        project_id: target.project_id.clone(),
-                        policy: Some(target.policy),
-                        request_id: Some(*start_request),
-                    },
-                )
+                .project_open_state_guard(&target.project_id)
                 .await;
-            if !sent {
-                state
-                    .sessions
-                    .clear_machine_outcome(&target.project_id, &machine_id);
-                // Every pane that joined this start fails with it.
-                state
-                    .sessions
-                    .fail_instance_start(session_id, machine_id, *start_request);
-                let error = format!("{} is offline", machine_label(state, machine_id));
+            start_instance_for_pane(state, &request, machine_id, target, knows_open_state).await
+        };
+        match started {
+            Ok(wait) => wait,
+            Err(error) => {
                 answer_add_pane_launch(state, &request, Some(machine_id), Err(error)).await;
                 return;
             }
-            tracing::info!(
-                %session_id,
-                %machine_id,
-                request_id = %start_request,
-                "starting the project's instance for a new pane"
-            );
         }
-        wait
     };
     match wait {
         InstanceStartWait::Ready => {
@@ -16016,6 +16229,9 @@ mod project_instance_tests {
         use crate::session::open_state::MachineOutcome;
         use shared::{OpenStateSetKind, ProjectOpenState, PROJECT_OPEN_STATE_CAPABILITY};
 
+        // Requests around a close, machines that are away or still run a
+        // closed project, and a project first heard of from an Open.
+        mod edges;
         // 3.1: a machine follows the recorded state when its daemon registers.
         mod follow;
         // 3.2 to 3.4: machines' parts, what viewers are told, and the refusal
@@ -16563,8 +16779,11 @@ mod project_instance_tests {
             assert_eq!(recorded(&p).await, Some(ProjectOpenState::Open));
             assert!(started_once(&mut d5));
 
-            // "Keep open" on a project that already runs records it and
-            // changes nothing on the machine that runs it.
+            // "Keep open" on a project that already runs records it. The
+            // machine that runs it is sent the start a running machine was
+            // always sent, with no id: its daemon answers that the project
+            // already runs and changes nothing. It is sent because a stop an
+            // older client asked for may still be taking effect there.
             let q = project().await;
             let mut q5 = q.daemon(q.m5, HOST_A, CAPABLE_DAEMON);
             let _running = q.instance(q.m5, HOST_A);
@@ -16572,8 +16791,123 @@ mod project_instance_tests {
             tabs(&q, vec![pane(3, Some(q.m5), Some(HOST_A))]);
             open(&q, &web, q.owner, q.m5).await;
             assert_eq!(recorded(&q).await, Some(ProjectOpenState::Open));
-            assert!(nothing_sent(&mut q5));
+            assert_eq!(sent(&mut q5), (vec![None], 0));
             assert_eq!(outcome(&q, q.m5), Some(MachineOutcome::Started));
+            assert_eq!(
+                follow::part(&q, q.m5),
+                Some((shared::MachinePart::Running, None)),
+                "its part never reads as starting"
+            );
+
+            // Keeping it open again sends nothing: the project is open.
+            open(&q, &web, q.owner, q.m5).await;
+            assert!(nothing_sent(&mut q5));
+        }
+
+        /// "Keep open" on a project that a daemon without multi-instance
+        /// support runs as its only runtime, with its older CLI holding every
+        /// tab untagged: the project is recorded open and that daemon is sent
+        /// the start it was always sent for a project it runs, which it does
+        /// not answer. Nothing is refused, for a viewer that shows no parts
+        /// either.
+        #[tokio::test]
+        async fn keeping_open_a_project_an_older_daemon_runs_alone_refuses_nothing() {
+            let p = project().await;
+            let laptop = Uuid::new_v4();
+            let mut dl = p.daemon(laptop, LAPTOP, OLDER_DAEMON);
+            let _older = p.instance_with(laptop, LAPTOP, &[shared::PROJECT_POLICY_CAPABILITY]);
+            reports_running(&p, laptop, LAPTOP);
+            let mut web = p.viewer(p.owner, KNOWS);
+            tabs(
+                &p,
+                vec![pane(3, None, Some(LAPTOP)), pane(4, None, Some(LAPTOP))],
+            );
+
+            open(&p, &web, p.owner, laptop).await;
+
+            assert_eq!(recorded(&p).await, Some(ProjectOpenState::Open));
+            assert_eq!(sent(&mut dl), (vec![None], 0));
+            assert_eq!(outcome(&p, laptop), Some(MachineOutcome::Started));
+            assert!(errors(&web.drain()).is_empty());
+
+            // Closed and opened again by a viewer that shows no parts.
+            let mut older_web = p.viewer(p.owner, OLDER_VIEWER);
+            close(&p, &older_web, p.owner, laptop).await;
+            assert!(stopped_once(&mut dl));
+            open(&p, &older_web, p.owner, laptop).await;
+            assert_eq!(sent(&mut dl), (vec![None], 0));
+            assert!(errors(&older_web.drain()).is_empty());
+        }
+
+        /// The race an Open lost before: a Close sends each machine its stop,
+        /// and the machines read as running until their daemons have ended
+        /// the project. An Open made meanwhile must not conclude that they
+        /// run it. Each machine is sent exactly one start, after its stop:
+        /// a daemon takes its frames in order, so it stops and then starts.
+        /// The same after an administrative stop.
+        #[tokio::test]
+        async fn opening_before_a_stop_is_confirmed_starts_each_machine_after_its_stop() {
+            let p = project().await;
+            let mut d5 = p.daemon(p.m5, HOST_A, CAPABLE_DAEMON);
+            let mut d6 = p.daemon(p.m6, HOST_B, CAPABLE_DAEMON);
+            // zoo-005's instance is attached; zoo-006's daemon reports it.
+            let _a = p.instance(p.m5, HOST_A);
+            reports_running(&p, p.m6, HOST_B);
+            let mut web = p.viewer(p.owner, KNOWS);
+            two_machine_roster(&p);
+            set_recorded(&p, ProjectOpenState::Open, p.owner, Some(p.m5)).await;
+            let frames = |daemon: &mut Endpoint<ServerToDaemon>| -> Vec<&'static str> {
+                daemon
+                    .drain()
+                    .into_iter()
+                    .map(|message| match message {
+                        ServerToDaemon::StopProjectCli { .. } => "stop",
+                        ServerToDaemon::StartProjectCli {
+                            policy: Some(_),
+                            request_id: None,
+                            ..
+                        } => "start",
+                        other => panic!("unexpected {other:?}"),
+                    })
+                    .collect()
+            };
+
+            close(&p, &web, p.owner, p.m5).await;
+            // Neither daemon has ended the project yet.
+            open(&p, &web, p.owner, p.m5).await;
+
+            assert_eq!(recorded(&p).await, Some(ProjectOpenState::Open));
+            assert_eq!(frames(&mut d5), vec!["stop", "start"]);
+            assert_eq!(frames(&mut d6), vec!["stop", "start"]);
+            for machine in [p.m5, p.m6] {
+                assert_eq!(outcome(&p, machine), Some(MachineOutcome::Started));
+                assert_eq!(
+                    follow::part(&p, machine),
+                    Some((shared::MachinePart::Running, None)),
+                    "it does not read as starting while it still runs"
+                );
+            }
+            assert!(errors(&web.drain()).is_empty());
+
+            // An operator's stop, then an Open before it has taken effect.
+            crate::open_state::record_administrative_close(
+                &p.state,
+                &p.owner.to_string(),
+                &p.project_id(),
+                "stop_runtime",
+            )
+            .await
+            .unwrap();
+            p.state.sessions.stop_project_runtime(&p.project_id()).await;
+            reports_running(&p, p.m5, HOST_A);
+            let web = p.viewer(p.owner, KNOWS);
+            open(&p, &web, p.owner, p.m5).await;
+            assert_eq!(frames(&mut d5), vec!["stop", "start"]);
+            assert_eq!(frames(&mut d6), vec!["stop", "start"]);
+
+            // Opening the open project again sends a running machine nothing.
+            open(&p, &web, p.owner, p.m5).await;
+            assert!(nothing_sent(&mut d5) && nothing_sent(&mut d6));
         }
 
         /// Scenario "Open a project with no tabs": it starts on the machine
@@ -17701,7 +18035,11 @@ mod project_instance_tests {
             );
             assert_eq!(recorded(&p).await, Some(ProjectOpenState::Open));
             assert!(matches!(sent(&mut d6).0.as_slice(), [Some(_)]));
-            assert!(nothing_sent(&mut d5), "zoo-005 runs it already");
+            assert_eq!(
+                sent(&mut d5),
+                (vec![None], 0),
+                "zoo-005 runs it already: the start its daemon answers by changing nothing"
+            );
         }
 
         /// Scenario "New tab on a machine that joins an open project": the
@@ -18017,11 +18355,16 @@ mod project_instance_tests {
             assert_eq!(kept(&p).await, before);
             assert_eq!(recorded(&p).await, Some(ProjectOpenState::Closed));
 
-            // Open again: every tab is where it was.
+            // Open again, while both instances are still attached because
+            // neither daemon has ended the project yet: each machine is sent
+            // one start, which its daemon takes after the stop. Every tab is
+            // where it was.
             open(&p, &web, p.owner, p.m5).await;
+            assert_eq!(sent(&mut d5), (vec![None], 0), "a start after its stop");
+            assert_eq!(sent(&mut d6), (vec![None], 0), "a start after its stop");
             assert!(
-                nothing_sent(&mut d5) && nothing_sent(&mut d6),
-                "still attached"
+                a.drain().is_empty() && b.drain().is_empty(),
+                "no instance is told anything by the open"
             );
             assert_eq!(kept(&p).await, before);
 

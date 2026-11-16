@@ -6,7 +6,7 @@ import { PaneStatusDots } from "@/components/PaneStatusDots";
 import { FolderOpen, RefreshCw, Share2, Users, X, Crown, Trash2, ChevronLeft, ChevronDown, ChevronRight, BarChart3, Server, Plus, LogOut, ArrowRightLeft, MoreHorizontal, GripVertical } from "lucide-react";
 import { CreateInstanceModal } from "./CreateInstanceModal";
 import Link from "next/link";
-import { useMemo, useState, useEffect, type DragEvent, type KeyboardEvent } from "react";
+import { useMemo, useRef, useState, useEffect, type DragEvent, type KeyboardEvent } from "react";
 import { createPortal } from "react-dom";
 import {
   paneUsageLimit,
@@ -157,7 +157,15 @@ export function Sidebar({ onClose, onCollapse, width }: SidebarProps) {
   // The project the shared Delete project dialog is open for. It is opened
   // only from the owner's "Delete project…" in the project-access dialog,
   // which closes first.
-  const [deleteProjectTarget, setDeleteProjectTarget] = useState<{ id: string; sessionId: string; name: string } | null>(null);
+  const [deleteProjectTarget, setDeleteProjectTarget] = useState<{
+    id: string;
+    sessionId: string;
+    name: string;
+    /** What opened the access dialog that led here; focus returns to it. */
+    returnFocusTo: HTMLElement | null;
+  } | null>(null);
+  // The control that opened the project-access dialog.
+  const shareOpener = useRef<HTMLElement | null>(null);
   const openStateSupported = useStore(openStateNegotiated);
   const instancesSupported = useStore(instancesNegotiated);
   const projectOpenStates = useStore((s) => s.projectOpenStates);
@@ -427,6 +435,9 @@ export function Sidebar({ onClose, onCollapse, width }: SidebarProps) {
     role: ProjectRole,
   ) => {
     e.stopPropagation();
+    // Kept for the Delete project dialog this dialog can lead to: it closes
+    // as that one opens, and focus then belongs to this button again.
+    shareOpener.current = e.currentTarget instanceof HTMLElement ? e.currentTarget : null;
     setShareSessionId(representativeSessionId);
     setShareProjectId(canonicalProjectId);
     setShareTab(role === "owner" ? "invite" : "manage");
@@ -642,6 +653,7 @@ export function Sidebar({ onClose, onCollapse, width }: SidebarProps) {
       id: shareProjectId,
       sessionId: shareSessionId,
       name: entry?.name ?? (session ? projectNameFor(session) : ""),
+      returnFocusTo: shareOpener.current,
     });
     setShareModalOpen(false);
   };
@@ -1273,6 +1285,7 @@ export function Sidebar({ onClose, onCollapse, width }: SidebarProps) {
           stoppedFirstHosts={deleteProjectModel?.stoppedFirstHosts}
           offlineTabOwnerHosts={deleteProjectModel?.offlineTabOwnerHosts}
           onClose={() => setDeleteProjectTarget(null)}
+          returnFocusTo={deleteProjectTarget.returnFocusTo}
         />,
         document.body,
       )}

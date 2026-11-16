@@ -10,8 +10,9 @@
 //! someone opens the project again.
 
 use super::{
-    beside_other_owners_refusal, machine_runs_project, project_tab_owners, read_open_state,
-    recorded_actor_may_use_machine, refresh_basis, send_recorded_start, POLICY_INCOMPATIBLE,
+    audit_open_state, beside_other_owners_refusal, machine_runs_project, project_tab_owners,
+    read_open_state, recorded_actor_may_use_machine, refresh_basis, send_recorded_start,
+    POLICY_INCOMPATIBLE,
 };
 use crate::db::{ProjectLifecycle, ProjectOpenStateRecord};
 use crate::routes::ws_web::{
@@ -170,6 +171,40 @@ async fn follow_project_locked(
     }
 }
 
+/// Write the audit record of a start or a stop the follow step sent: the
+/// event an open or a close writes, by the account or administrator that
+/// set the state, with source "registration" and this one machine. So the
+/// history shows that a machine which was away was asked to stop, when, and
+/// on whose close; likewise for a start. A step that sent nothing writes
+/// nothing.
+async fn audit_followed(
+    state: &AppState,
+    machine_id: &Uuid,
+    record: &ProjectOpenStateRecord,
+    followed: &Followed,
+) {
+    let open_state = match followed {
+        Followed::Started => ProjectOpenState::Open,
+        Followed::Stopped => ProjectOpenState::Closed,
+        Followed::Nothing | Followed::Left(_) => return,
+    };
+    // The system administrator is recorded with no account id.
+    let actor = match record.set_by.as_deref() {
+        Some(actor) if !actor.is_empty() => actor,
+        _ => crate::db::SYSTEM_ADMIN_ACTOR,
+    };
+    audit_open_state(
+        state,
+        actor,
+        &record.project_id,
+        open_state,
+        record.set_kind.unwrap_or(OpenStateSetKind::Request),
+        "registration",
+        &[*machine_id],
+    )
+    .await;
+}
+
 /// The follow step for one project `machine_id`'s registration listed, under
 /// the project's open-state lock and on a fresh read of its state.
 /// `connection` is the daemon connection that registered: a later
@@ -189,7 +224,11 @@ pub(crate) async fn follow_project(
             return Followed::Nothing;
         }
         match read_open_state(state, project_id).await {
-            Ok(Some(record)) => follow_project_locked(state, machine_id, &record).await,
+            Ok(Some(record)) => {
+                let followed = follow_project_locked(state, machine_id, &record).await;
+                audit_followed(state, machine_id, &record, &followed).await;
+                followed
+            }
             // No record of the project, or its state cannot be read: nothing
             // is started and nothing stopped.
             Ok(None) | Err(_) => Followed::Nothing,

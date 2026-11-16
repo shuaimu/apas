@@ -1,8 +1,8 @@
 import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi, type Mock } from "vitest";
 import MachinesPage from "./page";
 import { validateClientMessage } from "@apas/protocol";
-import { useStore, type MachineInfo, type MachineWithProjects } from "@/lib/store";
+import { handleServerMessage, useStore, type MachineInfo, type MachineWithProjects } from "@/lib/store";
 import {
   CLOSE_DELETES_NOTHING,
   NOTHING_SENT_TEXT,
@@ -191,6 +191,8 @@ function confirmInDialog(name: string) {
 }
 
 beforeEach(() => {
+  // Each test starts on the page's own address, also when run alone.
+  window.history.replaceState({}, "", "/machines");
   fetchMock.mockReset();
   globalThis.fetch = fetchMock as unknown as typeof fetch;
   installClusterApi();
@@ -1363,5 +1365,367 @@ describe("Projects view: open state and deletion", () => {
     expect(actions.listMachines).toHaveBeenCalled();
     expect(fetchMock.mock.calls.filter(([url]) => String(url).endsWith("/projects/project-a/delete"))).toHaveLength(1);
     expect(new URL(window.location.href).searchParams.has("selected")).toBe(false);
+  });
+
+  /** The cluster API of a deletion of `project-a` that the test ends by
+   *  hand: accepted at once, done when `server.gone` is set. Until then the
+   *  status endpoint answers `server.status`. `project-b` is a second
+   *  project. */
+  function deletionApi(status: number, withSecondProject = false) {
+    const server = { gone: false, status };
+    const fallback = fetchMock.getMockImplementation()!;
+    const second = {
+      id: "project-b",
+      project_name: "other",
+      hostname: "build-host",
+      owner_user_id: "owner-1",
+      owner_email: "owner@example.com",
+      lifecycle_status: "active",
+      member_count: 0,
+      active_session_count: 0,
+      hosting_emails: ["me@example.com"],
+      connected: true,
+      effective_policy: policy,
+    };
+    fetchMock.mockImplementation(async (input: string | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/projects/project-a/delete") && init?.method === "POST") {
+        return { ok: true, status: 202, json: vi.fn().mockResolvedValue({}) };
+      }
+      if (url.endsWith("/projects/project-a/deletion")) {
+        return server.gone
+          ? apiResponse({ message: "gone" }, false, 404)
+          : apiResponse({ error: "Deletion status is unavailable" }, server.status < 300, server.status);
+      }
+      if (url.includes("/cluster/projects?")) {
+        const first = (await (await fallback(input, init)).json()).items as unknown[];
+        return apiResponse({
+          items: [...(server.gone ? [] : first), ...(withSecondProject ? [second] : [])],
+          limit: 200,
+          offset: 0,
+        });
+      }
+      if (url.match(/\/cluster\/projects\/project-b$/)) {
+        return apiResponse({ project: second, members: [], policy });
+      }
+      return fallback(input, init);
+    });
+    return server;
+  }
+
+  async function startDeletion() {
+    const actions = seedMachines([hosting({ openState: "closed", part: "not_started" })]);
+    capable();
+    act(() => { useStore.setState({ userId: "owner-1", forgetProject: vi.fn(), listSessions: vi.fn() }); });
+    const { unmount } = render(<MachinesPage />);
+    openView("Projects");
+    fireEvent.click(await screen.findByRole("button", { name: "Manage mako-soumojit" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Delete project…" }));
+    const dialog = screen.getByRole("dialog", { name: "Delete project" });
+    fireEvent.change(within(dialog).getByLabelText("Project name"), { target: { value: "mako-soumojit" } });
+    fireEvent.click(within(dialog).getByRole("button", { name: "Delete project" }));
+    return { actions, dialog, unmount };
+  }
+
+  const listLoads = () => fetchMock.mock.calls.filter(([url]) => String(url).includes("/cluster/projects?")).length;
+  const statusAsks = () => fetchMock.mock.calls.filter(([url]) => String(url).endsWith("/projects/project-a/deletion")).length;
+  const deleteRequests = () => fetchMock.mock.calls.filter(([url]) => String(url).endsWith("/projects/project-a/delete")).length;
+  const address = () => `${window.location.pathname}${window.location.search}`;
+  const pause = () => new Promise((done) => setTimeout(done, 50));
+
+  /** The server's one report that a project is deleted, as the socket
+   *  delivers it to the store. */
+  function reportDeleted(projectId: string) {
+    act(() => {
+      useStore.setState({ forgetProject: initialStore.forgetProject });
+      handleServerMessage(
+        { type: "project_access_changed", project_id: projectId, change: "deleted" },
+        useStore.setState,
+        useStore.getState,
+      );
+    });
+  }
+
+  /** A deletion the server accepted and whose dialog gave up and was
+   *  closed: the list was loaded once more and still has the project. */
+  async function giveUpAndClose() {
+    const server = deletionApi(500);
+    const started = await startDeletion();
+    await within(started.dialog).findByRole("alert", {}, { timeout: 5000 });
+    const loads = listLoads();
+    fireEvent.click(within(started.dialog).getByRole("button", { name: "Close" }));
+    await waitFor(() => expect(listLoads()).toBe(loads + 1));
+    await pause();
+    expect(screen.getByRole("button", { name: "Delete project…" })).toBeTruthy();
+    return { server, ...started };
+  }
+
+  // The deletion goes on without its dialog. The project list is loaded
+  // over HTTP only when asked, so the page must hear of the end.
+  it("drops the project when its deletion ends after the dialog was closed", async () => {
+    const server = deletionApi(200);
+    const { actions, dialog } = await startDeletion();
+    expect((await within(dialog).findByRole("status")).textContent).toContain("Deleting…");
+    fireEvent.click(within(dialog).getByRole("button", { name: "Close" }));
+    expect(screen.queryByRole("dialog")).toBeNull();
+    // Still deleting: the project and its panel are as they were.
+    expect(screen.getByRole("button", { name: "Delete project…" })).toBeTruthy();
+    actions.listMachines.mockClear();
+
+    server.gone = true;
+    expect(await screen.findByText("No projects are hosted in your cluster yet.", {}, { timeout: 5000 })).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Delete project…" })).toBeNull();
+    expect(actions.listMachines).toHaveBeenCalled();
+    expect(new URL(window.location.href).searchParams.has("selected")).toBe(false);
+    expect(fetchMock.mock.calls.filter(([url]) => String(url).endsWith("/projects/project-a/delete"))).toHaveLength(1);
+  });
+
+  it("keeps another project selected when the deletion ends after the dialog was closed", async () => {
+    const server = deletionApi(200, true);
+    const { dialog } = await startDeletion();
+    expect((await within(dialog).findByRole("status")).textContent).toContain("Deleting…");
+    fireEvent.click(within(dialog).getByRole("button", { name: "Close" }));
+    fireEvent.click(screen.getByRole("button", { name: "Manage other" }));
+    expect(await screen.findByRole("heading", { name: "other" })).toBeTruthy();
+
+    server.gone = true;
+    await waitFor(() => expect(screen.queryByRole("button", { name: "Manage mako-soumojit" })).toBeNull(), { timeout: 5000 });
+    // The deleted project left the list; the one now selected keeps its panel.
+    expect(screen.getByRole("heading", { name: "other" })).toBeTruthy();
+    expect(new URL(window.location.href).searchParams.get("selected")).toBe("project-b");
+  });
+
+  it("loads the project list again when the dialog closes without knowing how the deletion went", async () => {
+    const server = deletionApi(500);
+    const { dialog } = await startDeletion();
+    // The wait ended without an answer; the deletion goes on.
+    expect((await within(dialog).findByRole("alert", {}, { timeout: 5000 })).textContent)
+      .toBe("Deletion status is unavailable");
+    const loadsBefore = listLoads();
+    // Nothing is loaded while the dialog is open.
+    await new Promise((done) => setTimeout(done, 50));
+    expect(listLoads()).toBe(loadsBefore);
+
+    server.gone = true;
+    fireEvent.click(within(dialog).getByRole("button", { name: "Close" }));
+    expect(await screen.findByText("No projects are hosted in your cluster yet.", {}, { timeout: 5000 })).toBeTruthy();
+    expect(listLoads()).toBe(loadsBefore + 1);
+    // The project is gone from the fresh list, so its panel goes too.
+    await waitFor(() => expect(screen.queryByRole("button", { name: "Delete project…" })).toBeNull());
+    expect(fetchMock.mock.calls.filter(([url]) => String(url).endsWith("/projects/project-a/delete"))).toHaveLength(1);
+  });
+
+  it("keeps the project's panel when the list still has it after such a close", async () => {
+    deletionApi(500);
+    const { dialog } = await startDeletion();
+    await within(dialog).findByRole("alert", {}, { timeout: 5000 });
+    const loadsBefore = listLoads();
+    fireEvent.click(within(dialog).getByRole("button", { name: "Close" }));
+    await waitFor(() => expect(listLoads()).toBe(loadsBefore + 1));
+    await new Promise((done) => setTimeout(done, 50));
+    expect(screen.getByRole("button", { name: "Manage mako-soumojit" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Delete project…" })).toBeTruthy();
+  });
+
+  // The address names the selected project only while the Projects view
+  // shows. A deletion that ends later must not put that view back into it.
+  it("leaves the address alone when a deletion ends while another view shows", async () => {
+    const server = deletionApi(200);
+    const { actions, dialog } = await startDeletion();
+    expect((await within(dialog).findByRole("status")).textContent).toContain("Deleting…");
+    fireEvent.click(within(dialog).getByRole("button", { name: "Close" }));
+    openView("Usage");
+    expect(address()).toBe("/machines?view=usage");
+    actions.listMachines.mockClear();
+    const loads = listLoads();
+
+    server.gone = true;
+    await waitFor(() => expect(listLoads()).toBe(loads + 1), { timeout: 5000 });
+    await pause();
+    expect(actions.listMachines).toHaveBeenCalled();
+    expect(address()).toBe("/machines?view=usage");
+    // The project lost its panel all the same.
+    openView("Projects");
+    expect(await screen.findByText("No projects are hosted in your cluster yet.")).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Delete project…" })).toBeNull();
+    expect(address()).toBe("/machines?view=projects");
+  });
+
+  it("does nothing when a deletion ends after the page is gone", async () => {
+    const server = deletionApi(200);
+    const { actions, dialog, unmount } = await startDeletion();
+    expect((await within(dialog).findByRole("status")).textContent).toContain("Deleting…");
+    fireEvent.click(within(dialog).getByRole("button", { name: "Close" }));
+    const forgetProject = useStore.getState().forgetProject as unknown as Mock;
+    unmount();
+    // Another page is open now, with an address of its own.
+    window.history.replaceState({}, "", "/?probe=1&view=usage&selected=other");
+    actions.listMachines.mockClear();
+    const callsBefore = fetchMock.mock.calls.length;
+
+    server.gone = true;
+    await waitFor(() => expect(forgetProject).toHaveBeenCalledWith("project-a"), { timeout: 5000 });
+    await pause();
+    expect(address()).toBe("/?probe=1&view=usage&selected=other");
+    expect(actions.listMachines).not.toHaveBeenCalled();
+    // Only the wait for the deletion asked anything.
+    expect(fetchMock.mock.calls.slice(callsBefore).map(([url]) => String(url))
+      .filter((url) => !url.endsWith("/projects/project-a/deletion"))).toEqual([]);
+  });
+
+  it("does nothing when the wait for a deletion gives up after the page is gone", async () => {
+    const server = deletionApi(200);
+    const { actions, dialog, unmount } = await startDeletion();
+    expect((await within(dialog).findByRole("status")).textContent).toContain("Deleting…");
+    fireEvent.click(within(dialog).getByRole("button", { name: "Close" }));
+    unmount();
+    window.history.replaceState({}, "", "/?probe=1");
+    actions.listMachines.mockClear();
+    const callsBefore = fetchMock.mock.calls.length;
+    const asks = statusAsks();
+
+    server.status = 500;
+    await waitFor(() => expect(statusAsks()).toBeGreaterThan(asks), { timeout: 5000 });
+    await pause();
+    expect(address()).toBe("/?probe=1");
+    expect(actions.listMachines).not.toHaveBeenCalled();
+    expect(fetchMock.mock.calls.slice(callsBefore).map(([url]) => String(url))
+      .filter((url) => !url.endsWith("/projects/project-a/deletion"))).toEqual([]);
+  });
+
+  // A list load can be in flight when the owner leaves the page. When it
+  // comes back without the project, the address is another page's.
+  it("leaves the address alone when a list load ends after the page is gone", async () => {
+    const { server, unmount } = await giveUpAndClose();
+    const inner = fetchMock.getMockImplementation()!;
+    let release = () => {};
+    let held = 0;
+    const gate = new Promise<void>((done) => { release = done; });
+    fetchMock.mockImplementation(async (input: string | URL, init?: RequestInit) => {
+      if (String(input).includes("/cluster/projects?")) { held += 1; await gate; }
+      return inner(input, init);
+    });
+    server.gone = true;
+    reportDeleted("project-a");
+    await waitFor(() => expect(held).toBe(1));
+    unmount();
+    window.history.replaceState({}, "", "/?probe=1&view=usage&selected=other");
+    release();
+    await pause();
+    await pause();
+    expect(address()).toBe("/?probe=1&view=usage&selected=other");
+  });
+
+  // After the dialog gave up nothing asks about the deletion any more. The
+  // server reports its end once, and the store then forgets the project.
+  it("drops the project when the server reports it deleted after the dialog gave up", async () => {
+    const { server } = await giveUpAndClose();
+    const loads = listLoads();
+    const asks = statusAsks();
+
+    // Another project's end says nothing about this list.
+    reportDeleted("project-z");
+    expect(listLoads()).toBe(loads);
+
+    server.gone = true;
+    reportDeleted("project-a");
+    expect(listLoads()).toBe(loads + 1);
+    expect(await screen.findByText("No projects are hosted in your cluster yet.")).toBeTruthy();
+    await waitFor(() => expect(screen.queryByRole("button", { name: "Delete project…" })).toBeNull());
+    expect(address()).toBe("/machines?view=projects");
+    // The delete request went out once, and nobody asked about it again.
+    expect(deleteRequests()).toBe(1);
+    expect(statusAsks()).toBe(asks);
+
+    // The wait is over: a later report loads nothing.
+    reportDeleted("project-a");
+    expect(listLoads()).toBe(loads + 1);
+  });
+
+  it("keeps the project when the store forgets it and the list still has it", async () => {
+    await giveUpAndClose();
+    const loads = listLoads();
+
+    reportDeleted("project-a");
+    await waitFor(() => expect(listLoads()).toBe(loads + 1));
+    await pause();
+    expect(screen.getByRole("button", { name: "Manage mako-soumojit" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Delete project…" })).toBeTruthy();
+    expect(new URL(window.location.href).searchParams.get("selected")).toBe("project-a");
+  });
+
+  it("drops the project when a later load of the list no longer has it", async () => {
+    const { server } = await giveUpAndClose();
+
+    server.gone = true;
+    fireEvent.click(screen.getByRole("button", { name: "Refresh machines" }));
+    expect(await screen.findByText("No projects are hosted in your cluster yet.")).toBeTruthy();
+    await waitFor(() => expect(screen.queryByRole("button", { name: "Delete project…" })).toBeNull());
+    expect(new URL(window.location.href).searchParams.has("selected")).toBe(false);
+    expect(deleteRequests()).toBe(1);
+  });
+
+  // The server's report is sent once, to the sockets connected then.
+  it("loads the list again when the page reconnects while a deletion is unconfirmed", async () => {
+    const server = deletionApi(500);
+    const { dialog } = await startDeletion();
+    await within(dialog).findByRole("alert", {}, { timeout: 5000 });
+    const reconnect = () => {
+      act(() => { useStore.setState({ connected: false }); });
+      act(() => { useStore.setState({ connected: true }); });
+    };
+    // A reconnect loads no list while the page waits for no deletion.
+    const loads = listLoads();
+    reconnect();
+    expect(listLoads()).toBe(loads);
+
+    fireEvent.click(within(dialog).getByRole("button", { name: "Close" }));
+    await waitFor(() => expect(listLoads()).toBe(loads + 1));
+    await pause();
+    expect(screen.getByRole("button", { name: "Delete project…" })).toBeTruthy();
+
+    server.gone = true;
+    reconnect();
+    expect(listLoads()).toBe(loads + 2);
+    expect(await screen.findByText("No projects are hosted in your cluster yet.")).toBeTruthy();
+    await waitFor(() => expect(screen.queryByRole("button", { name: "Delete project…" })).toBeNull());
+    expect(deleteRequests()).toBe(1);
+  });
+
+  it("keeps waiting while another cluster's list shows, which never had the project", async () => {
+    const server = deletionApi(500);
+    const own = fetchMock.getMockImplementation()!;
+    fetchMock.mockImplementation(async (input: string | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/cluster/contexts")) return apiResponse([
+        { owner_user_id: "owner-1", owner_email: "owner@example.com", access: "owner" },
+        { owner_user_id: "host", owner_email: "host@example.com", access: "member" },
+      ]);
+      if (url.includes("/cluster/contexts/host/projects?")) return apiResponse({ items: [], limit: 200, offset: 0 });
+      if (url.endsWith("/cluster/contexts/host/policy/default")) return apiResponse({ cluster: null, deployment: policy });
+      return own(input, init);
+    });
+    const { dialog } = await startDeletion();
+    await within(dialog).findByRole("alert", {}, { timeout: 5000 });
+    fireEvent.click(within(dialog).getByRole("button", { name: "Close" }));
+    await pause();
+
+    const hostLoads = () => fetchMock.mock.calls.filter(([url]) => String(url).includes("/cluster/contexts/host/projects?")).length;
+    fireEvent.change(screen.getByLabelText("Selected cluster"), { target: { value: "host" } });
+    await waitFor(() => expect(hostLoads()).toBe(1));
+    await pause();
+    expect(screen.queryByRole("button", { name: "Manage mako-soumojit" })).toBeNull();
+
+    // Back in its own cluster the project is still being deleted.
+    fireEvent.change(screen.getByLabelText("Selected cluster"), { target: { value: "owner-1" } });
+    fireEvent.click(await screen.findByRole("button", { name: "Manage mako-soumojit" }));
+    expect(await screen.findByRole("button", { name: "Delete project…" })).toBeTruthy();
+    await pause();
+
+    server.gone = true;
+    reportDeleted("project-a");
+    await waitFor(() => expect(screen.queryByRole("button", { name: "Manage mako-soumojit" })).toBeNull());
+    await waitFor(() => expect(screen.queryByRole("button", { name: "Delete project…" })).toBeNull());
+    expect(deleteRequests()).toBe(1);
   });
 });

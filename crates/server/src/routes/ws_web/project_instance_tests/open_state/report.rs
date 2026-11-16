@@ -963,6 +963,9 @@ fn a_project_start_is_sent_only_from_an_open_a_tab_a_task_a_creation_and_a_regis
             // An Open, the follow step at a registration, and a start naming
             // one machine of an open project.
             "open_state.rs: send_recorded_start",
+            // An Open that changes the record, for a machine that reads as
+            // running: a stop sent before may still be taking effect there.
+            "open_state.rs: send_start_to_running_machine",
             // A task launch: beside a running instance, and as the
             // project's first start.
             "routes/mobile.rs: launch_task",
@@ -970,7 +973,7 @@ fn a_project_start_is_sent_only_from_an_open_a_tab_a_task_a_creation_and_a_regis
             // A creation: shared provisioning's finalize.
             "routes/ws_daemon.rs: apply_registered_daemon_message",
             // A tab request on a machine that is not running the project.
-            "routes/ws_web.rs: add_pane_on_machine",
+            "routes/ws_web.rs: start_instance_for_pane",
             // A start naming one machine: of an open project that already
             // runs there, and of a project nobody has recorded.
             "routes/ws_web.rs: start_one_machine_of_recorded_project",
@@ -985,5 +988,252 @@ fn a_project_start_is_sent_only_from_an_open_a_tab_a_task_a_creation_and_a_regis
             "open_state/follow.rs: follow_project_locked",
             "routes/ws_web.rs: start_one_machine_of_recorded_project",
         ])
+    );
+}
+
+/// A machine an open project's start did not bring up is reported with the
+/// reason whether or not it owns a tab, and also while the server holds no
+/// roster for the project: the first Open of a project that has never run
+/// names its machine, and a refusal, a failure or a start nothing answered
+/// would otherwise show an open project with no machine and no reason.
+#[tokio::test]
+async fn a_machine_an_open_could_not_start_is_reported_while_the_tab_owners_are_unknown() {
+    // Refused by a server check: the daemon cannot take the project policy.
+    let p = project().await;
+    let mut d5 = p.daemon(p.m5, HOST_A, &[PROJECT_INSTANCES_CAPABILITY]);
+    let mut web = p.viewer(p.owner, KNOWS);
+    assert_eq!(
+        project_tab_owners(&p.state, &p.project_id(), None).await,
+        TabOwners::Unknown
+    );
+    open(&p, &web, p.owner, p.m5).await;
+    assert_eq!(recorded(&p).await, Some(ProjectOpenState::Open));
+    assert!(nothing_sent(&mut d5));
+    let refused = vec![row(
+        HOST_A,
+        MachinePart::NotStarted,
+        Some(crate::open_state::POLICY_INCOMPATIBLE),
+        false,
+        true,
+    )];
+    assert_eq!(told(&p), refused);
+    assert_eq!(
+        last_report(web.drain()),
+        (Some(ProjectOpenState::Open), refused)
+    );
+
+    // Never answered, then refused by the daemon.
+    let q = project().await;
+    // Long enough for the part to be read while the start is within it.
+    q.state.sessions.set_pane_launch_timing(
+        crate::session::pane_launches::PANE_ID_RESERVATION_TTL,
+        Duration::from_secs(2),
+    );
+    let mut q5 = q.daemon(q.m5, HOST_A, CAPABLE_DAEMON);
+    let mut q6 = q.daemon(q.m6, HOST_B, CAPABLE_DAEMON);
+    let web = q.viewer(q.owner, KNOWS);
+    open(&q, &web, q.owner, q.m5).await;
+    let request_id = one_correlated_start(&mut q5);
+    assert_eq!(
+        told(&q),
+        vec![row(HOST_A, MachinePart::Starting, None, false, true)]
+    );
+    tokio::time::sleep(Duration::from_millis(2200)).await;
+    let unanswered = start_unanswered_reason(HOST_A);
+    assert_eq!(
+        told(&q),
+        vec![row(
+            HOST_A,
+            MachinePart::NotStarted,
+            Some(&unanswered),
+            false,
+            true
+        )]
+    );
+    assert!(q.state.sessions.machine_start_answered(
+        &q.m5,
+        &request_id,
+        &q.project_id(),
+        false,
+        Some("Another host holds this project's claim".to_string()),
+    ));
+    assert_eq!(
+        told(&q),
+        vec![row(
+            HOST_A,
+            MachinePart::NotStarted,
+            Some("Another host holds this project's claim"),
+            false,
+            true
+        )]
+    );
+    assert!(nothing_sent(&mut q6), "no other machine is involved");
+
+    // Once it runs, it reads as running; once the project is closed, a
+    // machine that owns no tab and does not run it is not listed.
+    reports_running(&q, q.m5, HOST_A);
+    assert_eq!(
+        told(&q),
+        vec![row(HOST_A, MachinePart::Running, None, false, true)]
+    );
+    q.state
+        .sessions
+        .update_daemon_projects(&q.m5, vec![listed(&q, HOST_A, false)]);
+    q.state
+        .sessions
+        .record_machine_not_started(&q.project_id(), q.m5, "it stopped");
+    close(&q, &web, q.owner, q.m5).await;
+    assert_eq!(told(&q), Vec::new());
+
+    // Another account's checkout with the same id is never listed, whatever
+    // is held for its machine.
+    let stranger = Uuid::new_v4();
+    q.state.db.create_user(&user(stranger)).await.unwrap();
+    let theirs = Uuid::new_v4();
+    let _df = foreign_daemon(
+        &q,
+        stranger,
+        theirs,
+        "zoo-009",
+        vec![listed(&q, "zoo-009", false)],
+    );
+    set_recorded(&q, ProjectOpenState::Open, q.owner, Some(q.m5)).await;
+    refresh_basis(&q.state, &q.project_id()).await;
+    q.state
+        .sessions
+        .record_machine_not_started(&q.project_id(), theirs, "not theirs to start");
+    assert!(told(&q).iter().all(|machine| machine.0 != "zoo-009"));
+}
+
+/// A report a viewer's full queue did not take is not counted as told: the
+/// next report sends the complete frame again, although nothing changed in
+/// between. A view that was delivered is not repeated.
+#[tokio::test]
+async fn a_report_a_full_queue_dropped_is_sent_again_by_the_next_report() {
+    let p = project().await;
+    let _d5 = p.daemon(p.m5, HOST_A, CAPABLE_DAEMON);
+    let id = Uuid::new_v4();
+    let (tx, mut rx) = mpsc::channel(1);
+    p.state.sessions.register_web(id, tx.clone());
+    p.state.sessions.set_web_user(id, p.owner);
+    p.state.sessions.set_web_capabilities(
+        id,
+        KNOWS
+            .iter()
+            .map(|capability| capability.to_string())
+            .collect(),
+    );
+    assert!(p.state.sessions.attach_web_to_session(&p.session, id, None));
+    tabs(&p, vec![pane(3, Some(p.m5), Some(HOST_A))]);
+    set_recorded(&p, ProjectOpenState::Open, p.owner, Some(p.m5)).await;
+    refresh_basis(&p.state, &p.project_id()).await;
+    let drain = |rx: &mut mpsc::Receiver<ServerToWeb>| {
+        let mut frames = Vec::new();
+        while let Ok(frame) = rx.try_recv() {
+            frames.push(frame);
+        }
+        frames
+    };
+    drain(&mut rx);
+
+    // The viewer's queue is full when the machine's part changes.
+    tx.try_send(ServerToWeb::Error {
+        message: "unread".to_string(),
+    })
+    .unwrap();
+    p.state
+        .sessions
+        .record_machine_not_started(&p.project_id(), p.m5, "zoo-005 refused");
+    assert!(
+        open_state_frames(drain(&mut rx)).is_empty(),
+        "the report was dropped"
+    );
+
+    // Nothing has changed since, and the next report still sends it.
+    p.state.sessions.report_project_open_state(&p.project_id());
+    assert_eq!(
+        last_report(drain(&mut rx)),
+        (
+            Some(ProjectOpenState::Open),
+            vec![row(
+                HOST_A,
+                MachinePart::NotStarted,
+                Some("zoo-005 refused"),
+                true,
+                true
+            )]
+        )
+    );
+
+    // Told now: the same view is not sent again.
+    p.state.sessions.report_project_open_state(&p.project_id());
+    assert!(open_state_frames(drain(&mut rx)).is_empty());
+}
+
+/// Two changes of one project reported side by side leave every viewer on
+/// the newest view. A report is derived, compared and queued as one step:
+/// a second report that begins while the first is between deriving its view
+/// and queuing it waits, so the first's older view is never queued after the
+/// second's newer one, where nothing would correct it.
+#[tokio::test]
+async fn reports_made_side_by_side_leave_viewers_on_the_newest_view() {
+    let p = project().await;
+    let _d5 = p.daemon(p.m5, HOST_A, CAPABLE_DAEMON);
+    let _d6 = p.daemon(p.m6, HOST_B, CAPABLE_DAEMON);
+    let mut web = p.viewer(p.owner, KNOWS);
+    two_machine_roster(&p);
+    set_recorded(&p, ProjectOpenState::Open, p.owner, Some(p.m5)).await;
+    refresh_basis(&p.state, &p.project_id()).await;
+    web.drain();
+
+    // While zoo-005's change is being reported, zoo-006's is reported from
+    // another thread. Unordered, it would finish within the wait below.
+    let second: std::sync::Arc<std::sync::Mutex<Option<std::thread::JoinHandle<()>>>> =
+        Default::default();
+    {
+        let sessions = p.state.sessions.clone();
+        let (project_id, m6) = (p.project_id(), p.m6);
+        let second = second.clone();
+        p.state.sessions.after_next_view_derived(move || {
+            let (done, finished) = std::sync::mpsc::channel();
+            *second.lock().unwrap() = Some(std::thread::spawn(move || {
+                sessions.record_machine_not_started(&project_id, m6, "zoo-006 refused");
+                let _ = done.send(());
+            }));
+            let _ = finished.recv_timeout(Duration::from_millis(300));
+        });
+    }
+    p.state
+        .sessions
+        .record_machine_not_started(&p.project_id(), p.m5, "zoo-005 refused");
+    second
+        .lock()
+        .unwrap()
+        .take()
+        .expect("the second report was begun")
+        .join()
+        .unwrap();
+
+    let newest = vec![
+        row(
+            HOST_A,
+            MachinePart::NotStarted,
+            Some("zoo-005 refused"),
+            true,
+            true,
+        ),
+        row(
+            HOST_B,
+            MachinePart::NotStarted,
+            Some("zoo-006 refused"),
+            true,
+            true,
+        ),
+    ];
+    assert_eq!(told(&p), newest);
+    assert_eq!(
+        last_report(web.drain()),
+        (Some(ProjectOpenState::Open), newest),
+        "the last report a viewer holds is the newest view"
     );
 }

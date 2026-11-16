@@ -296,7 +296,9 @@ export interface MachineChoiceGroup {
  * project: the server starts every machine that owns its tabs, then adds the
  * tab. Against a server that records no open state it starts that machine
  * alone, as it always did, and the group keeps its old name. The choices say
- * which (`MachineChoice.alsoStarts`).
+ * which (`MachineChoice.alsoStarts`). A machine to clone onto is the same
+ * once its checkout exists: its group keeps the name "Clone here", and its
+ * line says that the tab opens the project (`machineChoiceDetail`).
  */
 export function groupMachineChoices(choices: MachineChoice[]): MachineChoiceGroup[] {
   const opensProject = choices.some((choice) => choice.kind === "registered" && choice.alsoStarts !== undefined);
@@ -326,7 +328,10 @@ export function machineChoiceDetail(choice: MachineChoice): string {
         ? `Registered · opens the project, which also starts its tabs on ${hostList(choice.alsoStarts)}, then the tab opens`
         : "Registered · opens the project, then the tab opens";
     case "clone":
-      return "Not there yet · clone the repository, then start it";
+      if (choice.alsoStarts === undefined) return "Not there yet · clone the repository, then start it";
+      return choice.alsoStarts.length > 0
+        ? `Not there yet · clones the repository and opens the project, which also starts its tabs on ${hostList(choice.alsoStarts)}, then the tab opens`
+        : "Not there yet · clones the repository and opens the project, then the tab opens";
   }
 }
 
@@ -350,13 +355,22 @@ export function confirmationText(copy: ConfirmationCopy): string {
  *  for: the daemon never reuses an existing folder, so when another checkout
  *  (often a separate project of the same repository) already has that name it
  *  clones into a suffixed one instead. The acknowledgement does not carry the
- *  path; the Machines page lists where the checkout went. */
-export function cloneHereCopy(hostname: string, gitRemote: string): ConfirmationCopy {
+ *  path; the Machines page lists where the checkout went.
+ *
+ *  `alsoStarts` is the choice's (`MachineChoice.alsoStarts`). Against a
+ *  server that records open states the new tab opens the project, which
+ *  starts every other connected machine that owns its tabs: the confirmation
+ *  says so and names them, before anything is cloned. Absent, the server
+ *  starts the clone's machine alone and nothing is added. */
+export function cloneHereCopy(hostname: string, gitRemote: string, alsoStarts?: string[]): ConfirmationCopy {
   const name = cloneInstanceName(gitRemote);
   return {
     title: `Clone this project onto ${hostname}?`,
     body: [
       `${hostname} clones ${gitRemote} into ~/apas_projects/${name} (auto-suffixed, as ${name}-2 and so on, if that folder exists) as another checkout of this project, with no new branch. The project then starts there and the new tab opens on ${hostname}.`,
+      ...(alsoStarts === undefined ? [] : [alsoStarts.length > 0
+        ? `The new tab opens the project, which also starts its tabs on ${hostList(alsoStarts)}.`
+        : "The new tab opens the project."]),
       "Cloning a large repository can take a few minutes.",
     ],
   };

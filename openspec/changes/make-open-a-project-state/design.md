@@ -155,6 +155,18 @@ project those too act as before the change (today's
 on a recorded project they are an Open or a Close, which is what their
 confirmations already describe.
 
+The closed row applies also when the named machine still has an instance
+attached (its stop is under way, or a close could not reach it): a tab
+request or a task launch there opens the project or is refused, and is never
+admitted into a project that stays recorded closed.
+A tab request that names no machine is judged as naming the machine of the
+instance it would go to. Opening through such a request takes the authority
+to set the state (Decision 6), so an account whose Open would be refused is
+refused here with the same answer. The chosen machine is then sent the start
+whether or not it owns a tab, because its stop may still be taking effect. A
+task chosen for a machine whose daemon is not connected fails as offline and
+records nothing.
+
 So on a not-recorded project every button of an older client does exactly
 what it did, an older "Start on \<host\>" can retry a machine of an open
 project, and the common single-machine case works as before. Only a client
@@ -215,8 +227,19 @@ re-reads the state, and:
 
 Open, Close, the tab request of Decision 10 and the recording paths of
 Decision 9 take the same lock, from reading the state to sending the last
-frame, so a follow step that read "closed" cannot send its stop after a
-later Open found the project running and sent nothing.
+frame, so the server's starts and stops for one project go out in the order
+the state changed.
+
+The lock orders what the server sends, not what a machine has finished. A
+daemon keeps reporting a project as running, and its instance stays
+attached, until the stop it was sent has been carried out, which can take up
+to 30 seconds. An Open that changes the record (from closed or from not
+recorded) therefore sends the start to every connected tab owner, also one
+that still reads as running: the daemon takes its frames in order and
+answers "already running" when nothing was stopping. Without this, a Close
+followed at once by an Open would leave the project recorded open and
+running nowhere. Opening a project that is already open sends nothing to a
+machine that runs it.
 
 Every server deploy makes every daemon register again. From the second
 deploy on, that is also a retry of each machine that had failed to start
@@ -260,6 +283,16 @@ registered.
   `open_state_set_by` and `open_state_machine_id` as they were, so a second
   account's retry does not take the first account's machines out of
   following. They change only through a close and a new open.
+- **The closer is replaced only by wider authority.** Closing a project a
+  request already closed leaves the recorded closer as it was, unless the
+  new requester may use every machine listing the project that the recorded
+  closer may use, and at least one more. So an owner's Close after a
+  member's makes the owner's machines follow, and a member's Close after the
+  owner's takes nothing out of following.
+- **A follow-start needs an active account.** The recorded opener must
+  still exist and be active when a machine registers. A suspended account's
+  open starts nothing later. A suspended account's close still stops
+  machines.
 
 One limit remains and is accepted: one recorded actor cannot stand for
 machines of two accounts. In a project whose tabs sit on machines of
@@ -337,7 +370,10 @@ there.
   creates the project's row records it open by that account, naming that
   machine. A `SessionStart` for a project that already has a row, as after
   "Clone here" or `apas register` joining by remote, records nothing.
-- Open and close are audited, with the actor and the machines asked.
+- Open and close are audited, with the actor and the machines asked. A start
+  or stop the follow step sends at a registration is audited too, with the
+  recorded actor, that machine and the source "registration"; a registration
+  that sends nothing writes nothing.
 
 ### 10. A tab that needs a machine started
 
@@ -452,7 +488,11 @@ deletion leaves local APAS configuration alone. Not done here.
   never sends `all_instances`, and the "Start on \<host\>" tests, are
   rewritten, not deleted without replacement.
 - [An older server after rollback] It ignores the columns and behaves as
-  before; a project left recorded closed is simply started by hand again.
+  before, so people start and stop projects by hand again while the recorded
+  states go stale. The next start of a server with this change would then
+  follow those stale states at every registration: start projects someone
+  stopped by hand, and stop projects someone started. The rollback therefore
+  clears the recorded states (Migration Plan).
 - [Scenario titles] OpenSpec keeps a modified requirement's scenario titles.
   "Start one machine from the Machines page", "A project that is not
   running" and "A project that is running" keep their titles with new
@@ -474,9 +514,21 @@ deletion leaves local APAS configuration alone. Not done here.
    bring machines in line as their daemons register again (Decision 5).
 
 Rollback: redeploy the previous web, then the previous server. The columns
-stay and are ignored. No stop is needed first, because nothing durable
-depends on the new server except the follow step, which simply no longer
-happens.
+stay and the older server ignores them. No stop is needed first, because
+nothing durable depends on the new server except the follow step, which
+simply no longer happens. **Clear the recorded states as part of every
+server rollback**, with the server stopped, also when the rollback is the
+deploy procedure's "restore the backed-up binary":
+
+```sql
+UPDATE projects SET open_state = NULL, open_state_set_by = NULL,
+  open_state_set_kind = NULL, open_state_set_at = NULL,
+  open_state_machine_id = NULL;
+```
+
+Every project is then not recorded again, as after the first deployment.
+Without this, the next deploy of a server with this change would start and
+stop machines from states recorded before the rollback.
 
 Smoke on the two-host harness before production: open with one machine
 offline and bring it back; close with one daemon frozen and release it;

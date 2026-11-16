@@ -48,6 +48,7 @@ export function ProjectPanel({
   userId,
   openState,
   onDeleted,
+  onDeletionUnconfirmed,
   usagePeriod,
   onUsagePeriod,
   profiles,
@@ -69,8 +70,12 @@ export function ProjectPanel({
   userId?: string | null;
   /** Where the project's Open / Closed comes from. */
   openState?: ClusterOpenStateSource;
-  /** The owner deleted the project and the server reported it done. */
+  /** The owner deleted the project and the server reported it done. It can
+   *  arrive after the Delete dialog, or this panel, is gone. */
   onDeleted?: (projectId: string) => void;
+  /** The Delete dialog closed without learning how an accepted deletion
+   *  went: the project list may be out of date. */
+  onDeletionUnconfirmed?: (projectId: string) => void;
   usagePeriod: UsagePeriod;
   onUsagePeriod: (value: UsagePeriod) => void;
   profiles: LaunchProfile[];
@@ -109,6 +114,7 @@ export function ProjectPanel({
           userId={userId}
           openState={openState}
           onDeleted={onDeleted}
+          onDeletionUnconfirmed={onDeletionUnconfirmed}
           usagePeriod={usagePeriod}
           onUsagePeriod={onUsagePeriod}
           profiles={profiles}
@@ -130,6 +136,7 @@ function ProjectDetail({
   userId,
   openState,
   onDeleted,
+  onDeletionUnconfirmed,
   usagePeriod,
   onUsagePeriod,
   profiles,
@@ -145,6 +152,7 @@ function ProjectDetail({
   userId?: string | null;
   openState?: ClusterOpenStateSource;
   onDeleted?: (projectId: string) => void;
+  onDeletionUnconfirmed?: (projectId: string) => void;
   usagePeriod: UsagePeriod;
   onUsagePeriod: (value: UsagePeriod) => void;
   profiles: LaunchProfile[];
@@ -205,6 +213,7 @@ function ProjectDetail({
           offlineTabOwnerHosts={open?.offlineTabOwnerHosts}
           onClose={() => setDeleteOpen(false)}
           onDeleted={onDeleted}
+          onUnconfirmedClose={onDeletionUnconfirmed}
         />
       )}
     </OverviewSection>

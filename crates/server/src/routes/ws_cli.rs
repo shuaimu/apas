@@ -378,8 +378,13 @@ pub(crate) async fn persist_pane_roster(state: &AppState, session_id: &Uuid) {
 /// The same reason is kept for the machine's part in the project, when a
 /// start the server asked of it is still pending: it then reads as not
 /// started, with this reason, instead of starting until the time limit.
+/// That is kept only for a machine whose daemon belongs to `user_id`, the
+/// account of the CLI that was refused. The machine id is the CLI's own
+/// claim, and a refused CLI of another account must not be able to replace
+/// what viewers are told of a machine it does not run on.
 fn refuse_waiting_panes(
     state: &AppState,
+    user_id: &Uuid,
     session_id: Uuid,
     project_id: &Uuid,
     machine_id: Option<Uuid>,
@@ -401,6 +406,9 @@ fn refuse_waiting_panes(
     state
         .sessions
         .refuse_instance_start(session_id, machine_id, &reason);
+    if state.sessions.daemon_owner(&machine_id) != Some(*user_id) {
+        return;
+    }
     let project_id = project_id.to_string();
     if state
         .sessions
@@ -1087,16 +1095,24 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                 // also served as the session id.
                                 let project_id = project_id.unwrap_or(session_id);
                                 // A `SessionStart` that creates the project's row is a
-                                // creation that starts it, and records it open. One for a
-                                // project the server already holds records nothing, so it
-                                // needs no open-state lock. Taken before the shared permit,
-                                // as everywhere.
+                                // creation that starts it, and records it open. One for an
+                                // active project the server already holds records nothing,
+                                // so it needs no open-state lock. A row that is not active
+                                // may be one a deletion is about to erase while this waits
+                                // for its permit: the project is then created again below,
+                                // so the lock is taken for it too. Taken before the shared
+                                // permit, as everywhere.
                                 let creating_open_state = match state
                                     .db
                                     .get_project(&project_id.to_string())
                                     .await
                                 {
-                                    Ok(Some(_)) => None,
+                                    Ok(Some(project))
+                                        if project.lifecycle()
+                                            == crate::db::ProjectLifecycle::Active =>
+                                    {
+                                        None
+                                    }
                                     _ => Some(
                                         state
                                             .sessions
@@ -1138,6 +1154,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                     );
                                     refuse_waiting_panes(
                                         &state,
+                                        &user_id,
                                         session_id,
                                         &project_id,
                                         machine_id,
@@ -1189,6 +1206,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                         // panes' requester is told only why.
                                         refuse_waiting_panes(
                                             &state,
+                                            &user_id,
                                             session_id,
                                             &project_id,
                                             machine_id,
@@ -1231,6 +1249,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                         );
                                         refuse_waiting_panes(
                                             &state,
+                                            &user_id,
                                             session_id,
                                             &project_id,
                                             machine_id,
@@ -3708,6 +3727,8 @@ mod instance_tests {
         let sessions = &harness.state.sessions;
         let (mut older, _) = connect_cli(&harness, false).await;
         start(&mut older, session_start(session, Uuid::new_v4(), HOST_A, Some(vec![pane(3)]))).await;
+        // The start goes to that machine's daemon, which is this account's.
+        let _zoo_006 = daemon(&harness, harness.user_id, m6, HOST_B);
         let crate::session::pane_launches::InstanceStartWait::Waiting {
             waiter,
             start: Some(_),
@@ -3751,6 +3772,174 @@ mod instance_tests {
             }
             other => panic!("expected the refusal, got {other:?}"),
         }
+    }
+
+    /// A connected daemon of `account` on `machine_id`, listing nothing.
+    fn daemon(
+        harness: &Harness,
+        account: Uuid,
+        machine_id: Uuid,
+        host: &str,
+    ) -> mpsc::Receiver<shared::ServerToDaemon> {
+        let (tx, rx) = mpsc::channel(16);
+        harness.state.sessions.register_daemon(
+            machine_id,
+            account,
+            tx,
+            shared::MachineInfo {
+                machine_id,
+                hostname: host.to_string(),
+                os: "linux".to_string(),
+                arch: "x86_64".to_string(),
+                daemon_version: None,
+                deepseek_backend: None,
+                last_seen: None,
+                providers: None,
+            },
+            Vec::new(),
+        );
+        rx
+    }
+
+    /// The machine id in a `SessionStart` is the CLI's own claim. A CLI of
+    /// an account with no access to a project, naming a machine of the
+    /// project's owner that is being started, is refused, and its refusal is
+    /// not kept as that machine's reason: the machine keeps reading as
+    /// starting, and a close still finds its start pending.
+    #[tokio::test]
+    async fn a_refused_cli_of_another_account_does_not_change_a_machines_pending_start() {
+        let harness = harness().await;
+        let session = Uuid::new_v4();
+        let m6 = Uuid::new_v4();
+        let sessions = &harness.state.sessions;
+        harness
+            .state
+            .db
+            .authorize_project_registration(&session.to_string(), &harness.user_id.to_string())
+            .await
+            .unwrap();
+        let _zoo_006 = daemon(&harness, harness.user_id, m6, HOST_B);
+        sessions.record_machine_start_asked(&session.to_string(), m6, Some(Uuid::new_v4()));
+
+        let stranger = Uuid::new_v4();
+        harness
+            .state
+            .db
+            .create_user(&crate::db::User {
+                id: stranger.to_string(),
+                email: format!("{stranger}@example.test"),
+                password_hash: "unused".to_string(),
+                created_at: None,
+                cluster_role: "user".to_string(),
+                account_status: "active".to_string(),
+            })
+            .await
+            .unwrap();
+        let token = encode(
+            &Header::default(),
+            &crate::routes::auth::Claims {
+                sub: stranger.to_string(),
+                exp: (chrono::Utc::now() + chrono::Duration::hours(1)).timestamp() as usize,
+                device_session_id: None,
+                token_kind: None,
+                credential_version: None,
+            },
+            &EncodingKey::from_secret(SECRET.as_bytes()),
+        )
+        .unwrap();
+        let (mut theirs, _) = connect_async(&harness.url).await.unwrap();
+        send(
+            &mut theirs,
+            CliToServer::Register {
+                token,
+                version: Some("26.11.0".to_string()),
+                capabilities: vec![
+                    shared::PROJECT_POLICY_CAPABILITY.to_string(),
+                    PROJECT_INSTANCES_CAPABILITY.to_string(),
+                ],
+            },
+        )
+        .await;
+        receive(&mut theirs, |message| matches!(message, ServerToCli::Registered { .. })).await;
+        send(&mut theirs, session_start(session, m6, HOST_B, Some(Vec::new()))).await;
+        receive(&mut theirs, |message| matches!(message, ServerToCli::SessionRejected { .. })).await;
+
+        assert!(
+            sessions
+                .machine_outcome(&session.to_string(), &m6)
+                .is_some_and(|outcome| outcome.is_start_pending()),
+            "the owner's machine is still being started"
+        );
+
+        // Called for the machine's own account, the refusal is kept.
+        crate::routes::ws_cli::refuse_waiting_panes(
+            &harness.state,
+            &harness.user_id,
+            session,
+            &session,
+            Some(m6),
+            Some(HOST_B),
+            "it cannot run beside the other machine",
+        );
+        assert_eq!(
+            sessions.machine_outcome(&session.to_string(), &m6),
+            Some(crate::session::open_state::MachineOutcome::NotStarted(format!(
+                "{HOST_B} started this project, but the server refused its instance: it cannot run beside the other machine"
+            )))
+        );
+    }
+
+    /// A deletion can erase a project's row while a `SessionStart` for it
+    /// waits for the project's permit. The project is then created again by
+    /// that `SessionStart`, as a creation that starts it, and is recorded
+    /// open by that account naming that machine, exactly as a project the
+    /// server had never heard of.
+    #[tokio::test]
+    async fn a_session_start_that_recreates_a_project_being_deleted_records_it_open() {
+        let harness = harness().await;
+        let session = Uuid::new_v4();
+        let project_id = session.to_string();
+        let m5 = Uuid::new_v4();
+        let owner = harness.user_id.to_string();
+        harness
+            .state
+            .db
+            .authorize_project_registration(&project_id, &owner)
+            .await
+            .unwrap();
+        assert!(harness
+            .state
+            .db
+            .begin_project_deletion(&owner, &project_id, &project_id)
+            .await
+            .unwrap());
+        assert_eq!(
+            open_state(&harness, session).await.lifecycle,
+            crate::db::ProjectLifecycle::Deleting
+        );
+
+        // The cleanup holds the project's gate for its whole attempt.
+        let cleanup = harness.state.project_deletion_guard(&project_id).await;
+        let (mut a, _) = connect_cli(&harness, true).await;
+        send(&mut a, session_start(session, m5, HOST_A, Some(vec![pane(3)]))).await;
+        // The handler has read the row, which is still there, and waits.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        harness
+            .state
+            .db
+            .delete_project_records(&project_id)
+            .await
+            .unwrap();
+        assert!(harness.state.db.get_project(&project_id).await.unwrap().is_none());
+        drop(cleanup);
+        receive(&mut a, |message| matches!(message, ServerToCli::ProjectPolicy { .. })).await;
+
+        let created = open_state(&harness, session).await;
+        assert_eq!(created.lifecycle, crate::db::ProjectLifecycle::Active);
+        assert_eq!(created.state, Some(shared::ProjectOpenState::Open));
+        assert_eq!(created.set_by_account(), Some(harness.user_id));
+        assert_eq!(created.set_kind, Some(shared::OpenStateSetKind::Request));
+        assert_eq!(created.stand_in_machine(), Some(m5));
     }
 
     /// A start without a roster changes nothing, an empty one removes only

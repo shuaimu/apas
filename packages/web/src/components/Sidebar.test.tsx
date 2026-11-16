@@ -506,6 +506,9 @@ describe("Sidebar project list", () => {
     fireEvent.click(within(dialog).getByRole("button", { name: "Cancel" }));
     expect(screen.queryByRole("dialog", { name: "Delete project" })).toBeNull();
     expect(fetchMock.mock.calls.length).toBe(callsBefore);
+    // The access dialog's own button is gone with it, so focus goes back to
+    // what opened that dialog, not to the top of the page.
+    expect(document.activeElement).toBe(screen.getByTitle("Manage project access"));
   });
 
   it("deletes through the shared dialog with one request, naming the machines stopped first", async () => {

@@ -188,12 +188,73 @@ describe("buildMachineChoices", () => {
     expect(result.showChoice).toBe(true);
     expect(result.defaultChoice?.machineId).toBe("zoo-005");
 
-    // A server that records no open state starts the chosen machine alone,
-    // and a clone is not an Open of anything yet.
+    // A server that records no open state starts the chosen machine alone.
     const older = model(input);
     expect(older.choices.every((choice) => choice.alsoStarts === undefined)).toBe(true);
-    const clone = model({ openStateSupported: true, machines: [machine("zoo-007")] });
-    expect(clone.choices.map((choice) => [choice.kind, choice.alsoStarts])).toEqual([["clone", undefined]]);
+  });
+
+  // "Clone here" ends in a tab request on a machine that is not running the
+  // project, and the server opens the project for that like for any other:
+  // every connected tab owner that is not running it starts. The choice
+  // carries those hosts so the step and the confirmation can name them.
+  it("says which tab owners start when a tab on a cloned machine opens the project", () => {
+    // What `buildProjectOpenModel(...).machines` holds for a closed project,
+    // and equally for one nobody has recorded that runs nowhere: tab owners
+    // that are not running it. zoo-006 is another account's machine, which
+    // this viewer does not list.
+    const idle = [
+      { machineId: "zoo-005", hostname: "zoo-005", part: "not_started", ownsTabs: true, connected: true },
+      { hostname: "zoo-006", part: "not_started", ownsTabs: true, connected: true },
+      { machineId: "mini", hostname: "mini", part: "not_started", ownsTabs: true, connected: false },
+      { machineId: "spare", hostname: "spare", part: "not_started", ownsTabs: false, connected: true },
+    ];
+    const result = model({
+      openStateSupported: true,
+      machines: [machine("laptop"), machine("zoo-005", { registered: true })],
+      projectMachines: idle,
+    });
+    expect(result.choices.map((choice) => [choice.hostname, choice.kind, choice.alsoStarts])).toEqual([
+      ["zoo-005", "registered", ["zoo-006"]],
+      ["laptop", "clone", ["zoo-005", "zoo-006"]],
+    ]);
+    // A clone is still never preselected.
+    expect(result.defaultChoice?.machineId).toBe("zoo-005");
+
+    // An open project that runs on its only tab owner: the tab still opens
+    // the project, and nothing else starts.
+    const running = model({
+      openStateSupported: true,
+      instances: [instance("zoo-005", "zoo-005", { primary: true })],
+      machines: [machine("laptop"), machine("zoo-005", { registered: true })],
+      projectMachines: [
+        { machineId: "zoo-005", hostname: "zoo-005", part: "running", ownsTabs: true, connected: true },
+      ],
+    });
+    expect(running.choices.find((choice) => choice.kind === "clone")?.alsoStarts).toEqual([]);
+    // No parts given: the clone is known to open the project, with nobody named.
+    const unnamed = model({ openStateSupported: true, machines: [machine("zoo-007")] });
+    expect(unnamed.choices.map((choice) => [choice.kind, choice.alsoStarts])).toEqual([["clone", []]]);
+
+    // A server that records no open state starts the cloned machine alone.
+    const older = model({ machines: [machine("laptop")], projectMachines: idle });
+    expect(older.choices.map((choice) => [choice.kind, choice.alsoStarts])).toEqual([["clone", undefined]]);
+  });
+
+  it("does not name a machine whose part the server did not state among those a tab starts", () => {
+    // From another entry's `other_hosts` alone, a connected tab owner of an
+    // open project that is not running it may be starting already.
+    const result = model({
+      openStateSupported: true,
+      machines: [machine("laptop"), machine("zoo-005", { registered: true })],
+      projectMachines: [
+        { machineId: "zoo-005", hostname: "zoo-005", part: "not_started", ownsTabs: true, connected: true },
+        { hostname: "zoo-006", part: "not_started", ownsTabs: true, connected: true, partUnconfirmed: true },
+      ],
+    });
+    expect(result.choices.map((choice) => [choice.hostname, choice.alsoStarts])).toEqual([
+      ["zoo-005", []],
+      ["laptop", ["zoo-005"]],
+    ]);
   });
 
   it("keeps the step hidden when the only eligible machine already runs the project", () => {

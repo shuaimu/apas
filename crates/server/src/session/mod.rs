@@ -2088,6 +2088,9 @@ impl SessionManager {
                 )
                 .await
             {
+                // A tab still waiting for this machine's instance fails now
+                // and says why, as when a close stops the machine.
+                self.end_tab_starts_for_stop(project_id, &machine_id);
                 sent += 1;
             }
         }

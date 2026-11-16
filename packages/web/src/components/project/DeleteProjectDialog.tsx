@@ -27,9 +27,25 @@ export interface DeleteProjectDialogProps {
   offlineTabOwnerHosts?: string[];
   /** Cancel, Escape, a press on the backdrop, and the end of a deletion. */
   onClose: () => void;
+  /** Where focus goes when the dialog closes, when that is not the element
+   *  that had it as the dialog opened: another dialog led here and closed
+   *  itself in the same step, so its button is gone, and focus belongs to
+   *  what opened that dialog. Read when the dialog mounts. */
+  returnFocusTo?: HTMLElement | null;
   /** The server reported the deletion done and the project was dropped from
-   *  the lists. Called before `onClose`, and only while the dialog is open. */
+   *  the lists. Called before `onClose` while the dialog is open, and also
+   *  after the dialog was closed during "Deleting…": the deletion goes on
+   *  without the dialog, and a caller that keeps a list of its own must
+   *  still drop the project from it. It is then the handler of the dialog's
+   *  last render, so it must not rely on what that render saw (another
+   *  project may be selected by now). */
   onDeleted?: (projectId: string) => void;
+  /** The server accepted the deletion, and the wait for it ended without an
+   *  answer. Called once, when the dialog closes after that, or at once when
+   *  it was closed already: the deletion may have finished since, so a
+   *  caller that keeps a list of its own loads it again. Like `onDeleted`,
+   *  it can run after the dialog is gone. */
+  onUnconfirmedClose?: (projectId: string) => void;
   /** How often to ask whether the deletion is done; the shared default
    *  otherwise. */
   deletionWait?: DeletionWaitOptions;
@@ -65,7 +81,9 @@ export function DeleteProjectDialog({
   stoppedFirstHosts = [],
   offlineTabOwnerHosts = [],
   onClose,
+  returnFocusTo,
   onDeleted,
+  onUnconfirmedClose,
   deletionWait,
 }: DeleteProjectDialogProps) {
   const token = useStore((state) => state.token);
@@ -76,19 +94,37 @@ export function DeleteProjectDialog({
   const input = useRef<HTMLInputElement | null>(null);
   const mounted = useRef(true);
   const opener = useRef<HTMLElement | null>(null);
+  // As given when the dialog opened.
+  const returnTo = useRef(returnFocusTo ?? null);
   // Set with the click, before any state lands, so two quick presses cannot
   // send two requests.
   const requestOut = useRef(false);
+  // The deletion outlives the dialog: closing it during "Deleting…" stops
+  // nothing. These are read when the wait ends, which can be after the
+  // dialog is gone, so they hold the handlers of its last render.
+  const deletedHandler = useRef(onDeleted);
+  const unconfirmedHandler = useRef(onUnconfirmedClose);
+  useEffect(() => {
+    deletedHandler.current = onDeleted;
+    unconfirmedHandler.current = onUnconfirmedClose;
+  }, [onDeleted, onUnconfirmedClose]);
+  // The project whose wait gave up while the dialog was open; said to the
+  // caller when the dialog closes.
+  const unconfirmed = useRef<string | null>(null);
 
   useEffect(() => {
     mounted.current = true;
     // Kept across a development double-mount, which would otherwise take the
     // dialog's own input for the opener.
-    opener.current ??= document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    opener.current ??= returnTo.current
+      ?? (document.activeElement instanceof HTMLElement ? document.activeElement : null);
     input.current?.focus();
     return () => {
       mounted.current = false;
       opener.current?.focus?.();
+      const waitedFor = unconfirmed.current;
+      unconfirmed.current = null;
+      if (waitedFor) unconfirmedHandler.current?.(waitedFor);
     };
   }, []);
 
@@ -123,8 +159,13 @@ export function DeleteProjectDialog({
       await waitForProjectDeletion(project.id, token, deletionWait);
     } catch (cause) {
       // The server accepted the deletion and goes on with it. The request is
-      // not sent again.
-      if (!mounted.current) return;
+      // not sent again. The caller hears of it when the dialog closes, or
+      // now when it is closed already.
+      if (!mounted.current) {
+        unconfirmedHandler.current?.(project.id);
+        return;
+      }
+      unconfirmed.current = project.id;
       setPhase("unconfirmed");
       setError(cause instanceof Error && cause.message ? cause.message : "Failed to check deletion status");
       return;
@@ -134,8 +175,9 @@ export function DeleteProjectDialog({
     const store = useStore.getState();
     store.forgetProject(project.id);
     store.listSessions();
+    // Also when the dialog was closed meanwhile: only closing it is skipped.
+    deletedHandler.current?.(project.id);
     if (!mounted.current) return;
-    onDeleted?.(project.id);
     onClose();
   };
 

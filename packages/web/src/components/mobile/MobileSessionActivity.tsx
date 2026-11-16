@@ -905,7 +905,7 @@ export function MobileSessionActivity({ connected, onBack, onReconnect }: Mobile
         setActionError("This project has no repository to clone.");
         return;
       }
-      setCloneTarget({ choice: target, option, copy: cloneHereCopy(target.hostname, gitRemote) });
+      setCloneTarget({ choice: target, option, copy: cloneHereCopy(target.hostname, gitRemote, target.alsoStarts) });
       return;
     }
     if (!target && machineChoices.showChoice) {

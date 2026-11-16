@@ -23,8 +23,8 @@ use shared::{
 };
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
-use tokio::sync::OwnedMutexGuard;
+use std::time::{Duration, Instant};
+use tokio::sync::{mpsc, OwnedMutexGuard};
 use uuid::Uuid;
 
 /// What became of the last start or stop the server asked of one machine
@@ -60,6 +60,13 @@ impl MachineOutcome {
     /// machine too.
     pub fn is_start_pending(&self) -> bool {
         matches!(self, Self::StartAsked { .. } | Self::StartAccepted { .. })
+    }
+
+    /// [`Self::is_start_pending`], and the start was sent less than `limit`
+    /// ago: the machine still reads as starting.
+    pub fn is_start_pending_within(&self, limit: Duration) -> bool {
+        self.pending_since()
+            .is_some_and(|asked_at| asked_at.elapsed() < limit)
     }
 
     /// When the start still pending was sent.
@@ -147,6 +154,12 @@ pub(crate) fn start_unanswered_reason(host: &str) -> String {
     format!("{host} did not answer the request to start this project.")
 }
 
+/// Why a tab waiting for `host`'s instance fails when the project is closed
+/// or stopped before that instance attached.
+pub(crate) fn closed_before_start_reason(host: &str) -> String {
+    format!("The project was closed before it started on {host}.")
+}
+
 /// Why a machine reads as not started when its daemon answered that it
 /// started the project and the machine was never seen running it.
 pub(crate) fn start_not_seen_reason(host: &str) -> String {
@@ -170,6 +183,10 @@ pub(super) struct OpenStateRuntime {
     /// By account: the projects it holds a role in, among those listed on
     /// machines it does not own, as its last machine list found them.
     readers: DashMap<Uuid, HashSet<String>>,
+    /// Run once by the next report, between deriving its view and queuing
+    /// it: where a test lets a second report of the project begin.
+    #[cfg(test)]
+    after_view_derived: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 impl SessionManager {
@@ -179,7 +196,10 @@ impl SessionManager {
     /// other path that records the state, and the follow step at a daemon's
     /// registration hold it from reading the recorded state to sending their
     /// last frame. So a step that read "closed" cannot send its stop after a
-    /// later open found the project running and sent nothing.
+    /// later open. The lock orders what the server sends, not what a daemon
+    /// has done with it: a machine still reads as running while a stop sent
+    /// to it takes effect, which is why an open that changes the record
+    /// sends its start to such a machine too.
     /// `AppState::project_operation_guard` is a shared permit and serializes
     /// none of this.
     ///
@@ -399,9 +419,16 @@ impl SessionManager {
 
     /// Drop everything held for a project that has been deleted: its lock,
     /// its machines' outcomes and what viewers were told of it.
+    ///
+    /// The lock is dropped only while nobody holds it or waits for it. A
+    /// task that took it before this call keeps the same mutex as whoever
+    /// asks next; removing it under that task would hand the next one a new
+    /// mutex, and the two would run at once.
     pub fn forget_project_open_state(&self, project_id: &str) {
         self.drop_project_outcomes(project_id);
-        self.open_state.locks.remove(project_id);
+        self.open_state
+            .locks
+            .remove_if(project_id, |_, lock| Arc::strong_count(lock) == 1);
         self.open_state.bases.remove(project_id);
         self.open_state.basis_locks.remove(project_id);
         self.open_state
@@ -409,6 +436,24 @@ impl SessionManager {
             .lock()
             .expect("open-state reports poisoned")
             .remove(project_id);
+    }
+
+    /// `StopProjectCli` for `project_id` was sent to `machine_id`: a tab
+    /// waiting for a start of its instance that the server sent fails now,
+    /// with [`closed_before_start_reason`]. Its daemon may already have
+    /// answered that the runtime started, so nothing else would end the wait
+    /// before its time limit, and a tab request made meanwhile would join
+    /// that wait instead of asking the machine to start again.
+    pub fn end_tab_starts_for_stop(&self, project_id: &str, machine_id: &Uuid) {
+        let host = self
+            .machine_hostname(machine_id)
+            .map(|host| host.trim().to_string())
+            .filter(|host| !host.is_empty())
+            .unwrap_or_else(|| "that machine".to_string());
+        let reason = closed_before_start_reason(&host);
+        for session_id in self.project_session_ids(project_id) {
+            self.refuse_instance_start(session_id, *machine_id, &reason);
+        }
     }
 
     pub fn machine_outcome(&self, project_id: &str, machine_id: &Uuid) -> Option<MachineOutcome> {
@@ -442,13 +487,27 @@ impl SessionManager {
     /// listing the project under the host it is attributed to, or that host
     /// by name when none does. While no machine owns a tab, `stand_in` is
     /// the one owner. Sorted, machines the server knows by id first.
+    ///
+    /// `hosts` are the accounts whose machines are the project's (its owner
+    /// and every account whose cluster hosts it). When given, a host name
+    /// resolves only to their machines: another account's checkout can carry
+    /// the same project id on a machine of the same name, and that machine
+    /// owns none of these tabs. A name only such a machine carries stays a
+    /// name.
     pub(crate) fn tab_owners_at(
         &self,
         project_id: &str,
         places: &[TabPlace],
         stand_in: Option<Uuid>,
+        hosts: Option<&HashSet<Uuid>>,
     ) -> Vec<TabOwner> {
-        let listing = self.machines_listing_project(project_id);
+        let mut listing = self.machines_listing_project(project_id);
+        if let Some(hosts) = hosts {
+            listing.retain(|machine_id| {
+                self.daemon_owner(machine_id)
+                    .is_some_and(|account| hosts.contains(&account))
+            });
+        }
         // The name its daemon registered under, else the one the roster holds.
         let host_of = |machine_id: &Uuid, recorded: Option<&str>| {
             self.machine_hostname(machine_id)
@@ -614,7 +673,10 @@ impl SessionManager {
     ///
     /// Listed are the machines that own tabs, the machines that run the
     /// project (an instance attached, or a connected daemon of one of the
-    /// project's accounts reporting it), and the machines being started.
+    /// project's accounts reporting it), the machines being started, and
+    /// for an open project the machines of the project's accounts whose
+    /// start was refused, failed or was never answered, whether or not they
+    /// own a tab and also while the tab owners are unknown.
     /// Each one's part, by the recorded state:
     ///
     /// - **open**: running; else waiting while its daemon is not connected;
@@ -633,7 +695,9 @@ impl SessionManager {
             .map(|basis| basis.clone())?;
         let session_ids = self.project_session_ids(project_id);
         let mut owners = match self.project_tab_places(&session_ids, &basis) {
-            Some(places) => self.tab_owners_at(project_id, &places, basis.stand_in),
+            Some(places) => {
+                self.tab_owners_at(project_id, &places, basis.stand_in, Some(&basis.hosts))
+            }
             None => Vec::new(),
         };
         // An untagged tab is attributed to a host by name, and another
@@ -683,8 +747,22 @@ impl SessionManager {
                     .is_some_and(|asked_at| asked_at.elapsed() < limit)
         };
 
-        // Tab owners first, then every other machine that runs the project
-        // or is being started for it.
+        // A machine of the project that an open project's start did not
+        // bring up: it was refused or failed, or its start was never
+        // answered within the time limit. It is listed with that reason
+        // whether or not it owns a tab, which is also how the machine an
+        // open named is reported while the project has no roster yet.
+        let open = basis.state == Some(ProjectOpenState::Open);
+        let failed_start = |machine_id: &Uuid| {
+            open && outcomes.get(machine_id).is_some_and(|outcome| {
+                matches!(outcome, MachineOutcome::NotStarted(_)) || outcome.is_start_pending()
+            }) && self
+                .daemon_owner(machine_id)
+                .is_some_and(|owner| basis.hosts.contains(&owner))
+        };
+
+        // Tab owners first, then every other machine that runs the project,
+        // is being started for it, or was not started for an open one.
         let mut listed: Vec<(Option<Uuid>, String, bool)> = owners
             .iter()
             .map(|owner| (owner.machine_id, owner.hostname.clone(), true))
@@ -697,7 +775,7 @@ impl SessionManager {
             .chain(
                 outcomes
                     .keys()
-                    .filter(|machine_id| starting(machine_id))
+                    .filter(|machine_id| starting(machine_id) || failed_start(machine_id))
                     .copied(),
             )
             .filter(|machine_id| {
@@ -774,7 +852,7 @@ impl SessionManager {
                         (MachinePart::WaitingOffline, None)
                     } else if is_starting {
                         (MachinePart::Starting, None)
-                    } else if owns_tabs {
+                    } else if owns_tabs || machine_id.is_some_and(|id| failed_start(&id)) {
                         (MachinePart::NotStarted, not_started_reason())
                     } else {
                         continue;
@@ -832,43 +910,65 @@ impl SessionManager {
 
     /// [`Self::report_project_open_state`]; `machine_lists` false leaves the
     /// machine lists to a caller that is about to send them itself.
+    ///
+    /// Reports are made one at a time, from deriving the view to queuing
+    /// its frames: two of one project that ran side by side could queue the
+    /// older view last, and nothing would correct it, since the next report
+    /// would find the newer view already told. A frame a viewer's full queue
+    /// did not take is not counted as told either: the next report sends the
+    /// complete frame again.
     pub(super) fn report_open_state_change(&self, project_id: &str, machine_lists: bool) {
-        let Some(view) = self.project_open_view(project_id) else {
-            return;
-        };
         {
+            // Held from deriving the view to queuing the last frame. Deriving
+            // takes only short synchronous locks and never this one, and no
+            // caller holds one of those when it reports.
             let mut reported = self
                 .open_state
                 .reported
                 .lock()
                 .expect("open-state reports poisoned");
+            let Some(view) = self.project_open_view(project_id) else {
+                return;
+            };
+            #[cfg(test)]
+            self.run_after_view_derived();
             if reported.get(project_id) == Some(&view) {
                 return;
             }
             reported.insert(project_id.to_string(), view.clone());
-        }
-        let mut viewers: Vec<Uuid> = Vec::new();
-        for session_id in self.project_session_ids(project_id) {
-            if let Some(session) = self.sessions.get(&session_id) {
-                for connection_id in &session.web_connection_ids {
-                    if !viewers.contains(connection_id) {
-                        viewers.push(*connection_id);
+            let mut viewers: Vec<Uuid> = Vec::new();
+            for session_id in self.project_session_ids(project_id) {
+                if let Some(session) = self.sessions.get(&session_id) {
+                    for connection_id in &session.web_connection_ids {
+                        if !viewers.contains(connection_id) {
+                            viewers.push(*connection_id);
+                        }
                     }
                 }
             }
-        }
-        let frame = view.frame(project_id);
-        for connection_id in viewers {
-            if !self.web_supports_capability(&connection_id, shared::PROJECT_OPEN_STATE_CAPABILITY)
-            {
-                continue;
+            let frame = view.frame(project_id);
+            let mut dropped = false;
+            for connection_id in viewers {
+                if !self
+                    .web_supports_capability(&connection_id, shared::PROJECT_OPEN_STATE_CAPABILITY)
+                {
+                    continue;
+                }
+                let sender = self
+                    .web_senders
+                    .get(&connection_id)
+                    .map(|sender| sender.clone());
+                if let Some(sender) = sender {
+                    if let Err(mpsc::error::TrySendError::Full(_)) = sender.try_send(frame.clone())
+                    {
+                        dropped = true;
+                    }
+                }
             }
-            let sender = self
-                .web_senders
-                .get(&connection_id)
-                .map(|sender| sender.clone());
-            if let Some(sender) = sender {
-                let _ = sender.try_send(frame.clone());
+            if dropped {
+                // That viewer was not told. Forgetting what was told makes
+                // the next report send the whole frame again, to everyone.
+                reported.remove(project_id);
             }
         }
         if machine_lists {
@@ -882,6 +982,30 @@ impl SessionManager {
             for owner in owners {
                 self.broadcast_machines_update_for_user(&owner);
             }
+        }
+    }
+
+    /// Have the next report run `hook` once it has derived its view and
+    /// before it queues it.
+    #[cfg(test)]
+    pub(crate) fn after_next_view_derived(&self, hook: impl FnOnce() + Send + 'static) {
+        *self
+            .open_state
+            .after_view_derived
+            .lock()
+            .expect("report hook poisoned") = Some(Box::new(hook));
+    }
+
+    #[cfg(test)]
+    fn run_after_view_derived(&self) {
+        let hook = self
+            .open_state
+            .after_view_derived
+            .lock()
+            .expect("report hook poisoned")
+            .take();
+        if let Some(hook) = hook {
+            hook();
         }
     }
 
@@ -1001,7 +1125,6 @@ impl SessionManager {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::time::Duration;
 
     /// The lock is exclusive per project: a second holder waits for the
     /// first, and another project's lock is not involved.
@@ -1033,6 +1156,47 @@ mod tests {
             .expect("the waiter got the lock")
             .unwrap();
         assert_eq!(entered.load(Ordering::SeqCst), 1);
+    }
+
+    /// Forgetting a deleted project does not take its lock from under a
+    /// task that holds it: whoever asks next waits for that same lock, and
+    /// never runs beside its holder. The lock is dropped once nobody holds
+    /// it or waits for it.
+    #[tokio::test]
+    async fn forgetting_a_project_keeps_a_lock_that_is_held() {
+        let manager = Arc::new(SessionManager::new());
+        let held = manager.project_open_state_guard("p").await;
+        manager.forget_project_open_state("p");
+        let entered = Arc::new(AtomicUsize::new(0));
+        let waiting = {
+            let manager = manager.clone();
+            let entered = entered.clone();
+            tokio::spawn(async move {
+                let _guard = manager.project_open_state_guard("p").await;
+                entered.fetch_add(1, Ordering::SeqCst);
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            entered.load(Ordering::SeqCst),
+            0,
+            "the next holder waits for the lock that was held"
+        );
+        // Forgetting again while one holds it and one waits changes nothing.
+        manager.forget_project_open_state("p");
+        assert!(manager.open_state.locks.contains_key("p"));
+        drop(held);
+        tokio::time::timeout(Duration::from_secs(5), waiting)
+            .await
+            .expect("the waiter got the lock")
+            .unwrap();
+        assert_eq!(entered.load(Ordering::SeqCst), 1);
+
+        manager.forget_project_open_state("p");
+        assert!(
+            !manager.open_state.locks.contains_key("p"),
+            "nobody holds it: it is dropped"
+        );
     }
 
     #[test]

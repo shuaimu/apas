@@ -429,6 +429,61 @@ describe("machine choice presentation", () => {
   });
 });
 
+describe("a clone choice that opens the project", () => {
+  const input = {
+    projectId: PROJECT,
+    instances: [],
+    // The laptop does not have the project; zoo-005 and zoo-006 own its tabs.
+    machines: [machine(ZOO5, "zoo-005"), machine(ZOO6, "zoo-006"), machine(LAPTOP, "laptop", { registered: false })],
+    instancesSupported: true,
+    canClone: true,
+    projectMachines: [
+      { machineId: ZOO5, hostname: "zoo-005", part: "not_started", ownsTabs: true, connected: true },
+      { machineId: ZOO6, hostname: "zoo-006", part: "not_started", ownsTabs: true, connected: true },
+    ],
+  };
+  const cloneOf = (model: ReturnType<typeof buildMachineChoices>) =>
+    model.choices.find((choice) => choice.kind === "clone")!;
+
+  it("says so in the machine step and names the machines whose tabs start", () => {
+    const model = buildMachineChoices({ ...input, openStateSupported: true });
+    expect(groupMachineChoices(model.choices).map((group) => [group.label, group.choices.map((choice) => choice.hostname)]))
+      .toEqual([
+        ["Opens the project", ["zoo-005", "zoo-006"]],
+        ["Clone here", ["laptop"]],
+      ]);
+    expect(machineChoiceDetail(cloneOf(model))).toBe(
+      "Not there yet · clones the repository and opens the project, which also starts its tabs on zoo-005 and zoo-006, then the tab opens",
+    );
+
+    // Nothing else to start: it still says the project is opened.
+    const alone = buildMachineChoices({ ...input, openStateSupported: true, projectMachines: [] });
+    expect(machineChoiceDetail(cloneOf(alone)))
+      .toBe("Not there yet · clones the repository and opens the project, then the tab opens");
+
+    // An older server starts the cloned machine alone, and the line is what
+    // it was.
+    const older = buildMachineChoices(input);
+    expect(machineChoiceDetail(cloneOf(older))).toBe("Not there yet · clone the repository, then start it");
+  });
+
+  it("says so in the confirmation, before anything is cloned", () => {
+    const model = buildMachineChoices({ ...input, openStateSupported: true });
+    const copy = cloneHereCopy("laptop", "github.com/example/chiral-network", cloneOf(model).alsoStarts);
+    expect(copy.title).toBe("Clone this project onto laptop?");
+    expect(copy.body).toHaveLength(3);
+    expect(copy.body[1]).toBe("The new tab opens the project, which also starts its tabs on zoo-005 and zoo-006.");
+    expect(copy.body[2]).toBe("Cloning a large repository can take a few minutes.");
+
+    expect(cloneHereCopy("laptop", "github.com/example/chiral-network", []).body[1])
+      .toBe("The new tab opens the project.");
+    // An older server: nothing about opening, as before.
+    const older = cloneHereCopy("laptop", "github.com/example/chiral-network");
+    expect(older.body).toHaveLength(2);
+    expect(confirmationText(older)).not.toContain("opens the project");
+  });
+});
+
 describe("launchStatus", () => {
   function request(overrides: Partial<AddPaneRequest>): AddPaneRequest {
     return {

@@ -143,6 +143,23 @@ export default function MachinesPage() {
   const [projectNotice, setProjectNotice] = useTimedNotice();
   const latestProjectRequest = useRef<string | null>(null);
   const pendingSelection = useRef<string | null>(null);
+  // A deletion's end can be reported after this page is gone. From then on
+  // it has no list to bring up to date, and the address is another page's.
+  const mounted = useRef(false);
+  useEffect(() => {
+    mounted.current = true;
+    return () => { mounted.current = false; };
+  }, []);
+  // Deletions the server accepted whose end the Delete dialog did not hear
+  // of: the project, and the cluster whose list has it.
+  const unconfirmedDeletions = useRef(new Map<string, string>());
+  // What the page holds now, for what runs after a wait or after the Delete
+  // dialog is gone: the selection, the view and the cluster may have changed.
+  const pageNow = useRef<{
+    selectedClusterId: string;
+    closeGoneProject: (projectId: string) => void;
+    loadCluster: () => Promise<ClusterProject[] | null>;
+  } | null>(null);
 
   const [requestedView, setRequestedView] = useState<ClusterView>("machines");
   const [createOpen, setCreateOpen] = useState(false);
@@ -293,7 +310,9 @@ export default function MachinesPage() {
   // Only the newest load may write its answers: a reload after a write and a
   // cluster switch can overlap.
   const loadGeneration = useRef(0);
-  const loadCluster = useCallback(async () => {
+  // Answers with the cluster's projects as just loaded, or `null` when the
+  // load failed or a newer one took over.
+  const loadCluster = useCallback(async (): Promise<ClusterProject[] | null> => {
     const generation = ++loadGeneration.current;
     const current = () => generation === loadGeneration.current;
     const clusterId = selectedClusterId;
@@ -309,10 +328,22 @@ export default function MachinesPage() {
         api<ClusterPolicy>(policyPath),
         api<LaunchProfile[]>("/cluster/launch-profiles"),
       ]);
-      if (!current()) return;
+      if (!current()) return null;
       setClusterProjects(projectPage.items);
       setProjectsLoad("loaded");
       setProjectsLoadedFor(clusterId);
+      // A deletion nobody reported done is over once its cluster's list no
+      // longer has the project, whatever loaded that list. Another cluster's
+      // list never had it and says nothing.
+      for (const [projectId, listedIn] of unconfirmedDeletions.current) {
+        if (projectPage.items.some((project) => project.id === projectId)) {
+          unconfirmedDeletions.current.set(projectId, clusterId);
+        } else if (listedIn === clusterId) {
+          unconfirmedDeletions.current.delete(projectId);
+          // The load may come back after the page is gone; see `mounted`.
+          if (mounted.current) pageNow.current?.closeGoneProject(projectId);
+        }
+      }
       setClusterPolicy(policy);
       setPolicyLoad("loaded");
       setProfiles(launchProfiles.filter((profile) => !isRetiredLaunchProfileKey(profile.key)));
@@ -329,7 +360,7 @@ export default function MachinesPage() {
           api<unknown>("/cluster/members"),
           api<ClusterUsageReport>("/cluster/usage?limit=200"),
         ]);
-        if (!current()) return;
+        if (!current()) return null;
         setAudit(auditPage.items || []);
         setAuditLoad("loaded");
         setClusterMembers(Array.isArray(memberRows) ? memberRows as ClusterMembership[] : []);
@@ -338,8 +369,9 @@ export default function MachinesPage() {
         setUsageLoad("loaded");
       }
       setPageError(null);
+      return projectPage.items;
     } catch (cause) {
-      if (!current()) return;
+      if (!current()) return null;
       const failed = (state: LoadState): LoadState => state === "loading" ? "failed" : state;
       setProjectsLoad(failed);
       setPolicyLoad(failed);
@@ -347,6 +379,7 @@ export default function MachinesPage() {
       setMembersLoad(failed);
       setUsageLoad(failed);
       setPageError(message(cause));
+      return null;
     }
   }, [api, selectedClusterId, sharedView]);
 
@@ -420,7 +453,8 @@ export default function MachinesPage() {
     selectProject(pending);
   }, [clustersResolved, projectsLoad, projectsLoadedFor, selectedClusterId, selectProject]);
 
-  const clearProject = () => {
+  // Closes the selected project's panel. The address is not touched.
+  const clearSelection = () => {
     latestProjectRequest.current = null;
     setSelectedId(null);
     setSelected(null);
@@ -428,8 +462,59 @@ export default function MachinesPage() {
     setProjectError(null);
     setProjectNotice(null);
     setDetailLoading(false);
+  };
+
+  const clearProject = () => {
+    clearSelection();
     writeUrl("projects", null);
   };
+
+  // A project that is gone keeps no panel; another selection stays. The
+  // address names the selected project only while the Projects view shows,
+  // so it is written only then.
+  const closeGoneProject = (projectId: string) => {
+    if (selectedId !== projectId) return;
+    clearSelection();
+    if (view === "projects") writeUrl("projects", null);
+  };
+
+  useEffect(() => {
+    pageNow.current = { selectedClusterId, closeGoneProject, loadCluster };
+  });
+
+  // The end of a deletion can arrive after its dialog is gone: the dialog
+  // was closed during "Deleting…", and another project, another view or
+  // another cluster may show by then.
+  const handleProjectDeleted = useCallback((projectId: string) => {
+    if (!mounted.current) return;
+    unconfirmedDeletions.current.delete(projectId);
+    pageNow.current?.closeGoneProject(projectId);
+    listMachines();
+    void pageNow.current?.loadCluster();
+  }, [listMachines]);
+  // The dialog stopped learning how an accepted deletion went. It may have
+  // finished since, and this list is loaded over HTTP only when asked: load
+  // it now, and again when the server reports the project gone. The delete
+  // request itself is never sent again.
+  const handleDeletionUnconfirmed = useCallback((projectId: string) => {
+    const now = pageNow.current;
+    if (!mounted.current || !now) return;
+    unconfirmedDeletions.current.set(projectId, now.selectedClusterId);
+    void now.loadCluster();
+  }, []);
+  // The server says once, on the socket, that a deletion is done, and the
+  // store then forgets the project.
+  useEffect(() => useStore.subscribe((state, previous) => {
+    if (state.projectForgets === previous.projectForgets) return;
+    const forgotten = [...unconfirmedDeletions.current.keys()].some((projectId) =>
+      (state.projectForgets[projectId] ?? 0) > (previous.projectForgets[projectId] ?? 0));
+    if (forgotten) void pageNow.current?.loadCluster();
+  }), []);
+  // A page that was not connected then missed it, and asks when it is
+  // connected again.
+  useEffect(() => {
+    if (connected && unconfirmedDeletions.current.size > 0) void pageNow.current?.loadCluster();
+  }, [connected]);
 
   const selectView = (next: ClusterView) => {
     setRequestedView(next);
@@ -634,11 +719,8 @@ export default function MachinesPage() {
               selectedId={selectedId}
               onSelect={selectProject}
               onClear={clearProject}
-              onDeleted={() => {
-                clearProject();
-                listMachines();
-                void loadCluster();
-              }}
+              onDeleted={handleProjectDeleted}
+              onDeletionUnconfirmed={handleDeletionUnconfirmed}
               detail={selected}
               detailUsage={selectedUsage}
               detailLoading={detailLoading}

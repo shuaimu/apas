@@ -155,6 +155,14 @@ describe("machinePartLabel", () => {
     expect(machinePartLabel({ hostname: "laptop" }, open)).toBe("No tabs here");
   });
 
+  it("claims neither a start nor a failure for a part the server did not state", () => {
+    const inferred = { part: "not_started" as const, hostname: "zoo-006", partUnconfirmed: true };
+    expect(machinePartLabel(inferred, open)).toBe("Not running yet");
+    // Outside an open project the machine was asked nothing.
+    expect(machinePartLabel(inferred, closed)).toBe("Not running");
+    expect(machinePartLabel(inferred, notRecorded)).toBe("Not running");
+  });
+
   it("never words a tab owner of a closed or unrecorded project as a failure", () => {
     expect(machinePartLabel({ part: "not_started", hostname: "zoo-006" }, open)).toBe("Not started");
     expect(machinePartLabel({ part: "not_started", hostname: "zoo-006" }, closed)).toBe("Not running");
@@ -572,6 +580,60 @@ describe("buildProjectOpenModel", () => {
       ]);
     });
 
+    // `other_hosts` says "running" only of a machine that runs the project:
+    // one that was just asked to start arrives exactly like one that failed.
+    it("does not say another account's machine failed to start, nor offer to open again for it", () => {
+      const result = model({
+        machines: [machine(ZOO5, "zoo-005", {
+          isRunning: true,
+          openState: "open",
+          part: "running",
+          otherHosts: [{ hostname: "zoo-006", connected: true, running: false, ownsTabs: true }],
+        })],
+        fromMachineId: ZOO5,
+      });
+      expect(result.machines.map((entry) => [entry.hostname, entry.part, entry.label, entry.partUnconfirmed === true])).toEqual([
+        ["zoo-005", "running", "Running", false],
+        ["zoo-006", "not_started", "Not running yet", true],
+      ]);
+      expect(result.openAction).toBeUndefined();
+      expect(result.closeAction?.kind).toBe("close");
+      expect(result.notice).toEqual([expect.objectContaining({
+        hostname: "zoo-006",
+        kind: "not_running_yet",
+        text: "zoo-006 is not running this project yet.",
+      })]);
+    });
+
+    it("keeps Open again for a machine whose part the server stated, without naming the unstated one", () => {
+      const result = model({
+        machines: [machine(ZOO5, "zoo-005", {
+          openState: "open",
+          part: "not_started",
+          partReason: "zoo-005 could not start the project: the checkout is missing.",
+          otherHosts: [{ hostname: "zoo-006", connected: true, running: false, ownsTabs: true }],
+        })],
+        fromMachineId: ZOO5,
+      });
+      expect(result.openAction).toMatchObject({ kind: "open_again", label: "Open again" });
+      expect(result.openAction?.confirmation.body).toEqual(["Its tabs start on zoo-005."]);
+      expect(result.machines.find((entry) => entry.hostname === "zoo-006")?.label).toBe("Not running yet");
+    });
+
+    it("still counts another machine of a closed project among those an Open starts", () => {
+      const result = model({
+        machines: [machine(ZOO5, "zoo-005", {
+          openState: "closed",
+          part: "not_started",
+          otherHosts: [{ hostname: "zoo-006", connected: true, running: false, ownsTabs: true }],
+        })],
+        fromMachineId: ZOO5,
+      });
+      expect(result.machines.map((entry) => [entry.hostname, entry.label, entry.partUnconfirmed === true]))
+        .toEqual([["zoo-005", "Not running", false], ["zoo-006", "Not running", false]]);
+      expect(result.openAction?.confirmation.body).toEqual(["Its tabs start on zoo-005 and zoo-006."]);
+    });
+
     it("says an Open from a machine with no tabs starts the others and not this one", () => {
       const laptop = machine(LAPTOP, "laptop", {
         openState: "closed",
@@ -695,8 +757,9 @@ describe("buildProjectOpenModel", () => {
   });
 
   it("offers nothing without a machine to name, and Delete only to the owner", () => {
+    // A roster of untagged tabs: the frame names the host, and no machine.
     const result = model({
-      report: report("closed", [part(ZOO5, "zoo-005", "not_started")]),
+      report: report("closed", [part(undefined, "zoo-005", "not_started")]),
       session: { openState: "closed" },
       target: null,
     });
@@ -704,8 +767,99 @@ describe("buildProjectOpenModel", () => {
     expect(result.openAction).toBeUndefined();
     expect(result.closeAction).toBeUndefined();
     expect(result.canDelete).toBe(false);
+    // No frame and no entry: nothing names a machine either.
+    const unknown = model({ session: { openState: "open", isActive: false }, target: null });
+    expect(unknown.request).toBeNull();
+    expect(unknown.openAction).toBeUndefined();
+    expect(unknown.closeAction).toBeUndefined();
     expect(model({ isOwner: true }).canDelete).toBe(true);
     expect(model({ isOwner: false }).canDelete).toBe(false);
+  });
+
+  describe("when no machine-list entry lists the project", () => {
+    // The server keeps its machine list in memory. After it restarts, a
+    // machine that has not registered again is in no list, while the frame
+    // still names the project's machines. Open and Close are for the whole
+    // project, and the server takes them without that machine connected.
+    const offline = { connected: false };
+
+    it("takes the request's machine from the frame, so an open project can be closed", () => {
+      const result = model({
+        report: report("open", [part(LAPTOP, "laptop", "waiting_offline", offline)]),
+        session: { openState: "open", isActive: false },
+        machines: [],
+        target: null,
+      });
+      expect(result).toMatchObject({ state: "open", recorded: true });
+      expect(result.request).toEqual({ machineId: LAPTOP, projectId: PROJECT });
+      expect(result.notice.map((line) => line.text))
+        .toEqual(["laptop is offline. Its tabs start when laptop reconnects."]);
+      // Nothing an Open would start now; the close is recorded for its return.
+      expect(result.openAction).toBeUndefined();
+      expect(result.closeAction).toMatchObject({ kind: "close", label: "Close" });
+      expect(result.closeAction?.confirmation.body).toEqual([
+        "This stops its agents on every machine that runs it.",
+        "laptop is offline. If it still runs the project when it reconnects, its agents are stopped then.",
+        CLOSE_DELETES_NOTHING,
+      ]);
+    });
+
+    it("lets a closed project be opened to wait for its machine", () => {
+      const result = model({
+        report: report("closed", [part(LAPTOP, "laptop", "not_started", offline)]),
+        session: { openState: "closed", isActive: false },
+        machines: [],
+        target: null,
+      });
+      expect(result.request).toEqual({ machineId: LAPTOP, projectId: PROJECT });
+      expect(result.openAction).toMatchObject({ kind: "open", label: "Open" });
+      expect(result.openAction?.confirmation.body)
+        .toEqual(["laptop is offline. Its tabs start when laptop reconnects."]);
+      expect(result.closeAction).toBeUndefined();
+    });
+
+    it("prefers a connected tab owner, and skips a host the frame knows only by name", () => {
+      const result = model({
+        report: report(undefined, [
+          part(undefined, "mini", "not_started"),
+          part(LAPTOP, "laptop", "not_started", offline),
+          part(ZOO6, "zoo-006", "running", { ownsTabs: false }),
+          part(ZOO5, "zoo-005", "not_started"),
+        ]),
+        session: { isActive: true },
+        machines: [],
+        target: null,
+      });
+      expect(result.request).toEqual({ machineId: ZOO5, projectId: PROJECT });
+      // With no connected tab owner, the first machine named by id.
+      const first = model({
+        report: report("open", [
+          part(undefined, "mini", "waiting_offline", offline),
+          part(LAPTOP, "laptop", "waiting_offline", offline),
+          part(ZOO6, "zoo-006", "waiting_offline", offline),
+        ]),
+        session: { openState: "open" },
+        machines: [],
+        target: null,
+      });
+      expect(first.request).toEqual({ machineId: LAPTOP, projectId: PROJECT });
+    });
+
+    it("leaves the machine to the list while an entry lists the project, and to no one on an older server", () => {
+      const held = report("open", [part(LAPTOP, "laptop", "waiting_offline", offline)]);
+      // An entry lists it: the caller's answer stands, also when it is none.
+      const listed = model({
+        report: held,
+        session: { openState: "open" },
+        machines: [machine(ZOO5, "zoo-005", { openState: "open" })],
+        target: null,
+      });
+      expect(listed.request).toBeNull();
+      // A frame kept from a server that no longer records open states.
+      const older = model({ supported: false, report: held, session: { isActive: true }, machines: [], target: null });
+      expect(older.request).toBeNull();
+      expect(older.closeAction).toBeUndefined();
+    });
   });
 
   it("says an Open of a closed project waits for its only machine while that is offline", () => {

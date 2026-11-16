@@ -36,10 +36,12 @@ export interface MachineChoice {
    *  unknown. A machine can take a tab of one provider and not another, so
    *  this never disables the machine: see `providerOfferOn`. */
   providers?: MachineProviderStatus[];
-  /** Only on a `registered` choice, and only against a server that records
-   *  open states: a tab there opens the project, and these are the other
-   *  hosts whose tabs start with it (empty when there are none). Absent
-   *  means the request starts that machine alone, as an older server does. */
+  /** On a `registered` or `clone` choice, and only against a server that
+   *  records open states: a tab there opens the project, and these are the
+   *  other hosts whose tabs start with it (empty when there are none). A
+   *  clone opens the project too: its tab request is a tab on a machine that
+   *  is not running the project. Absent means the request starts that
+   *  machine alone, as an older server does. */
   alsoStarts?: string[];
 }
 
@@ -71,6 +73,10 @@ export interface MachineChoiceInput {
     part: string;
     ownsTabs: boolean;
     connected: boolean;
+    /** The part was not stated by the server
+     *  (`ProjectMachinePartInfo.partUnconfirmed`): the machine may be
+     *  starting already, and is not named as one an Open starts. */
+    partUnconfirmed?: boolean;
   }[];
 }
 
@@ -160,10 +166,13 @@ export function buildMachineChoices(input: MachineChoiceInput): MachineChoiceMod
       disabledReason,
       providers: entry.machine.providers,
       // Opening the project starts every connected tab owner that is not
-      // running it, not only the machine the tab goes to.
-      ...(hasProject && input.openStateSupported ? {
+      // running it, not only the machine the tab goes to. A clone is no
+      // exception: once the checkout exists its tab request opens the
+      // project like any other tab on a machine that is not running it.
+      ...(input.openStateSupported ? {
         alsoStarts: (input.projectMachines ?? [])
           .filter((other) => other.ownsTabs && other.connected && other.part === "not_started"
+            && !other.partUnconfirmed
             && !(other.machineId ? other.machineId === machineId : sameHost(other.hostname, hostname)))
           .map((other) => other.hostname)
           .sort((a, b) => a.localeCompare(b)),

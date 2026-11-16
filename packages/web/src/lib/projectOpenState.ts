@@ -45,6 +45,16 @@ export interface ProjectMachinePartInfo {
   reason?: string;
   ownsTabs: boolean;
   connected: boolean;
+  /**
+   * Set here, never by the server: no frame is held and the machine has no
+   * entry of its own, so its part was worked out from another entry's
+   * `other_hosts`, which says only whether the machine runs the project. A
+   * connected tab owner of an open project that is not running it may have
+   * been asked to start, or may have failed to: `ProjectHostSummary` cannot
+   * tell the two apart. Such a part reads "Not running yet", and the machine
+   * is not counted among those an Open starts.
+   */
+  partUnconfirmed?: boolean;
 }
 
 /** Another machine of a project, as a machine-list entry names it; mirrors
@@ -197,13 +207,15 @@ export function openStateLabel(state: OpenState): "Open" | "Closed" {
  * `not_started` is worded by the project's state: in an open project, or
  * with a reason, the machine failed or refused ("Not started: <reason>"). A
  * tab owner that does not run a closed project, or one nobody has recorded,
- * has not failed at anything and reads "Not running".
+ * has not failed at anything and reads "Not running". Where the server did
+ * not state the part of an open project's machine (`partUnconfirmed`), it
+ * may be starting or may have failed, and reads "Not running yet".
  *
  * `part` absent means the machine has no part: it owns no tabs of the
  * project and does not run it.
  */
 export function machinePartLabel(
-  machine: { part?: MachinePart; hostname: string; reason?: string },
+  machine: { part?: MachinePart; hostname: string; reason?: string; partUnconfirmed?: boolean },
   project: { state: OpenState; recorded: boolean },
 ): string {
   switch (machine.part) {
@@ -219,7 +231,8 @@ export function machinePartLabel(
       return "Still running";
     case "not_started":
       if (machine.reason) return `Not started: ${machine.reason}`;
-      return project.recorded && project.state === "open" ? "Not started" : "Not running";
+      if (!(project.recorded && project.state === "open")) return "Not running";
+      return machine.partUnconfirmed ? "Not running yet" : "Not started";
   }
 }
 
@@ -270,12 +283,15 @@ export interface ProjectOpenNoticeLine {
   hostname: string;
   /**
    * `not_started`: connected and not running an open (or half-running)
-   * project; Open again can start it. `offline`: not running it because it
-   * is offline, and nothing starts it when it returns. `waiting_offline`:
-   * offline, and started when it reconnects. `starting`: asked to start.
-   * `still_running`: runs a closed project.
+   * project; Open again can start it. `not_running_yet`: connected and not
+   * running an open project, where the server did not say whether it is
+   * starting or failed (`partUnconfirmed`); nothing is offered for it.
+   * `offline`: not running it because it is offline, and nothing starts it
+   * when it returns. `waiting_offline`: offline, and started when it
+   * reconnects. `starting`: asked to start. `still_running`: runs a closed
+   * project.
    */
-  kind: "not_started" | "offline" | "waiting_offline" | "starting" | "still_running";
+  kind: "not_started" | "not_running_yet" | "offline" | "waiting_offline" | "starting" | "still_running";
   /** The sentence that names the machine. */
   text: string;
   /** The server's reason, as it gave it. Shown after `text`. */
@@ -321,15 +337,17 @@ export interface ProjectOpenModel {
   /** Connected hosts that run it: a deletion stops their agents first. */
   stoppedFirstHosts: string[];
   /** At most one way to open; absent when there is nothing an Open would
-   *  do, or no machine to name in the request. */
+   *  do, or no machine to name in the request (`request` is null). */
   openAction?: ProjectOpenAction;
   closeAction?: ProjectCloseAction;
   /** Machines that are not in line, each with its reason. Empty when every
    *  machine follows. Shown with `openAction` (when its kind is `open` or
    *  `open_again`) or `closeAction` (`close_again`) as its button. */
   notice: ProjectOpenNoticeLine[];
-  /** What `openProject` / `closeProject` take; `null` when no machine lists
-   *  the project for this viewer, and then no action is offered. */
+  /** What `openProject` / `closeProject` take: the input's `target`, or,
+   *  when no machine-list entry lists the project, a machine the held frame
+   *  names (see `reportTarget`). `null` when neither names a machine, and
+   *  then no action is offered. */
   request: { machineId: string; projectId: string } | null;
   /** Present when `fromMachineId` was given and that machine is known. */
   thisMachine?: ProjectOpenThisMachine;
@@ -356,7 +374,9 @@ export interface ProjectOpenModelInput {
   instances?: SessionInstance[];
   machines: MachineWithProjects[];
   /** The machine and project id the requests name: the answer of
-   *  `resolveMachineProjectTarget`, or the Machines row's own machine. */
+   *  `resolveMachineProjectTarget`, or the Machines row's own machine. When
+   *  it is absent and no machine-list entry lists the project, the held
+   *  frame's machines supply one (`reportTarget`). */
   target?: { machineId: string; projectId: string; hostname?: string } | null;
   /** The Machines page: the machine whose entry the controls sit in. */
   fromMachineId?: string;
@@ -470,7 +490,16 @@ function resolveSources(input: ProjectOpenModelInput, ids: string[]): Sources {
       const part: MachinePart = host.running
         ? (polledState === "closed" ? "still_running" : "running")
         : polledState === "open" && !host.connected ? "waiting_offline" : "not_started";
-      machines.push({ hostname: host.hostname, part, ownsTabs: host.ownsTabs, connected: host.connected });
+      machines.push({
+        hostname: host.hostname,
+        part,
+        ownsTabs: host.ownsTabs,
+        connected: host.connected,
+        // `other_hosts` says "running" only of a machine that runs the
+        // project. A connected tab owner of an open project that is not
+        // running it may be starting right now; the server did not say.
+        ...(part === "not_started" && polledState === "open" ? { partUnconfirmed: true } : {}),
+      });
     }
   }
   return { recordedState: polledState, machines, serverParts: true };
@@ -520,6 +549,30 @@ function derivedParts(
     });
   }
   return machines;
+}
+
+/**
+ * The machine a request names when the viewer's machine list has no entry
+ * for the project. The server keeps its machine list in memory, so after a
+ * server restart a machine that has not registered again is in no list,
+ * while the frame still names the project's machines. An Open or a Close is
+ * for the whole project and the server accepts it without that machine
+ * being connected, so any machine the frame names by id will do: a
+ * connected tab owner first, since an Open starts that one.
+ *
+ * `null` when the frame names no machine by id, as for a roster of untagged
+ * tabs only.
+ */
+function reportTarget(
+  report: ProjectOpenReport,
+  projectId: string | undefined,
+): { machineId: string; projectId: string; hostname: string } | null {
+  if (!projectId) return null;
+  const named = report.machines.filter((machine) => machine.machineId);
+  const machine = named.find((candidate) => candidate.connected && candidate.ownsTabs) ?? named[0];
+  return machine?.machineId
+    ? { machineId: machine.machineId, projectId, hostname: machine.hostname }
+    : null;
 }
 
 function offlineStartLines(hosts: string[], supported: boolean): string[] {
@@ -574,11 +627,15 @@ export function buildProjectOpenModel(input: ProjectOpenModelInput): ProjectOpen
   const starting = machines.filter((machine) => machine.part === "starting");
   const idleOwners = owners.filter((machine) =>
     machine.part === "not_started" || machine.part === "waiting_offline");
-  /** The tab owners an Open starts now. */
-  const startable = idleOwners.filter((machine) => machine.connected);
+  /** The tab owners an Open starts now. A machine whose part the server
+   *  did not state may be starting already, and is not counted. */
+  const startable = idleOwners.filter((machine) => machine.connected && !machine.partUnconfirmed);
   const offlineOwners = idleOwners.filter((machine) => !machine.connected);
 
-  const target = input.target ?? null;
+  const target = input.target
+    ?? (input.supported && input.report && listingEntries(input, ids).length === 0
+      ? reportTarget(input.report, ids[0])
+      : null);
   const targetEntry = target
     ? input.machines.find((entry) => entry.machine.machineId === target.machineId)
     : undefined;
@@ -747,8 +804,9 @@ export function buildProjectOpenModel(input: ProjectOpenModelInput): ProjectOpen
     } else if (machine.part === "starting") {
       line("starting", `${machine.hostname} is starting this project.`);
     } else if (machine.part === "not_started") {
-      if (machine.connected) line("not_started", `${machine.hostname} is not running this project.`);
-      else line("offline", stoppedOnHostReason(machine.hostname, true));
+      if (!machine.connected) line("offline", stoppedOnHostReason(machine.hostname, true));
+      else if (machine.partUnconfirmed) line("not_running_yet", `${machine.hostname} is not running this project yet.`);
+      else line("not_started", `${machine.hostname} is not running this project.`);
     }
   }
 

@@ -165,7 +165,7 @@ export function MachineProjectRow({
   const othersLine = others
     .filter((machine) => model.state === "open"
       || (machine.part !== "not_started" && machine.part !== "waiting_offline"))
-    .map((machine) => `${machine.hostname}: ${machinePartLabel({ part: machine.part, hostname: machine.hostname }, model)}`)
+    .map((machine) => `${machine.hostname}: ${machinePartLabel({ part: machine.part, hostname: machine.hostname, partUnconfirmed: machine.partUnconfirmed }, model)}`)
     .join(" · ");
   const disabled = !connected || pending !== null;
 

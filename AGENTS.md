@@ -554,9 +554,12 @@ apas/
 │   │   │   ├── state.rs     # AppState with DB, sessions, storage
 │   │   │   ├── storage.rs   # File-based message storage (JSONL)
 │   │   │   ├── db/          # SQLite database
+│   │   │   ├── open_state.rs # Open and Close: tab owners, authority, the starts and stops sent
+│   │   │   │                #   (open_state/follow.rs: what a registering machine is sent)
 │   │   │   ├── session/     # Session manager (instances.rs: a session's per-machine attachments;
 │   │   │   │                #   pane_launches.rs: pane ids and new panes in flight;
-│   │   │   │                #   autopilot.rs: each OMP tab's reported autopilot and request routing)
+│   │   │   │                #   autopilot.rs: each OMP tab's reported autopilot and request routing;
+│   │   │   │                #   open_state.rs: the per-project lock, each machine's outcome and part)
 │   │   │   └── routes/
 │   │   │       ├── project_join.rs # GET /projects/by-remote and clone-to-join
 │   │   │       ├── ws_cli.rs  # CLI WebSocket handler, pane/session replay
@@ -589,6 +592,7 @@ apas/
 │       │       ├── terminalBus.ts    # Pty frame fan-out (deliberately NOT zustand)
 │       │       ├── projectInstances.ts # A session's instances, one per machine
 │       │       ├── tabHosts.ts       # Which machine runs each tab, and why a tab cannot be used
+│       │       ├── projectOpenState.ts # The one model of open/closed: state, each machine's part, Open and Close
 │       │       ├── machineChoice.ts  # The "Run on" step for a new tab
 │       │       ├── autopilot.ts      # Autopilot: frame parsing, the control's model, texts
 │       │       ├── autopilotTemplates.ts # Built-in prompts the Start autopilot dialog offers
@@ -723,14 +727,15 @@ identities fail without deleting local files. No session is fabricated.
 The modal retains progress, errors, and the canonical success path. A lost
 connection leaves registration unconfirmed rather than replaying the request.
 **View on Machines** selects the owning cluster and target project even when a
-shared cluster was previously selected. Use the existing **Start** control
-there explicitly; saved panes only launch on that action. An already-running
-project remains running unchanged.
+shared cluster was previously selected. Use **Open** there explicitly; saved
+panes only launch on that action. An already-running project remains running
+unchanged.
 
 **Registration is enough to appear in project lists.** The expanded desktop
 sidebar, collapsed rail, and mobile **All projects** include registered projects
-from owned-machine inventory before their first session. They show **Stopped**
-or **Running** from that inventory and link to **View on Machines**, never to a
+from owned-machine inventory before their first session. They show **Closed**
+or **Open** (the recorded state; for a project nobody has recorded, whether
+that inventory says it runs) and link to **View on Machines**, never to a
 fabricated session. Opening the link does not start the project. A real session,
 when one arrives, replaces registration-only navigation; duplicate registrations
 across hosts collapse by stable project ID. A reported running placement wins;
@@ -863,8 +868,13 @@ under Key Concepts for why.
 Running one project on several machines adds `ServerToWeb::SessionInstances`,
 `AddPane { machine_id, request_id }` answered by `ServerToWeb::AddPaneResult`,
 `ForgetMachinePanes`, `CreateProjectInstance { join_project_id }`, the
-`all_instances` flag on project Start/Stop, `DaemonToServer::ProjectRuntimeStarted`,
-and the input `MutationAck`. Autopilot adds `ControlPaneAutopilot` (web to
+`all_instances` flag on project Start/Stop (true means open or close the
+project), `DaemonToServer::ProjectRuntimeStarted`, and the input
+`MutationAck`. A project's open state adds `ServerToWeb::ProjectOpenState`,
+sent only to viewers that negotiated `project_open_state_v1`, and the
+server-filled `open_state` on session entries and `open_state`, `part`,
+`part_reason` and `other_hosts` on machine-list project entries; see "A
+project is open or closed". Autopilot adds `ControlPaneAutopilot` (web to
 server to the tab's CLI), `PaneAutopilotReceipt` and `PaneAutopilotState` (CLI
 to server to web), and `negotiated_capabilities` on `ServerToCli::Registered`. Every `ServerToCli` variant is classified by
 `ServerToCli::scope()`, which routes it; see "A project's tabs can run on several
@@ -1067,6 +1077,8 @@ release without a protocol directory does not need one. A rollback may restore
 older vulnerable dependencies; follow it with a corrected patched deployment.
 
 For server rollback, restore the backed-up binary atomically and restart.
+When the server being rolled back records open states, clear them while it is
+stopped; see "Rollout and rollback" under "A project is open or closed".
 Do not automatically restore an old SQLite snapshot after traffic has resumed:
 that can discard acknowledged work. Preserve the current database and evaluate
 any schema/data recovery separately. Rotate an administrator credential only
@@ -1190,9 +1202,13 @@ Every function it had is still there.
 - **Machines.** One card per machine with a Connected or Offline chip, at
   most one amber chip ("Update available", else "Older APAS"), its version,
   the "Providers:" line and "r of t projects running". Rows are ordered
-  errors, running, stopped, and more than three stopped projects fold into
-  "Show N stopped projects". Start and Stop still never send
-  `all_instances`. Reboot stays per machine; its dialog title names the
+  errors, running, not running, and more than three projects the machine is
+  not running fold into "Show N projects not running here". A row shows the
+  project's state (Open or Closed) and this machine's part, and offers Open
+  and Close **for the whole project**, with a confirmation that names the
+  other machines; the page has no per-machine Start or Stop and never sends
+  `all_instances: false` (see "A project is open or closed"). Reboot stays
+  per machine; its dialog title names the
   machine, and "Reboot to update" and `rebootEffectNote` keep their wording.
 - **The DeepSeek API key is never shown, prefilled or kept in browser
   state.** It used to sit in plain text in an input on every machine card.
@@ -1443,7 +1459,10 @@ distinguishes them from an `apas --attach` in use. Those stay a manual step.
 
 `apas --headless -d <path>` survives as a way to run one project alone for
 debugging. Nothing spawns it, and a project with an external headless run is
-never given a second owner.
+never given a second owner. The daemon reports such a run as running, so for
+a project recorded **closed** the server stops it at the daemon's next
+registration: open the project first, or debug one that is not recorded
+closed.
 
 ## One instance per user per host
 
@@ -1775,10 +1794,14 @@ for display and routing only, never as ownership.
 **Tags are permanent, by the owner's decision.** Starting a project on zoo-006
 after stopping it on zoo-005 used to resume zoo-005's tabs there. Now they stay
 listed as stopped on zoo-005, with their ids, until zoo-005 runs the project
-again. While any instance is attached, controls and closes for such a tab are
-refused with "<host> is not running this project. Start it on <host> first.";
-the web dims the tab and offers **Start on <host>**, and the sidebar's pane dots
-read "Not running on <host>" and leave it out of idle and waiting lists.
+again. While any instance is attached, controls, closes, typed input and
+autopilot requests for such a tab are refused with "<host> is not running
+this project. Open the project again to start it there." while that machine's
+daemon is connected, and "<host> is not running this project because it is
+offline." while it is not. The web dims the tab and names the machine in the
+project's notice, where **Open again** retries it; there is no "Start on
+<host>" any more. The sidebar's pane dots read "Not running on <host>" and
+leave the tab out of idle and waiting lists.
 
 **Routing is by message scope, and a new variant does not compile until
 someone classifies it.** `ServerToCli::scope()` matches every variant with no
@@ -1840,14 +1863,16 @@ that never hears a final result is shown as unconfirmed and **never resent**:
 a replay can create a second tab. Native task launches follow the same rule
 once a capable instance runs the project.
 
-**Project-level Start and Close act on every machine; the Machines page does
-not.** The project view sends `all_instances: true`. Start starts every online,
-capable machine that owns tabs of the project (or only the given machine when
-none does). Close stops the given machine, every attached instance, and every
-connected daemon of the project's own accounts that reports running it while
-its instance is not attached (still starting, or reconnecting). The Machines
-page's per-machine Start and Stop keep `all_instances: false` and must never
-reach other machines.
+**Open and Close act on the whole project, from every page.** The project
+view and the Machines page both send `all_instances: true`, which the server
+treats as opening or closing the project and records. Open starts every
+connected, capable machine that owns tabs of the project (or only the given
+machine when none does); a machine that is offline is started when its daemon
+registers. Close stops every connected machine that runs the project, has an
+instance attached or has a start pending, and a machine that was away is
+stopped when it registers. A request that names one machine
+(`all_instances: false`, which only older clients send) never reaches another
+machine. The rules are in "A project is open or closed".
 
 **Forget is roster-only.** **Forget <host>'s tabs**, for a machine that will not
 come back, removes its tabs from the server roster and tells no instance:
@@ -2057,6 +2082,211 @@ the server denies is retried only after 30 s. That code predates this change
 and is in the October CLI too. The cause is not confirmed and nothing is
 fixed. Until it is, wait for a rebooted machine to show as online before
 acting on its projects.
+
+## A project is open or closed
+
+Open and closed are **one recorded state of the project**, kept by the server,
+the same for every viewer and after every restart. An open project runs on
+every machine that owns tabs of it; a closed project runs nowhere. Before
+2026-11-16 nothing recorded this: a project was "running" wherever someone had
+started it, a machine that was offline at Start never caught up, and a project
+on two machines could be half open. The design record is
+`openspec/changes/make-open-a-project-state/` (Decisions 1 to 12); the doc
+comments in `crates/shared/src/messages.rs` are the binding statement of the
+wire. Nothing in `crates/client-cli` changed: daemons and CLIs need no update.
+
+**Implemented on master on 2026-11-16. Not deployed yet**; see "Verification"
+below for what was and was not exercised.
+
+**Where it is kept.** Five nullable columns on `projects`: `open_state`
+(`NULL`, `open`, `closed`), `open_state_set_by`, `open_state_set_kind`
+(`request` or `administrative`), `open_state_set_at` and
+`open_state_machine_id`. `NULL` is a third value, **not recorded**: the server
+leaves such a project alone, shows it from what runs, and neither starts nor
+stops it. Every project is not recorded on the day the server is first
+deployed, and stays so until someone opens or closes it from the new web. For
+a not-recorded project that already runs, the button reads **Keep open**
+("This records the project as open. Nothing starts now."). Only an active
+project can be open.
+
+**What Open and Close do** (`crates/server/src/open_state.rs`):
+
+- **Open** records the project open and starts every connected tab owner the
+  requester may use. The tab owners come from the persisted roster (each tab's
+  machine, or an untagged tab's host), never from which instances happen to be
+  attached; with no tab at all, the machine the Open named stands in. A daemon
+  without `project_instances_v1` is started only as the sole owner and is
+  otherwise reported with the older-APAS sentence. An Open that changes the
+  record also sends the start to a machine that still reads as running, so a
+  Close followed at once by an Open does not leave the project open and
+  running nowhere. Opening a project that is already open is the retry for a
+  machine that failed ("Open again").
+- **Close** records the project closed and sends `StopProjectCli` to every
+  connected machine that runs it, has an instance attached or has a start
+  pending. **It deletes nothing**: no tab, roster entry, worktree, provider
+  conversation, registration, session, share, policy or saved prompt. Both
+  Close confirmations end with "Nothing is deleted. Its tabs come back when
+  you open it again." A server test pins that the roster and history are the
+  same after a close and the open that follows. A tab start that was waiting
+  for a machine the close stopped ends with "The project was closed before it
+  started on <host>."
+- **Machines follow at registration** (`open_state/follow.rs`, called from
+  `ws_daemon.rs`). When a daemon registers, the server goes once through the
+  recorded projects it lists: an open project this machine owns tabs of and
+  does not run is started; a closed project it runs is stopped. Nothing is
+  sent for a machine that is in line, and nothing for a project that is not
+  recorded. There is no loop and no retry on heartbeats: registration is the
+  one event that means "this machine was away".
+- **Every start and stop of one project is ordered** by an exclusive
+  per-project lock (`session/open_state.rs`), held from reading the state to
+  the last frame to a machine. Refusals to the requester are sent after it is
+  released.
+
+**What a deploy or a reboot now does.** Every server deploy makes every daemon
+register again, so **from the second deploy on, a server deploy brings
+machines in line**: it starts an open project on a machine that had failed or
+been away, and stops a machine still running a closed project. A machine
+reboot from the Machines page still resumes what ran from the daemon's resume
+manifest; in addition the registration that follows starts open projects that
+machine owns tabs of and was not running, and stops a project that was closed
+while the daemon was being replaced. Wait for a rebooted machine to show as
+online before judging its projects: its own channel can take about 30 seconds
+to register (see the Rollout record of "A project's tabs can run on several
+machines"), and following is that late.
+
+**Whose authority.** Open and Close are accepted from an account with runtime
+access on at least one connected machine that lists the project, else from the
+project's owner or a placement holder. Each connected machine is started or
+stopped only where the requester may use it; the others are reported with the
+reason. A follow-start uses the recorded opener's authority at the moment the
+machine registers, and needs that account to still be active; a follow-stop
+uses the closer's, and an administrative close is followed everywhere. The
+opener is recorded only on the transition, so a second person's Open again
+does not replace it. A second Close replaces the recorded closer only when the
+new requester may use every machine the first may, and at least one more.
+One accepted limit: in a project whose tabs sit on machines of two accounts, a
+machine the recorded actor may not use does not follow by itself.
+
+**Other paths that record the state.** Suspension, the operator's and the
+administrator's Stop runtime, and the start of a deletion record closed, kind
+administrative; their dialogs say so ("This closes the project. Its machines
+do not start it again until someone opens it."). Reactivation starts nothing,
+and the project stays closed until someone opens it. A creation that starts
+the project records it open (shared provisioning at finalize; otherwise the
+`SessionStart` that creates the project's row). A tab request whose machine is
+not running opens the project as the requester, after its own checks pass, and
+the Run on step says so ("Opens the project", naming the other machines whose
+tabs start; "Clone here" says it too). Opens, closes and the starts and stops
+sent at a registration (source "registration") are written to the audit
+history, so the cluster's Activity view shows them.
+
+**What each machine is doing is computed by the server** and sent as
+`ProjectOpenState { project_id, state, set_by, set_at, machines }` to viewers
+that negotiated `project_open_state_v1`, on attach and on every change, and as
+`open_state`, `part`, `part_reason` and `other_hosts` on machine-list entries.
+A part is Running, Starting…, "Waiting for <host> (offline)", "Not started:
+<reason>", "No tabs here" or "Still running" (a closed project a machine still
+runs; Close is offered again). The reasons are kept in memory only: after a
+server restart a reason is unknown until that machine registers. `set_by` is
+the email of whoever opened or closed the project, and every viewer who may
+read the project sees it. The web builds every control and sentence from one
+model, `lib/projectOpenState.ts`; it shows the reported state after a request
+and resends nothing ("Not connected to the server. Nothing was sent.").
+
+**What a person can no longer do per machine**, by the owner's rule that an
+open project runs every agent it owns:
+
+- *Run a project on one of two machines that both hold its tabs.* Close the
+  tabs on the other machine, or forget them: a machine with no tabs in the
+  roster is not started.
+- *Stop or restart one machine's instance alone.* Close that machine's tabs,
+  or close and open the project. Reboot CLI still restarts every project on
+  that host.
+- *Stop an instance left empty after its last tab was closed.* It ends when
+  the project is closed, or with the daemon, and is not started again.
+- *Another account's project on your machine.* Remove the machine from that
+  member's allowlist, suspend the project, or stop its runtime, which now
+  closes it.
+
+**Delete project is its own control.** The project's owner finds **Delete
+project…** beside Close in the workspace's project controls, in the cluster
+page's project panel and in the project-access dialog's danger zone; all three
+open one `DeleteProjectDialog`. It says what is erased (the project on the
+APAS server) and what stays (the folder and its files on every machine, which
+keep the folder registered), names the machines whose agents are stopped
+first and any offline tab owner, and is confirmed by typing the project's
+name. It sends one `POST /projects/:id/delete` and shows "Deleting…" until the
+server reports it done. Nobody but the owner is offered it, and the phone has
+none. The server-side deletion is unchanged except that it records the project
+closed. A machine that is offline during a deletion and returns still running
+the project creates a new project under the same id; the dialog says so.
+
+### Older clients and mixed fleets
+
+- **A request that names one machine** (`all_instances: false`, a tab request
+  from a viewer without `project_open_state_v1`, native task launches) never
+  starts or stops a machine it did not name:
+
+  | Project | Start / tab / task naming one machine | Stop naming one machine |
+  | --- | --- | --- |
+  | not recorded | as before; nothing recorded | as before; nothing recorded |
+  | open | start that machine | Close if no other machine owns tabs or runs it, else refused |
+  | closed | Open if no other machine owns tabs, else refused | stop that machine |
+
+  The refusals are "This project runs on other machines too. Close it from the
+  project." and "This project is closed and has tabs on other machines. Open
+  it from the project." The closed row applies also while the named machine
+  still has an instance attached.
+- **An older web bundle or the phone's "Open project"** sending
+  `all_instances: true` acts as before on a not-recorded project and records
+  nothing; on a recorded project it is an Open or a Close. Only a viewer that
+  negotiated `project_open_state_v1` records a project nobody has recorded.
+- **Older viewers and native** are sent no `ProjectOpenState` frame; the new
+  fields are optional and ignored. Native composes its own refusal sentence
+  and gains the new wording with its next build. The phone's browser screen
+  gains "Open project" again while a machine is not following, and no Close.
+
+### Rollout and rollback
+
+Deploy **server, then web**. No daemon or agent restart, and no native
+release. The columns are added on first start with every project not
+recorded, so the deployment itself starts and stops nothing. After it, check
+that no project was started or stopped, that every project offers "Keep open",
+and that an un-reloaded older web bundle's buttons still work and record
+nothing.
+
+**A server rollback must clear the recorded states**, with the server
+stopped, also when the rollback is only "restore the backed-up binary":
+
+```bash
+ssh root@apas.mpaxos.com "systemctl stop apas-server && sqlite3 /opt/apas/data/apas.db \
+  'UPDATE projects SET open_state = NULL, open_state_set_by = NULL, open_state_set_kind = NULL, open_state_set_at = NULL, open_state_machine_id = NULL;'"
+```
+
+An older server ignores the columns, people start and stop projects by hand
+again, and the recorded states go stale. Without the statement, the next
+deploy of a server with this change would follow those stale states at every
+registration: start projects someone stopped, and stop projects someone
+started. Roll the web back first, then the server.
+
+### Verification
+
+**Gates on 2026-11-16**, on the tree with every review fix: `cargo test` for
+shared (116 + 5 + 1) and server (567), the protocol's 149 tests and typecheck,
+native (146 tests and typecheck), web typecheck, lint (0 errors) and the
+production build, `openspec validate --all --strict` and the runbook check.
+The web suite passed 1,670 of 1,671 in the full run; the one failure is the
+worker Overview layout test ("lays the Overview out as one page"), which this
+change does not touch, fails on a loaded host and passed alone. `crates/client-cli`
+has no diff.
+
+**Review.** Five independent reviews (races, authority, older clients, the
+spec, the web), each finding checked by a second reader, confirmed 24
+findings; all were fixed in two rounds, each fix with a test that fails
+without it and checked again by a reader who had not written it. The three
+that mattered: a Close followed at once by an Open left the project open and
+running nowhere; "Clone here" opened the project without saying so; and the
+rollback rule above, which the first design lacked.
 
 ## Pane work summaries: which summarizer
 

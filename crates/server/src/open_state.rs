@@ -23,6 +23,7 @@ use crate::session::open_state::OpenStateBasis;
 pub(crate) use crate::session::open_state::TabOwner;
 use crate::state::AppState;
 use shared::{OpenStateSetKind, ProjectOpenState, ServerToDaemon};
+use std::collections::HashSet;
 use uuid::Uuid;
 
 pub(crate) mod follow;
@@ -99,8 +100,11 @@ impl TabOwners {
 /// loaded and else as persisted; the session id is the project id, so this
 /// works right after a server restart with nothing attached. A machine owns
 /// a tab the roster records for it, and an untagged tab attributed to its
-/// host. While the roster is known and no machine owns a tab, `stand_in`
-/// (the machine an open named; see
+/// host. That host resolves only to machines of the project: ones whose
+/// daemon's account owns the project or hosts it. Another account's checkout
+/// can carry the same project id on a machine of the same name, and that
+/// machine owns none of this project's tabs. While the roster is known and
+/// no machine owns a tab, `stand_in` (the machine an open named; see
 /// [`ProjectOpenStateRecord::stand_in_machine`]) is the one owner.
 pub(crate) async fn project_tab_owners(
     state: &AppState,
@@ -122,8 +126,42 @@ pub(crate) async fn project_tab_owners(
         .into_iter()
         .map(|pane| (pane.machine_id, pane.hostname))
         .collect();
-    let owners = state.sessions.tab_owners_at(project_id, &places, stand_in);
+    // An untagged tab is attributed to a host by name. Only then does it
+    // matter whose machines carry that name.
+    let hosts = if places
+        .iter()
+        .any(|(machine_id, hostname)| machine_id.is_none() && hostname.is_some())
+    {
+        project_host_accounts(state, project_id).await
+    } else {
+        None
+    };
+    let owners = state
+        .sessions
+        .tab_owners_at(project_id, &places, stand_in, hosts.as_ref());
     TabOwners::Known(owners)
+}
+
+/// The accounts whose machines are the project's: its owner and every
+/// account whose cluster hosts it. `None` when they cannot be read, or the
+/// server holds no record of the project.
+async fn project_host_accounts(state: &AppState, project_id: &str) -> Option<HashSet<Uuid>> {
+    let record = match state.db.get_project_open_state(project_id).await {
+        Ok(record) => record?,
+        Err(error) => {
+            tracing::warn!(%project_id, %error, "could not read the project's owner for its tab owners");
+            return None;
+        }
+    };
+    let mut hosts: HashSet<Uuid> = Uuid::parse_str(&record.owner_user_id).into_iter().collect();
+    match state.db.project_cluster_user_ids(project_id).await {
+        Ok(placed) => hosts.extend(placed.iter().filter_map(|host| Uuid::parse_str(host).ok())),
+        Err(error) => {
+            tracing::warn!(%project_id, %error, "could not read the clusters hosting the project for its tab owners");
+            return None;
+        }
+    }
+    Some(hosts)
 }
 
 /// Why `machine_id` cannot run the project beside the other tab owners, or
@@ -346,8 +384,10 @@ pub(crate) async fn may_not_use_reason(
 /// Whether the account or administrator that set `record`'s state may have
 /// `machine_id` follow it now (design Decision 6): the opener for a start,
 /// the closer for a stop, checked as a direct request of theirs would be at
-/// this moment. A close made by an administrative stop is followed on every
-/// machine. `Err` is the reason the machine is left as it is.
+/// this moment. For a start that also takes the opener's account to exist
+/// and be active: a suspended account can make no request. A close made by
+/// an administrative stop is followed on every machine. `Err` is the reason
+/// the machine is left as it is.
 pub(crate) async fn recorded_actor_may_use_machine(
     state: &AppState,
     record: &ProjectOpenStateRecord,
@@ -364,6 +404,21 @@ pub(crate) async fn recorded_actor_may_use_machine(
             "No account that may use {host} for this project set its state."
         ));
     };
+    // A start is made on the opener's authority, and a direct request of an
+    // account that no longer exists or is suspended is not accepted. A close
+    // such an account made still stops machines.
+    if record.state == Some(ProjectOpenState::Open) {
+        let active = match state.db.get_user_by_id(&actor.to_string()).await {
+            Ok(user) => user.is_some_and(|user| user.is_active()),
+            Err(error) => {
+                tracing::warn!(project_id = %record.project_id, %error, "could not read the account that opened the project");
+                false
+            }
+        };
+        if !active {
+            return Err(may_not_use_reason(state, &actor, machine_id).await);
+        }
+    }
     if has_machine_project_runtime_access(state, &actor, machine_id, &record.project_id).await {
         Ok(())
     } else {
@@ -380,6 +435,19 @@ pub(crate) struct MachineRefusal {
     /// What a requester whose client shows no parts is told instead: the
     /// text the request was refused with before the open state existed.
     pub legacy: String,
+}
+
+/// The machine of the tab or task an open is made for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WorkMachine {
+    /// The caller checks and starts this machine itself, for the tab or
+    /// task waiting on it: the open sends it nothing.
+    CallerStarts(Uuid),
+    /// An instance is attached on this machine, so the caller starts
+    /// nothing. The open checks and starts it with the tab owners, whether
+    /// or not it owns a tab: a stop sent to it may still be taking effect,
+    /// and the tab or task would go to an instance that is ending.
+    Attached(Uuid),
 }
 
 /// What an open did.
@@ -490,6 +558,39 @@ pub(crate) async fn send_recorded_start(
     true
 }
 
+/// Send a start of `project_id` to `machine_id`, which reads as running it,
+/// and keep that it runs: its part does not read as starting meanwhile. The
+/// start carries no id, as the start a running machine was always sent: its
+/// daemon answers that the project already runs, which changes nothing, and
+/// what goes wrong with a start that follows a stop arrives with the daemon's
+/// inventory. False when the frame could not be handed to the daemon.
+async fn send_start_to_running_machine(
+    state: &AppState,
+    project_id: &str,
+    machine_id: &Uuid,
+    policy: &shared::EffectiveProjectPolicy,
+) -> bool {
+    let sent = state
+        .sessions
+        .send_to_daemon(
+            machine_id,
+            ServerToDaemon::StartProjectCli {
+                project_id: project_id.to_string(),
+                policy: Some(policy.clone()),
+                request_id: None,
+            },
+        )
+        .await;
+    if sent {
+        state
+            .sessions
+            .record_machine_started(project_id, *machine_id);
+    } else {
+        state.sessions.clear_machine_outcome(project_id, machine_id);
+    }
+    sent
+}
+
 fn machines_for_audit(state: &AppState, machines: &[Uuid]) -> serde_json::Value {
     serde_json::Value::Array(
         machines
@@ -548,17 +649,28 @@ pub(crate) async fn audit_open_state(
 /// other owners; `named_machine` (the recorded machine, for a project
 /// already open) when no machine owns a tab; and `named_machine` alone when
 /// the owners are unknown. A machine left out keeps its reason for its
-/// part, and never fails the request. `caller_starts` is a machine the
-/// caller checks and starts itself, for a tab or task waiting on it: it is
-/// sent nothing here.
+/// part, and never fails the request. `work` is the machine of the tab or
+/// task this open is made for, if any; see [`WorkMachine`].
+///
+/// A machine that reads as running the project is sent nothing when the
+/// project was open already. When this open changes the record, it is
+/// checked and sent the start like the others: a close, a follow step or an
+/// administrative stop may have sent it a stop that is still taking effect,
+/// and the lock orders only what the server sends. Its daemon answers a
+/// start of a project that runs by changing nothing.
 pub(crate) async fn open_project_locked(
     state: &AppState,
     actor: &Uuid,
     project_id: &str,
     named_machine: Option<Uuid>,
     source: &str,
-    caller_starts: Option<Uuid>,
+    work: Option<WorkMachine>,
 ) -> Result<OpenOutcome, String> {
+    let (caller_starts, attached) = match work {
+        Some(WorkMachine::CallerStarts(machine_id)) => (Some(machine_id), None),
+        Some(WorkMachine::Attached(machine_id)) => (None, Some(machine_id)),
+        None => (None, None),
+    };
     let record = read_open_state(state, project_id)
         .await?
         .ok_or_else(|| "Canonical project metadata is unavailable".to_string())?;
@@ -579,6 +691,7 @@ pub(crate) async fn open_project_locked(
         TabOwners::Unknown => named_machine.into_iter().collect(),
         TabOwners::Known(owners) => owners.iter().filter_map(|owner| owner.machine_id).collect(),
     };
+    targets.extend(attached);
     targets.sort();
     targets.dedup();
 
@@ -617,8 +730,9 @@ pub(crate) async fn open_project_locked(
             state.sessions.clear_machine_outcome(project_id, &target);
             continue;
         }
-        if machine_runs_project(state, project_id, &target) {
-            // Nothing changes on a machine that runs it.
+        let runs = machine_runs_project(state, project_id, &target);
+        if runs && !transition {
+            // Nothing changes on a machine that runs an open project.
             state.sessions.record_machine_started(project_id, target);
             continue;
         }
@@ -629,7 +743,18 @@ pub(crate) async fn open_project_locked(
             outcome.refused.push(refusal);
             continue;
         }
-        if send_recorded_start(state, project_id, &target, &policy).await {
+        let sent = if runs {
+            // The project was closed or not recorded until now, so a stop
+            // may have been sent to this machine and still be taking effect:
+            // it reads as running until its daemon has ended the project.
+            // The start is sent anyway. Its daemon takes frames in order: it
+            // answers that the project already runs when nothing was
+            // stopping, and starts it again after a stop sent before.
+            send_start_to_running_machine(state, project_id, &target, &policy).await
+        } else {
+            send_recorded_start(state, project_id, &target, &policy).await
+        };
+        if sent {
             outcome.asked.push(target);
         } else {
             let host = machine_label(state, target);
@@ -727,15 +852,47 @@ async fn close_targets(
     targets
 }
 
+/// Whether `requester` may use the project's runtime on every machine
+/// listing the project where `closer` may, and on at least one more. Only
+/// then does a repeated close record the requester as the closer. A member
+/// who closes again after the owner therefore does not take the owner's
+/// machines out of following, and the owner's close after a member's reaches
+/// the machines the member could not.
+async fn closer_has_wider_authority(
+    state: &AppState,
+    project_id: &str,
+    requester: &Uuid,
+    closer: &Uuid,
+) -> bool {
+    let mut wider = false;
+    for machine_id in state.sessions.machines_listing_project(project_id) {
+        let requester_may =
+            has_machine_project_runtime_access(state, requester, &machine_id, project_id).await;
+        let closer_may =
+            has_machine_project_runtime_access(state, closer, &machine_id, project_id).await;
+        if closer_may && !requester_may {
+            return false;
+        }
+        wider |= requester_may && !closer_may;
+    }
+    wider
+}
+
 /// Close `project_id` as `actor`. The caller holds the project's open-state
 /// lock and has checked that `actor` may set the state.
 ///
-/// The project is recorded closed by `actor`, unless it already is: a
-/// repeated close leaves the recorded closer as it was. Then every
-/// connected machine that runs the project, has an instance of it attached
-/// or was asked to start it is sent the stop a project stop always sent,
-/// where `actor` may use it; a machine `actor` may not use keeps running
-/// and keeps the reason for its part.
+/// The project is recorded closed by `actor`, unless it already is. A
+/// repeated close leaves the recorded closer as it was, except that an
+/// account that may stop every machine the recorded closer may, and at
+/// least one more, becomes the closer: a machine that was away is stopped
+/// on the closer's authority when its daemon registers, and the wider one
+/// reaches it. An administrative close is never replaced by a request.
+/// Then every connected machine that runs the project, has an instance of
+/// it attached or was asked to start it is sent the stop a project stop
+/// always sent, where `actor` may use it; a machine `actor` may not use
+/// keeps running and keeps the reason for its part. A tab that was waiting
+/// for a stopped machine's instance fails with
+/// [`crate::session::open_state::closed_before_start_reason`].
 ///
 /// A close sends nothing but `StopProjectCli`. It forgets no machine's tabs,
 /// closes no tab and deletes nothing, on the server or on any machine.
@@ -750,9 +907,20 @@ pub(crate) async fn close_project_locked(
         .await?
         .ok_or_else(|| "Machine not found".to_string())?;
     let transition = record.state != Some(ProjectOpenState::Closed);
+    // A close of a project a person already closed changes who closed it
+    // only when the new closer may stop more machines; see
+    // `closer_has_wider_authority`.
+    let replaces_closer = !transition
+        && record.set_kind == Some(OpenStateSetKind::Request)
+        && match record.set_by_account() {
+            Some(closer) if closer != *actor => {
+                closer_has_wider_authority(state, project_id, actor, &closer).await
+            }
+            _ => false,
+        };
     // Found before anything is cleared: a start still pending is stopped.
     let targets = close_targets(state, actor, project_id, named_machine).await;
-    if transition {
+    if transition || replaces_closer {
         match state
             .db
             .set_project_open_state(
@@ -807,6 +975,9 @@ pub(crate) async fn close_project_locked(
             )
             .await
         {
+            // A tab still waiting for this machine's instance fails now, so
+            // the next tab request begins a new start.
+            state.sessions.end_tab_starts_for_stop(project_id, &target);
             outcome.asked.push(target);
         } else {
             let host = machine_label(state, target);
@@ -817,7 +988,7 @@ pub(crate) async fn close_project_locked(
             });
         }
     }
-    if transition || !outcome.asked.is_empty() {
+    if transition || replaces_closer || !outcome.asked.is_empty() {
         audit_open_state(
             state,
             &actor.to_string(),
@@ -868,11 +1039,19 @@ pub(crate) async fn other_machines_own_or_run(
         .machines_with_pending_instance_start(&session_ids)
         .iter()
         .any(|other| other != machine_id)
-        || state
-            .sessions
-            .project_machine_outcomes(project_id)
-            .iter()
-            .any(|(other, outcome)| other != machine_id && outcome.is_start_pending())
+        || {
+            // A start nothing answered counts only within its time limit:
+            // past it the machine reads as not started, and must not keep
+            // this machine's stop from closing the project for ever.
+            let limit = state.sessions.instance_start_timeout();
+            state
+                .sessions
+                .project_machine_outcomes(project_id)
+                .iter()
+                .any(|(other, outcome)| {
+                    other != machine_id && outcome.is_start_pending_within(limit)
+                })
+        }
 }
 
 /// Whether a machine other than `machine_id` owns tabs of the project: what
@@ -895,6 +1074,14 @@ pub(crate) async fn other_machines_own_tabs(
 /// start. The caller holds the project's open-state lock and keeps it until
 /// that start is sent.
 ///
+/// `caller_starts` says the caller sends that start itself, so an open made
+/// here sends `machine_id` nothing. It is false for a tab or task on a
+/// machine that already has an instance attached, in a project recorded
+/// closed: the caller starts nothing, and the open treats that machine as it
+/// treats every tab owner that reads as running, whether or not it owns a
+/// tab. Its stop may still be taking effect, and the tab or task would then
+/// go to an instance that is ending.
+///
 /// From a viewer that negotiated the open state (`knows_open_state`), the
 /// project is opened as `actor`: recorded open, and the other machines that
 /// own tabs started as an open starts them. From any other client the
@@ -909,6 +1096,7 @@ pub(crate) async fn admit_start_for_new_work(
     machine_id: Uuid,
     knows_open_state: bool,
     source: &str,
+    caller_starts: bool,
 ) -> Result<(), String> {
     let Some(record) = read_open_state(state, project_id).await? else {
         // No record of the project: as before the open state.
@@ -930,10 +1118,68 @@ pub(crate) async fn admit_start_for_new_work(
         project_id,
         Some(machine_id),
         source,
-        Some(machine_id),
+        Some(if caller_starts {
+            WorkMachine::CallerStarts(machine_id)
+        } else {
+            WorkMachine::Attached(machine_id)
+        }),
     )
     .await
     .map(|_| ())
+}
+
+/// [`admit_start_for_new_work`] for a tab that goes to an attached instance
+/// whose machine the server cannot name: its CLI reported none, and no one
+/// machine of the project matches its host. The caller holds the project's
+/// open-state lock, and starts nothing.
+///
+/// The closed row of design Decision 3 applies with no machine named. The
+/// instance's own tabs are the untagged ones attributed to `hostname`, where
+/// no machine of that name lists the project; a tab of any other owner is on
+/// another machine. The open names no machine, and starts the tab owners the
+/// server knows as any open does.
+pub(crate) async fn admit_new_work_on_unnamed_machine(
+    state: &AppState,
+    actor: &Uuid,
+    project_id: &str,
+    hostname: Option<&str>,
+    knows_open_state: bool,
+    source: &str,
+) -> Result<(), String> {
+    let Some(record) = read_open_state(state, project_id).await? else {
+        return Ok(());
+    };
+    if !knows_open_state {
+        match record.state {
+            None | Some(ProjectOpenState::Open) => return Ok(()),
+            Some(ProjectOpenState::Closed) => {
+                let host = hostname
+                    .map(crate::session::normalize_machine_hostname)
+                    .filter(|host| !host.is_empty());
+                let owners = project_tab_owners(state, project_id, None).await;
+                let elsewhere = owners.list().iter().any(|owner| {
+                    owner.machine_id.is_some()
+                        || Some(crate::session::normalize_machine_hostname(&owner.hostname)) != host
+                });
+                if elsewhere {
+                    return Err(CLOSED_WITH_TABS_ELSEWHERE.to_string());
+                }
+            }
+        }
+    }
+    open_project_locked(state, actor, project_id, None, source, None)
+        .await
+        .map(|_| ())
+}
+
+/// Whether the project is recorded closed. False when it is open, not
+/// recorded, unknown to the server, or its state cannot be read: the caller
+/// then changes nothing.
+pub(crate) async fn is_recorded_closed(state: &AppState, project_id: &str) -> bool {
+    matches!(
+        read_open_state(state, project_id).await,
+        Ok(Some(record)) if record.state == Some(ProjectOpenState::Closed)
+    )
 }
 
 /// A creation that starts the project records it open, by its creator and

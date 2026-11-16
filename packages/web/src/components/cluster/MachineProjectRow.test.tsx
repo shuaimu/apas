@@ -163,6 +163,24 @@ describe("MachineProjectRow", () => {
     expect(button("Close mako (listed on zoo-006)").textContent).toContain("Closing…");
   });
 
+  // The machine list says of another account's machine only whether it
+  // runs the project. Right after an Open it is starting, and the row must
+  // not say it failed, nor offer to open the project again for it.
+  it("says another account's machine is not running yet, and offers no Open again for it", () => {
+    renderRow({
+      machines: [
+        machine(ZOO5, "zoo-005", { isRunning: true, openState: "open", part: "running", otherHosts: [other("zoo-006", false)] }),
+      ],
+      from: ZOO5,
+    });
+
+    expect(state()).toBe("Open");
+    expect(part()).toBe("Running");
+    expect(screen.getByTestId("other-machines").textContent).toBe("zoo-006: Not running yet");
+    expect(screen.queryByRole("button", { name: /^Open/ })).toBeNull();
+    expect(button("Close mako (listed on zoo-005)").disabled).toBe(false);
+  });
+
   it("opens a registered project that never ran on the machine whose entry is used", () => {
     const { onOpen } = renderRow({ machines: [machine(ZOO5, "zoo-005")], from: ZOO5 });
 

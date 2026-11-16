@@ -22,6 +22,7 @@ vi.mock("@/components/tabs/TerminalPane", () => ({
 const SID = "20000000-0000-4000-8000-000000000001";
 const ZOO5 = "50000000-0000-4000-8000-000000000005";
 const ZOO6 = "50000000-0000-4000-8000-000000000006";
+const LAPTOP = "50000000-0000-4000-8000-000000000007";
 const KEEP_OPEN = "Its tabs start again on zoo-005 and zoo-006 after those machines have been away.";
 const initialStore = useStore.getInitialState();
 
@@ -426,5 +427,38 @@ describe("a new agent on a machine that is not running the project", () => {
     const opens = within(step).getByRole("group", { name: "Opens the project" });
     expect(within(step).queryByRole("group", { name: "Starts the project first" })).toBeNull();
     expect(opens.textContent).toContain("opens the project, which also starts its tabs on zoo-006, then the tab opens");
+  });
+
+  // "Clone here" ends in a tab request on a machine that is not running
+  // the project, which opens the project: the saved agents on zoo-005 and
+  // zoo-006 start. The step and the confirmation sheet say so first.
+  it.each([
+    ["closed", "closed" as const],
+    ["not recorded", undefined],
+  ])("says an agent on a machine to clone onto opens a %s project, and names the machines whose tabs start", (_name, state) => {
+    seed({ instances: [] });
+    act(() => useStore.setState((current) => ({
+      sessions: current.sessions.map((item) => ({ ...item, openState: state, gitRemote: "github.com/example/mako" })),
+      // An owned machine that does not have the project.
+      machines: [...current.machines, { ...machine(LAPTOP, "laptop", false), projects: [] }],
+    })));
+    report(state, [part(ZOO5, "zoo-005", "not_started"), part(ZOO6, "zoo-006", "not_started")]);
+    renderScreen();
+
+    fireEvent.click(screen.getByRole("button", { name: "Add agent" }));
+    const sheet = screen.getByRole("dialog", { name: "Add agent" });
+    const clone = within(within(sheet).getByRole("group", { name: "Run on" })).getByRole("group", { name: "Clone here" });
+    expect(clone.textContent).toContain(
+      "Not there yet · clones the repository and opens the project, which also starts its tabs on zoo-005 and zoo-006, then the tab opens",
+    );
+
+    fireEvent.click(within(clone).getByRole("radio", { name: /^laptop/ }));
+    fireEvent.click(within(sheet).getByRole("button", { name: /^Claude/ }));
+    const confirm = screen.getByRole("dialog", { name: "Clone this project onto laptop?" });
+    expect(lines(confirm)).toContain("The new tab opens the project, which also starts its tabs on zoo-005 and zoo-006.");
+    // Nothing is cloned, opened or started before the confirmation.
+    expect(ws.send).not.toHaveBeenCalled();
+    fireEvent.click(within(confirm).getByRole("button", { name: "Cancel" }));
+    expect(ws.send).not.toHaveBeenCalled();
   });
 });

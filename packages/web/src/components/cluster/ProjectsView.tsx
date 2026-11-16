@@ -31,6 +31,7 @@ export function ProjectsView({
   onSelect,
   onClear,
   onDeleted,
+  onDeletionUnconfirmed,
   detail,
   detailUsage,
   detailLoading,
@@ -53,9 +54,13 @@ export function ProjectsView({
   selectedId: string | null;
   onSelect: (projectId: string) => void;
   onClear: () => void;
-  /** The owner deleted the selected project and the server reported it
-   *  done. */
+  /** The owner deleted a project and the server reported it done. It can
+   *  arrive after the Delete dialog was closed, when another project, or
+   *  none, is selected. */
   onDeleted: (projectId: string) => void;
+  /** The Delete dialog closed without learning how an accepted deletion
+   *  went: the project list may be out of date. */
+  onDeletionUnconfirmed?: (projectId: string) => void;
   detail: ClusterProjectDetail | null;
   detailUsage: UsageWindows | null;
   detailLoading: boolean;
@@ -123,6 +128,7 @@ export function ProjectsView({
               userId={userId}
               openState={openState}
               onDeleted={onDeleted}
+              onDeletionUnconfirmed={onDeletionUnconfirmed}
               usagePeriod={usagePeriod}
               onUsagePeriod={onUsagePeriod}
               profiles={profiles}

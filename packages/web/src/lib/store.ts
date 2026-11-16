@@ -1044,6 +1044,11 @@ interface AppState {
   clearPendingPaneSelection: () => void;
   /** Remove all browser-side projections for a project after access loss. */
   forgetProject: (projectId: string) => void;
+  /** How many times each project was forgotten since the page loaded: the
+   *  server reported it deleted, or this account's access to it ended. A
+   *  page that keeps a project list of its own, loaded over HTTP, watches its
+   *  project's count to learn that the list is out of date. */
+  projectForgets: Record<string, number>;
   refreshCliClients: () => void;
   listMachines: () => void;
   /** Open the project: the server records it open and starts it on every
@@ -2148,6 +2153,7 @@ export const useStore = create<AppState>((set, get) => ({
   sessions: [],
   sessionInstances: {},
   projectOpenStates: {},
+  projectForgets: {},
   addPaneRequests: loadAddPaneRequests(),
   paneAutopilot: {},
   autopilotRequests: {},
@@ -2853,6 +2859,10 @@ export const useStore = create<AppState>((set, get) => ({
         cliLifecycleLatestBySession,
         sessionInstances,
         projectOpenStates,
+        projectForgets: {
+          ...state.projectForgets,
+          [projectId]: (state.projectForgets[projectId] ?? 0) + 1,
+        },
         addPaneRequests,
         ...autopilot,
         ...(pendingRemoved

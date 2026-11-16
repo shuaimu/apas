@@ -786,6 +786,32 @@ describe('useStore', () => {
       expect(useStore.getState().paneConfigs).toEqual([]);
       expect(listSessions).toHaveBeenCalledTimes(2);
     });
+
+    // A page that keeps a project list of its own watches this count, also
+    // for a project the store holds nothing else about.
+    it('counts each time a project is forgotten, and not a transfer', () => {
+      useStore.setState({ listSessions: vi.fn() });
+      const deleted = (projectId: string) => handleServerMessage({
+        type: 'project_access_changed',
+        project_id: projectId,
+        change: 'deleted',
+      }, useStore.setState, useStore.getState);
+      const before = useStore.getState().projectForgets['project-a'] ?? 0;
+
+      handleServerMessage({
+        type: 'project_access_changed',
+        project_id: 'project-a',
+        change: 'transferred',
+        role: 'user',
+      }, useStore.setState, useStore.getState);
+      expect(useStore.getState().projectForgets['project-a'] ?? 0).toBe(before);
+
+      deleted('project-a');
+      expect(useStore.getState().projectForgets['project-a']).toBe(before + 1);
+      deleted('project-a');
+      expect(useStore.getState().projectForgets['project-a']).toBe(before + 2);
+      expect(useStore.getState().projectForgets['project-b']).toBeUndefined();
+    });
   });
 
   describe('addMessage', () => {

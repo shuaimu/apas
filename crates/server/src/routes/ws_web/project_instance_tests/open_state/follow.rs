@@ -530,8 +530,9 @@ async fn a_daemon_that_registers_twice_is_asked_once_per_registration() {
 /// An Open racing a follow-stop: the step for a machine that registered
 /// running a closed project waits for the project's open-state lock and
 /// reads the state again once it has it. An Open that got there first found
-/// the machine running and sent nothing, so a stop decided on the earlier
-/// state would end what was just opened. None is sent.
+/// the machine running and sent it only the start its daemon answers by
+/// changing nothing, so a stop decided on the earlier state would end what
+/// was just opened. None is sent.
 #[tokio::test]
 async fn a_follow_stop_is_never_sent_after_a_later_open() {
     let p = project().await;
@@ -566,7 +567,8 @@ async fn a_follow_stop_is_never_sent_after_a_later_open() {
     )
     .await
     .unwrap();
-    assert!(opened.recorded && opened.asked.is_empty());
+    assert!(opened.recorded);
+    assert_eq!(opened.asked, vec![p.m5], "the start that changes nothing");
     drop(opening);
 
     let followed = tokio::time::timeout(Duration::from_secs(5), follow)
@@ -574,7 +576,7 @@ async fn a_follow_stop_is_never_sent_after_a_later_open() {
         .expect("the step runs once the lock is free")
         .unwrap();
     assert_eq!(followed, Followed::Nothing);
-    assert!(nothing_sent(&mut d5), "no stop after the open");
+    assert_eq!(sent(&mut d5), (vec![None], 0), "no stop after the open");
     assert_eq!(recorded(&p).await, Some(ProjectOpenState::Open));
     assert_eq!(part(&p, p.m5), Some((MachinePart::Running, None)));
 }
@@ -645,4 +647,281 @@ async fn nothing_follows_a_not_recorded_project_and_no_heartbeat_starts_anything
     assert!(nothing_sent(&mut q5));
     let mut again = registers(&q, q.m6, HOST_B, false).await;
     one_correlated_start(&mut again);
+}
+
+/// A member closed the project and one machine, which the member may not
+/// use, was away. The owner closes it again while that machine is still
+/// away, so nothing can be sent. The owner may stop every machine the member
+/// may and one more, so the owner becomes the recorded closer, and the
+/// machine is stopped on the owner's authority when its daemon registers.
+#[tokio::test]
+async fn a_second_close_by_a_wider_authority_reaches_the_machine_that_was_away() {
+    let p = project().await;
+    let mut d5 = p.daemon(p.m5, HOST_A, CAPABLE_DAEMON);
+    let _d6 = p.daemon(p.m6, HOST_B, CAPABLE_DAEMON);
+    let mut web = p.viewer(p.owner, KNOWS);
+    two_machine_roster(&p);
+    let member = cluster_member(&p, &[p.m5]).await;
+    let member_web = p.viewer(member, KNOWS);
+    set_recorded(&p, ProjectOpenState::Open, p.owner, None).await;
+    reports_running(&p, p.m5, HOST_A);
+    reports_running(&p, p.m6, HOST_B);
+    p.state.sessions.unregister_daemon(&p.m6);
+
+    close(&p, &member_web, member, p.m5).await;
+    assert!(stopped_once(&mut d5));
+    assert_eq!(record(&p).await.set_by_account(), Some(member));
+
+    close(&p, &web, p.owner, p.m5).await;
+    assert!(errors(&web.drain()).is_empty());
+    let closed = record(&p).await;
+    assert_eq!(closed.state, Some(ProjectOpenState::Closed));
+    assert_eq!(closed.set_kind, Some(OpenStateSetKind::Request));
+    assert_eq!(
+        closed.set_by_account(),
+        Some(p.owner),
+        "the closer who may stop more machines is recorded"
+    );
+
+    let mut d6 = registers(&p, p.m6, HOST_B, true).await;
+    assert!(stopped_once(&mut d6), "stopped on the owner's close");
+    assert_eq!(outcome(&p, p.m6), None);
+}
+
+/// The mirror: the owner closed the project while a machine was away, and a
+/// member who may not use that machine closes it again. The member may stop
+/// fewer machines, so the owner stays the recorded closer and the machine is
+/// still stopped when its daemon registers. An administrative close is not
+/// replaced by anyone's repeated close.
+#[tokio::test]
+async fn a_second_close_by_a_narrower_authority_leaves_the_recorded_closer() {
+    let p = project().await;
+    let mut d5 = p.daemon(p.m5, HOST_A, CAPABLE_DAEMON);
+    let _d6 = p.daemon(p.m6, HOST_B, CAPABLE_DAEMON);
+    let web = p.viewer(p.owner, KNOWS);
+    two_machine_roster(&p);
+    let member = cluster_member(&p, &[p.m5]).await;
+    let mut member_web = p.viewer(member, KNOWS);
+    set_recorded(&p, ProjectOpenState::Open, p.owner, None).await;
+    reports_running(&p, p.m5, HOST_A);
+    reports_running(&p, p.m6, HOST_B);
+    p.state.sessions.unregister_daemon(&p.m6);
+
+    close(&p, &web, p.owner, p.m5).await;
+    assert!(stopped_once(&mut d5));
+    let closed = record(&p).await;
+    assert_eq!(closed.set_by_account(), Some(p.owner));
+
+    close(&p, &member_web, member, p.m5).await;
+    assert!(errors(&member_web.drain()).is_empty());
+    assert!(stopped_once(&mut d5), "the member may stop zoo-005 again");
+    assert_eq!(record(&p).await, closed, "the owner stays the closer");
+
+    let mut d6 = registers(&p, p.m6, HOST_B, true).await;
+    assert!(stopped_once(&mut d6), "still stopped on the owner's close");
+
+    // An operator's stop stays the record whoever closes again.
+    crate::open_state::record_administrative_close(
+        &p.state,
+        &member.to_string(),
+        &p.project_id(),
+        "stop_runtime",
+    )
+    .await
+    .unwrap();
+    let administrative = record(&p).await;
+    close(&p, &web, p.owner, p.m5).await;
+    assert_eq!(record(&p).await, administrative);
+}
+
+/// A follow-start is made on the opener's authority, and a suspended
+/// account can make no request: a machine that registers is not started for
+/// a project that account opened, and says why. A close that account made
+/// before it was suspended still stops a machine that returns running it.
+#[tokio::test]
+async fn a_suspended_openers_project_is_not_started_and_its_close_still_stops() {
+    let p = project().await;
+    let _web = p.viewer(p.owner, KNOWS);
+    two_machine_roster(&p);
+    let member = cluster_member(&p, &[p.m5, p.m6]).await;
+    set_recorded(&p, ProjectOpenState::Open, member, Some(p.m5)).await;
+
+    // While the account is active its open is followed.
+    let mut d6 = registers(&p, p.m6, HOST_B, false).await;
+    one_correlated_start(&mut d6);
+
+    assert!(p
+        .state
+        .db
+        .update_cluster_user_status(
+            crate::db::SYSTEM_ADMIN_ACTOR,
+            &member.to_string(),
+            crate::db::AccountStatus::Suspended,
+        )
+        .await
+        .unwrap());
+    let opened = record(&p).await;
+    assert_eq!(
+        recorded_actor_may_use_machine(&p.state, &opened, &p.m6).await,
+        Err(may_not_use(member, HOST_B))
+    );
+    let mut d6 = registers(&p, p.m6, HOST_B, false).await;
+    assert!(nothing_sent(&mut d6), "a suspended account starts nothing");
+    let reason = may_not_use(member, HOST_B);
+    assert_eq!(
+        outcome(&p, p.m6),
+        Some(MachineOutcome::NotStarted(reason.clone()))
+    );
+    assert_eq!(
+        part(&p, p.m6),
+        Some((MachinePart::NotStarted, Some(reason)))
+    );
+
+    // Its close is still followed: stopping needs no active account.
+    set_recorded(&p, ProjectOpenState::Closed, member, None).await;
+    let closed = record(&p).await;
+    assert_eq!(
+        recorded_actor_may_use_machine(&p.state, &closed, &p.m6).await,
+        Ok(())
+    );
+    let mut d6 = registers(&p, p.m6, HOST_B, true).await;
+    assert!(stopped_once(&mut d6));
+
+    // An opener whose account no longer exists starts nothing either.
+    let gone = Uuid::new_v4();
+    set_recorded(&p, ProjectOpenState::Open, gone, Some(p.m5)).await;
+    let mut d6 = registers(&p, p.m6, HOST_B, false).await;
+    assert!(nothing_sent(&mut d6));
+}
+
+/// The open and close events of the project in the deployment's audit
+/// history, newest first: (action, actor, kind, source, hosts).
+async fn open_state_audit(p: &Project) -> Vec<(String, String, String, String, Vec<String>)> {
+    p.state
+        .db
+        .list_audit_events(200, 0)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|event| {
+            event.project_id.as_deref() == Some(p.project_id().as_str())
+                && (event.action == "project.opened" || event.action == "project.closed")
+        })
+        .map(|event| {
+            let details: serde_json::Value =
+                serde_json::from_str(event.details.as_deref().unwrap()).unwrap();
+            (
+                event.action,
+                event.actor_user_id,
+                details["kind"].as_str().unwrap().to_string(),
+                details["source"].as_str().unwrap().to_string(),
+                details["machines"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|machine| machine["hostname"].as_str().unwrap().to_string())
+                    .collect(),
+            )
+        })
+        .collect()
+}
+
+/// A start or a stop the follow step sends is written to the audit history
+/// as the open or close it carries out: the same event, by whoever set the
+/// state, with source "registration" and the one machine. So the history of
+/// a close also shows the machine that was away and was stopped later. A
+/// registration that sends nothing, or leaves the machine as it is, writes
+/// nothing.
+#[tokio::test]
+async fn a_start_or_stop_sent_at_registration_is_audited_with_who_set_the_state() {
+    let p = project().await;
+    let mut d5 = p.daemon(p.m5, HOST_A, CAPABLE_DAEMON);
+    let web = p.viewer(p.owner, KNOWS);
+    two_machine_roster(&p);
+    set_recorded(&p, ProjectOpenState::Closed, p.owner, None).await;
+    let registration = |action: &str, actor: String, kind: &str, host: &str| {
+        (
+            action.to_string(),
+            actor,
+            kind.to_string(),
+            "registration".to_string(),
+            vec![host.to_string()],
+        )
+    };
+
+    // Opened while zoo-006 was away: its start at registration is audited.
+    open(&p, &web, p.owner, p.m5).await;
+    assert!(started_once(&mut d5));
+    let before = open_state_audit(&p).await;
+    let mut d6 = registers(&p, p.m6, HOST_B, false).await;
+    one_correlated_start(&mut d6);
+    let after = open_state_audit(&p).await;
+    assert_eq!(after.len(), before.len() + 1);
+    assert_eq!(
+        after[0],
+        registration("project.opened", p.owner.to_string(), "request", HOST_B)
+    );
+    // Every hosting cluster finds it in its own history too.
+    assert!(p
+        .state
+        .db
+        .list_cluster_audit_events(&p.owner.to_string(), 50, 0)
+        .await
+        .unwrap()
+        .iter()
+        .any(|event| event.action == "project.opened"
+            && event
+                .details
+                .as_deref()
+                .is_some_and(|details| details.contains("\"registration\""))));
+
+    // A registration that finds the machine in line writes nothing.
+    let mut d6 = registers(&p, p.m6, HOST_B, true).await;
+    assert!(nothing_sent(&mut d6));
+    assert_eq!(open_state_audit(&p).await, after);
+
+    // Closed while zoo-006 was away: its stop at registration is audited.
+    p.state.sessions.unregister_daemon(&p.m6);
+    close(&p, &web, p.owner, p.m5).await;
+    let before = open_state_audit(&p).await;
+    let mut d6 = registers(&p, p.m6, HOST_B, true).await;
+    assert!(stopped_once(&mut d6));
+    let after = open_state_audit(&p).await;
+    assert_eq!(after.len(), before.len() + 1);
+    assert_eq!(
+        after[0],
+        registration("project.closed", p.owner.to_string(), "request", HOST_B)
+    );
+
+    // A machine left as it is writes nothing: the closer may not use it.
+    let member = cluster_member(&p, &[p.m5]).await;
+    set_recorded(&p, ProjectOpenState::Closed, member, None).await;
+    let mut d6 = registers(&p, p.m6, HOST_B, true).await;
+    assert!(nothing_sent(&mut d6));
+    assert_eq!(open_state_audit(&p).await, after);
+
+    // The system administrator's stop is followed in the administrator's
+    // name, as an administrative close.
+    crate::open_state::record_administrative_close(
+        &p.state,
+        crate::db::SYSTEM_ADMIN_ACTOR,
+        &p.project_id(),
+        "stop_runtime",
+    )
+    .await
+    .unwrap();
+    let before = open_state_audit(&p).await;
+    let mut d6 = registers(&p, p.m6, HOST_B, true).await;
+    assert!(stopped_once(&mut d6));
+    let after = open_state_audit(&p).await;
+    assert_eq!(after.len(), before.len() + 1);
+    assert_eq!(
+        after[0],
+        registration(
+            "project.closed",
+            crate::db::SYSTEM_ADMIN_ACTOR.to_string(),
+            "administrative",
+            HOST_B
+        )
+    );
 }

@@ -592,6 +592,77 @@ describe("a viewer that has received no project_open_state frame", () => {
   });
 });
 
+describe("a project no machine-list entry lists", () => {
+  // The server restarted while the project's only machine was asleep: that
+  // machine is in no list until its daemon registers again, and the frame
+  // still names it. The request names it from the frame.
+  const LAPTOP_TAB = [terminal(10, "Claude 1", ZOO7, "laptop")];
+
+  it("still offers Close for an open project, and records the close for the machine's return", async () => {
+    seed({ instances: [], machines: [], panes: LAPTOP_TAB, session: { openState: "open", hostname: "laptop" } });
+    report("open", [part(ZOO7, "laptop", "waiting_offline", { connected: false })]);
+    await renderView();
+
+    expect(screen.getByTestId("project-open-state").textContent).toBe("Open");
+    expect(notice()?.textContent).toBe("laptop is offline. Its tabs start when laptop reconnects.");
+    expect(projectButtons()).toEqual(["Close"]);
+
+    fireEvent.click(screen.getByRole("button", { name: "Close" }));
+    expect(dialogLines()).toEqual([
+      "This stops its agents on every machine that runs it.",
+      "laptop is offline. If it still runs the project when it reconnects, its agents are stopped then.",
+      NOTHING_DELETED,
+    ]);
+    confirmDialog("Close");
+    const [close] = sent("stop_machine_project_cli");
+    expect(close).toEqual({
+      type: "stop_machine_project_cli",
+      machine_id: ZOO7,
+      project_id: SID,
+      all_instances: true,
+    });
+    expectValid(close);
+    expect(sent("start_machine_project_cli")).toEqual([]);
+  });
+
+  it("still offers Open for a closed project, to wait for the machine", async () => {
+    seed({ instances: [], machines: [], panes: LAPTOP_TAB, session: { openState: "closed", hostname: "laptop" } });
+    report("closed", [part(ZOO7, "laptop", "not_started", { connected: false })]);
+    await renderView();
+
+    expect(projectButtons()).toEqual(["Open"]);
+    fireEvent.click(screen.getByRole("button", { name: "Open" }));
+    expect(dialogLines()).toEqual(["laptop is offline. Its tabs start when laptop reconnects."]);
+    confirmDialog("Open");
+    const [open] = sent("start_machine_project_cli");
+    expect(open).toEqual({
+      type: "start_machine_project_cli",
+      machine_id: ZOO7,
+      project_id: SID,
+      all_instances: true,
+    });
+    expectValid(open);
+  });
+
+  it("offers neither while the frame names no machine", async () => {
+    // A roster of untagged tabs: the server knows the host by name only.
+    seed({ instances: [], machines: [], panes: LAPTOP_TAB, session: { openState: "open", hostname: "laptop" } });
+    act(() => handleServerMessage(
+      {
+        type: "project_open_state",
+        project_id: SID,
+        state: "open",
+        machines: [{ hostname: "laptop", part: "waiting_offline", owns_tabs: true, connected: false }],
+      },
+      useStore.setState,
+      useStore.getState,
+    ));
+    await renderView();
+    expect(screen.getByTestId("project-open-state").textContent).toBe("Open");
+    expect(projectButtons()).toEqual([]);
+  });
+});
+
 describe("a request that could not be sent", () => {
   it("says nothing was sent, and sends nothing later", async () => {
     seed({ session: { openState: "open" } });
@@ -721,6 +792,85 @@ describe("a new tab on a machine that is not running the project", () => {
     expect(add).toMatchObject({ type: "add_pane", session_id: SID, machine_id: ZOO6 });
     expectValid(add);
     expect(sent("start_machine_project_cli")).toEqual([]);
+  });
+
+  // "Clone here" ends in a tab request on a machine that is not running
+  // the project, which opens the project like any other such tab: the saved
+  // agents on zoo-005 and zoo-006 start. The step and the confirmation say
+  // so before anything is cloned.
+  it.each([
+    ["closed", "closed" as const],
+    ["not recorded", undefined],
+  ])("says a tab on a machine to clone onto opens a %s project, and names the machines whose tabs start", async (_name, state) => {
+    seed({
+      instances: [],
+      session: { openState: state, gitRemote: "github.com/example/apas", gitRemoteUrl: "https://github.com/example/apas.git" },
+      machines: [
+        machine(ZOO5, "zoo-005"),
+        machine(ZOO6, "zoo-006"),
+        // An owned machine that does not have the project.
+        { ...machine(ZOO7, "laptop"), projects: [] },
+      ],
+    });
+    act(() => useStore.setState({
+      projectPolicies: {
+        [SID]: {
+          teamAvailable: false,
+          allowedLaunchProfiles: ["terminal:claude:official:default"],
+          version: 3,
+          projectSuspended: false,
+          noncompliantPaneIds: [],
+        },
+      },
+    }));
+    report(state, [part(ZOO5, "zoo-005", "not_started"), part(ZOO6, "zoo-006", "not_started")]);
+    await renderView();
+
+    fireEvent.click(screen.getByTitle("New tab"));
+    const step = screen.getByRole("group", { name: "Run on" });
+    const clone = within(step).getByRole("group", { name: "Clone here" });
+    expect(within(clone).getByText(
+      "Not there yet · clones the repository and opens the project, which also starts its tabs on zoo-005 and zoo-006, then the tab opens",
+    )).toBeTruthy();
+
+    fireEvent.click(within(clone).getByRole("radio", { name: /^laptop/ }));
+    fireEvent.click(screen.getByText("Claude"));
+    // The clone is the one confirmation this view still asks with confirm().
+    expect(confirmSpy).toHaveBeenCalledTimes(1);
+    const asked = String(confirmSpy.mock.calls[0][0]);
+    expect(asked).toContain("Clone this project onto laptop?");
+    expect(asked).toContain("The new tab opens the project, which also starts its tabs on zoo-005 and zoo-006.");
+    // Declined: nothing is cloned, opened or started.
+    expect(ws.send).not.toHaveBeenCalled();
+    confirmSpy.mockClear();
+  });
+
+  it("keeps the clone's older wording against a server that records no open state", async () => {
+    seed({
+      negotiated: false,
+      instances: [],
+      session: { gitRemote: "github.com/example/apas" },
+      machines: [machine(ZOO5, "zoo-005"), machine(ZOO6, "zoo-006"), { ...machine(ZOO7, "laptop"), projects: [] }],
+    });
+    act(() => useStore.setState({
+      projectPolicies: {
+        [SID]: {
+          teamAvailable: false,
+          allowedLaunchProfiles: ["terminal:claude:official:default"],
+          version: 3,
+          projectSuspended: false,
+          noncompliantPaneIds: [],
+        },
+      },
+    }));
+    await renderView();
+    fireEvent.click(screen.getByTitle("New tab"));
+    const clone = within(screen.getByRole("group", { name: "Run on" })).getByRole("group", { name: "Clone here" });
+    expect(within(clone).getByText("Not there yet · clone the repository, then start it")).toBeTruthy();
+    fireEvent.click(within(clone).getByRole("radio", { name: /^laptop/ }));
+    fireEvent.click(screen.getByText("Claude"));
+    expect(String(confirmSpy.mock.calls[0][0])).not.toContain("opens the project");
+    confirmSpy.mockClear();
   });
 
   it("keeps the older wording against a server that records no open state", async () => {
