@@ -101,6 +101,7 @@ describe("native terminal containment and input", () => {
       negotiatedCapabilities: [],
       instancesBySession: {},
       panesBySession: {},
+      knownMachines: [],
     });
   });
 
@@ -219,17 +220,25 @@ describe("native terminal containment and input", () => {
     expect(view.getByRole("button", { name: "Esc" })).toBeDisabled();
   });
 
-  it("says when the tab's machine is not running the project", () => {
+  it("says when the tab's machine is not running the project, by whether that machine is connected", () => {
     useMobileStore.setState({
       negotiatedCapabilities: ["project_instances_v1"],
       instancesBySession: { [sessionId]: [zoo005] },
       panesBySession: { [sessionId]: [zoo006Pane] },
+      knownMachines: [{ machine_id: ZOO_006, hostname: "zoo-006", connected: true }],
     });
     const view = render(<TerminalScreen />);
     makeRunning();
     mockSend.mockClear();
     bridge({ type: "input", data: "ls" });
     expect(mockSend).not.toHaveBeenCalled();
-    expect(view.getByText("zoo-006 is not running this project. Start it on zoo-006 first.")).toBeTruthy();
+    expect(view.getByText("zoo-006 is not running this project. Open the project again to start it there.")).toBeTruthy();
+
+    // The next synchronization lists zoo-006's daemon as gone.
+    act(() => useMobileStore.setState({ knownMachines: [{ machine_id: ZOO_006, hostname: "zoo-006", connected: false }] }));
+    expect(view.getByText("zoo-006 is not running this project because it is offline.")).toBeTruthy();
+    expect(view.queryByText(/Open the project again/)).toBeNull();
+    bridge({ type: "input", data: "ls" });
+    expect(mockSend).not.toHaveBeenCalled();
   });
 });

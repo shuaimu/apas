@@ -151,6 +151,11 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
     let (tx, mut rx) = mpsc::channel::<ServerToDaemon>(64);
     let connection_sender = tx.clone();
     let job_registration_guard = state.jobs.daemon_guard(machine_id).await;
+    // The projects this registration lists: the ones the machine follows.
+    let listed_projects: Vec<String> = initial_projects
+        .iter()
+        .map(|project| project.project_id.clone())
+        .collect();
     let registered_msg = register_daemon_session(
         &state.sessions,
         machine_id,
@@ -179,6 +184,24 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
     }
     crate::jobs::daemon_connected(&state, machine_id).await;
     drop(job_registration_guard);
+
+    // The machine was away: bring it in line with each recorded project it
+    // lists, now that its capabilities are known and it has been told it is
+    // registered. Once, here, and at no other time; a spawned task, so that
+    // this connection already drains what the step sends it.
+    {
+        let state = state.clone();
+        let connection = connection_sender.clone();
+        tokio::spawn(async move {
+            crate::open_state::follow::follow_registered_daemon(
+                &state,
+                machine_id,
+                &connection,
+                listed_projects,
+            )
+            .await;
+        });
+    }
 
     tracing::info!(
         "Daemon connected: machine={} user={} hostname={}",
@@ -341,6 +364,9 @@ async fn apply_registered_daemon_message(
         }
         DaemonToServer::Heartbeat { projects } => {
             state.sessions.update_daemon_projects(machine_id, projects);
+            // A project this machine lists for the first time is read once,
+            // so its part is reported. A heartbeat starts and stops nothing.
+            crate::open_state::load_missing_bases(state, machine_id).await;
         }
         DaemonToServer::Register {
             machine, projects, ..
@@ -443,17 +469,44 @@ async fn apply_registered_daemon_message(
                             .get_effective_project_policy(&project_id)
                             .await
                             .ok();
-                        let _ = state
-                            .sessions
-                            .send_to_daemon(
-                                machine_id,
-                                ServerToDaemon::StartProjectCli {
-                                    project_id: project_id.clone(),
-                                    policy,
-                                    request_id: None,
-                                },
+                        {
+                            // A creation that starts the project records it
+                            // open, by its creator and naming this machine.
+                            // Held until the start has been sent.
+                            let _open_state =
+                                state.sessions.project_open_state_guard(&project_id).await;
+                            crate::open_state::record_created_open(
+                                state,
+                                &requester_id,
+                                &project_id,
+                                Some(*machine_id),
+                                "provisioning",
                             )
                             .await;
+                            // Kept for the machine's part until it is seen
+                            // running; this start carries no id to answer.
+                            state.sessions.record_machine_start_asked(
+                                &project_id,
+                                *machine_id,
+                                None,
+                            );
+                            if !state
+                                .sessions
+                                .send_to_daemon(
+                                    machine_id,
+                                    ServerToDaemon::StartProjectCli {
+                                        project_id: project_id.clone(),
+                                        policy,
+                                        request_id: None,
+                                    },
+                                )
+                                .await
+                            {
+                                state
+                                    .sessions
+                                    .clear_machine_outcome(&project_id, machine_id);
+                            }
+                        }
                         state.sessions.relay_project_instance_created_to_user(
                             &requester_id,
                             machine_id,
@@ -537,6 +590,16 @@ async fn apply_registered_daemon_message(
                 error = error.as_deref().unwrap_or(""),
                 "daemon project-runtime start completed"
             );
+            // The answer is kept for the machine's part in the project: a
+            // refusal with the daemon's reason, a success as a machine still
+            // starting until it is seen running the project.
+            let kept = state.sessions.machine_start_answered(
+                machine_id,
+                &request_id,
+                &project_id,
+                success,
+                error.clone(),
+            );
             // A start sent for new panes waiting on this machine. A refusal
             // fails them; a success leaves them waiting for the instance's
             // `SessionStart`, since only that makes it able to take a pane.
@@ -546,8 +609,9 @@ async fn apply_registered_daemon_message(
                 &project_id,
                 success,
                 error,
-            ) {
-                tracing::debug!(%machine_id, %request_id, "no new pane is waiting on this start");
+            ) && !kept
+            {
+                tracing::debug!(%machine_id, %request_id, "nothing is waiting on this start");
             }
         }
     }
@@ -1101,6 +1165,36 @@ mod tests {
             .project_is_placed_in_cluster(&project_id, &owner.to_string())
             .await
             .unwrap());
+        // A creation that starts the project records it open, by its
+        // creator and naming the machine it starts on, so the machine is
+        // started again when its daemon next registers without running it.
+        let record = state
+            .db
+            .get_project_open_state(&project_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.state, Some(shared::ProjectOpenState::Open));
+        assert_eq!(record.set_by_account(), Some(member));
+        assert_eq!(record.set_kind, Some(shared::OpenStateSetKind::Request));
+        assert_eq!(record.stand_in_machine(), Some(machine_id));
+        let audited = state
+            .db
+            .list_cluster_audit_events(&owner.to_string(), 50, 0)
+            .await
+            .unwrap();
+        assert!(
+            audited.iter().any(|event| {
+                event.action == "project.opened"
+                    && event.actor_user_id == member.to_string()
+                    && event.project_id.as_deref() == Some(project_id.as_str())
+                    && event
+                        .details
+                        .as_deref()
+                        .is_some_and(|details| details.contains("\"provisioning\""))
+            }),
+            "the hosting cluster's history shows who opened it"
+        );
     }
 
     #[tokio::test]
@@ -1165,6 +1259,195 @@ mod tests {
             } if discarded_request == request_id && discarded_project == project_id
         ));
         assert!(state.db.get_project(&project_id).await.unwrap().is_none());
+    }
+
+    /// A daemon that registers is brought in line with the recorded state of
+    /// the projects its `Register` frame lists, after it has been told it is
+    /// registered: an open project it owns tabs of and does not run is
+    /// started with a start it answers, a closed one it still runs is
+    /// stopped, and one nobody recorded is left alone. That happens once.
+    /// Heartbeats ask nothing, also after the daemon refused the start,
+    /// whose reason is kept for the machine's part.
+    #[tokio::test]
+    async fn a_registering_daemon_follows_the_recorded_state_once() {
+        use crate::session::open_state::MachineOutcome;
+        use tokio_tungstenite::{connect_async, tungstenite::Message as ClientMessage};
+
+        let state = test_state().await;
+        let user_id = Uuid::new_v4();
+        add_active_user(&state, user_id, "follow@example.com").await;
+        let machine_id = Uuid::new_v4();
+        let (open, closed, unrecorded) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        for project in [open, closed, unrecorded] {
+            state
+                .db
+                .authorize_project_registration(&project.to_string(), &user_id.to_string())
+                .await
+                .unwrap();
+            // The project's roster: one tab, recorded for this machine.
+            assert!(state
+                .sessions
+                .attach_web_to_session(&project, Uuid::new_v4(), None));
+            let mut pane = shared::PaneConfig::defaults().remove(0);
+            pane.machine_id = Some(machine_id);
+            pane.hostname = Some("follow-host".to_string());
+            state.sessions.set_session_panes(&project, vec![pane]);
+        }
+        for (project, recorded) in [
+            (open, shared::ProjectOpenState::Open),
+            (closed, shared::ProjectOpenState::Closed),
+        ] {
+            assert!(state
+                .db
+                .set_project_open_state(
+                    &project.to_string(),
+                    recorded,
+                    &user_id.to_string(),
+                    shared::OpenStateSetKind::Request,
+                    None,
+                )
+                .await
+                .unwrap());
+        }
+        let inventory = vec![
+            test_project(&open.to_string(), "/work/open", false),
+            test_project(&closed.to_string(), "/work/closed", true),
+            test_project(&unrecorded.to_string(), "/work/unrecorded", false),
+        ];
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let router = crate::routes::create_router(state.clone());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        let (mut daemon, _) = connect_async(format!("ws://{address}/ws/daemon"))
+            .await
+            .unwrap();
+        let send = |message: DaemonToServer| {
+            ClientMessage::Text(serde_json::to_string(&message).unwrap().into())
+        };
+        daemon
+            .send(send(DaemonToServer::Register {
+                token: test_token(user_id, &state.config.auth.jwt_secret),
+                machine: test_machine(machine_id, "follow-host"),
+                projects: inventory.clone(),
+                capabilities: vec![
+                    shared::PROJECT_POLICY_CAPABILITY.to_string(),
+                    shared::PROJECT_INSTANCES_CAPABILITY.to_string(),
+                ],
+            }))
+            .await
+            .unwrap();
+
+        // Every frame the daemon is sent within `wait`, pings answered.
+        async fn frames(
+            daemon: &mut tokio_tungstenite::WebSocketStream<
+                tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+            >,
+            wait: std::time::Duration,
+            until: usize,
+        ) -> Vec<ServerToDaemon> {
+            let mut received = Vec::new();
+            let _ = tokio::time::timeout(wait, async {
+                while received.len() < until {
+                    match daemon.next().await.unwrap().unwrap() {
+                        ClientMessage::Text(text) => {
+                            received.push(serde_json::from_str::<ServerToDaemon>(&text).unwrap())
+                        }
+                        ClientMessage::Ping(data) => {
+                            daemon.send(ClientMessage::Pong(data)).await.unwrap()
+                        }
+                        other => panic!("unexpected websocket frame: {other:?}"),
+                    }
+                }
+            })
+            .await;
+            received
+        }
+
+        let received = frames(&mut daemon, std::time::Duration::from_secs(5), 3).await;
+        assert!(
+            matches!(received.first(), Some(ServerToDaemon::Registered { .. })),
+            "told it is registered before anything is asked of it: {received:?}"
+        );
+        let mut request_id = None;
+        let mut stopped = Vec::new();
+        for frame in &received[1..] {
+            match frame {
+                ServerToDaemon::StartProjectCli {
+                    project_id,
+                    policy,
+                    request_id: asked,
+                } => {
+                    assert_eq!(project_id, &open.to_string());
+                    assert!(policy.is_some(), "a start carries the project's policy");
+                    assert!(request_id.is_none(), "asked once");
+                    request_id = Some(asked.expect("a start its daemon answers"));
+                }
+                ServerToDaemon::StopProjectCli { project_id, .. } => {
+                    stopped.push(project_id.clone())
+                }
+                other => panic!("the follow step sent {other:?}"),
+            }
+        }
+        let request_id = request_id.expect("the open project is started");
+        assert_eq!(stopped, vec![closed.to_string()]);
+
+        // The daemon refuses the start. Heartbeats follow; nothing more is
+        // asked of it.
+        let refusal = "Another host holds this project's claim";
+        daemon
+            .send(send(DaemonToServer::ProjectRuntimeStarted {
+                request_id,
+                project_id: open.to_string(),
+                success: false,
+                error: Some(refusal.to_string()),
+            }))
+            .await
+            .unwrap();
+        for _ in 0..3 {
+            daemon
+                .send(send(DaemonToServer::Heartbeat {
+                    projects: inventory.clone(),
+                }))
+                .await
+                .unwrap();
+        }
+        let more = frames(&mut daemon, std::time::Duration::from_millis(500), usize::MAX).await;
+        assert!(more.is_empty(), "nothing is asked on a heartbeat: {more:?}");
+        assert_eq!(
+            state
+                .sessions
+                .machine_outcome(&open.to_string(), &machine_id),
+            Some(MachineOutcome::NotStarted(refusal.to_string()))
+        );
+        let part = state
+            .sessions
+            .project_open_view(&open.to_string())
+            .unwrap()
+            .machines
+            .into_iter()
+            .find(|machine| machine.machine_id == Some(machine_id))
+            .unwrap();
+        assert_eq!(part.part, shared::MachinePart::NotStarted);
+        assert_eq!(part.reason.as_deref(), Some(refusal));
+        // The project nobody recorded is reported too, and stays so.
+        assert!(state
+            .sessions
+            .project_open_view(&unrecorded.to_string())
+            .is_some_and(|view| view.state.is_none()));
+        assert_eq!(
+            state
+                .db
+                .get_project_open_state(&unrecorded.to_string())
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            None
+        );
+        server.abort();
     }
 
     /// The daemon's answer to a correlated start reaches the new panes

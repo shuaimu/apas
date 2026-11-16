@@ -31,7 +31,7 @@ const CLI = "cli-instances";
 const ZOO5 = "50000000-0000-4000-8000-000000000005";
 const ZOO6 = "50000000-0000-4000-8000-000000000006";
 const LAPTOP = "50000000-0000-4000-8000-000000000007";
-const STOPPED = "zoo-006 is not running this project. Start it on zoo-006 first.";
+const STOPPED = "zoo-006 is not running this project. Open the project again to start it there.";
 const initialStore = useStore.getInitialState();
 
 function terminal(pane_id: number, label: string, machine_id: string, hostname: string): PaneConfig {
@@ -163,7 +163,7 @@ afterEach(() => {
 });
 
 describe("a tab whose machine is not running the project", () => {
-  it("explains it, starts only that machine, and forgets its tabs after confirmation", async () => {
+  it("explains it, offers no start of that machine alone, and forgets its tabs after confirmation", async () => {
     seed(11);
     const confirm = vi.spyOn(window, "confirm").mockReturnValue(true);
     render(<TabbedView />);
@@ -176,11 +176,11 @@ describe("a tab whose machine is not running the project", () => {
     expect(reboot.disabled).toBe(true);
     expect(reboot.title).toBe(STOPPED);
 
-    fireEvent.click(within(banner as HTMLElement).getByRole("button", { name: "Start on zoo-006" }));
-    const [start] = sent("start_machine_project_cli");
-    // That machine only: the project view's Open is what starts them all.
-    expect(start).toEqual({ type: "start_machine_project_cli", machine_id: ZOO6, project_id: SID });
-    expectValid(start);
+    // Opening the project again is what starts zoo-006; nothing here starts
+    // it alone.
+    expect(screen.queryByRole("button", { name: /^Start on/ })).toBeNull();
+    expect(screen.getByRole("button", { name: "Open again" })).toBeTruthy();
+    expect(sent("start_machine_project_cli")).toEqual([]);
 
     fireEvent.click(within(banner as HTMLElement).getByRole("button", { name: "Forget zoo-006's tabs" }));
     expect(String(confirm.mock.calls[0][0])).toContain("They come back if zoo-006 runs this project again.");
@@ -289,7 +289,7 @@ describe("a tab whose machine is not running the project", () => {
     expect(state.showToast).not.toHaveBeenCalledWith("Answer sent to Claude", "success");
   });
 
-  it("offers no Start beside a CLI without multi-machine support, and says which to reboot", async () => {
+  it("offers no Start beside a CLI without multi-machine support either", async () => {
     // zoo-005's daemon is connected but older: its instance owns the project,
     // so the server would refuse zoo-006's instance beside it.
     seed(11);
@@ -302,10 +302,8 @@ describe("a tab whose machine is not running the project", () => {
     }));
     render(<TabbedView />);
     await screen.findByTestId("terminal-pane-11");
-    const start = screen.getByRole("button", { name: "Start on zoo-006" }) as HTMLButtonElement;
-    expect(start.disabled).toBe(true);
-    expect(start.title).toBe("Reboot zoo-005 to update");
-    fireEvent.click(start);
+    expect(screen.getAllByRole("status").some((element) => element.textContent?.includes(STOPPED))).toBe(true);
+    expect(screen.queryByRole("button", { name: /^Start on/ })).toBeNull();
     expect(sent("start_machine_project_cli")).toEqual([]);
   });
 

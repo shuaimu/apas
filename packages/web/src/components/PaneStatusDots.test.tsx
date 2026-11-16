@@ -91,3 +91,41 @@ describe("PaneStatusDots and autopilot", () => {
     expect(dot("Nightly: Not running on zoo-006").hasAttribute("data-autopilot")).toBe(false);
   });
 });
+
+describe("PaneStatusDots and a project's open state", () => {
+  const zoo5 = pane({ pane_id: 1, label: "Claude 1", hostname: "zoo-005", machine_id: "m5", is_working: true });
+  const zoo6 = pane({ pane_id: 2, label: "Claude 2", hostname: "zoo-006", machine_id: "m6", awaiting_answer: true });
+
+  it("says Not running for every tab of a project that runs nowhere", () => {
+    // A closed project, or an open one whose machines are all away.
+    render(<PaneStatusDots isActive={false} panes={[zoo5, zoo6]} />);
+    expect(dot("Claude 1: Not running").className).toContain("bg-gray-400");
+    expect(dot("Claude 2: Not running").className).toContain("bg-gray-400");
+  });
+
+  it("says Not running on <host> for a tab whose machine is not running an open project", () => {
+    render(
+      <PaneStatusDots
+        isActive
+        panes={[zoo5, zoo6]}
+        instances={[{ machineId: "m5", hostname: "zoo-005", primary: true }]}
+      />,
+    );
+    expect(dot("Claude 1: Working").className).toContain("bg-blue-500");
+    expect(dot("Claude 2: Not running on zoo-006").className).toContain("bg-gray-400");
+  });
+
+  it("keeps the real status of tabs on a machine that still runs a closed project", () => {
+    // The project is closed, but zoo-006 still runs it, so something runs
+    // the project and zoo-006's tab is as its agent is.
+    render(
+      <PaneStatusDots
+        isActive
+        panes={[zoo5, zoo6]}
+        instances={[{ machineId: "m6", hostname: "zoo-006", primary: true }]}
+      />,
+    );
+    expect(dot("Claude 2: Pending answer").className).toContain("bg-red-500");
+    expect(dot("Claude 1: Not running on zoo-005")).toBeTruthy();
+  });
+});

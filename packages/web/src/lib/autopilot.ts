@@ -1104,6 +1104,6 @@ function nameList(names: string[]): string {
 export function closeProjectAutopilotNote(tabLabels: string[]): string | undefined {
   if (tabLabels.length === 0) return undefined;
   return tabLabels.length === 1
-    ? `${tabLabels[0]} is on autopilot. Its autopilot comes back paused when the project is started again.`
-    : `${nameList(tabLabels)} are on autopilot. Their autopilots come back paused when the project is started again.`;
+    ? `${tabLabels[0]} is on autopilot. Its autopilot comes back paused when the project is opened again.`
+    : `${nameList(tabLabels)} are on autopilot. Their autopilots come back paused when the project is opened again.`;
 }

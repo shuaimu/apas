@@ -10,11 +10,12 @@ import {
   overviewPrimaryButton,
   overviewQuietDangerButton,
 } from "@/components/overview/OverviewElements";
+import { NOTHING_SENT_TEXT } from "@/lib/projectOpenState";
 import type { ConfirmRequest } from "./ConfirmDialog";
 
 const DEEPSEEK_API_BASE_URL = "https://api.deepseek.com/anthropic";
 const NOT_CONNECTED = "Not connected to the server";
-const NOT_SENT = "Not connected to the server. Nothing was sent.";
+const NOT_SENT = NOTHING_SENT_TEXT;
 
 type SetDeepseekConfig = (machineId: string, apiKey?: string, clearApiKey?: boolean) => boolean;
 

@@ -148,6 +148,11 @@ async fn accessible_sessions(
             session: info,
         });
     }
+    crate::open_state::fill_session_open_states(
+        state,
+        summaries.iter_mut().map(|summary| &mut summary.session),
+    )
+    .await;
     summaries.sort_by(|left, right| {
         right
             .last_user_input_at
@@ -299,6 +304,30 @@ async fn fail_task_launch(
     }
 }
 
+/// Admit a native task launch that needs its chosen machine started. A
+/// native build shows nothing about a project's open state, so the launch
+/// never starts a machine other than the one it names (design Decision 3):
+/// a project that is not recorded or is open is left as it is, and a closed
+/// one is opened only when no other machine owns tabs of it, else the launch
+/// is refused with the reason and nothing starts. The caller holds the
+/// project's open-state lock until it has sent the start.
+async fn admit_task_start(
+    state: &AppState,
+    user_id: &str,
+    request: &MobileTaskLaunchRequest,
+) -> Result<(), String> {
+    let actor = Uuid::parse_str(user_id).map_err(|_| "Invalid user identifier".to_string())?;
+    crate::open_state::admit_start_for_new_work(
+        state,
+        &actor,
+        &request.project_id,
+        request.machine_id,
+        false,
+        "task",
+    )
+    .await
+}
+
 /// The chosen machine's instance of the project, for a launch on a project
 /// an instance that can share it runs, or will run. One registered there but
 /// not running is started, as a web `AddPane` naming that machine starts it.
@@ -312,7 +341,7 @@ async fn task_launch_instance(
     session_id: Uuid,
 ) -> Result<crate::session::InstanceAttachment, AppError> {
     let machine_id = request.machine_id;
-    let (wait, start_policy) = if state
+    let (wait, start_policy, open_state_guard) = if state
         .sessions
         .instance_on_machine(&session_id, &machine_id)
         .is_some()
@@ -322,7 +351,7 @@ async fn task_launch_instance(
         let wait = state
             .sessions
             .wait_for_instance_start(session_id, machine_id, None);
-        (wait, None)
+        (wait, None, None)
     } else {
         if !state.sessions.is_daemon_connected(&machine_id) {
             return Err(fail_task_launch(state, request, user_id, MACHINE_WENT_OFFLINE).await);
@@ -367,12 +396,22 @@ async fn task_launch_instance(
             .db
             .get_effective_project_policy(&request.project_id)
             .await?;
+        // The machine may be started for this task. A native launch names
+        // one machine and reaches no other; see `admit_task_start`. Held
+        // until that start has been sent.
+        let open_state_guard = state
+            .sessions
+            .project_open_state_guard(&request.project_id)
+            .await;
+        if let Err(reason) = admit_task_start(state, user_id, request).await {
+            return Err(fail_task_launch(state, request, user_id, reason).await);
+        }
         let wait = state.sessions.wait_for_instance_start(
             session_id,
             machine_id,
             Some(&request.project_id),
         );
-        (wait, Some(policy))
+        (wait, Some(policy), Some(open_state_guard))
     };
     // A request dropped from here on, because its client went away, must not
     // leave its wait behind.
@@ -388,6 +427,12 @@ async fn task_launch_instance(
         Some(policy),
     ) = (&wait, start_policy)
     {
+        // Kept before the frame goes out, so the daemon's answer finds it.
+        state.sessions.record_machine_start_asked(
+            &request.project_id,
+            machine_id,
+            Some(*start_request),
+        );
         if !state
             .sessions
             .send_to_daemon(
@@ -402,10 +447,14 @@ async fn task_launch_instance(
         {
             state
                 .sessions
+                .clear_machine_outcome(&request.project_id, &machine_id);
+            state
+                .sessions
                 .fail_instance_start(session_id, machine_id, *start_request);
             return Err(fail_task_launch(state, request, user_id, MACHINE_WENT_OFFLINE).await);
         }
     }
+    drop(open_state_guard);
     if let InstanceStartWait::Waiting {
         waiter, outcome, ..
     } = wait
@@ -579,21 +628,40 @@ pub async fn launch_task(
                 .db
                 .get_effective_project_policy(&request.project_id)
                 .await?;
-            if !state
-                .sessions
-                .send_to_daemon(
-                    &request.machine_id,
-                    ServerToDaemon::StartProjectCli {
-                        project_id: request.project_id.clone(),
-                        policy: Some(policy),
-                        request_id: None,
-                    },
-                )
-                .await
             {
-                return Err(
-                    fail_task_launch(&state, &request, &user.id, MACHINE_WENT_OFFLINE).await,
+                // Held until the start has been sent; see `admit_task_start`.
+                let _open_state = state
+                    .sessions
+                    .project_open_state_guard(&request.project_id)
+                    .await;
+                if let Err(reason) = admit_task_start(&state, &user.id, &request).await {
+                    return Err(fail_task_launch(&state, &request, &user.id, reason).await);
+                }
+                // This daemon answers no start; kept for the machine's part.
+                state.sessions.record_machine_start_asked(
+                    &request.project_id,
+                    request.machine_id,
+                    None,
                 );
+                if !state
+                    .sessions
+                    .send_to_daemon(
+                        &request.machine_id,
+                        ServerToDaemon::StartProjectCli {
+                            project_id: request.project_id.clone(),
+                            policy: Some(policy),
+                            request_id: None,
+                        },
+                    )
+                    .await
+                {
+                    state
+                        .sessions
+                        .clear_machine_outcome(&request.project_id, &request.machine_id);
+                    return Err(
+                        fail_task_launch(&state, &request, &user.id, MACHINE_WENT_OFFLINE).await,
+                    );
+                }
             }
             let mut session_id = None;
             for _ in 0..60 {
@@ -1678,5 +1746,221 @@ mod tests {
         let response = p.submit(p.launch(m6, request_id)).await.unwrap();
         assert_eq!(response.pane_id, Some(native_task_pane_id(request_id)));
         assert_eq!(on_zoo_006.lock().unwrap()[0].0.machine_id, Some(m6));
+    }
+
+    // A native build shows nothing about a project's open state, so a task
+    // launch never starts a machine other than the one it names.
+
+    async fn open_state_of(p: &NativeProject) -> crate::db::ProjectOpenStateRecord {
+        p.state
+            .db
+            .get_project_open_state(&p.session.to_string())
+            .await
+            .unwrap()
+            .unwrap()
+    }
+
+    async fn record_state(
+        p: &NativeProject,
+        state: shared::ProjectOpenState,
+        machine: Option<Uuid>,
+    ) {
+        assert!(p
+            .state
+            .db
+            .set_project_open_state(
+                &p.session.to_string(),
+                state,
+                &p.owner.to_string(),
+                shared::OpenStateSetKind::Request,
+                machine.as_ref(),
+            )
+            .await
+            .unwrap());
+    }
+
+    /// The project's persisted roster: one tab on each of `machines`.
+    async fn tabs_on(p: &NativeProject, machines: &[(Uuid, &str)]) {
+        let panes: Vec<PaneConfig> = machines
+            .iter()
+            .enumerate()
+            .map(|(index, (machine_id, host))| {
+                let mut pane = test_pane(3 + index as u32, "tab");
+                pane.machine_id = Some(*machine_id);
+                pane.hostname = Some(host.to_string());
+                pane
+            })
+            .collect();
+        p.state
+            .storage
+            .save_pane_list(&p.session, &panes)
+            .await
+            .unwrap();
+    }
+
+    /// Scenario "A native task in a closed project with tabs elsewhere": the
+    /// launch fails with the reason, for every retry, and nothing starts.
+    #[tokio::test]
+    async fn a_task_in_a_closed_project_with_tabs_on_another_machine_starts_nothing() {
+        let p = native_project().await;
+        let m5 = Uuid::new_v4();
+        let m6 = Uuid::new_v4();
+        let mut zoo_005 = p.daemon(m5, HOST_A, CAPABLE_DAEMON);
+        let mut zoo_006 = p.daemon(m6, HOST_B, CAPABLE_DAEMON);
+        tabs_on(&p, &[(m5, HOST_A), (m6, HOST_B)]).await;
+        record_state(&p, shared::ProjectOpenState::Closed, None).await;
+        let closed = open_state_of(&p).await;
+        let request_id = Uuid::new_v4();
+
+        let refusal = conflict(p.submit(p.launch(m5, request_id)).await);
+        assert_eq!(
+            refusal,
+            "This project is closed and has tabs on other machines. Open it from the project."
+        );
+        assert_eq!(conflict(p.submit(p.launch(m5, request_id)).await), refusal);
+        assert!(zoo_005.try_recv().is_err() && zoo_006.try_recv().is_err());
+        assert_eq!(open_state_of(&p).await, closed);
+        assert!(p
+            .state
+            .sessions
+            .machines_with_pending_instance_start(&[p.session])
+            .is_empty());
+    }
+
+    /// Scenario "A native task in a closed single-machine project": the
+    /// project is recorded open, by the account that launched the task and
+    /// naming its machine, and the task runs there.
+    #[tokio::test]
+    async fn a_task_in_a_closed_single_machine_project_opens_it_and_runs_there() {
+        let p = native_project().await;
+        let m5 = Uuid::new_v4();
+        let m6 = Uuid::new_v4();
+        let mut zoo_005 = p.daemon(m5, HOST_A, CAPABLE_DAEMON);
+        let mut zoo_006 = p.daemon(m6, HOST_B, CAPABLE_DAEMON);
+        tabs_on(&p, &[(m5, HOST_A)]).await;
+        record_state(&p, shared::ProjectOpenState::Closed, None).await;
+        let state = p.state.clone();
+        let session = p.session;
+        let started = tokio::spawn(async move {
+            let Some(ServerToDaemon::StartProjectCli {
+                project_id,
+                request_id: Some(request_id),
+                ..
+            }) = zoo_005.recv().await
+            else {
+                panic!("expected a correlated start")
+            };
+            state
+                .sessions
+                .instance_start_result(m5, request_id, &project_id, true, None);
+            let (cli_id, added) =
+                instance_reporting_its_panes(&state, session, m5, HOST_A, CAPABLE_CLI);
+            state.sessions.instance_started(session, m5, cli_id);
+            added
+        });
+        let request_id = Uuid::new_v4();
+
+        let response = p.submit(p.launch(m5, request_id)).await.unwrap();
+
+        let on_zoo_005 = started.await.unwrap();
+        assert_eq!(on_zoo_005.lock().unwrap().len(), 1);
+        assert_eq!(response.pane_id, Some(native_task_pane_id(request_id)));
+        let opened = open_state_of(&p).await;
+        assert_eq!(opened.state, Some(shared::ProjectOpenState::Open));
+        assert_eq!(opened.set_by_account(), Some(p.owner));
+        assert_eq!(opened.stand_in_machine(), Some(m5));
+        assert!(zoo_006.try_recv().is_err(), "no other machine is started");
+    }
+
+    /// On a project nobody recorded, and on an open one, a task that needs
+    /// its machine started starts that machine and no other, and changes
+    /// nothing that is recorded.
+    #[tokio::test]
+    async fn a_task_starts_only_its_machine_and_records_nothing() {
+        let p = native_project().await;
+        p.state.sessions.set_pane_launch_timing(
+            crate::session::pane_launches::PANE_ID_RESERVATION_TTL,
+            Duration::from_millis(200),
+        );
+        let m5 = Uuid::new_v4();
+        let m6 = Uuid::new_v4();
+        let mut zoo_005 = p.daemon(m5, HOST_A, CAPABLE_DAEMON);
+        let mut zoo_006 = p.daemon(m6, HOST_B, CAPABLE_DAEMON);
+        tabs_on(&p, &[(m5, HOST_A), (m6, HOST_B)]).await;
+
+        // Not recorded.
+        assert_eq!(
+            conflict(p.submit(p.launch(m6, Uuid::new_v4())).await),
+            STILL_STARTING
+        );
+        assert!(matches!(
+            zoo_006.try_recv(),
+            Ok(ServerToDaemon::StartProjectCli {
+                request_id: Some(_),
+                ..
+            })
+        ));
+        assert!(zoo_005.try_recv().is_err());
+        assert_eq!(open_state_of(&p).await.state, None);
+
+        // Open: zoo-005 owns tabs and does not run them, and stays so.
+        record_state(&p, shared::ProjectOpenState::Open, Some(m5)).await;
+        let open = open_state_of(&p).await;
+        assert_eq!(
+            conflict(p.submit(p.launch(m6, Uuid::new_v4())).await),
+            STILL_STARTING
+        );
+        assert!(matches!(
+            zoo_006.try_recv(),
+            Ok(ServerToDaemon::StartProjectCli { .. })
+        ));
+        assert!(zoo_005.try_recv().is_err());
+        assert_eq!(open_state_of(&p).await, open);
+    }
+
+    /// The other launch path, for a machine whose daemon cannot share the
+    /// project while nothing runs it, follows the same rule: refused in a
+    /// closed project with tabs elsewhere, and the project's open in a closed
+    /// one whose tabs are all on that machine.
+    #[tokio::test]
+    async fn a_task_on_an_older_daemon_follows_the_same_rule() {
+        let older_daemon: &[&str] = &[shared::PROJECT_POLICY_CAPABILITY];
+        let p = native_project().await;
+        let m5 = Uuid::new_v4();
+        let m6 = Uuid::new_v4();
+        let mut zoo_005 = p.daemon(m5, HOST_A, older_daemon);
+        let mut zoo_006 = p.daemon(m6, HOST_B, CAPABLE_DAEMON);
+        tabs_on(&p, &[(m5, HOST_A), (m6, HOST_B)]).await;
+        record_state(&p, shared::ProjectOpenState::Closed, None).await;
+        let closed = open_state_of(&p).await;
+
+        assert_eq!(
+            conflict(p.submit(p.launch(m5, Uuid::new_v4())).await),
+            "This project is closed and has tabs on other machines. Open it from the project."
+        );
+        assert!(zoo_005.try_recv().is_err() && zoo_006.try_recv().is_err());
+        assert_eq!(open_state_of(&p).await, closed);
+
+        tabs_on(&p, &[(m5, HOST_A)]).await;
+        let state = p.state.clone();
+        let session = p.session;
+        let started = tokio::spawn(async move {
+            let Some(ServerToDaemon::StartProjectCli {
+                request_id: None, ..
+            }) = zoo_005.recv().await
+            else {
+                panic!("expected the start an older daemon is sent")
+            };
+            // Its CLI attaches as the project's only runtime.
+            instance_reporting_its_panes(&state, session, m5, HOST_A, OLDER_CLI).1
+        });
+        let request_id = Uuid::new_v4();
+        let response = p.submit(p.launch(m5, request_id)).await.unwrap();
+        assert_eq!(response.pane_id, Some(native_task_pane_id(request_id)));
+        assert_eq!(started.await.unwrap().lock().unwrap().len(), 1);
+        let opened = open_state_of(&p).await;
+        assert_eq!(opened.state, Some(shared::ProjectOpenState::Open));
+        assert_eq!(opened.set_by_account(), Some(p.owner));
+        assert!(zoo_006.try_recv().is_err(), "no other machine is started");
     }
 }

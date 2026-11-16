@@ -54,6 +54,7 @@ pub async fn cleanup_project(state: &AppState, project_id: &str) -> Result<()> {
         );
     }
     state.forget_project_mutation_gate(project_id);
+    state.sessions.forget_project_open_state(project_id);
     drop(guard);
     Ok(())
 }

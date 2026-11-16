@@ -75,7 +75,7 @@ describe("UserMessage", () => {
   });
 
   it("says why a refused send was not delivered, keeping its text", () => {
-    const reason = "zoo-005 is not running this project. Start it on zoo-005 first.";
+    const reason = "zoo-005 is not running this project. Open the project again to start it there.";
     const { container } = render(
       <UserMessage message={userMessage({ content: "Run the suite.", deliveryError: reason })} />,
     );

@@ -11,10 +11,12 @@ use std::time::Duration;
 pub mod job_policy;
 pub mod jobs;
 mod models;
+mod open_state;
 mod shared_cluster;
 pub mod workers;
 
 pub use models::*;
+pub use open_state::ProjectOpenStateRecord;
 
 #[derive(Clone)]
 pub struct Database {
@@ -440,6 +442,22 @@ impl Database {
         )
         .execute(&self.pool)
         .await;
+        // A project's open state (see `db/open_state.rs`). All five stay
+        // NULL until someone opens or closes the project: an upgraded
+        // deployment starts with every project not recorded.
+        let project_columns = sqlx::query("PRAGMA table_info(projects)")
+            .fetch_all(&self.pool)
+            .await?;
+        for column in open_state::OPEN_STATE_COLUMNS {
+            if !project_columns
+                .iter()
+                .any(|existing| existing.get::<String, _>("name") == column)
+            {
+                sqlx::query(&format!("ALTER TABLE projects ADD COLUMN {column} TEXT"))
+                    .execute(&self.pool)
+                    .await?;
+            }
+        }
         sqlx::query("CREATE INDEX IF NOT EXISTS idx_projects_owner ON projects(owner_user_id)")
             .execute(&self.pool)
             .await?;
@@ -3276,18 +3294,35 @@ impl Database {
         project_id: &str,
         user_id: &str,
     ) -> Result<Project> {
+        Ok(self
+            .authorize_project_registration_reporting_creation(project_id, user_id)
+            .await?
+            .0)
+    }
+
+    /// [`Self::authorize_project_registration`], also saying whether this
+    /// call created the project's row. A `SessionStart` that creates it is a
+    /// creation that starts the project, which records it open; one for a
+    /// project that already has a row records nothing.
+    pub async fn authorize_project_registration_reporting_creation(
+        &self,
+        project_id: &str,
+        user_id: &str,
+    ) -> Result<(Project, bool)> {
         let user = self
             .get_user_by_id(user_id)
             .await?
             .ok_or_else(|| anyhow::anyhow!("cluster account not found"))?;
         anyhow::ensure!(user.is_active(), "cluster account is suspended");
-        sqlx::query(
+        let created = sqlx::query(
             "INSERT OR IGNORE INTO projects (id, owner_user_id, lifecycle_status) VALUES (?, ?, 'active')",
         )
         .bind(project_id)
         .bind(user_id)
         .execute(&self.pool)
-        .await?;
+        .await?
+        .rows_affected()
+            > 0;
         let project = self
             .get_project(project_id)
             .await?
@@ -3312,7 +3347,7 @@ impl Database {
         anyhow::ensure!(has_access, "user is not a member of this project");
         self.add_project_cluster_placement(project_id, user_id, user_id, "direct_registration")
             .await?;
-        Ok(project)
+        Ok((project, created))
     }
 
     pub async fn get_project_role_for_user(
@@ -3681,6 +3716,21 @@ impl Database {
         .rows_affected()
             > 0;
         if changed {
+            // A suspension closes the project, in the same transaction, so
+            // "open and suspended" never exists and a machine that registers
+            // afterwards is not started. Reactivating records nothing: the
+            // project stays closed until someone opens it.
+            if lifecycle == ProjectLifecycle::Suspended {
+                Self::write_project_open_state(
+                    &mut *tx,
+                    project_id,
+                    shared::ProjectOpenState::Closed,
+                    actor_user_id,
+                    shared::OpenStateSetKind::Administrative,
+                    None,
+                )
+                .await?;
+            }
             Self::insert_audit_tx(
                 &mut tx,
                 actor_user_id,
@@ -3741,6 +3791,17 @@ impl Database {
         .rows_affected()
             > 0;
         anyhow::ensure!(changed, "project deletion state changed concurrently");
+        // A deletion closes the project too, so a host that returns while it
+        // is being deleted is not started.
+        Self::write_project_open_state(
+            &mut *tx,
+            project_id,
+            shared::ProjectOpenState::Closed,
+            actor_user_id,
+            shared::OpenStateSetKind::Administrative,
+            None,
+        )
+        .await?;
         tx.commit().await?;
         Ok(true)
     }

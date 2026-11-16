@@ -9,6 +9,7 @@ import {
   groupProjectsByRepo,
   projectHue,
   projectInitials,
+  projectStateLabel,
   type ProjectEntry,
 } from "@/lib/projectList";
 import { CreateInstanceModal } from "./CreateInstanceModal";
@@ -128,7 +129,8 @@ function ProjectIcon({
     projectHostLabel(project.instances, project.hostname).text,
     project.workingDir !== project.name ? project.workingDir : undefined,
     project.isShared && project.ownerEmail ? `Shared by ${project.ownerEmail}` : undefined,
-    project.sessionId === null ? project.isActive ? "Running" : "Stopped" : project.isActive ? "Active" : undefined,
+    // The project's state: recorded, or open while something runs it.
+    projectStateLabel(project),
     unread ? "New activity" : undefined,
   ]
     .filter(Boolean)
@@ -146,6 +148,7 @@ function ProjectIcon({
   const contents = (
     <>
       <span aria-hidden="true">{projectInitials(project.name)}</span>
+      {/* Something runs the project now; its state is in the tooltip. */}
       {project.isActive && (
         <span
           data-testid="rail-active-dot"
@@ -163,7 +166,7 @@ function ProjectIcon({
     </>
   );
   return project.sessionId === null ? (
-    <Link {...iconProps} href={project.machinesHref} aria-label={`View ${project.name} on Machines — ${project.isActive ? "Running" : "Stopped"}`}>
+    <Link {...iconProps} href={project.machinesHref} aria-label={`View ${project.name} on Machines — ${projectStateLabel(project)}`}>
       {contents}
     </Link>
   ) : (

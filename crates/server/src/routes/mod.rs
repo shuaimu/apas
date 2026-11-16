@@ -25,7 +25,7 @@ pub mod system_admin;
 pub(crate) mod workers;
 mod ws_cli;
 mod ws_daemon;
-mod ws_web;
+pub(crate) mod ws_web;
 
 pub use system_admin::seed_system_admin;
 
@@ -536,6 +536,208 @@ mod cluster_authorization_tests {
         )
         .await
         .is_err());
+    }
+
+    /// Scenarios "An operator stops a project's runtime" and "Reactivating
+    /// after a suspension": an operator's and the system administrator's
+    /// "Stop runtime", and a suspension, record the project closed by that
+    /// actor as an administrative stop, with the machines asked in the audit
+    /// history. Reactivating records nothing and starts nothing.
+    #[tokio::test]
+    async fn stopping_a_runtime_and_suspending_record_the_project_closed() {
+        use shared::{OpenStateSetKind, ProjectOpenState, ServerToDaemon};
+        let state = state().await;
+        add_user(&state, "owner", "user", "active").await;
+        add_user(&state, "host", "user", "active").await;
+        state
+            .db
+            .authorize_project_registration("project-a", "owner")
+            .await
+            .unwrap();
+        state
+            .db
+            .add_project_cluster_placement("project-a", "host", "host", "test")
+            .await
+            .unwrap();
+        let machine_id = uuid::Uuid::new_v4();
+        let (daemon_tx, mut daemon_rx) = tokio::sync::mpsc::channel(16);
+        state.sessions.register_daemon(
+            machine_id,
+            uuid::Uuid::new_v4(),
+            daemon_tx,
+            shared::MachineInfo {
+                machine_id,
+                hostname: "zoo-005".to_string(),
+                os: "linux".to_string(),
+                arch: "x86_64".to_string(),
+                daemon_version: None,
+                deepseek_backend: None,
+                last_seen: None,
+                providers: None,
+            },
+            vec![shared::MachineProjectInfo {
+                project_id: "project-a".to_string(),
+                name: None,
+                path: "/work/project-a".to_string(),
+                preferred_machine_id: None,
+                is_running: true,
+                pid: None,
+                memory_kb: None,
+                last_error: None,
+                git_remote: None,
+                open_state: None,
+                part: None,
+                part_reason: None,
+                other_hosts: Vec::new(),
+            }],
+        );
+        let open_again = || async {
+            assert!(state
+                .db
+                .set_project_open_state(
+                    "project-a",
+                    ProjectOpenState::Open,
+                    "owner",
+                    OpenStateSetKind::Request,
+                    Some(&machine_id),
+                )
+                .await
+                .unwrap());
+        };
+        let record = || async {
+            state
+                .db
+                .get_project_open_state("project-a")
+                .await
+                .unwrap()
+                .unwrap()
+        };
+        let mut stops = || {
+            let mut stops = 0;
+            while let Ok(message) = daemon_rx.try_recv() {
+                assert!(
+                    matches!(message, ServerToDaemon::StopProjectCli { .. }),
+                    "{message:?}"
+                );
+                stops += 1;
+            }
+            stops
+        };
+        let closes = || async {
+            state
+                .db
+                .list_cluster_audit_events("host", 100, 0)
+                .await
+                .unwrap()
+                .into_iter()
+                .filter(|event| event.action == "project.closed")
+                .map(|event| {
+                    let details: serde_json::Value =
+                        serde_json::from_str(event.details.as_deref().unwrap()).unwrap();
+                    (
+                        event.actor_kind,
+                        event.actor_user_id,
+                        details["kind"].as_str().unwrap().to_string(),
+                        details["source"].as_str().unwrap().to_string(),
+                        details["machines"][0]["hostname"]
+                            .as_str()
+                            .map(str::to_string),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+
+        // An operator of a cluster that hosts it stops its runtime.
+        open_again().await;
+        let _ = cluster::stop_runtime(
+            State(state.clone()),
+            headers(&state, "host"),
+            Path("project-a".to_string()),
+        )
+        .await
+        .unwrap();
+        let stopped = record().await;
+        assert_eq!(stopped.state, Some(ProjectOpenState::Closed));
+        assert_eq!(stopped.set_by.as_deref(), Some("host"));
+        assert_eq!(stopped.set_kind, Some(OpenStateSetKind::Administrative));
+        assert_eq!(stopped.machine_id, None);
+        assert_eq!(stops(), 1);
+        assert_eq!(
+            closes().await,
+            vec![(
+                "user".to_string(),
+                "host".to_string(),
+                "administrative".to_string(),
+                "stop_runtime".to_string(),
+                Some("zoo-005".to_string()),
+            )]
+        );
+
+        // The system administrator, who is not an account.
+        open_again().await;
+        let admin_headers = system_admin_headers(&state).await;
+        let _ = admin::stop_runtime(
+            State(state.clone()),
+            admin_headers,
+            Path("project-a".to_string()),
+        )
+        .await
+        .unwrap();
+        let stopped = record().await;
+        assert_eq!(stopped.state, Some(ProjectOpenState::Closed));
+        assert_eq!(stopped.set_by.as_deref(), Some(""));
+        assert_eq!(stopped.set_kind, Some(OpenStateSetKind::Administrative));
+        assert_eq!(stops(), 1);
+        assert_eq!(
+            closes().await[0],
+            (
+                "system_admin".to_string(),
+                crate::db::SYSTEM_ADMIN_ACTOR.to_string(),
+                "administrative".to_string(),
+                "stop_runtime".to_string(),
+                Some("zoo-005".to_string()),
+            )
+        );
+
+        // A suspension closes it in the transaction that suspends it.
+        open_again().await;
+        let _ = cluster::update_lifecycle(
+            State(state.clone()),
+            headers(&state, "host"),
+            Path("project-a".to_string()),
+            Json(admin::LifecycleRequest {
+                status: "suspended".to_string(),
+            }),
+        )
+        .await
+        .unwrap();
+        let suspended = record().await;
+        assert_eq!(suspended.lifecycle, crate::db::ProjectLifecycle::Suspended);
+        assert_eq!(suspended.state, Some(ProjectOpenState::Closed));
+        assert_eq!(suspended.set_by.as_deref(), Some("host"));
+        assert_eq!(suspended.set_kind, Some(OpenStateSetKind::Administrative));
+        assert_eq!(stops(), 1);
+        assert_eq!(closes().await[0].3, "suspension");
+        assert_eq!(closes().await.len(), 3);
+
+        // Reactivating leaves it closed and starts nothing.
+        let _ = cluster::update_lifecycle(
+            State(state.clone()),
+            headers(&state, "host"),
+            Path("project-a".to_string()),
+            Json(admin::LifecycleRequest {
+                status: "active".to_string(),
+            }),
+        )
+        .await
+        .unwrap();
+        let reactivated = record().await;
+        assert_eq!(reactivated.lifecycle, crate::db::ProjectLifecycle::Active);
+        assert_eq!(reactivated.state, Some(ProjectOpenState::Closed));
+        assert_eq!(reactivated.set_at, suspended.set_at);
+        assert_eq!(stops(), 0);
+        assert!(daemon_rx.try_recv().is_err(), "nothing starts it");
+        assert_eq!(closes().await.len(), 3);
     }
 
     #[tokio::test]

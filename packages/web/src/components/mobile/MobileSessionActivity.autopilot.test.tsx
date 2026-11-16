@@ -844,7 +844,7 @@ describe("offline or with the tab's machine unreachable", () => {
         : entry),
     })));
     renderScreen();
-    const reason = "zoo-006 is not running this project. Start it on zoo-006 first.";
+    const reason = "zoo-006 is not running this project. Open the project again to start it there.";
     expect(within(notice()).getByRole("note").textContent).toBe(reason);
     for (const name of ["Resume", "Stop"]) {
       expect(button(notice(), name).disabled).toBe(true);

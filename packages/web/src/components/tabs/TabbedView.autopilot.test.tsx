@@ -1,4 +1,4 @@
-import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi, type Mock } from "vitest";
 import { validateClientMessage, type PaneAutopilotState } from "@apas/protocol";
 import {
@@ -468,7 +468,7 @@ describe("who may use the tab", () => {
     fireEvent.click(controlButton());
     const stop = within(screen.getByRole("group", { name: "Autopilot" })).getByRole("button", { name: /^Stop(?! now)/ }) as HTMLButtonElement;
     expect(stop.disabled).toBe(true);
-    expect(stop.title).toBe("zoo-006 is not running this project. Start it on zoo-006 first.");
+    expect(stop.title).toBe("zoo-006 is not running this project. Open the project again to start it there.");
   });
 });
 
@@ -630,6 +630,16 @@ describe("confirmations", () => {
     expect(confirm.mock.calls.at(-1)?.[0]).not.toContain("autopilot");
   });
 
+  function closeDialogLines(): (string | null)[] {
+    return Array.from(screen.getByRole("dialog").querySelectorAll("p")).map((line) => line.textContent);
+  }
+
+  function closeRequests(): Record<string, unknown>[] {
+    return ws.send.mock.calls
+      .map(([raw]) => JSON.parse(String(raw)) as Record<string, unknown>)
+      .filter((frame) => frame.type === "stop_machine_project_cli");
+  }
+
   it("names the tabs on autopilot when the project is closed", async () => {
     seed([tab(7, "OMP 1"), tab(8, "OMP 2"), tab(9, "OMP 3")], 8, {
       entries: {
@@ -638,33 +648,45 @@ describe("confirmations", () => {
         9: { support: "supported", state: autopilot("paused", "requested") },
       },
     });
-    const stopMachineProjectCli = vi.fn();
-    act(() => useStore.setState({ stopMachineProjectCli }));
     const confirm = vi.fn((_message?: string) => true);
     vi.stubGlobal("confirm", confirm);
     render(<TabbedView />);
     await screen.findByTestId("terminal-pane-8");
 
     fireEvent.click(screen.getByTitle("Close this project and shut down its agents"));
-    const message = confirm.mock.calls.at(-1)?.[0] ?? "";
-    expect(message).toMatch(/^Close this project\?/);
-    expect(message).toContain(
-      "OMP 1 is on autopilot. Its autopilot comes back paused when the project is started again.",
-    );
-    expect(message).not.toContain("OMP 3");
-    await waitFor(() => expect(stopMachineProjectCli).toHaveBeenCalled());
+    expect(screen.getByRole("dialog", { name: /^Close .+\?$/ })).toBeTruthy();
+    // The note stands before the last line, which says nothing is deleted.
+    expect(closeDialogLines()).toEqual([
+      "This stops its agents on zoo-006.",
+      "OMP 1 is on autopilot. Its autopilot comes back paused when the project is opened again.",
+      "Nothing is deleted. Its tabs come back when you open it again.",
+    ]);
+    expect(closeRequests()).toEqual([]);
+
+    fireEvent.click(within(screen.getByRole("dialog")).getByRole("button", { name: "Close" }));
+    const [request] = closeRequests();
+    expect(request).toEqual({
+      type: "stop_machine_project_cli",
+      machine_id: ZOO6,
+      project_id: SID,
+      all_instances: true,
+    });
+    expect(validateClientMessage(request).errors).toEqual([]);
+    // Asked in the page, never through the browser's own dialog.
+    expect(confirm).not.toHaveBeenCalled();
   });
 
-  it("asks what it always asked when no tab is on autopilot", async () => {
+  it("says nothing about autopilot when no tab is on autopilot, and closes nothing when declined", async () => {
     seed([tab(7, "OMP 1")], 7, { entries: { 7: { support: "supported" } } });
-    act(() => useStore.setState({ stopMachineProjectCli: vi.fn() }));
-    const confirm = vi.fn((_message?: string) => false);
-    vi.stubGlobal("confirm", confirm);
     render(<TabbedView />);
     await screen.findByTestId("terminal-pane-7");
     fireEvent.click(screen.getByTitle("Close this project and shut down its agents"));
-    expect(confirm).toHaveBeenLastCalledWith(
-      "Close this project? Every agent in it is shut down, and it stops appearing in the idle list until you open it again.",
-    );
+    expect(closeDialogLines()).toEqual([
+      "This stops its agents on zoo-006.",
+      "Nothing is deleted. Its tabs come back when you open it again.",
+    ]);
+    fireEvent.click(within(screen.getByRole("dialog")).getByRole("button", { name: "Cancel" }));
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(closeRequests()).toEqual([]);
   });
 });

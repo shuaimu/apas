@@ -1,11 +1,12 @@
 import type { CliClient, MachineWithProjects, SessionInfo, SessionPaneSummary } from "@/lib/store";
 import { machineProjectHref } from "./machineProjectTarget";
 import type { SessionInstance } from "./projectInstances";
+import { openStateLabel, type OpenState } from "./projectOpenState";
 
 /**
  * The project list the sidebar shows, derived once so the expanded list and
  * the collapsed icon rail can never disagree about which projects exist, which
- * are running, or what order they come in.
+ * are open, or what order they come in.
  */
 
 export type ProjectRole = "owner" | "user";
@@ -18,7 +19,17 @@ interface ProjectDetails {
   hostname?: string;
   gitRemote?: string;
   gitRemoteUrl?: string;
+  /** Something runs the project now: a machine's inventory or an attached
+   *  CLI says so. This is what the pane dots and the idle lists go by, so a
+   *  closed project a machine still runs keeps its tabs' real status. It is
+   *  not the project's state; that is `openState`. */
   isActive: boolean;
+  /** The project's state as the lists word it (`projectStateLabel`): the
+   *  state the server recorded, or, while nobody has recorded one and on an
+   *  older server, open while something runs it. */
+  openState: OpenState;
+  /** Whether the server recorded `openState`. */
+  openStateRecorded: boolean;
   createdAt?: string;
   isShared?: boolean;
   ownerEmail?: string;
@@ -28,6 +39,12 @@ interface ProjectDetails {
   /** Attached instances, one per machine; `instanceHostSummary` turns them
    *  into "zoo-005 +1". Absent for registration-only entries. */
   instances?: SessionInstance[];
+}
+
+/** "Open" or "Closed": how a project list words a project's state. It
+ *  replaces "Running" / "Stopped", which described one machine. */
+export function projectStateLabel(project: Pick<ProjectDetails, "openState">): "Open" | "Closed" {
+  return openStateLabel(project.openState);
 }
 
 /** Only session-backed entries may be attached or carry session actions. */
@@ -72,6 +89,9 @@ export function buildProjectList(
 ): ProjectEntry[] {
   const projectMap = new Map<string, ProjectEntry>();
   const preferredInventoryProjects = new Set<string>();
+  // The state the server recorded, per project. A session entry and every
+  // machine entry of a project carry the same value; any of them will do.
+  const recordedStates = new Map<string, OpenState>();
 
   // Sort sessions by date (newest first) so we keep the most recent per project
   const sortedSessions = [...sessions].sort((a, b) => {
@@ -99,6 +119,9 @@ export function buildProjectList(
         gitRemote: session.gitRemote,
         gitRemoteUrl: session.gitRemoteUrl,
         isActive: session.isActive || false,
+        // Settled below, once everything that says whether it runs is in.
+        openState: "closed",
+        openStateRecorded: false,
         createdAt: session.createdAt,
         isShared: session.isShared,
         ownerEmail: session.ownerEmail,
@@ -107,6 +130,9 @@ export function buildProjectList(
         panes: session.panes,
         instances: session.instances,
       });
+    }
+    if (session.openState && !recordedStates.has(projectKey)) {
+      recordedStates.set(projectKey, session.openState);
     }
   }
 
@@ -133,6 +159,10 @@ export function buildProjectList(
   for (const machine of orderedMachines) {
     for (const mp of machine.projects) {
       const existing = projectMap.get(mp.projectId);
+      // The server fills this in only for a viewer that may read the project.
+      if (mp.openState && !recordedStates.has(mp.projectId)) {
+        recordedStates.set(mp.projectId, mp.openState);
+      }
       if (existing && existing.sessionId !== null) {
         if (mp.isRunning) existing.isActive = true;
         // A session started by an older CLI may not carry its remote; the
@@ -165,6 +195,8 @@ export function buildProjectList(
         // "(no remote)" instead of beside its repository's other projects.
         gitRemote: mp.gitRemote ?? existing?.gitRemote,
         isActive: mp.isRunning,
+        openState: "closed",
+        openStateRecorded: false,
         machinesHref: machineProjectHref({
           machineId: machine.machine.machineId,
           projectId: mp.projectId,
@@ -172,6 +204,12 @@ export function buildProjectList(
         }),
       });
     }
+  }
+
+  for (const project of projectMap.values()) {
+    const recorded = recordedStates.get(project.projectId);
+    project.openStateRecorded = recorded !== undefined;
+    project.openState = recorded ?? (project.isActive ? "open" : "closed");
   }
 
   // Sort: active first, then by creation date (newest first)

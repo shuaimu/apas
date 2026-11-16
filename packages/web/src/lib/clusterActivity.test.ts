@@ -3,6 +3,8 @@ import type { ClusterMembership, ClusterProject } from "@/components/cluster/typ
 import { actionLabel, resolveActor, resolveTarget } from "./clusterActivity";
 
 const LABELS: Record<string, string> = {
+  "project.opened": "Project opened",
+  "project.closed": "Project closed",
   "project.runtime_stopped": "Runtime stopped",
   "project.lifecycle_changed": "Project state changed",
   "project.owner_transferred": "Owner transferred",

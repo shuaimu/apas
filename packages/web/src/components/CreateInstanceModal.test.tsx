@@ -244,7 +244,10 @@ describe("existing-folder creation", () => {
       [operation.requestId]: { ...operation, source: "local", path: "~/alias", status: "registered", clusterOwnerUserId: "owner", project: { projectId: "project-1", path: "/canonical/project", isRunning: false } },
     } }));
     expect(screen.getByText("/canonical/project")).toBeTruthy();
-    expect(screen.getByText(/The project is stopped/)).toBeTruthy();
+    // Registering opens nothing; the sentence sends the owner to Open, which
+    // is the Machines page's control now.
+    expect(screen.getByText("Nothing was started. Opening the project is a separate step: use Open on the Machines page when you are ready. Its saved agents run only once the project is open.")).toBeTruthy();
+    expect(screen.queryByText(/Use Start on Machines/)).toBeNull();
     expect(screen.getByRole("link", { name: "View on Machines" }).getAttribute("href")).toBe("/machines?cluster_owner=owner&machine=m1&project=project-1#project-m1-project-1");
     expect(send).toHaveBeenCalledTimes(1);
     expect(screen.queryByRole("button", { name: "Register folder" })).toBeNull();

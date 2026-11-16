@@ -372,9 +372,9 @@ export function projectPlacement(
 }
 
 /**
- * A pane's machine id, for "Start on <host>" and for defaulting a new tab to
- * the selected tab's machine. Undefined when the pane names no machine and
- * its attributed host is not a known machine.
+ * A pane's machine id, for defaulting a new tab to the selected tab's
+ * machine. Undefined when the pane names no machine and its attributed host
+ * is not a known machine.
  */
 export function paneMachineId(
   pane: PaneMachineFields & { pane_id: number },

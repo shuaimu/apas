@@ -169,6 +169,33 @@ describe("buildMachineChoices", () => {
     expect(elsewhere.defaultChoice).toMatchObject({ machineId: "zoo-005", kind: "registered" });
   });
 
+  it("says which other tab owners start when a tab opens the project", () => {
+    const input = {
+      machines: [machine("zoo-005", { registered: true }), machine("zoo-006", { registered: true })],
+      projectMachines: [
+        { machineId: "zoo-005", hostname: "zoo-005", part: "not_started", ownsTabs: true, connected: true },
+        { machineId: "zoo-006", hostname: "zoo-006", part: "not_started", ownsTabs: true, connected: true },
+        // Offline, running, or with no tabs: an Open starts none of these now.
+        { machineId: "laptop", hostname: "laptop", part: "not_started", ownsTabs: true, connected: false },
+        { machineId: "mini", hostname: "mini", part: "running", ownsTabs: true, connected: true },
+        { machineId: "spare", hostname: "spare", part: "not_started", ownsTabs: false, connected: true },
+      ],
+    };
+    const result = model({ ...input, openStateSupported: true });
+    expect(result.choices.map((choice) => [choice.hostname, choice.kind, choice.alsoStarts]))
+      .toEqual([["zoo-005", "registered", ["zoo-006"]], ["zoo-006", "registered", ["zoo-005"]]]);
+    // The step and its default are what they were.
+    expect(result.showChoice).toBe(true);
+    expect(result.defaultChoice?.machineId).toBe("zoo-005");
+
+    // A server that records no open state starts the chosen machine alone,
+    // and a clone is not an Open of anything yet.
+    const older = model(input);
+    expect(older.choices.every((choice) => choice.alsoStarts === undefined)).toBe(true);
+    const clone = model({ openStateSupported: true, machines: [machine("zoo-007")] });
+    expect(clone.choices.map((choice) => [choice.kind, choice.alsoStarts])).toEqual([["clone", undefined]]);
+  });
+
   it("keeps the step hidden when the only eligible machine already runs the project", () => {
     // Also with a registered machine that cannot take the tab: only eligible
     // choices count.

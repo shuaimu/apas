@@ -1,4 +1,4 @@
-import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import type { AnchorHTMLAttributes, ReactNode } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
@@ -196,8 +196,14 @@ describe("Sidebar project list", () => {
 
     expect(screen.getByText("/repo/duplicate-new")).toBeTruthy();
     expect(screen.queryByText("/repo/duplicate-old")).toBeNull();
-    expect(projectRow("/repo/cli-active").textContent).toContain("Active");
-    expect(projectRow("/repo/daemon-only").textContent).toContain("Active");
+    // Nobody has recorded a state for these, so each reads from what runs:
+    // open while a CLI or a machine runs it, closed otherwise.
+    const stateOf = (workingDir: string) =>
+      projectRow(workingDir).querySelector('[data-testid="project-open-state"]')?.textContent;
+    expect(stateOf("/repo/cli-active")).toBe("Open");
+    expect(stateOf("/repo/daemon-only")).toBe("Open");
+    expect(stateOf("/repo/history")).toBe(`Closed · ${new Date("2026-06-17T11:00:00Z").toLocaleDateString()}`);
+    expect(projectRow("/repo/cli-active").textContent).not.toContain("Active");
 
     const rowTexts = Array.from(container.querySelectorAll(".cursor-pointer")).map(
       (row) => row.textContent || "",
@@ -255,8 +261,8 @@ describe("Sidebar project list", () => {
         { ...makeMachine([{ projectId: "p-member", path: "/repo/member-only", isRunning: false }]), clusterAccess: "member" },
       ],
     });
-    const start = vi.fn();
-    act(() => useStore.setState({ startMachineProjectCli: start, unreadSessions: new Set(["p-q-index"]) }));
+    const open = vi.fn();
+    act(() => useStore.setState({ openProject: open, unreadSessions: new Set(["p-q-index"]) }));
     const onClose = vi.fn();
     const { container } = render(<Sidebar onClose={onClose} />);
 
@@ -268,7 +274,12 @@ describe("Sidebar project list", () => {
     expect(screen.getByText("zoo-005")).toBeTruthy();
     expect(screen.queryByText("zoo-002")).toBeNull();
     expect(destination.searchParams.get("project")).toBe("p-q-index");
-    expect(screen.getByText("Stopped")).toBeTruthy();
+    // A registration that has never run is registered and closed.
+    expect(screen.getByText("Closed")).toBeTruthy();
+    expect(screen.queryByText("Stopped")).toBeNull();
+    // The dot is about what runs, not the state, and says so.
+    expect(container.querySelector('[data-testid="project-running-dot"]')?.getAttribute("title"))
+      .toBe("No machine is running this project");
     expect(container.querySelectorAll('[data-project-id="p-q-index"]')).toHaveLength(1);
     expect(container.querySelector('[data-project-id="p-member"]')).toBeNull();
     expect(container.querySelector(".bg-blue-100")).toBeNull();
@@ -281,7 +292,7 @@ describe("Sidebar project list", () => {
     fireEvent.click(link);
     expect(onClose).toHaveBeenCalledOnce();
     expect(attachSession).not.toHaveBeenCalled();
-    expect(start).not.toHaveBeenCalled();
+    expect(open).not.toHaveBeenCalled();
   });
 
   it("replaces registration navigation with normal session selection when history arrives", () => {
@@ -290,7 +301,8 @@ describe("Sidebar project list", () => {
       machines: [makeMachine([{ projectId: "p-q-index", path: "/repo/q-index", isRunning: true }])],
     });
     const { container } = render(<Sidebar />);
-    expect(screen.getByText("Running")).toBeTruthy();
+    expect(screen.getByText("Open")).toBeTruthy();
+    expect(screen.queryByText("Running")).toBeNull();
     expect(screen.getByRole("link", { name: "View q-index on Machines" })).toBeTruthy();
 
     act(() => useStore.setState({
@@ -407,11 +419,13 @@ describe("Sidebar project list", () => {
     expect(await screen.findByRole("button", { name: "Leave project" })).toBeTruthy();
     expect(screen.queryByText("Invite")).toBeNull();
     expect(screen.queryByTitle("Transfer ownership")).toBeNull();
-    expect(screen.queryByRole("button", { name: "Permanently delete project" })).toBeNull();
+    // Deleting is the owner's; a project user is offered leaving only.
+    expect(screen.queryByRole("button", { name: /delete project/i })).toBeNull();
+    expect(screen.queryByRole("dialog", { name: "Delete project" })).toBeNull();
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
-  it("uses the canonical project id for transfer and exact deletion confirmation", async () => {
+  it("uses the canonical project id for transfer and leads the owner to the Delete project dialog", async () => {
     seedSidebarState({
       sessions: [makeSession({
         id: "representative-session",
@@ -467,17 +481,78 @@ describe("Sidebar project list", () => {
       });
     fireEvent.click(screen.getByTitle("Manage project access"));
     fireEvent.click(await screen.findByText("Manage Access"));
-    const deleteButton = await screen.findByRole("button", { name: "Permanently delete project" }) as HTMLButtonElement;
-    expect(deleteButton.disabled).toBe(true);
-    fireEvent.change(screen.getByLabelText("Project deletion confirmation"), {
-      target: { value: "wrong" },
-    });
-    expect(deleteButton.disabled).toBe(true);
-    fireEvent.change(screen.getByLabelText("Project deletion confirmation"), {
-      target: { value: "canonical-project" },
-    });
-    expect(deleteButton.disabled).toBe(false);
+    // The access dialog no longer deletes by itself: no id to type, only a
+    // button that leads to the shared dialog.
+    expect(screen.queryByLabelText("Project deletion confirmation")).toBeNull();
+    expect(screen.queryByRole("button", { name: "Permanently delete project" })).toBeNull();
     expect(screen.queryByRole("button", { name: "Leave project" })).toBeNull();
+    const callsBefore = fetchMock.mock.calls.length;
+    fireEvent.click(await screen.findByRole("button", { name: "Delete project…" }));
+
+    // The access dialog closes and the Delete project dialog takes over. It
+    // asks for the project's name, not its id.
+    expect(screen.queryByText("Users with access to this project only:")).toBeNull();
+    const dialog = screen.getByRole("dialog", { name: "Delete project" });
+    expect(within(dialog).getByRole("heading", { name: "Delete owned?" })).toBeTruthy();
+    const confirm = within(dialog).getByRole("button", { name: "Delete project" }) as HTMLButtonElement;
+    expect(confirm.disabled).toBe(true);
+    fireEvent.change(within(dialog).getByLabelText("Project name"), { target: { value: "canonical-project" } });
+    expect(confirm.disabled).toBe(true);
+    fireEvent.change(within(dialog).getByLabelText("Project name"), { target: { value: "owned" } });
+    expect(confirm.disabled).toBe(false);
+    // Opening the dialog and typing sent nothing.
+    expect(fetchMock.mock.calls.length).toBe(callsBefore);
+
+    fireEvent.click(within(dialog).getByRole("button", { name: "Cancel" }));
+    expect(screen.queryByRole("dialog", { name: "Delete project" })).toBeNull();
+    expect(fetchMock.mock.calls.length).toBe(callsBefore);
+  });
+
+  it("deletes through the shared dialog with one request, naming the machines stopped first", async () => {
+    const forgetProject = vi.fn();
+    seedSidebarState({
+      forgetProject,
+      sessions: [makeSession({
+        id: "representative-session",
+        projectId: "canonical-project",
+        workingDir: "/repo/owned",
+        isActive: true,
+        shareRole: "owner",
+      })],
+      machines: [{
+        ...makeMachine([{ projectId: "canonical-project", path: "/repo/owned", isRunning: true }]),
+        daemonConnected: true,
+      }],
+    });
+    const fetchMock = vi.fn(async (url: string, init?: RequestInit) => {
+      if (url.endsWith("/share/generate")) return { ok: true, json: async () => ({ code: "CODE", share_url: "http://share" }) };
+      if (url.includes("/share/list")) {
+        return { ok: true, json: async () => ({ owner: null, shares: [], viewer_role: "owner", can_manage: true }) };
+      }
+      if (url.endsWith("/projects/canonical-project/delete") && init?.method === "POST") {
+        return { ok: true, status: 202, json: async () => ({}) };
+      }
+      if (url.endsWith("/projects/canonical-project/deletion")) return { ok: false, status: 404, json: async () => ({}) };
+      return { ok: true, json: async () => ({ owner: null, shares: [], viewer_role: "owner", can_manage: true }) };
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    render(<Sidebar />);
+    fireEvent.click(screen.getByTitle("Manage project access"));
+    fireEvent.click(await screen.findByText("Manage Access"));
+    fireEvent.click(await screen.findByRole("button", { name: "Delete project…" }));
+
+    const dialog = screen.getByRole("dialog", { name: "Delete project" });
+    expect(dialog.textContent).toContain("Agents running in the project are stopped first, on daemon-host.");
+    fireEvent.change(within(dialog).getByLabelText("Project name"), { target: { value: "owned" } });
+    fireEvent.click(within(dialog).getByRole("button", { name: "Delete project" }));
+
+    await waitFor(() => expect(forgetProject).toHaveBeenCalledWith("canonical-project"), { timeout: 3000 });
+    const deletions = fetchMock.mock.calls.filter(([url]) => String(url).endsWith("/projects/canonical-project/delete"));
+    expect(deletions).toHaveLength(1);
+    // The server's confirmation value is the project's id, whatever was typed.
+    expect(deletions[0][1]).toMatchObject({ method: "POST", body: JSON.stringify({ confirmation: "canonical-project" }) });
+    await waitFor(() => expect(screen.queryByRole("dialog", { name: "Delete project" })).toBeNull());
   });
 
   it("keeps project state and shows the server error when leave fails", async () => {

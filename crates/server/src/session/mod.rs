@@ -14,6 +14,7 @@ pub mod autopilot;
 pub mod autopilot_prompts;
 pub mod instances;
 mod local_projects;
+pub mod open_state;
 pub mod pane_launches;
 pub(crate) use autopilot::AutopilotReceipt;
 pub use instances::{
@@ -192,6 +193,10 @@ pub struct SessionManager {
     /// Never taken while a `sessions` guard is held: it reads `sessions`
     /// itself.
     instance_starts: Mutex<pane_launches::InstanceStarts>,
+    /// The per-project open-state locks, each machine's last start or stop
+    /// outcome, and what each machine's part is derived from and viewers
+    /// were last told; see `open_state.rs`.
+    open_state: open_state::OpenStateRuntime,
     pane_launch_timing: Mutex<pane_launches::PaneLaunchTiming>,
 }
 
@@ -536,6 +541,7 @@ impl SessionManager {
             pending_pane_reboots: DashMap::new(),
             terminal_states: DashMap::new(),
             instance_starts: Mutex::new(Default::default()),
+            open_state: Default::default(),
             pane_launch_timing: Mutex::new(Default::default()),
         }
     }
@@ -1691,6 +1697,10 @@ impl SessionManager {
         // A new connection replaces the old one, which will not answer a
         // start sent on it.
         self.fail_instance_starts_for_machine(&machine_id);
+        // Nor will it answer a project start, and what this machine refused
+        // or failed before is decided again now that it has registered.
+        let mut affected = self.drop_machine_outcomes(&machine_id);
+        affected.extend(self.machine_project_ids(&machine_id));
         self.daemon_capabilities.remove(&machine_id);
         let existing_deepseek = self
             .machine_infos
@@ -1710,7 +1720,17 @@ impl SessionManager {
             projects.len(),
             running_count,
         );
+        // The open-state fields of a project entry are the server's; a
+        // daemon reports none, and whatever one sent is discarded.
+        let mut projects = projects;
+        projects.iter_mut().for_each(Self::clear_open_state_fields);
+        affected.extend(projects.iter().map(|project| project.project_id.clone()));
         self.machine_projects.insert(machine_id, projects);
+        affected.sort();
+        affected.dedup();
+        for project_id in &affected {
+            self.report_open_state_change(project_id, false);
+        }
         self.broadcast_machines_update_for_user(&user_id);
         tracing::info!("Daemon registered: {} (user: {})", machine_id, user_id);
     }
@@ -1721,6 +1741,9 @@ impl SessionManager {
         self.daemon_capabilities.remove(machine_id);
         self.fail_local_project_requests_for_machine(machine_id);
         self.fail_instance_starts_for_machine(machine_id);
+        // A start sent on this connection will not be answered either.
+        let mut affected = self.drop_machine_outcomes(machine_id);
+        affected.extend(self.machine_project_ids(machine_id));
         // Keep machine metadata/project snapshot to avoid UI flicker during transient daemon reconnects.
         if let Some(mut machine) = self.machine_infos.get_mut(machine_id) {
             machine.last_seen = Some(chrono::Utc::now().to_rfc3339());
@@ -1734,6 +1757,12 @@ impl SessionManager {
                 p.is_running = false;
                 p.pid = None;
             }
+        }
+        // This machine's part in each of its projects changed with that.
+        affected.sort();
+        affected.dedup();
+        for project_id in &affected {
+            self.report_open_state_change(project_id, false);
         }
 
         if let Some(user_id) = owner {
@@ -1759,9 +1788,52 @@ impl SessionManager {
                 running_count,
             );
         }
+        // The open-state fields of a project entry are the server's; a
+        // daemon reports none, and whatever one sent is discarded.
+        let mut projects = projects;
+        projects.iter_mut().for_each(Self::clear_open_state_fields);
+        // The projects whose part on this machine this inventory may change:
+        // one it lists, or listed before, differently, and one a start is
+        // still pending for, whose time limit is noticed here.
+        let before = self
+            .machine_projects
+            .get(machine_id)
+            .map(|projects| projects.clone())
+            .unwrap_or_default();
+        let shown = |project: &MachineProjectInfo| (project.is_running, project.last_error.clone());
+        let mut affected: Vec<String> = Vec::new();
+        for project in &projects {
+            if project.is_running {
+                self.note_machine_runs(&project.project_id, machine_id);
+            }
+            let changed = before
+                .iter()
+                .find(|listed| listed.project_id == project.project_id)
+                .is_none_or(|listed| shown(listed) != shown(project));
+            if changed
+                || self
+                    .machine_outcome(&project.project_id, machine_id)
+                    .is_some_and(|outcome| outcome.is_start_pending())
+            {
+                affected.push(project.project_id.clone());
+            }
+        }
+        affected.extend(
+            before
+                .iter()
+                .filter(|listed| {
+                    !projects
+                        .iter()
+                        .any(|project| project.project_id == listed.project_id)
+                })
+                .map(|listed| listed.project_id.clone()),
+        );
         self.machine_projects.insert(*machine_id, projects);
         if let Some(mut machine) = self.machine_infos.get_mut(machine_id) {
             machine.last_seen = Some(chrono::Utc::now().to_rfc3339());
+        }
+        for project_id in &affected {
+            self.report_open_state_change(project_id, false);
         }
         if let Some(owner) = self.daemon_users.get(machine_id).map(|entry| *entry) {
             self.broadcast_machines_update_for_user(&owner);
@@ -2451,6 +2523,7 @@ impl SessionManager {
                 }
             }
         }
+        self.fill_machines_open_state(user_id, &mut machines);
         let msg = ServerToWeb::Machines { machines };
 
         for web_entry in self.web_users.iter() {
@@ -2522,6 +2595,7 @@ impl SessionManager {
                 tracing::info!("CLI {} assigned to session {}", cli_id, session_id);
                 self.broadcast_session_instances(session_id);
                 self.broadcast_pane_autopilot(session_id, None);
+                self.report_session_open_state(session_id);
                 true
             }
             AttachOutcome::Rejected { reason } => {
@@ -3056,6 +3130,18 @@ impl SessionManager {
     /// [`Self::route_to_web`] for callers that are not async. It never waits:
     /// every send is a `try_send`.
     pub(crate) fn route_to_web_now(&self, session_id: &Uuid, msg: ServerToWeb) -> bool {
+        // Which machines own the project's tabs is read from its roster, and
+        // every change of the roster is told to its viewers with this frame.
+        // Their parts follow it.
+        let roster_changed = matches!(msg, ServerToWeb::PaneList { .. });
+        let sent = self.route_to_session_viewers(session_id, msg);
+        if roster_changed {
+            self.report_session_open_state(session_id);
+        }
+        sent
+    }
+
+    fn route_to_session_viewers(&self, session_id: &Uuid, msg: ServerToWeb) -> bool {
         if let Some(session) = self.sessions.get(session_id) {
             if session.web_connection_ids.is_empty() {
                 tracing::debug!("No web clients attached to session {}", session_id);

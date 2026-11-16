@@ -351,10 +351,10 @@ describe("requests", () => {
     expect(sentFrames(ws, "control_pane_autopilot")).toHaveLength(1);
 
     // A receipt that arrives late still says what happened.
-    deliver(ws, receipt(requestId!, "refused", "zoo-005 is not running this project. Start it on zoo-005 first."));
+    deliver(ws, receipt(requestId!, "refused", "zoo-005 is not running this project. Open the project again to start it there."));
     expect(requests()).toMatchObject([{
       status: "refused",
-      reason: "zoo-005 is not running this project. Start it on zoo-005 first.",
+      reason: "zoo-005 is not running this project. Open the project again to start it there.",
     }]);
   });
 

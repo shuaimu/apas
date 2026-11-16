@@ -7,6 +7,7 @@ import type { UsagePeriod } from "@/components/overview/UsagePeriodControl";
 import { ProjectList, projectRowId } from "./ProjectList";
 import { ProjectPanel, type ProjectWrite } from "./ProjectPanel";
 import type { ConfirmRequest } from "./ConfirmDialog";
+import type { ClusterOpenStateSource } from "./clusterOpenState";
 import type {
   ClusterPolicy,
   ClusterProject,
@@ -25,9 +26,11 @@ export function ProjectsView({
   projects,
   load,
   userId,
+  openState,
   selectedId,
   onSelect,
   onClear,
+  onDeleted,
   detail,
   detailUsage,
   detailLoading,
@@ -45,9 +48,14 @@ export function ProjectsView({
   projects: ClusterProject[];
   load: LoadState;
   userId: string | null | undefined;
+  /** Where each project's Open / Closed comes from. */
+  openState: ClusterOpenStateSource;
   selectedId: string | null;
   onSelect: (projectId: string) => void;
   onClear: () => void;
+  /** The owner deleted the selected project and the server reported it
+   *  done. */
+  onDeleted: (projectId: string) => void;
   detail: ClusterProjectDetail | null;
   detailUsage: UsageWindows | null;
   detailLoading: boolean;
@@ -95,7 +103,7 @@ export function ProjectsView({
       ) : (
         <div className="grid gap-4 lg:grid-cols-[minmax(0,1fr)_26rem] lg:items-start">
           <div className={`min-w-0 ${hasSelection ? "max-lg:hidden" : ""}`}>
-            <ProjectList projects={projects} userId={userId} selectedId={selectedId} onSelect={onSelect} />
+            <ProjectList projects={projects} userId={userId} openState={openState} selectedId={selectedId} onSelect={onSelect} />
           </div>
           <div
             ref={panel}
@@ -112,6 +120,9 @@ export function ProjectsView({
               error={projectError}
               notice={projectNotice}
               sharedView={sharedView}
+              userId={userId}
+              openState={openState}
+              onDeleted={onDeleted}
               usagePeriod={usagePeriod}
               onUsagePeriod={onUsagePeriod}
               profiles={profiles}

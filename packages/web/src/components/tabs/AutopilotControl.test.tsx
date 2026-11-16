@@ -546,7 +546,7 @@ describe("a state that is not reported", () => {
 
   it("disables Stop while the tab's machine is not running the project", () => {
     seed(undefined);
-    const reason = "zoo-005 is not running this project. Start it on zoo-005 first.";
+    const reason = "zoo-005 is not running this project. Open the project again to start it there.";
     renderControl({ tabRefusal: reason, hostname: "zoo-005" });
     fireEvent.click(controlButton());
     const stop = within(menu()).getByRole("button", { name: /^Stop(?! now)/ }) as HTMLButtonElement;

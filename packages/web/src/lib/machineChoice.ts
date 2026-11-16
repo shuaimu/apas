@@ -11,8 +11,9 @@ import {
 /**
  * Which machine a new tab runs on. A project's tabs can run on any machine
  * with an instance of it: one already attached, one where it is registered
- * (the server starts the instance, then adds the tab), or an owned machine
- * that does not have it yet (clone there and join). This model is pure so the
+ * (the server opens the project, which starts that machine and every other
+ * machine that owns its tabs, then adds the tab), or an owned machine that
+ * does not have it yet (clone there and join). This model is pure so the
  * desktop `+` menu and the mobile pane sheet offer exactly the same choices.
  */
 
@@ -35,6 +36,11 @@ export interface MachineChoice {
    *  unknown. A machine can take a tab of one provider and not another, so
    *  this never disables the machine: see `providerOfferOn`. */
   providers?: MachineProviderStatus[];
+  /** Only on a `registered` choice, and only against a server that records
+   *  open states: a tab there opens the project, and these are the other
+   *  hosts whose tabs start with it (empty when there are none). Absent
+   *  means the request starts that machine alone, as an older server does. */
+  alsoStarts?: string[];
 }
 
 export interface MachineChoiceInput {
@@ -53,6 +59,19 @@ export interface MachineChoiceInput {
   /** Tried after the selected tab and the primary instance, for example the
    *  project view's resolved machine. */
   fallbackMachineId?: string;
+  /** The server negotiated `project_open_state_v1`: a tab on a machine that
+   *  is not running the project opens the project first. */
+  openStateSupported?: boolean;
+  /** The project's machines and their parts
+   *  (`buildProjectOpenModel(...).machines`): which other tab owners an Open
+   *  starts. May be omitted; no other machine is then named. */
+  projectMachines?: {
+    machineId?: string;
+    hostname: string;
+    part: string;
+    ownsTabs: boolean;
+    connected: boolean;
+  }[];
 }
 
 export interface MachineChoiceModel {
@@ -140,6 +159,15 @@ export function buildMachineChoices(input: MachineChoiceInput): MachineChoiceMod
       primary: false,
       disabledReason,
       providers: entry.machine.providers,
+      // Opening the project starts every connected tab owner that is not
+      // running it, not only the machine the tab goes to.
+      ...(hasProject && input.openStateSupported ? {
+        alsoStarts: (input.projectMachines ?? [])
+          .filter((other) => other.ownsTabs && other.connected && other.part === "not_started"
+            && !(other.machineId ? other.machineId === machineId : sameHost(other.hostname, hostname)))
+          .map((other) => other.hostname)
+          .sort((a, b) => a.localeCompare(b)),
+      } : {}),
     });
   }
 
@@ -168,8 +196,8 @@ export function buildMachineChoices(input: MachineChoiceInput): MachineChoiceMod
     // runs the project. A registered machine as the only choice (typically a
     // stopped single-machine project) would be started first, relaunching
     // its saved tabs and unpaused bots: the step is shown so the menu says
-    // "Starts the project first" before the click, as Open asks before the
-    // same start. A clone is never a default, so it is always picked here.
+    // "Opens the project" before the click, as Open asks before the same
+    // start. A clone is never a default, so it is always picked here.
     showChoice: eligible.length > 1 || (eligible.length === 1 && defaultChoice?.kind !== "instance"),
   };
 }

@@ -185,8 +185,8 @@ describe("projectPlacement", () => {
       [machine(ZOO5, "zoo-005"), machine(ZOO6, "zoo-006")],
     );
     expect(placement.spansMachines).toBe(true);
-    // Stopped on zoo-006, which the inventory knows, so "Start on zoo-006"
-    // has a machine to start.
+    // Stopped on zoo-006, which the inventory knows, so opening the
+    // project has a machine to start.
     expect(placement.panes.get(2)).toMatchObject({ machineId: ZOO6, hostname: "zoo-006", connected: false });
     expect(placement.machines.map((state) => [state.hostname, state.attached, state.paneIds]))
       .toEqual([["zoo-005", true, [1]], ["zoo-006", false, [2]]]);

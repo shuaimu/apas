@@ -154,7 +154,7 @@ describe("AskUserQuestionCard", () => {
 
   it("locks a question its pane cannot take now, says why, and sends nothing", () => {
     const { answerQuestion } = seedQuestionStore();
-    const reason = "zoo-006 is not running this project. Start it on zoo-006 first.";
+    const reason = "zoo-006 is not running this project. Open the project again to start it there.";
 
     render(
       <AskUserQuestionCard

@@ -1,5 +1,6 @@
 "use client";
 
+import { useMemo } from "react";
 import { RotateCcw } from "lucide-react";
 import type { CreationOperation, MachineWithProjects } from "@/lib/store";
 import { installedProvidersSummary } from "@/lib/machineChoice";
@@ -14,6 +15,7 @@ import {
   overviewQuietButton,
 } from "@/components/overview/OverviewElements";
 import { MachineProjectRow } from "./MachineProjectRow";
+import type { ConfirmRequest } from "./ConfirmDialog";
 import { formatMemory } from "./types";
 
 const AMBER_CHIP = "shrink-0 rounded bg-amber-100 px-1.5 py-0.5 text-[11px] font-medium text-amber-800 dark:bg-amber-900/40 dark:text-amber-200";
@@ -27,8 +29,10 @@ function pendingLabel(pending: CreationOperation): string {
 
 /**
  * One machine: whether its daemon is connected and current, what it can run,
- * and its projects with Start and Stop. More than three stopped projects fold
- * into one line, so a machine with many checkouts does not bury the rest.
+ * and the projects it lists, each with the project's open state, this
+ * machine's part in it, and Open and Close for the whole project. More than
+ * three projects this machine is not running fold into one line, so a
+ * machine with many checkouts does not bury the rest.
  */
 export function MachineCard({
   entry,
@@ -40,9 +44,12 @@ export function MachineCard({
   stoppedOpen,
   onToggleStopped,
   registrationProjectId,
+  openStateSupported = false,
+  projectMachines,
+  requestConfirm,
   onReboot,
-  onStart,
-  onStop,
+  onOpen,
+  onClose,
 }: {
   entry: MachineWithProjects;
   behind: boolean;
@@ -54,9 +61,16 @@ export function MachineCard({
   onToggleStopped: () => void;
   /** The project a link asked to reveal on this machine, if any. */
   registrationProjectId?: string;
+  /** The server records open states (`openStateNegotiated`). */
+  openStateSupported?: boolean;
+  /** Every machine this viewer lists; this card's alone when absent. */
+  projectMachines?: MachineWithProjects[];
+  requestConfirm: (request: ConfirmRequest) => void;
   onReboot: () => void;
-  onStart: (projectId: string) => boolean;
-  onStop: (projectId: string) => boolean;
+  /** Open or close the whole project, naming this machine. Each returns
+   *  whether the request was sent. */
+  onOpen: (projectId: string) => boolean;
+  onClose: (projectId: string) => boolean;
 }) {
   const { machine, projects, daemonConnected, projectInstancesAvailable } = entry;
   const installed = installedProvidersSummary(machine.providers);
@@ -65,6 +79,7 @@ export function MachineCard({
   const runningMemoryKb = running.reduce((sum, project) => sum + (project.memoryKb ?? 0), 0);
   const runningMemory = running.some((project) => project.memoryKb != null) ? formatMemory(runningMemoryKb) : "";
   const hostname = machine.hostname;
+  const allMachines = useMemo(() => projectMachines ?? [entry], [projectMachines, entry]);
 
   let attention: { text: string; title: string } | null = null;
   if (behind) {
@@ -148,8 +163,11 @@ export function MachineCard({
           project={project}
           highlighted={registrationProjectId === project.projectId}
           connected={connected}
-          onStart={() => onStart(project.projectId)}
-          onStop={() => onStop(project.projectId)}
+          openStateSupported={openStateSupported}
+          projectMachines={allMachines}
+          requestConfirm={requestConfirm}
+          onOpen={() => onOpen(project.projectId)}
+          onClose={() => onClose(project.projectId)}
         />
       ))}
 
@@ -161,7 +179,9 @@ export function MachineCard({
             onClick={onToggleStopped}
             className={`${overviewQuietButton} w-full`}
           >
-            {stoppedOpen ? "Hide stopped projects" : `Show ${rows.hiddenStopped} stopped projects`}
+            {stoppedOpen
+              ? "Hide projects not running here"
+              : `Show ${rows.hiddenStopped} projects not running here`}
           </button>
         </div>
       )}

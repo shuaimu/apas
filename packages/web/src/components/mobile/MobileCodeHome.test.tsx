@@ -112,21 +112,57 @@ describe("MobileCodeHome", () => {
     expect(screen.getByRole("button", { name: "Idle sessions" }).getAttribute("aria-pressed")).toBe("true");
   });
 
-  it("uses only working, idle, and offline session badges", () => {
+  it("badges a running project by what its agents do and one that runs nowhere by its state", () => {
     renderHome({
       legacySessions: [
         session({ id: "working", workingDir: "/workspace/working", isWorking: true }),
         session({ id: "idle", workingDir: "/workspace/idle", isWorking: false }),
-        session({ id: "offline", workingDir: "/workspace/offline", isActive: false, isWorking: false }),
+        // Nobody has recorded a state: shown from what runs, so closed.
+        session({ id: "unrecorded", workingDir: "/workspace/unrecorded", isActive: false, isWorking: false }),
+        session({ id: "closed", workingDir: "/workspace/closed", isActive: false, isWorking: false, openState: "closed" }),
+        // Recorded open, and no machine runs it.
+        session({ id: "away", workingDir: "/workspace/away", isActive: false, isWorking: false, openState: "open" }),
+        // Closed, but a machine still runs it: its agents are as they are.
+        session({ id: "lingering", workingDir: "/workspace/lingering", isWorking: true, openState: "closed" }),
       ],
     });
 
-    expect(screen.getByText("Working")).toBeTruthy();
-    expect(screen.getByText("Idle")).toBeTruthy();
-    expect(screen.getByText("Offline")).toBeTruthy();
-    for (const name of ["working", "idle", "offline"]) {
+    const badge = (name: string, text: string) => within(screen.getByRole("button", { name: `Open ${name}` })).getByText(text);
+    expect(badge("working", "Working")).toBeTruthy();
+    expect(badge("idle", "Idle")).toBeTruthy();
+    expect(badge("unrecorded", "Closed").className).not.toContain("bg-red-100");
+    expect(badge("closed", "Closed").className).not.toContain("bg-red-100");
+    expect(badge("away", "Not running").className).toContain("bg-red-100");
+    expect(badge("lingering", "Working")).toBeTruthy();
+    expect(screen.queryByText("Offline")).toBeNull();
+    for (const name of ["working", "idle", "unrecorded", "closed", "away", "lingering"]) {
       expect(within(screen.getByRole("button", { name: `Open ${name}` })).queryByText("Active")).toBeNull();
     }
+  });
+
+  it("takes a project's state from the bootstrap until the live list arrives, then from the live list", async () => {
+    stubBootstrap({
+      sessions: [{
+        id: "session-a",
+        project_id: "project-a",
+        project_name: "alpha",
+        hostname: "builder-a",
+        is_active: false,
+        open_state: "open",
+      }],
+      machines: [],
+    });
+    const home = renderHomeWith({ active: true, legacySessions: [] });
+    const card = await screen.findByRole("button", { name: "Open alpha" });
+    expect(within(card).getByText("Not running")).toBeTruthy();
+
+    // The live list is the authority, also when it says nobody has recorded
+    // a state.
+    home.rerender({
+      ...home.props,
+      legacySessions: [session({ id: "session-a", projectId: "project-a", workingDir: "/workspace/alpha", isActive: false })],
+    });
+    expect(within(screen.getByRole("button", { name: "Open alpha" })).getByText("Closed")).toBeTruthy();
   });
 
   it("excludes agents in projects that are not running", async () => {
@@ -828,7 +864,9 @@ describe("MobileCodeHome", () => {
     expect(props.onAccount).toHaveBeenCalledTimes(1);
 
     fireEvent.click(screen.getByRole("button", { name: "Start a task" }));
-    expect(screen.getByText(/No running projects/)).toBeTruthy();
+    // Opening is the project's own control and the Machines page's; nothing
+    // is "started from Machines" any more.
+    expect(screen.getByText("No project is running. Open one from its project screen or from Machines first.")).toBeTruthy();
     fireEvent.click(screen.getByRole("button", { name: "Manage machines and projects" }));
     expect(props.onManageMachines).toHaveBeenCalledTimes(1);
   });
@@ -865,7 +903,9 @@ describe("mobile registered projects", () => {
     const card = await screen.findByRole("article", { name: "Registered project q-index" });
     expect(within(card).getByText("/workspace/q-index")).toBeTruthy();
     expect(within(card).getByText("builder-q")).toBeTruthy();
-    expect(within(card).getByText("Stopped")).toBeTruthy();
+    // Registered and closed.
+    expect(within(card).getByText("Closed")).toBeTruthy();
+    expect(within(card).queryByText("Stopped")).toBeNull();
     expect(within(card).queryByText("No recent activity")).toBeNull();
     expect(within(card).queryByRole("button")).toBeNull();
     const link = within(card).getByRole("link", { name: "View q-index on Machines" });
@@ -890,6 +930,18 @@ describe("mobile registered projects", () => {
     expect(screen.getByRole("article", { name: "Registered project q-index" })).toBeTruthy();
   });
 
+  it("reads a registration's recorded state from the bootstrap's machine entry", async () => {
+    // Recorded open while its machine does not run it.
+    stubBootstrap({
+      sessions: [],
+      machines: [{ ...bootstrapInventory, projects: [{ ...bootstrapInventory.projects[0], open_state: "open" }] }],
+    });
+    renderHomeWith({ active: true, liveMachines: [] });
+    const card = await screen.findByRole("article", { name: "Registered project q-index" });
+    expect(within(card).getByText("Open")).toBeTruthy();
+    expect(within(card).queryByText("Closed")).toBeNull();
+  });
+
   it("keeps the preferred stopped host from bootstrap through reordered live heartbeats", async () => {
     const bootstrapMachines = ["002", "005"].map((suffix) => ({
       ...bootstrapInventory,
@@ -905,7 +957,7 @@ describe("mobile registered projects", () => {
       const card = cards[0];
       expect(within(card).getByText("zoo-005")).toBeTruthy();
       expect(within(card).queryByText("zoo-002")).toBeNull();
-      expect(within(card).getByText("Stopped")).toBeTruthy();
+      expect(within(card).getByText("Closed")).toBeTruthy();
       const link = within(card).getByRole("link", { name: "View q-index on Machines" });
       expect(new URL(link.getAttribute("href")!, "https://apas.test").searchParams.get("machine"))
         .toBe("machine-005");
@@ -952,8 +1004,21 @@ describe("mobile registered projects", () => {
     const card = screen.getByRole("article", { name: "Registered project live-name" });
     expect(within(card).getByText("/new/path")).toBeTruthy();
     expect(within(card).getByText("new-host")).toBeTruthy();
-    expect(within(card).getByText("Running")).toBeTruthy();
+    // Nobody has recorded a state, and its machine runs it: open.
+    expect(within(card).getByText("Open")).toBeTruthy();
+    expect(within(card).queryByText("Running")).toBeNull();
     expect(screen.queryByRole("article", { name: "Registered project q-index" })).toBeNull();
+
+    // A recorded state wins over what runs: closed while the machine still
+    // runs it, and open while it does not.
+    for (const [openState, isRunning, label] of [["closed", true, "Closed"], ["open", false, "Open"]] as const) {
+      home.rerender({
+        ...home.props,
+        machineListReceived: true,
+        liveMachines: [{ ...inventory, projects: [{ ...registeredProject, isRunning, openState }] }],
+      });
+      expect(within(screen.getByRole("article", { name: "Registered project q-index" })).getByText(label)).toBeTruthy();
+    }
 
     home.rerender({ ...home.props, machineListReceived: true, liveMachines: [] });
     expect(screen.queryByRole("article")).toBeNull();

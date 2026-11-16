@@ -40,6 +40,7 @@ export default function TerminalScreen() {
   const livePanes = useMobileStore((state) => state.panesBySession[sessionId]);
   const liveInstances = useMobileStore((state) => state.instancesBySession[sessionId]);
   const instancesSupported = useMobileStore((state) => state.negotiatedCapabilities.includes(PROJECT_INSTANCES_CAPABILITY));
+  const machines = useMobileStore((state) => state.knownMachines);
   // Whether this tab's machine runs the project and this viewer may use it,
   // judged as the activity screen judges it. The retained screen still
   // attaches and reads, but keys and sizes would each come back refused, and
@@ -47,8 +48,8 @@ export default function TerminalScreen() {
   const unavailableReason = useMemo(() => {
     const pane = (livePanes ?? session?.panes)?.find((candidate) => candidate.pane_id === paneId);
     if (paneIsRetiredBot(pane)) return "Earlier bot terminal history is read-only. Create and approve a fresh worker separately.";
-    return tabUnavailableReason(pane, instancesForSession(session, liveInstances), instancesSupported && Boolean(session?.is_active));
-  }, [instancesSupported, liveInstances, livePanes, paneId, session]);
+    return tabUnavailableReason(pane, instancesForSession(session, liveInstances), instancesSupported && Boolean(session?.is_active), machines);
+  }, [instancesSupported, liveInstances, livePanes, machines, paneId, session]);
   // The size the terminal last asked for, and whether it was held back while
   // the tab could not take it: then it is sent once the tab can.
   const lastSize = useRef<{ cols: number; rows: number } | null>(null);

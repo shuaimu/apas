@@ -6,6 +6,8 @@
 import type { AuditEvent, ClusterMembership, ClusterProject } from "@/components/cluster/types";
 
 const ACTION_LABELS: Record<string, string> = {
+  "project.opened": "Project opened",
+  "project.closed": "Project closed",
   "project.runtime_stopped": "Runtime stopped",
   "project.lifecycle_changed": "Project state changed",
   "project.owner_transferred": "Owner transferred",

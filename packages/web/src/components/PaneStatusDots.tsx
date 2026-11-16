@@ -4,6 +4,9 @@ import { paneIsOnAutopilot } from "@/lib/autopilot";
 
 interface PaneStatusDotsProps {
   panes?: readonly SessionPaneSummary[];
+  /** Whether anything runs the project now. This is not the project's open
+   *  state: a closed project that a machine still runs is active, and the
+   *  tabs on that machine keep their real status. */
   isActive: boolean;
   /** The project's attached instances. A pane whose machine none of them is
    *  on is not running, however long the project stays active elsewhere. */
@@ -25,10 +28,13 @@ export function PaneStatusDots({ panes, isActive, instances, machines }: PaneSta
       {panes.map((pane) => {
         const host = pane.hostname?.trim();
         const status = !isActive
+          // Nothing runs the project: it is closed, or open with every
+          // machine away.
           ? "Not running"
           : paneNotRunning(pane, instances, machines)
-            // Another machine keeps the project active; this pane's does not
-            // run it, so it is not idle, whatever its last status said.
+            // Another machine runs the project; this pane's does not (an
+            // open project it is not following, or a closed one it has
+            // stopped), so it is not idle, whatever its last status said.
             ? host ? `Not running on ${host}` : "Not running"
             : pane.awaiting_answer
               ? "Pending answer"

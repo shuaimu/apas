@@ -276,22 +276,28 @@ describe("machines", () => {
   });
 });
 
-describe("project-wide start and stop", () => {
-  it("fans out only when the project view asks", async () => {
+describe("opening and closing a project", () => {
+  it("always names the whole project, never one machine alone", async () => {
     const ws = await openSocket();
-    useStore.getState().startMachineProjectCli(ZOO5, PROJECT);
-    useStore.getState().stopMachineProjectCli(ZOO5, PROJECT);
-    useStore.getState().startMachineProjectCli(ZOO5, PROJECT, { allInstances: true });
-    useStore.getState().stopMachineProjectCli(ZOO5, PROJECT, { allInstances: true });
-    const [start, stop, startAll, stopAll] = sentFrames(ws).filter((frame) =>
+    useStore.getState().openProject(ZOO5, PROJECT);
+    useStore.getState().closeProject(ZOO5, PROJECT);
+    const frames = sentFrames(ws).filter((frame) =>
       frame.type === "start_machine_project_cli" || frame.type === "stop_machine_project_cli");
-    // The Machines page's per-machine controls must never start or stop
-    // another machine.
-    expect(start).toEqual({ type: "start_machine_project_cli", machine_id: ZOO5, project_id: PROJECT });
-    expect(stop).toEqual({ type: "stop_machine_project_cli", machine_id: ZOO5, project_id: PROJECT });
-    expect(startAll).toEqual(fixture("web-start-machine-project-cli-all.json"));
-    expect(stopAll).toEqual(fixture("web-stop-machine-project-cli-all.json"));
-    for (const frame of [start, stop, startAll, stopAll]) expectValidFrame(frame);
+    // Which machines run a project follows its open state. A request without
+    // `all_instances: true` would start or stop one machine as a choice of
+    // its own, which the web no longer offers.
+    expect(frames).toEqual([
+      fixture("web-start-machine-project-cli-all.json"),
+      fixture("web-stop-machine-project-cli-all.json"),
+    ]);
+    for (const frame of frames) {
+      expect(frame.all_instances).toBe(true);
+      expectValidFrame(frame);
+    }
+    // The per-machine start and stop are gone from the store.
+    const actions = useStore.getState() as unknown as Record<string, unknown>;
+    expect(actions.startMachineProjectCli).toBeUndefined();
+    expect(actions.stopMachineProjectCli).toBeUndefined();
   });
 });
 
@@ -872,12 +878,14 @@ describe("refused input", () => {
   // already raised the notice. The send is settled: never sent again under
   // that id, its reason shown where it is shown, its text kept.
   const PANE = 4;
-  const REFUSAL = "zoo-005 is not running this project. Start it on zoo-005 first.";
+  const REFUSAL = "zoo-005 is not running this project. Open the project again to start it there.";
 
   function refusalFor(clientMsgId: unknown): Record<string, unknown> {
+    // The golden frame gives the shape. Its reason is whatever sentence the
+    // server sends; this one is the sentence for a connected machine.
     const ack = fixture("server-mutation-ack-input.json");
-    expect(ack).toMatchObject({ mutation: "input", accepted: false, error: REFUSAL });
-    return { ...ack, request_id: clientMsgId, session_id: SID, pane_id: PANE };
+    expect(ack).toMatchObject({ mutation: "input", accepted: false });
+    return { ...ack, error: REFUSAL, request_id: clientMsgId, session_id: SID, pane_id: PANE };
   }
 
   function bubble(clientMsgId: unknown) {

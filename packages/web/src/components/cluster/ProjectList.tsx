@@ -8,6 +8,7 @@ import {
   overviewMuted,
   overviewQuietButton,
 } from "@/components/overview/OverviewElements";
+import { clusterProjectOpenModel, type ClusterOpenStateSource } from "./clusterOpenState";
 import type { ClusterProject } from "./types";
 
 /** Above this many projects the list gets a filter. */
@@ -66,6 +67,20 @@ export function ConnectionChip({ connected }: { connected: boolean }) {
   );
 }
 
+/** "Open" or "Closed": the project's state as every list shows it. With
+ *  `derived`, nobody has recorded it and it is shown from what runs. */
+export function OpenStateChip({ label, derived = false }: { label: "Open" | "Closed"; derived?: boolean }) {
+  return (
+    <span
+      data-testid="project-open-state"
+      className={overviewChip}
+      title={derived ? "Nobody has opened or closed this project yet. It is shown from what runs." : undefined}
+    >
+      {label}
+    </span>
+  );
+}
+
 export function SuspendedChip() {
   return <span className={AMBER_CHIP}>Suspended</span>;
 }
@@ -73,11 +88,15 @@ export function SuspendedChip() {
 export function ProjectList({
   projects,
   userId,
+  openState,
   selectedId,
   onSelect,
 }: {
   projects: ClusterProject[];
   userId: string | null | undefined;
+  /** Where each project's Open / Closed comes from; none is shown without
+   *  it, or for a project nothing is known about. */
+  openState?: ClusterOpenStateSource;
   selectedId: string | null;
   onSelect: (projectId: string) => void;
 }) {
@@ -116,6 +135,9 @@ export function ProjectList({
         {shown.map((project) => {
           const selected = project.id === selectedId;
           const facts = projectFacts(project, userId);
+          const open = openState
+            ? clusterProjectOpenModel({ id: project.id, name: project.project_name }, openState)
+            : null;
           return (
             <button
               key={project.id}
@@ -131,6 +153,7 @@ export function ProjectList({
                   {project.project_name || "Unnamed project"}
                 </span>
                 <ConnectionChip connected={project.connected} />
+                {open && <OpenStateChip label={open.stateLabel} derived={openState?.supported === true && !open.recorded} />}
                 {project.lifecycle_status === "suspended" && <SuspendedChip />}
               </span>
               {facts && <span className={`block truncate ${overviewMuted}`}>{facts}</span>}

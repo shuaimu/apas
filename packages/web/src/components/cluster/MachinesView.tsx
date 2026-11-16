@@ -25,8 +25,10 @@ export function MachinesView({
   canRebootAll,
   onReboot,
   onRebootAll,
-  onStart,
-  onStop,
+  openStateSupported,
+  projectMachines,
+  onOpen,
+  onClose,
   setMachineDeepseekConfig,
   requestConfirm,
 }: {
@@ -41,8 +43,15 @@ export function MachinesView({
   canRebootAll: boolean;
   onReboot: (target: { id: string; hostname: string; behind: boolean }) => void;
   onRebootAll: () => void;
-  onStart: (machineId: string, projectId: string) => boolean;
-  onStop: (machineId: string, projectId: string) => boolean;
+  /** The server records open states (`openStateNegotiated`). */
+  openStateSupported: boolean;
+  /** Every machine this viewer lists, also outside the selected cluster:
+   *  another machine that lists the same project says what it does. */
+  projectMachines: MachineWithProjects[];
+  /** Open or close the whole project, naming the machine whose entry was
+   *  used. Each returns whether the request was sent. */
+  onOpen: (machineId: string, projectId: string) => boolean;
+  onClose: (machineId: string, projectId: string) => boolean;
   setMachineDeepseekConfig: (machineId: string, apiKey?: string, clearApiKey?: boolean) => boolean;
   requestConfirm: (request: ConfirmRequest) => void;
 }) {
@@ -95,8 +104,11 @@ export function MachinesView({
                   onToggleStopped={() => onToggleStopped(id)}
                   registrationProjectId={registrationTarget?.machineId === id ? registrationTarget.projectId : undefined}
                   onReboot={() => onReboot({ id, hostname: entry.machine.hostname, behind })}
-                  onStart={(projectId) => onStart(id, projectId)}
-                  onStop={(projectId) => onStop(id, projectId)}
+                  openStateSupported={openStateSupported}
+                  projectMachines={projectMachines}
+                  requestConfirm={requestConfirm}
+                  onOpen={(projectId) => onOpen(id, projectId)}
+                  onClose={(projectId) => onClose(id, projectId)}
                 />
               );
             })}

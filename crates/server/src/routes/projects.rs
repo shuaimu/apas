@@ -200,11 +200,25 @@ pub async fn delete_project(
             "Project deletion confirmation does not match".to_string(),
         ));
     }
-    state
-        .db
-        .begin_project_deletion(&actor.id, &project_id, &request.confirmation)
-        .await
-        .map_err(|error| AppError::Conflict(error.to_string()))?;
+    {
+        // Beginning a deletion records the project closed in its own
+        // transaction, so a host that returns meanwhile is not started.
+        let _open_state = state.sessions.project_open_state_guard(&project_id).await;
+        let began = state
+            .db
+            .begin_project_deletion(&actor.id, &project_id, &request.confirmation)
+            .await
+            .map_err(|error| AppError::Conflict(error.to_string()))?;
+        if began {
+            crate::open_state::note_administrative_close(
+                &state,
+                &actor.id,
+                &project_id,
+                "deletion",
+            )
+            .await;
+        }
+    }
     crate::jobs::cancel_project_jobs(&state, &project_id, "project_deleting").await?;
     crate::jobs::reconcile_authority(&state).await?;
     schedule_project_cleanup(state, project_id);
@@ -409,6 +423,93 @@ mod tests {
             .await,
             Err(AppError::AuthError(_))
         ));
+    }
+
+    /// Beginning a deletion records the project closed by its owner, as an
+    /// administrative stop, so a host that returns while the project is
+    /// being deleted is not started.
+    #[tokio::test]
+    async fn beginning_a_deletion_records_the_project_closed() {
+        use shared::{OpenStateSetKind, ProjectOpenState};
+        let state = test_state().await;
+        let owner = Uuid::new_v4();
+        add_user(&state, owner, "active").await;
+        let project_id = Uuid::new_v4().to_string();
+        state
+            .db
+            .authorize_project_registration(&project_id, &owner.to_string())
+            .await
+            .unwrap();
+        assert!(state
+            .db
+            .set_project_open_state(
+                &project_id,
+                ProjectOpenState::Open,
+                &owner.to_string(),
+                OpenStateSetKind::Request,
+                None,
+            )
+            .await
+            .unwrap());
+
+        // Hold the cleanup back so the record can still be read.
+        let cleanup_blocker = state.project_deletion_guard(&project_id).await;
+        let (status, _) = delete_project(
+            State(state.clone()),
+            headers(&state, owner),
+            Path(project_id.clone()),
+            Json(DeleteProjectRequest {
+                confirmation: project_id.clone(),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(status, StatusCode::ACCEPTED);
+        let record = state
+            .db
+            .get_project_open_state(&project_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.lifecycle, ProjectLifecycle::Deleting);
+        assert_eq!(record.state, Some(ProjectOpenState::Closed));
+        assert_eq!(record.set_by_account(), Some(owner));
+        assert_eq!(record.set_kind, Some(OpenStateSetKind::Administrative));
+        let audited = state
+            .db
+            .list_cluster_audit_events(&owner.to_string(), 50, 0)
+            .await
+            .unwrap();
+        assert!(audited.iter().any(|event| {
+            event.action == "project.closed"
+                && event
+                    .details
+                    .as_deref()
+                    .is_some_and(|details| details.contains("\"deletion\""))
+        }));
+        // It cannot be opened while it is being deleted.
+        assert!(state
+            .db
+            .set_project_open_state(
+                &project_id,
+                ProjectOpenState::Open,
+                &owner.to_string(),
+                OpenStateSetKind::Request,
+                None,
+            )
+            .await
+            .is_err());
+        drop(cleanup_blocker);
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                if state.db.get_project(&project_id).await.unwrap().is_none() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]

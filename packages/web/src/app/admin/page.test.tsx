@@ -1,6 +1,7 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import SystemAdminPage from "./page";
+import { STOP_RUNTIME_CLOSES_PROJECT, SUSPEND_CLOSES_PROJECT } from "@/lib/projectOpenState";
 
 const TOKEN_KEY = "apas_system_admin_token";
 
@@ -254,6 +255,44 @@ describe("SystemAdminPage", () => {
       }),
     ));
     expect(fetchMock.mock.calls.some(([url]) => /\/messages|\/terminal|\/diff|\/files/.test(String(url)))).toBe(false);
+  });
+
+  it("asks in the page before suspending or stopping a runtime, and says both close the project", async () => {
+    installApiFixtures();
+    const confirm = vi.spyOn(window, "confirm");
+    render(<SystemAdminPage />);
+    await screen.findByText("APAS system administration");
+    await signIn();
+    fireEvent.click(screen.getByRole("button", { name: "projects" }));
+    fireEvent.click(await screen.findByRole("button", { name: /project-a/ }));
+    await screen.findByText("Project control");
+    const sent = (path: string) => fetchMock.mock.calls.filter(([url]) => String(url).endsWith(path));
+
+    fireEvent.click(screen.getByRole("button", { name: "Stop runtime" }));
+    let dialog = screen.getByRole("dialog", { name: "Stop this project's current runtime?" });
+    expect(dialog.textContent).toContain(STOP_RUNTIME_CLOSES_PROJECT);
+    expect(sent("/admin/projects/project-a/stop-runtime")).toHaveLength(0);
+    // Declining sends nothing.
+    fireEvent.click(within(dialog).getByRole("button", { name: "Cancel" }));
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(sent("/admin/projects/project-a/stop-runtime")).toHaveLength(0);
+
+    fireEvent.click(screen.getByRole("button", { name: "Stop runtime" }));
+    dialog = screen.getByRole("dialog", { name: "Stop this project's current runtime?" });
+    fireEvent.click(within(dialog).getByRole("button", { name: "Stop runtime" }));
+    await waitFor(() => expect(sent("/admin/projects/project-a/stop-runtime")).toHaveLength(1));
+
+    fireEvent.click(screen.getByRole("button", { name: "Suspend project" }));
+    dialog = screen.getByRole("dialog", { name: "Suspend this project?" });
+    expect(dialog.textContent).toContain(SUSPEND_CLOSES_PROJECT);
+    expect(sent("/admin/projects/project-a/lifecycle")).toHaveLength(0);
+    fireEvent.click(within(dialog).getByRole("button", { name: "Suspend project" }));
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith(
+      "https://apas.mpaxos.com/admin/projects/project-a/lifecycle",
+      expect.objectContaining({ method: "PATCH", body: JSON.stringify({ status: "suspended" }) }),
+    ));
+    expect(confirm).not.toHaveBeenCalled();
+    confirm.mockRestore();
   });
 
   it("attributes audit records to the system administrator", async () => {

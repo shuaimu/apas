@@ -156,6 +156,7 @@ describe("mobile code screens", () => {
       visibleSummaryPane: null,
       lastUpdatedAt: null,
       launchTargets: [],
+      knownMachines: [],
       features: {},
     });
   });
@@ -749,8 +750,19 @@ describe("mobile code screens", () => {
     await waitFor(() => expect(view.getByText("Codex 4 · zoo-006 · stopped")).toBeTruthy());
     expect(view.queryByTestId("pane-unavailable")).toBeNull();
     fireEvent.press(view.getByText("Codex 4 · zoo-006 · stopped"));
-    await waitFor(() => expect(view.getByText("zoo-006 is not running this project. Start it on zoo-006 first.")).toBeTruthy());
+    // The bootstrap listed no connected daemon for zoo-006.
+    await waitFor(() => expect(view.getByText("zoo-006 is not running this project because it is offline.")).toBeTruthy());
+    expect(view.queryByText(/Start it on/)).toBeNull();
     fireEvent.changeText(view.getByPlaceholderText("Message this terminal conversation"), "Run the suite.");
+    expect(view.getByRole("button", { name: "Send message" })).toBeDisabled();
+    fireEvent.press(view.getByText("Send message"));
+    expect(mockSendAcknowledged).not.toHaveBeenCalled();
+
+    // A later synchronization lists zoo-006's daemon as connected: the tab
+    // stays refused, with the sentence for a machine that could be started.
+    act(() => useMobileStore.setState({ knownMachines: [{ machine_id: ZOO_006, hostname: "zoo-006", connected: true }] }));
+    await waitFor(() => expect(view.getByText("zoo-006 is not running this project. Open the project again to start it there.")).toBeTruthy());
+    expect(view.queryByText(/because it is offline/)).toBeNull();
     expect(view.getByRole("button", { name: "Send message" })).toBeDisabled();
     fireEvent.press(view.getByText("Send message"));
     expect(mockSendAcknowledged).not.toHaveBeenCalled();
@@ -822,7 +834,7 @@ describe("mobile code screens", () => {
     // host recorded, so the screen lets the server decide. The server refuses
     // the input with a mutation_ack carrying its client_msg_id, which settles
     // the send with that reason instead of retrying it into a timeout.
-    const refusal = "zoo-005 is not running this project. Start it on zoo-005 first.";
+    const refusal = "zoo-005 is not running this project. Open the project again to start it there.";
     mockParams = { sessionId: session.id };
     mockReadCachedSnapshot.mockReturnValue(new Promise(() => undefined));
     mockSendAcknowledged.mockRejectedValueOnce(new MutationRefusedError(refusal));
@@ -956,6 +968,38 @@ describe("mobile code screens", () => {
       profile_key: "terminal:codex:official:default",
     });
     expect(mockDeleteTaskDraft).not.toHaveBeenCalled();
+  });
+
+  it("shows the server's reason as it is when a launch is refused for a closed project with tabs elsewhere", async () => {
+    // A launch names one machine and never opens a project on another. This
+    // app has no Open control, so the server's sentence is all it shows.
+    const refusal = "This project is closed and has tabs on other machines. Open it from the project.";
+    useMobileStore.setState({
+      launchTargets: [launchTarget],
+      features: { coding_mutations: true },
+      sessions: [{ ...session, is_active: false, open_state: "closed" }],
+    });
+    mockLaunchTask.mockRejectedValueOnce(new Error(refusal));
+    jest.mocked(router.replace).mockClear();
+    const view = render(<NewTaskScreen />);
+    await waitFor(() => expect(mockLoadTaskDraft).toHaveBeenCalled());
+
+    fireEvent.press(view.getByText(launchTarget.project_name));
+    fireEvent.press(view.getByText("Codex terminal"));
+    fireEvent.changeText(view.getByPlaceholderText(/diagnose the failing login test/), "Run the slow suite here");
+    fireEvent.press(view.getByText("Review task"));
+    fireEvent.press(view.getByText("Submit task"));
+
+    await waitFor(() => expect(view.getByText(refusal)).toBeTruthy());
+    expect(mockLaunchTask).toHaveBeenCalledTimes(1);
+    expect(mockLaunchTask.mock.calls[0]?.[0]).toMatchObject({
+      machine_id: launchTarget.machine_id,
+      project_id: launchTarget.project_id,
+    });
+    // Nothing was started, so nothing is opened and the draft is kept.
+    expect(router.replace).not.toHaveBeenCalled();
+    expect(mockDeleteTaskDraft).not.toHaveBeenCalled();
+    expect(view.getByText("Run the slow suite here")).toBeTruthy();
   });
 
 });

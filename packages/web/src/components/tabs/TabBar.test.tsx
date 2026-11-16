@@ -1,7 +1,7 @@
-import { act, createEvent, fireEvent, render, screen } from "@testing-library/react";
+import { act, createEvent, fireEvent, render, screen, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ReactNode } from "react";
-import { TabBar } from "./TabBar";
+import { TabBar, type ProjectControls } from "./TabBar";
 import { useStore, type CliLifecycleInventory, type CliLifecycleStatus, type PaneConfig } from "@/lib/store";
 
 function pane(overrides: Partial<PaneConfig> & Pick<PaneConfig, "pane_id" | "label" | "role">): PaneConfig {
@@ -24,10 +24,7 @@ function renderTabBar(
     onSelectTab?: ReturnType<typeof vi.fn>;
     onAddTab?: ReturnType<typeof vi.fn>;
     onRebootCli?: ReturnType<typeof vi.fn>;
-    onBootCli?: ReturnType<typeof vi.fn>;
-    onCloseProject?: ReturnType<typeof vi.fn>;
-    showBootButton?: boolean;
-    showCloseProjectButton?: boolean;
+    projectControls?: ProjectControls;
     lifecycleInventory?: CliLifecycleInventory;
     lifecycleStatus?: CliLifecycleStatus;
     onRenameTab?: ReturnType<typeof vi.fn>;
@@ -61,10 +58,7 @@ function renderTabBar(
       onRenameTab={onRenameTab as Parameters<typeof TabBar>[0]["onRenameTab"]}
       onReorderTabs={onReorderTabs as Parameters<typeof TabBar>[0]["onReorderTabs"]}
       onRebootCli={overrides.onRebootCli as Parameters<typeof TabBar>[0]["onRebootCli"]}
-      onBootCli={overrides.onBootCli as Parameters<typeof TabBar>[0]["onBootCli"]}
-      onCloseProject={overrides.onCloseProject as Parameters<typeof TabBar>[0]["onCloseProject"]}
-      showBootButton={overrides.showBootButton}
-      showCloseProjectButton={overrides.showCloseProjectButton}
+      projectControls={overrides.projectControls}
       lifecycleInventory={overrides.lifecycleInventory}
       lifecycleStatus={overrides.lifecycleStatus}
       showRebootButton={overrides.showRebootButton}
@@ -551,43 +545,89 @@ describe("TabBar add-tab worktree controls", () => {
 });
 
 describe("opening and closing a project", () => {
-  it("offers Open when the project is not running", () => {
-    const onBootCli = vi.fn();
-    renderTabBar({ showBootButton: true, onBootCli });
+  const openAction: ProjectControls["openAction"] = {
+    kind: "open",
+    label: "Open",
+    confirmation: { title: "Open apas?", body: ["It starts on zoo-005."] },
+  };
+  const closeAction: ProjectControls["closeAction"] = {
+    kind: "close",
+    label: "Close",
+    confirmation: {
+      title: "Close apas?",
+      body: [
+        "This stops its agents on zoo-005.",
+        "Nothing is deleted. Its tabs come back when you open it again.",
+      ],
+    },
+  };
+
+  function controls(overrides: Partial<ProjectControls>): ProjectControls {
+    return { onOpen: vi.fn(), onClose: vi.fn(), ...overrides };
+  }
+
+  it("offers Open for a closed project, and opens it only after the in-page confirmation", () => {
+    const confirmSpy = vi.spyOn(window, "confirm").mockReturnValue(false);
+    confirmSpy.mockClear();
+    const onOpen = vi.fn();
+    renderTabBar({ projectControls: controls({ openAction, onOpen }) });
 
     // It used to say "Boot", which named the process rather than the thing
     // the person is opening.
     expect(screen.queryByRole("button", { name: "Boot" })).toBeNull();
-    const open = screen.getByRole("button", { name: "Open" });
+    expect(screen.queryByRole("button", { name: "Close" })).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Open" }));
 
-    vi.spyOn(window, "confirm").mockReturnValue(true);
-    fireEvent.click(open);
-    expect(onBootCli).toHaveBeenCalledTimes(1);
+    const dialog = screen.getByRole("dialog", { name: "Open apas?" });
+    expect(dialog.textContent).toContain("It starts on zoo-005.");
+    expect(onOpen).not.toHaveBeenCalled();
+    fireEvent.click(within(dialog).getByRole("button", { name: "Open" }));
+    expect(onOpen).toHaveBeenCalledTimes(1);
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(confirmSpy).not.toHaveBeenCalled();
+    confirmSpy.mockRestore();
   });
 
-  it("offers Close in the same slot when the project is running", () => {
-    const onCloseProject = vi.fn();
-    renderTabBar({ showCloseProjectButton: true, onCloseProject });
+  it("offers Close in the same slot for an open project", () => {
+    const onClose = vi.fn();
+    renderTabBar({ projectControls: controls({ closeAction, onClose }) });
 
     expect(screen.queryByRole("button", { name: "Open" })).toBeNull();
-    const close = screen.getByRole("button", { name: "Close" });
-
-    vi.spyOn(window, "confirm").mockReturnValue(true);
-    fireEvent.click(close);
-    expect(onCloseProject).toHaveBeenCalledTimes(1);
+    fireEvent.click(screen.getByRole("button", { name: "Close" }));
+    const dialog = screen.getByRole("dialog", { name: "Close apas?" });
+    fireEvent.click(within(dialog).getByRole("button", { name: "Close" }));
+    expect(onClose).toHaveBeenCalledTimes(1);
   });
 
-  it("says what closing costs, and does nothing when declined", () => {
-    const onCloseProject = vi.fn();
-    renderTabBar({ showCloseProjectButton: true, onCloseProject });
-
+  it("says what closing costs and that nothing is deleted, and does nothing when declined", () => {
     const confirmSpy = vi.spyOn(window, "confirm").mockReturnValue(false);
-    fireEvent.click(screen.getByRole("button", { name: "Close" }));
+    confirmSpy.mockClear();
+    const onClose = vi.fn();
+    const onDelete = vi.fn();
+    renderTabBar({ projectControls: controls({ closeAction, onClose, onDelete }) });
 
-    // Closing stops every agent in the project — that has to be said before
-    // it happens, not discovered afterwards. Assert the call this test made:
-    // the spy accumulates across tests in this file.
-    expect(confirmSpy).toHaveBeenLastCalledWith(expect.stringContaining("agent"));
-    expect(onCloseProject).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "Close" }));
+    // Closing stops every agent in the project: that has to be said before
+    // it happens, not discovered afterwards.
+    const lines = Array.from(screen.getByRole("dialog").querySelectorAll("p")).map((line) => line.textContent);
+    expect(lines).toEqual([
+      "This stops its agents on zoo-005.",
+      "Nothing is deleted. Its tabs come back when you open it again.",
+    ]);
+    fireEvent.click(within(screen.getByRole("dialog")).getByRole("button", { name: "Cancel" }));
+
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(onClose).not.toHaveBeenCalled();
+    expect(onDelete).not.toHaveBeenCalled();
+    expect(confirmSpy).not.toHaveBeenCalled();
+    confirmSpy.mockRestore();
+  });
+
+  it("offers neither without project controls or actions", () => {
+    renderTabBar();
+    expect(screen.queryByRole("button", { name: "Open" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Close" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Delete project…" })).toBeNull();
+    expect(screen.queryByTestId("project-open-state")).toBeNull();
   });
 });

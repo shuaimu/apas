@@ -374,9 +374,14 @@ pub(crate) async fn persist_pane_roster(state: &AppState, session_id: &Uuid) {
 /// machine's instance, saying why. Its daemon has already answered that the
 /// runtime started, so without this they would wait out their time limit and
 /// be told the machine "did not start this project".
+///
+/// The same reason is kept for the machine's part in the project, when a
+/// start the server asked of it is still pending: it then reads as not
+/// started, with this reason, instead of starting until the time limit.
 fn refuse_waiting_panes(
     state: &AppState,
     session_id: Uuid,
+    project_id: &Uuid,
     machine_id: Option<Uuid>,
     hostname: Option<&str>,
     why: &str,
@@ -391,11 +396,21 @@ fn refuse_waiting_panes(
         .map(|host| host.trim().to_string())
         .filter(|host| !host.is_empty())
         .unwrap_or_else(|| "The machine".to_string());
-    state.sessions.refuse_instance_start(
-        session_id,
-        machine_id,
-        &format!("{host} started this project, but the server refused its instance: {why}"),
-    );
+    let reason =
+        format!("{host} started this project, but the server refused its instance: {why}");
+    state
+        .sessions
+        .refuse_instance_start(session_id, machine_id, &reason);
+    let project_id = project_id.to_string();
+    if state
+        .sessions
+        .machine_outcome(&project_id, &machine_id)
+        .is_some_and(|outcome| outcome.is_start_pending())
+    {
+        state
+            .sessions
+            .record_machine_not_started(&project_id, machine_id, reason);
+    }
 }
 
 /// Move the session's database row after an instance left: inactive when it
@@ -1071,17 +1086,48 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                 // historical 1:1 mapping where the .apas id
                                 // also served as the session id.
                                 let project_id = project_id.unwrap_or(session_id);
+                                // A `SessionStart` that creates the project's row is a
+                                // creation that starts it, and records it open. One for a
+                                // project the server already holds records nothing, so it
+                                // needs no open-state lock. Taken before the shared permit,
+                                // as everywhere.
+                                let creating_open_state = match state
+                                    .db
+                                    .get_project(&project_id.to_string())
+                                    .await
+                                {
+                                    Ok(Some(_)) => None,
+                                    _ => Some(
+                                        state
+                                            .sessions
+                                            .project_open_state_guard(&project_id.to_string())
+                                            .await,
+                                    ),
+                                };
                                 let _project_guard = state
                                     .project_operation_guard(&project_id.to_string())
                                     .await;
-                                if let Err(err) = state
+                                let registration = state
                                     .db
-                                    .authorize_project_registration(
+                                    .authorize_project_registration_reporting_creation(
                                         &project_id.to_string(),
                                         &user_id.to_string(),
                                     )
-                                    .await
+                                    .await;
+                                if matches!(registration, Ok((_, true)))
+                                    && creating_open_state.is_some()
                                 {
+                                    crate::open_state::record_created_open(
+                                        &state,
+                                        &user_id,
+                                        &project_id.to_string(),
+                                        machine_id,
+                                        "session_start",
+                                    )
+                                    .await;
+                                }
+                                drop(creating_open_state);
+                                if let Err(err) = registration {
                                     let reason = err.to_string();
                                     tracing::warn!(
                                         "Rejecting SessionStart from CLI {} (user {}, project {}): {}",
@@ -1093,6 +1139,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                     refuse_waiting_panes(
                                         &state,
                                         session_id,
+                                        &project_id,
                                         machine_id,
                                         hostname.as_deref(),
                                         &reason,
@@ -1143,6 +1190,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                         refuse_waiting_panes(
                                             &state,
                                             session_id,
+                                            &project_id,
                                             machine_id,
                                             hostname.as_deref(),
                                             "this project's session belongs to another account",
@@ -1184,6 +1232,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                         refuse_waiting_panes(
                                             &state,
                                             session_id,
+                                            &project_id,
                                             machine_id,
                                             hostname.as_deref(),
                                             &reason,
@@ -1390,6 +1439,10 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                 if let Some(machine_id) = machine_id {
                                     state.sessions.instance_started(session_id, machine_id, cli_id);
                                 }
+                                // The project's state, hosts and roster as they are now
+                                // that this instance runs it, for its machines' parts.
+                                crate::open_state::refresh_basis(&state, &project_id.to_string())
+                                    .await;
 
                                 tracing::info!(
                                     "CLI {} started local session {} (machine {:?}, primary {}, replaced {:?})",
@@ -3398,6 +3451,117 @@ mod instance_tests {
         }
     }
 
+    async fn open_state(harness: &Harness, project: Uuid) -> crate::db::ProjectOpenStateRecord {
+        harness
+            .state
+            .db
+            .get_project_open_state(&project.to_string())
+            .await
+            .unwrap()
+            .expect("the project has a record")
+    }
+
+    /// Scenario "A project created and started": a `SessionStart` that
+    /// creates the project's row is a creation that starts it, so the project
+    /// is recorded open, by that account and naming that machine, and the
+    /// opening is audited. A second machine's instance of the same project
+    /// records nothing more.
+    #[tokio::test]
+    async fn a_session_start_that_creates_the_project_records_it_open() {
+        let harness = harness().await;
+        let session = Uuid::new_v4();
+        let (m5, m6) = (Uuid::new_v4(), Uuid::new_v4());
+        let (mut a, _) = connect_cli(&harness, true).await;
+        start(
+            &mut a,
+            session_start(session, m5, HOST_A, Some(vec![pane(3)])),
+        )
+        .await;
+
+        let created = open_state(&harness, session).await;
+        assert_eq!(created.state, Some(shared::ProjectOpenState::Open));
+        assert_eq!(created.set_by_account(), Some(harness.user_id));
+        assert_eq!(created.set_kind, Some(shared::OpenStateSetKind::Request));
+        assert_eq!(created.stand_in_machine(), Some(m5));
+        let opened: Vec<_> = harness
+            .state
+            .db
+            .list_cluster_audit_events(&harness.user_id.to_string(), 50, 0)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|event| event.action == "project.opened")
+            .collect();
+        assert_eq!(opened.len(), 1);
+        assert_eq!(opened[0].actor_user_id, harness.user_id.to_string());
+        assert!(opened[0].details.as_deref().is_some_and(|details| details
+            .contains("session_start")
+            && details.contains(&m5.to_string())));
+
+        let (mut b, _) = connect_cli(&harness, true).await;
+        start(
+            &mut b,
+            session_start(session, m6, HOST_B, Some(vec![pane(4)])),
+        )
+        .await;
+        assert_eq!(open_state(&harness, session).await, created);
+    }
+
+    /// Scenario "A daemon restoring its projects does not open them", and
+    /// joining an existing project from another checkout: a `SessionStart`
+    /// for a project the server already holds records nothing. A project
+    /// nobody recorded stays not recorded, and one recorded closed stays
+    /// closed by whoever closed it.
+    #[tokio::test]
+    async fn a_session_start_for_a_project_the_server_holds_records_nothing() {
+        let harness = harness().await;
+        let session = Uuid::new_v4();
+        let (m5, m6) = (Uuid::new_v4(), Uuid::new_v4());
+        harness
+            .state
+            .db
+            .authorize_project_registration(&session.to_string(), &harness.user_id.to_string())
+            .await
+            .unwrap();
+
+        let (mut a, _) = connect_cli(&harness, true).await;
+        start(
+            &mut a,
+            session_start(session, m5, HOST_A, Some(vec![pane(3)])),
+        )
+        .await;
+        assert_eq!(open_state(&harness, session).await.state, None);
+
+        assert!(harness
+            .state
+            .db
+            .set_project_open_state(
+                &session.to_string(),
+                shared::ProjectOpenState::Closed,
+                &harness.user_id.to_string(),
+                shared::OpenStateSetKind::Request,
+                None,
+            )
+            .await
+            .unwrap());
+        let closed = open_state(&harness, session).await;
+        let (mut b, _) = connect_cli(&harness, true).await;
+        start(
+            &mut b,
+            session_start(session, m6, HOST_B, Some(vec![pane(4)])),
+        )
+        .await;
+        assert_eq!(open_state(&harness, session).await, closed);
+        assert!(harness
+            .state
+            .db
+            .list_cluster_audit_events(&harness.user_id.to_string(), 50, 0)
+            .await
+            .unwrap()
+            .iter()
+            .all(|event| event.action != "project.opened"));
+    }
+
     /// Two machines' instances share the project's session. The session row
     /// stays the primary's, another machine's pane traffic is refused, and a
     /// departing primary hands the row to the remaining instance until the
@@ -3553,11 +3717,25 @@ mod instance_tests {
             panic!("the pane begins a start of zoo-006's instance");
         };
 
+        // The start is also what the machine's part in the project waits on.
+        sessions.record_machine_start_asked(&session.to_string(), m6, Some(Uuid::new_v4()));
+
         // Its daemon started the runtime, whose CLI is refused beside the
         // older one.
         let (mut b, _) = connect_cli(&harness, true).await;
         send(&mut b, session_start(session, m6, HOST_B, Some(Vec::new()))).await;
         receive(&mut b, |message| matches!(message, ServerToCli::SessionRejected { .. })).await;
+        // The refusal is the reason the machine is not started, instead of a
+        // start that reads as pending until its time limit.
+        match sessions.machine_outcome(&session.to_string(), &m6) {
+            Some(crate::session::open_state::MachineOutcome::NotStarted(reason)) => assert!(
+                reason.starts_with(&format!(
+                    "{HOST_B} started this project, but the server refused its instance:"
+                )) && reason.contains(HOST_A),
+                "{reason}"
+            ),
+            other => panic!("expected the refusal as the machine's outcome, got {other:?}"),
+        }
 
         match sessions
             .await_instance_start(waiter, outcome, Duration::from_secs(5))

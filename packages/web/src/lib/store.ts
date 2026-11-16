@@ -39,6 +39,17 @@ import {
   type SessionInstance,
 } from "./projectInstances";
 import { noRuntimeAccessReason } from "./tabHosts";
+import {
+  parseMachinePart,
+  parseOpenState,
+  parseProjectHosts,
+  parseProjectOpenStateFrame,
+  PROJECT_OPEN_STATE_CAPABILITY,
+  type MachinePart,
+  type OpenState,
+  type ProjectHostInfo,
+  type ProjectOpenReport,
+} from "./projectOpenState";
 import { parseMachineProviders } from "./machineChoice";
 import { receiveWorkerMessage } from "./workers";
 import type { AutopilotAction, AutopilotPromptChange, PaneAutopilotSummary } from "@apas/protocol";
@@ -166,6 +177,11 @@ export interface SessionInfo {
    *  session. Pushed `session_instances` frames update it in place, so read
    *  it through `selectSessionInstances`. */
   instances?: SessionInstance[];
+  /** The project's recorded open state (`SessionInfo.open_state`). Absent
+   *  while nobody has recorded it and from older servers: the project is
+   *  then shown from what runs. A pushed `project_open_state` frame updates
+   *  it in place between two list polls. */
+  openState?: OpenState;
 }
 
 export interface SessionPaneSummary {
@@ -289,6 +305,19 @@ export interface MachineProject {
    *  has never started still groups under its repository. Absent without an
    *  origin and from older daemons. */
   gitRemote?: string;
+  /** The project's recorded open state, filled in by the server. Absent
+   *  while it is not recorded, for a viewer that may not read the project,
+   *  and from older servers. */
+  openState?: OpenState;
+  /** This machine's part in the project, filled in by the server. Absent
+   *  when it has none (it owns no tabs of the project and does not run it),
+   *  and from older servers. */
+  part?: MachinePart;
+  /** The server's sentence for why `part` is not started or still runs. */
+  partReason?: string;
+  /** The other machines that own tabs of the project or run it, never this
+   *  one. Absent when there is none and from older servers. */
+  otherHosts?: ProjectHostInfo[];
 }
 
 export interface MachineWithProjects {
@@ -808,6 +837,13 @@ interface AppState {
    *  the session's list entry; this record covers a session the list does
    *  not contain yet. Read through `selectSessionInstances`. */
   sessionInstances: Record<string, SessionInstance[]>;
+  /** The latest `project_open_state` frame per project id: the recorded
+   *  state, who set it, and each machine's part. Held only from a server
+   *  that negotiated `project_open_state_v1`, and dropped with the socket
+   *  and when this viewer attaches to another session; the next attach
+   *  replays it. Read through `selectProjectOpenReport` and
+   *  `buildProjectOpenModel` (`lib/projectOpenState.ts`). */
+  projectOpenStates: Record<string, ProjectOpenReport>;
   /** Correlated new-tab launches by `AddPaneRequest.requestId`, for every
    *  session. Never resent. Kept in this tab's session storage so a reload
    *  reports the ones it cut off as unconfirmed (`restoreAddPaneRequests`). */
@@ -1010,25 +1046,18 @@ interface AppState {
   forgetProject: (projectId: string) => void;
   refreshCliClients: () => void;
   listMachines: () => void;
-  /** Start a project on a machine. `allInstances` is what the project view's
-   *  Start means: every online machine that owns tabs of the project, with
-   *  `machineId` as the fallback when none does. Without it only `machineId`
-   *  starts, which is what the Machines page's per-machine Start means.
-   *  Returns whether the request was sent: nothing is sent while the socket
-   *  is not open. */
-  startMachineProjectCli: (
-    machineId: string,
-    projectId: string,
-    options?: { allInstances?: boolean },
-  ) => boolean;
-  /** Stop a project on a machine; `allInstances` stops every attached
-   *  instance, as the project view's Close means. Returns whether the
-   *  request was sent. */
-  stopMachineProjectCli: (
-    machineId: string,
-    projectId: string,
-    options?: { allInstances?: boolean },
-  ) => boolean;
+  /** Open the project: the server records it open and starts it on every
+   *  machine that owns its tabs, or on `machineId` when none does. Also the
+   *  retry for a machine of an open project that is not running it, and
+   *  "Keep open" for a project nobody has recorded. Sent once and never
+   *  resent; the state the server reports afterwards is the answer. Returns
+   *  whether the request was sent: nothing is sent while the socket is not
+   *  open. */
+  openProject: (machineId: string, projectId: string) => boolean;
+  /** Close the project: the server records it closed and stops its agents
+   *  on every machine. Nothing is deleted. Sent once and never resent.
+   *  Returns whether the request was sent. */
+  closeProject: (machineId: string, projectId: string) => boolean;
   /** Drop a stopped machine's tabs from the project roster after the owner
    *  confirms. The server refuses while that machine runs the project, and
    *  the tabs come back if it runs the project again. Returns whether the
@@ -2118,6 +2147,7 @@ export const useStore = create<AppState>((set, get) => ({
   cliLifecycleLatestBySession: {},
   sessions: [],
   sessionInstances: {},
+  projectOpenStates: {},
   addPaneRequests: loadAddPaneRequests(),
   paneAutopilot: {},
   autopilotRequests: {},
@@ -2241,6 +2271,7 @@ export const useStore = create<AppState>((set, get) => ({
       cliLifecycleLatestBySession: {},
       sessions: [],
       sessionInstances: {},
+      projectOpenStates: {},
       addPaneRequests: withoutAddPaneRequests(get().addPaneRequests, () => true),
       paneAutopilot: {},
       autopilotRequests: withoutAutopilotRequests(get().autopilotRequests, () => true),
@@ -2337,6 +2368,7 @@ export const useStore = create<AppState>((set, get) => ({
           PROJECT_INSTANCES_CAPABILITY,
           TAB_AUTOPILOT_CAPABILITY,
           PROJECT_AUTOPILOT_PROMPTS_CAPABILITY,
+          PROJECT_OPEN_STATE_CAPABILITY,
         ],
         client_kind: "web",
         app_version: process.env.NEXT_PUBLIC_WEB_UI_VERSION || "development",
@@ -2386,6 +2418,9 @@ export const useStore = create<AppState>((set, get) => ({
         // Pushed instance sets stop arriving with the socket; the next
         // attach replays them.
         sessionInstances: {},
+        // So do open-state frames. The session and machine lists keep the
+        // recorded state they last carried.
+        projectOpenStates: {},
         // So do autopilot states. Until they are replayed every tab reads as
         // not reported, which is what is known.
         paneAutopilot: {},
@@ -2500,6 +2535,7 @@ export const useStore = create<AppState>((set, get) => ({
       cliLifecycleOperations: {},
       cliLifecycleLatestBySession: {},
       sessionInstances: {},
+      projectOpenStates: {},
       addPaneRequests: withoutAddPaneRequests(get().addPaneRequests, () => true),
       machines: [],
       machineListReceived: false,
@@ -2570,6 +2606,12 @@ export const useStore = create<AppState>((set, get) => ({
         forceReload,
         requestedFromSessionId: currentSessionId,
       },
+      // A frame held for a project this viewer is leaving may not be kept
+      // up to date while it is away. The attach replays the frame of the
+      // project it goes to; until then the polled lists say the state.
+      ...(sessionId !== currentSessionId && Object.keys(state.projectOpenStates).length > 0
+        ? { projectOpenStates: {} }
+        : {}),
     });
     ws.send(JSON.stringify({
       type: "attach_session",
@@ -2778,6 +2820,9 @@ export const useStore = create<AppState>((set, get) => ({
         state.addPaneRequests,
         (request) => removedSessionIds.has(request.sessionId),
       );
+      const projectOpenStates = Object.fromEntries(
+        Object.entries(state.projectOpenStates).filter(([id]) => id !== projectId),
+      );
       const autopilot = withoutAutopilotOfSessions(state, removedSessionIds);
       for (const id of removedSessionIds) {
         sessionCache.delete(id);
@@ -2807,6 +2852,7 @@ export const useStore = create<AppState>((set, get) => ({
         cliLifecycleOperations,
         cliLifecycleLatestBySession,
         sessionInstances,
+        projectOpenStates,
         addPaneRequests,
         ...autopilot,
         ...(pendingRemoved
@@ -2857,11 +2903,7 @@ export const useStore = create<AppState>((set, get) => ({
     ws.send(JSON.stringify({ type: "list_machines" }));
   },
 
-  startMachineProjectCli: (
-    machineId: string,
-    projectId: string,
-    options?: { allInstances?: boolean },
-  ) => {
+  openProject: (machineId: string, projectId: string) => {
     const { ws } = get();
     if (!ws || ws.readyState !== WebSocket.OPEN) {
       return false;
@@ -2870,18 +2912,13 @@ export const useStore = create<AppState>((set, get) => ({
       type: "start_machine_project_cli",
       machine_id: machineId,
       project_id: projectId,
-      // Only the project view's Start sends the flag: a per-machine Start on
-      // the Machines page must never start other machines too.
-      ...(options?.allInstances ? { all_instances: true } : {}),
+      // Always the whole project. The web never names one machine alone.
+      all_instances: true,
     }));
     return true;
   },
 
-  stopMachineProjectCli: (
-    machineId: string,
-    projectId: string,
-    options?: { allInstances?: boolean },
-  ) => {
+  closeProject: (machineId: string, projectId: string) => {
     const { ws } = get();
     if (!ws || ws.readyState !== WebSocket.OPEN) {
       return false;
@@ -2890,7 +2927,7 @@ export const useStore = create<AppState>((set, get) => ({
       type: "stop_machine_project_cli",
       machine_id: machineId,
       project_id: projectId,
-      ...(options?.allInstances ? { all_instances: true } : {}),
+      all_instances: true,
     }));
     return true;
   },
@@ -5573,6 +5610,12 @@ export function handleServerMessage(
             gitRemote: typeof project.git_remote === "string" && project.git_remote
               ? project.git_remote
               : undefined,
+            openState: parseOpenState(project.open_state),
+            part: parseMachinePart(project.part),
+            partReason: typeof project.part_reason === "string" && project.part_reason
+              ? project.part_reason
+              : undefined,
+            otherHosts: parseProjectHosts(project.other_hosts),
           })),
           clusterOwnerUserId: item.cluster_owner_user_id as string | undefined,
           clusterAccess: (item.cluster_access as "owner" | "member" | undefined) || "owner",
@@ -5783,6 +5826,35 @@ export function handleServerMessage(
           cliLifecycleInventories,
         };
       });
+      break;
+    }
+
+    case "project_open_state": {
+      // Only a server that negotiated the capability sends it.
+      if (!get().negotiatedCapabilities.has(PROJECT_OPEN_STATE_CAPABILITY)) break;
+      const report = parseProjectOpenStateFrame(data);
+      if (!report) break;
+      set((state) => ({
+        projectOpenStates: { ...state.projectOpenStates, [report.projectId]: report },
+        // The list entry carries whichever of the polled list and this push
+        // arrived last, so the project lists show the new state at once.
+        sessions: state.sessions.some((session) =>
+          (session.projectId ?? session.id) === report.projectId && session.openState !== report.state)
+          ? state.sessions.map((session) =>
+            (session.projectId ?? session.id) === report.projectId
+              ? { ...session, openState: report.state }
+              : session)
+          : state.sessions,
+        machines: state.machines.some((entry) => entry.projects.some((project) =>
+          project.projectId === report.projectId && project.openState !== report.state))
+          ? state.machines.map((entry) => ({
+            ...entry,
+            projects: entry.projects.map((project) => project.projectId === report.projectId
+              ? { ...project, openState: report.state }
+              : project),
+          }))
+          : state.machines,
+      }));
       break;
     }
 
@@ -6388,6 +6460,7 @@ export function handleServerMessage(
         isWorking: s.is_working as boolean | undefined,
         panes: Array.isArray(s.panes) ? (s.panes as SessionPaneSummary[]) : undefined,
         instances: parseSessionInstances(s.instances),
+        openState: parseOpenState(s.open_state),
       }));
 
       set((state) => {

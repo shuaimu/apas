@@ -223,7 +223,7 @@ mod transit_truncation_tests {
 /// and an empty roster was suppressed rather than sent — so a web client that
 /// reloaded kept showing panes the user had already closed, with nothing to
 /// correct it.
-async fn resolve_pane_roster(
+pub(crate) async fn resolve_pane_roster(
     state: &AppState,
     session_id: &Uuid,
 ) -> Option<Vec<shared::PaneConfig>> {
@@ -534,6 +534,38 @@ pub(crate) async fn list_accessible_machines_for_user(
             .apply_project_machine_preferences(&machine.machine.machine_id, &mut machine.projects);
     }
 
+    // The open state on each project entry is the server's to fill in. On a
+    // machine the viewer does not own, only for a project the viewer holds a
+    // role in: seeing a machine is not reading the projects on it.
+    let mut readable = HashSet::new();
+    for machine in &machines {
+        if state.sessions.daemon_owner(&machine.machine.machine_id) == Some(*user_id) {
+            continue;
+        }
+        for project in &machine.projects {
+            if !readable.contains(&project.project_id)
+                && state
+                    .db
+                    .get_project_role_for_user(&project.project_id, &user_id.to_string())
+                    .await
+                    .ok()
+                    .flatten()
+                    .is_some()
+            {
+                readable.insert(project.project_id.clone());
+            }
+        }
+    }
+    state
+        .sessions
+        .set_open_state_readable_projects(*user_id, readable);
+    for machine in &machines {
+        crate::open_state::load_missing_bases(state, &machine.machine.machine_id).await;
+    }
+    state
+        .sessions
+        .fill_machines_open_state(user_id, &mut machines);
+
     machines
 }
 
@@ -630,12 +662,17 @@ pub(crate) async fn place_registered_project(
         .authorize_project_registration(project_id, &user_id.to_string())
         .await
     {
-        Ok(_) => tracing::info!(
-            %user_id,
-            %machine_id,
-            %project_id,
-            "placed a registered project in its owner's cluster for a Start"
-        ),
+        Ok(_) => {
+            tracing::info!(
+                %user_id,
+                %machine_id,
+                %project_id,
+                "placed a registered project in its owner's cluster for a Start"
+            );
+            // The project now has a record and a host: its machines' parts
+            // are reported from here on.
+            crate::open_state::refresh_basis(state, project_id).await;
+        }
         Err(error) => tracing::info!(
             %user_id,
             %machine_id,
@@ -697,7 +734,7 @@ async fn project_start_machines(state: &AppState, project_id: &str) -> Vec<Uuid>
 
 /// Why a project-wide Close stops a machine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum StopRelation {
+pub(crate) enum StopRelation {
     /// The machine the request names, which a Close always stopped.
     Named,
     /// An instance of the project is attached there.
@@ -721,7 +758,7 @@ enum StopRelation {
 /// runs under. Another account's checkout can carry the same project id, and
 /// its daemon reports running it until that instance's `SessionStart` is
 /// refused; it is not part of this project.
-async fn project_stop_machines(
+pub(crate) async fn project_stop_machines(
     state: &AppState,
     project_id: &str,
     machine_id: Uuid,
@@ -818,7 +855,7 @@ fn machine_refusal(
 
 /// The policy a daemon is sent with `StartProjectCli`, or why the project
 /// must not be started: it is suspended, or its policy cannot be read.
-async fn start_policy(
+pub(crate) async fn start_policy(
     state: &AppState,
     project_id: &str,
 ) -> Result<shared::EffectiveProjectPolicy, String> {
@@ -857,7 +894,7 @@ async fn start_policy(
 /// A native task launch needs no such check: while such a CLI runs the
 /// project, the task goes to its running session and no machine is started
 /// (`mobile::launch_task`).
-fn beside_older_instance_refusal(
+pub(crate) fn beside_older_instance_refusal(
     state: &AppState,
     project_id: &str,
     machine_id: &Uuid,
@@ -898,7 +935,7 @@ fn beside_older_instance_refusal(
 /// is refused when it attaches. A Start is not correlated, so its requester
 /// would hear nothing either way. It is refused before any daemon frame
 /// instead, with the reason a new tab targeted at that machine gets.
-fn older_daemon_beside_instance_refusal(
+pub(crate) fn older_daemon_beside_instance_refusal(
     state: &AppState,
     project_id: &str,
     machine_id: &Uuid,
@@ -924,16 +961,23 @@ fn older_daemon_beside_instance_refusal(
     })
 }
 
-/// `StartMachineProjectCli`. A per-machine Start on the Machines page, and
-/// every older client, starts only `machine_id`. The project view's Start
-/// (`all_instances`) starts each machine [`project_start_machines`] names,
-/// and `machine_id` only when none qualifies. Each machine is authorized as
-/// a per-machine Start would be, and when several were chosen a refusal names
-/// the host it concerns. A machine that cannot run the project beside an
-/// older CLI running it elsewhere, and a machine whose daemon cannot run
-/// instances while an instance runs the project elsewhere, are refused
-/// before any daemon frame; see [`beside_older_instance_refusal`] and
-/// [`older_daemon_beside_instance_refusal`].
+/// `StartMachineProjectCli`.
+///
+/// With `all_instances` it opens the project (design Decision 3): the
+/// project is recorded open and started on every machine that owns its tabs;
+/// see [`crate::open_state::open_project_locked`]. Without it the request
+/// names one machine and never reaches another: on an open project it starts
+/// that machine; on a closed one it opens the project when no other machine
+/// owns tabs of it and is otherwise refused with
+/// [`crate::open_state::CLOSED_WITH_TABS_ELSEWHERE`].
+///
+/// A project nobody has recorded is left to what the request did before the
+/// open state, with nothing recorded ([`start_unrecorded_machine_project`]),
+/// unless the request opens it from a viewer that negotiated
+/// `project_open_state_v1` and so told its user what opening does.
+///
+/// The project's open-state lock is held from reading the state to the last
+/// frame sent.
 async fn start_machine_project(
     state: &AppState,
     connection_id: &Uuid,
@@ -945,6 +989,259 @@ async fn start_machine_project(
     // A project only registered on the requester's machine is placed first,
     // or no Start of it would ever pass the access checks below.
     place_registered_project(state, user_id, &machine_id, project_id).await;
+    let _open_state = state.sessions.project_open_state_guard(project_id).await;
+    let record = match crate::open_state::read_open_state(state, project_id).await {
+        Ok(record) => record,
+        Err(message) => {
+            send_policy_error(state, connection_id, message).await;
+            return;
+        }
+    };
+    let knows_open_state = state
+        .sessions
+        .web_supports_capability(connection_id, shared::PROJECT_OPEN_STATE_CAPABILITY);
+    match (
+        record.as_ref().and_then(|record| record.state),
+        all_instances,
+    ) {
+        (None, false) => {
+            start_unrecorded_machine_project(
+                state,
+                connection_id,
+                user_id,
+                machine_id,
+                project_id,
+                false,
+            )
+            .await
+        }
+        (None, true) if !knows_open_state => {
+            start_unrecorded_machine_project(
+                state,
+                connection_id,
+                user_id,
+                machine_id,
+                project_id,
+                true,
+            )
+            .await
+        }
+        (_, true) => {
+            open_project_for_viewer(
+                state,
+                connection_id,
+                user_id,
+                machine_id,
+                project_id,
+                knows_open_state,
+            )
+            .await
+        }
+        (Some(recorded), false) => {
+            start_one_machine_of_recorded_project(
+                state,
+                connection_id,
+                user_id,
+                machine_id,
+                project_id,
+                recorded,
+                record.as_ref().and_then(|record| record.stand_in_machine()),
+            )
+            .await
+        }
+    }
+}
+
+/// Tell a requester whose client shows no machine parts which machines an
+/// open or a close left as they are, as the requests always did: one `Error`
+/// each, naming the host when several machines were looked at.
+async fn report_machine_refusals(
+    state: &AppState,
+    connection_id: &Uuid,
+    several: bool,
+    refusals: &[crate::open_state::MachineRefusal],
+) {
+    for refusal in refusals {
+        send_policy_error(
+            state,
+            connection_id,
+            machine_refusal(state, refusal.machine_id, several, true, &refusal.legacy),
+        )
+        .await;
+    }
+}
+
+/// Open the project for a viewer: `StartMachineProjectCli` with
+/// `all_instances`. An account that may not set the project's open state is
+/// answered with a bare "Machine not found", as a stranger's project-wide
+/// Start always was, and nothing is recorded. A machine the open leaves out
+/// keeps its reason for its part; a viewer that did not negotiate
+/// `project_open_state_v1` is also told as before.
+async fn open_project_for_viewer(
+    state: &AppState,
+    connection_id: &Uuid,
+    user_id: &Uuid,
+    machine_id: Uuid,
+    project_id: &str,
+    knows_open_state: bool,
+) {
+    if !crate::open_state::may_set_open_state(state, user_id, project_id).await {
+        send_policy_error(state, connection_id, "Machine not found").await;
+        return;
+    }
+    if !state
+        .sessions
+        .web_supports_capability(connection_id, shared::PROJECT_POLICY_CAPABILITY)
+    {
+        send_policy_error(state, connection_id, crate::open_state::POLICY_INCOMPATIBLE).await;
+        return;
+    }
+    match crate::open_state::open_project_locked(
+        state,
+        user_id,
+        project_id,
+        Some(machine_id),
+        "open",
+        None,
+    )
+    .await
+    {
+        Ok(outcome) if !knows_open_state => {
+            report_machine_refusals(state, connection_id, outcome.targets > 1, &outcome.refused)
+                .await
+        }
+        Ok(_) => {}
+        Err(message) => send_policy_error(state, connection_id, message).await,
+    }
+}
+
+/// A Start naming one machine of a project whose open state is recorded.
+/// It comes from a client that could not have said what opening does, so it
+/// never starts another machine: on an open project it starts `machine_id`,
+/// as a retry of it; on a closed one it opens the project when no other
+/// machine owns tabs of it, and is otherwise refused with nothing started.
+/// The machine is authorized and checked as a per-machine Start always was,
+/// and also against the roster: a daemon that cannot run instances is not
+/// started while another machine owns tabs.
+async fn start_one_machine_of_recorded_project(
+    state: &AppState,
+    connection_id: &Uuid,
+    user_id: &Uuid,
+    machine_id: Uuid,
+    project_id: &str,
+    recorded: shared::ProjectOpenState,
+    stand_in: Option<Uuid>,
+) {
+    if !has_machine_project_runtime_access(state, user_id, &machine_id, project_id).await {
+        send_policy_error(state, connection_id, "Machine not found").await;
+        return;
+    }
+    if !state
+        .sessions
+        .web_supports_capability(connection_id, shared::PROJECT_POLICY_CAPABILITY)
+    {
+        send_policy_error(state, connection_id, crate::open_state::POLICY_INCOMPATIBLE).await;
+        return;
+    }
+    if recorded == shared::ProjectOpenState::Closed
+        && crate::open_state::other_machines_own_tabs(state, project_id, &machine_id).await
+    {
+        send_policy_error(
+            state,
+            connection_id,
+            crate::open_state::CLOSED_WITH_TABS_ELSEWHERE,
+        )
+        .await;
+        return;
+    }
+    if !state.sessions.is_daemon_connected(&machine_id) {
+        send_policy_error(state, connection_id, "Daemon is offline").await;
+        return;
+    }
+    if recorded == shared::ProjectOpenState::Closed {
+        // No other machine owns tabs, so this start is the project's open.
+        match crate::open_state::open_project_locked(
+            state,
+            user_id,
+            project_id,
+            Some(machine_id),
+            "start",
+            None,
+        )
+        .await
+        {
+            Ok(outcome) => {
+                report_machine_refusals(state, connection_id, false, &outcome.refused).await
+            }
+            Err(message) => send_policy_error(state, connection_id, message).await,
+        }
+        return;
+    }
+    let owners = crate::open_state::project_tab_owners(state, project_id, stand_in).await;
+    let refusal = if !state
+        .sessions
+        .daemon_supports_capability(&machine_id, shared::PROJECT_POLICY_CAPABILITY)
+    {
+        Some(crate::open_state::POLICY_INCOMPATIBLE.to_string())
+    } else {
+        crate::open_state::beside_other_owners_refusal(state, &owners, &machine_id)
+            .or_else(|| beside_older_instance_refusal(state, project_id, &machine_id))
+            .or_else(|| older_daemon_beside_instance_refusal(state, project_id, &machine_id))
+    };
+    if let Some(refusal) = refusal {
+        send_policy_error(state, connection_id, refusal).await;
+        return;
+    }
+    let daemon_policy = match start_policy(state, project_id).await {
+        Ok(policy) => policy,
+        Err(message) => {
+            send_policy_error(state, connection_id, message).await;
+            return;
+        }
+    };
+    let sent = if crate::open_state::machine_runs_project(state, project_id, &machine_id) {
+        // It runs the project: the start goes ahead as it always did, and
+        // its daemon answers that the project already runs.
+        state
+            .sessions
+            .send_to_daemon(
+                &machine_id,
+                ServerToDaemon::StartProjectCli {
+                    project_id: project_id.to_string(),
+                    policy: Some(daemon_policy),
+                    request_id: None,
+                },
+            )
+            .await
+    } else {
+        crate::open_state::send_recorded_start(state, project_id, &machine_id, &daemon_policy).await
+    };
+    if !sent {
+        send_policy_error(state, connection_id, "Daemon is offline").await;
+    }
+}
+
+/// `StartMachineProjectCli` for a project nobody has recorded, exactly as
+/// the request was served before the open state, and recording nothing. A
+/// per-machine Start starts only `machine_id`. A project-wide Start
+/// (`all_instances`) from a viewer that did not negotiate
+/// `project_open_state_v1` starts each machine [`project_start_machines`]
+/// names, and `machine_id` only when none qualifies. Each machine is
+/// authorized as a per-machine Start would be, and when several were chosen
+/// a refusal names the host it concerns. A machine that cannot run the
+/// project beside an older CLI running it elsewhere, and a machine whose
+/// daemon cannot run instances while an instance runs the project elsewhere,
+/// are refused before any daemon frame; see
+/// [`beside_older_instance_refusal`] and
+/// [`older_daemon_beside_instance_refusal`].
+async fn start_unrecorded_machine_project(
+    state: &AppState,
+    connection_id: &Uuid,
+    user_id: &Uuid,
+    machine_id: Uuid,
+    project_id: &str,
+    all_instances: bool,
+) {
     // Checked before the fan-out is even computed: it reads the project's
     // roster, and its refusals name the hosts it found.
     if all_instances && !may_act_on_every_instance(state, user_id, project_id).await {
@@ -1025,6 +1322,14 @@ async fn start_machine_project(
     };
 
     for target in compatible {
+        // Kept for the machine's part, which reads as starting until the
+        // machine is seen running the project. Nothing is recorded of the
+        // project's state.
+        if !crate::open_state::machine_runs_project(state, project_id, &target) {
+            state
+                .sessions
+                .record_machine_start_asked(project_id, target, None);
+        }
         if !state
             .sessions
             .send_to_daemon(
@@ -1037,6 +1342,7 @@ async fn start_machine_project(
             )
             .await
         {
+            state.sessions.clear_machine_outcome(project_id, &target);
             send_policy_error(
                 state,
                 connection_id,
@@ -1047,17 +1353,139 @@ async fn start_machine_project(
     }
 }
 
-/// `StopMachineProjectCli`. A per-machine Stop, and every older client,
-/// stops only `machine_id`; the project view's Close (`all_instances`) stops
-/// every machine running the project, as [`project_stop_machines`] finds
-/// them: the machine named, every attached instance's, and every machine
-/// whose connected daemon reports running it while its instance is not
-/// attached. Each machine is authorized as a per-machine Stop would be.
+/// `StopMachineProjectCli`.
+///
+/// With `all_instances` it closes the project (design Decision 3): the
+/// project is recorded closed and stopped on every machine that runs it; see
+/// [`crate::open_state::close_project_locked`]. Without it the request names
+/// one machine and never reaches another: on a closed project it stops that
+/// machine; on an open one it closes the project when no other machine owns
+/// tabs of it or runs it, and is otherwise refused, with nothing stopped,
+/// with [`crate::open_state::RUNS_ON_OTHER_MACHINES`].
+///
+/// A project nobody has recorded is left to what the request did before the
+/// open state, with nothing recorded ([`stop_unrecorded_machine_project`]),
+/// unless the request closes it from a viewer that negotiated
+/// `project_open_state_v1`.
+///
+/// A close sends `StopProjectCli` and nothing else: no tab is closed or
+/// forgotten and nothing is deleted. The project's open-state lock is held
+/// from reading the state to the last frame sent.
+async fn stop_machine_project(
+    state: &AppState,
+    connection_id: &Uuid,
+    user_id: &Uuid,
+    machine_id: Uuid,
+    project_id: &str,
+    all_instances: bool,
+) {
+    let _open_state = state.sessions.project_open_state_guard(project_id).await;
+    let record = match crate::open_state::read_open_state(state, project_id).await {
+        Ok(record) => record,
+        Err(message) => {
+            send_policy_error(state, connection_id, message).await;
+            return;
+        }
+    };
+    let knows_open_state = state
+        .sessions
+        .web_supports_capability(connection_id, shared::PROJECT_OPEN_STATE_CAPABILITY);
+    let recorded = record.as_ref().and_then(|record| record.state);
+    match (recorded, all_instances) {
+        // A project nobody recorded, and one machine of a closed project:
+        // stop that machine, as before.
+        (None, false) | (Some(shared::ProjectOpenState::Closed), false) => {
+            stop_unrecorded_machine_project(
+                state,
+                connection_id,
+                user_id,
+                machine_id,
+                project_id,
+                false,
+            )
+            .await
+        }
+        (None, true) if !knows_open_state => {
+            stop_unrecorded_machine_project(
+                state,
+                connection_id,
+                user_id,
+                machine_id,
+                project_id,
+                true,
+            )
+            .await
+        }
+        (_, true) => {
+            if !crate::open_state::may_set_open_state(state, user_id, project_id).await {
+                send_policy_error(state, connection_id, "Machine not found").await;
+                return;
+            }
+            match crate::open_state::close_project_locked(
+                state, user_id, project_id, machine_id, "close",
+            )
+            .await
+            {
+                Ok(outcome) if !knows_open_state => {
+                    report_machine_refusals(
+                        state,
+                        connection_id,
+                        outcome.targets > 1,
+                        &outcome.refused,
+                    )
+                    .await
+                }
+                Ok(_) => {}
+                Err(message) => send_policy_error(state, connection_id, message).await,
+            }
+        }
+        (Some(shared::ProjectOpenState::Open), false) => {
+            let Some(record) = record else {
+                return;
+            };
+            if !has_machine_project_runtime_access(state, user_id, &machine_id, project_id).await {
+                send_policy_error(state, connection_id, "Machine not found").await;
+                return;
+            }
+            if crate::open_state::other_machines_own_or_run(state, &record, &machine_id).await {
+                send_policy_error(
+                    state,
+                    connection_id,
+                    crate::open_state::RUNS_ON_OTHER_MACHINES,
+                )
+                .await;
+                return;
+            }
+            // No other machine owns tabs or runs it, so stopping this
+            // machine is closing the project.
+            match crate::open_state::close_project_locked(
+                state, user_id, project_id, machine_id, "stop",
+            )
+            .await
+            {
+                Ok(outcome) => {
+                    report_machine_refusals(state, connection_id, false, &outcome.refused).await
+                }
+                Err(message) => send_policy_error(state, connection_id, message).await,
+            }
+        }
+    }
+}
+
+/// `StopMachineProjectCli` as it was served before the open state, recording
+/// nothing: for a project nobody has recorded, and for one machine of a
+/// closed project. A per-machine Stop stops only `machine_id`; a
+/// project-wide Close (`all_instances`) from a viewer that did not negotiate
+/// `project_open_state_v1` stops every machine running the project, as
+/// [`project_stop_machines`] finds them: the machine named, every attached
+/// instance's, and every machine whose connected daemon reports running it
+/// while its instance is not attached. Each machine is authorized as a
+/// per-machine Stop would be.
 ///
 /// When several machines are stopped a refusal names the host it concerns,
 /// except the machine the request named when [`may_name_machine`] does not
 /// allow it: that one is refused by its id, as an unknown machine is.
-async fn stop_machine_project(
+async fn stop_unrecorded_machine_project(
     state: &AppState,
     connection_id: &Uuid,
     user_id: &Uuid,
@@ -1091,6 +1519,8 @@ async fn stop_machine_project(
             .await;
             continue;
         }
+        // A start still pending there is over.
+        state.sessions.clear_machine_outcome(project_id, &target);
         if !state
             .sessions
             .send_to_daemon(
@@ -1906,7 +2336,7 @@ async fn handle_omp_question_answer(state: &AppState, connection_id: &Uuid, comm
         let owner = match state.sessions.pane_owner(&session_id, pane_id) {
             PaneOwner::Instance(owner) => owner,
             PaneOwner::NotRunning { machine_id, hostname } => {
-                return Err(not_running_message(state, machine_id, hostname));
+                return Err(not_running_message(state, &session_id, machine_id, hostname));
             }
             PaneOwner::NoInstance => return Err("The project runtime is unavailable".into()),
         };
@@ -2088,7 +2518,7 @@ async fn forward_pane_autopilot_control(
         AutopilotTarget::Tab(PaneOwner::NotRunning {
             machine_id,
             hostname,
-        }) => return Err(not_running_message(state, machine_id, hostname)),
+        }) => return Err(not_running_message(state, &session_id, machine_id, hostname)),
         AutopilotTarget::Tab(PaneOwner::NoInstance) => {
             return Err("CLI client not connected".to_string())
         }
@@ -3061,7 +3491,7 @@ async fn may_name_machine(
 }
 
 /// A machine's host name for messages, or "That machine".
-fn machine_label(state: &AppState, machine_id: Uuid) -> String {
+pub(crate) fn machine_label(state: &AppState, machine_id: Uuid) -> String {
     state
         .sessions
         .machine_hostname(&machine_id)
@@ -3285,7 +3715,7 @@ async fn launch_new_pane(
     // this the click produces no tab, no error, and no log on the requesting
     // client.
     Err(match outcome {
-        CliRouteOutcome::MachineNotRunning { .. } => undelivered_message(state, &outcome),
+        CliRouteOutcome::MachineNotRunning { .. } => undelivered_message(state, &session_id, &outcome),
         _ => "The project host is unreachable; the pane was not created. Reconnect and retry."
             .to_string(),
     })
@@ -3296,6 +3726,15 @@ async fn launch_new_pane(
 /// instance started, and the pane follows when that instance attaches. Any
 /// other machine is refused with the reason: the pane is never created on a
 /// machine the user did not pick.
+///
+/// Starting that machine follows the project's open state, once the checks
+/// of [`start_target`] have passed and under the project's open-state lock;
+/// see [`crate::open_state::admit_start_for_new_work`]. From a viewer that
+/// negotiated `project_open_state_v1` it opens the project as the requester,
+/// which also starts the other machines that own tabs. From any other
+/// viewer it starts this machine only, and is refused for a closed project
+/// that has tabs on other machines. The correlated answer keeps its meaning,
+/// for the chosen machine only.
 async fn add_pane_on_machine(state: &AppState, request: NewPaneRequest, machine_id: Uuid) {
     let session_id = request.session_id;
     let wait = if state
@@ -3317,6 +3756,32 @@ async fn add_pane_on_machine(state: &AppState, request: NewPaneRequest, machine_
                 return;
             }
         };
+        // The machine may be started for this pane. From a viewer that
+        // negotiated the open state that opens the project, as the requester;
+        // from any other it reaches this machine only, and a closed project
+        // with tabs on other machines refuses it. Held until this machine's
+        // start has been sent. A refusal has recorded and started nothing.
+        let _open_state = state
+            .sessions
+            .project_open_state_guard(&target.project_id)
+            .await;
+        let knows_open_state = state.sessions.web_supports_capability(
+            &request.connection_id,
+            shared::PROJECT_OPEN_STATE_CAPABILITY,
+        );
+        if let Err(error) = crate::open_state::admit_start_for_new_work(
+            state,
+            &request.user_id,
+            &target.project_id,
+            machine_id,
+            knows_open_state,
+            "tab",
+        )
+        .await
+        {
+            answer_add_pane_launch(state, &request, Some(machine_id), Err(error)).await;
+            return;
+        }
         let wait = state.sessions.wait_for_instance_start(
             session_id,
             machine_id,
@@ -3327,6 +3792,12 @@ async fn add_pane_on_machine(state: &AppState, request: NewPaneRequest, machine_
             ..
         } = &wait
         {
+            // Kept before the frame goes out, so the daemon's answer finds it.
+            state.sessions.record_machine_start_asked(
+                &target.project_id,
+                machine_id,
+                Some(*start_request),
+            );
             let sent = state
                 .sessions
                 .send_to_daemon(
@@ -3339,6 +3810,9 @@ async fn add_pane_on_machine(state: &AppState, request: NewPaneRequest, machine_
                 )
                 .await;
             if !sent {
+                state
+                    .sessions
+                    .clear_machine_outcome(&target.project_id, &machine_id);
                 // Every pane that joined this start fails with it.
                 state
                     .sessions
@@ -3368,7 +3842,7 @@ async fn add_pane_on_machine(state: &AppState, request: NewPaneRequest, machine_
                     )
                     .await
                 }
-                None => Err(not_running_message(state, Some(machine_id), None)),
+                None => Err(not_running_message(state, &session_id, Some(machine_id), None)),
             };
             answer_add_pane_launch(state, &request, Some(machine_id), result).await;
         }
@@ -3423,7 +3897,7 @@ async fn add_pane_after_start(
                     )
                     .await
                 }
-                None => Err(not_running_message(state, Some(machine_id), None)),
+                None => Err(not_running_message(state, &request.session_id, Some(machine_id), None)),
             }
         }
         Some(InstanceStartOutcome::Refused(reason)) => Err(reason),
@@ -4629,8 +5103,16 @@ async fn has_session_runtime_access(state: &AppState, session_id: &Uuid, user_id
 /// The refusal for a control aimed at a machine that runs no instance of the
 /// project. The tab's state lives on that machine, so nothing else can act on
 /// it. Clients show this same wording for such tabs.
+///
+/// It says what would bring the machine back (design Decision 11). While its
+/// daemon is connected, opening the project again starts it there. While it
+/// is not, nothing a person can do here does: the machine is offline. A
+/// machine named only by its host, as for an untagged tab, counts as
+/// connected when a connected machine that lists the project carries that
+/// name.
 fn not_running_message(
     state: &AppState,
+    session_id: &Uuid,
     machine_id: Option<Uuid>,
     hostname: Option<String>,
 ) -> String {
@@ -4643,21 +5125,46 @@ fn not_running_message(
                 .map(|host| host.trim().to_string())
                 .filter(|host| !host.is_empty())
         });
-    match host {
-        Some(host) => format!("{host} is not running this project. Start it on {host} first."),
-        None => "This tab's machine is not running this project.".to_string(),
+    let Some(host) = host else {
+        return "This tab's machine is not running this project.".to_string();
+    };
+    let connected = match machine_id {
+        Some(machine_id) => state.sessions.is_daemon_connected(&machine_id),
+        None => {
+            let project_id = state
+                .sessions
+                .project_for_session(session_id)
+                .unwrap_or_else(|| session_id.to_string());
+            let named = normalize_machine_hostname(&host);
+            state
+                .sessions
+                .machines_listing_project(&project_id)
+                .iter()
+                .any(|machine_id| {
+                    state.sessions.is_daemon_connected(machine_id)
+                        && state
+                            .sessions
+                            .machine_hostname(machine_id)
+                            .is_some_and(|known| normalize_machine_hostname(&known) == named)
+                })
+        }
+    };
+    if connected {
+        format!("{host} is not running this project. Open the project again to start it there.")
+    } else {
+        format!("{host} is not running this project because it is offline.")
     }
 }
 
 /// What a client is told when a control that passed its checks was still
 /// not delivered: its machine stopped in the meantime, or the instance's
 /// connection did not take it.
-fn undelivered_message(state: &AppState, outcome: &CliRouteOutcome) -> String {
+fn undelivered_message(state: &AppState, session_id: &Uuid, outcome: &CliRouteOutcome) -> String {
     match outcome {
         CliRouteOutcome::MachineNotRunning {
             machine_id,
             hostname,
-        } => not_running_message(state, *machine_id, hostname.clone()),
+        } => not_running_message(state, session_id, *machine_id, hostname.clone()),
         _ => "The project runtime is unavailable".to_string(),
     }
 }
@@ -4721,7 +5228,7 @@ async fn pane_control_refusal(
         PaneOwner::NotRunning {
             machine_id,
             hostname,
-        } => Some(not_running_message(state, machine_id, hostname)),
+        } => Some(not_running_message(state, session_id, machine_id, hostname)),
         // Nothing is attached: routing reports that, as it always has.
         PaneOwner::NoInstance => None,
     }
@@ -4952,6 +5459,38 @@ async fn replay_instances_after_attach(state: &AppState, connection_id: &Uuid, s
             })
             .await;
     }
+}
+
+/// What a viewer that just attached is told about the project's open state
+/// and each machine's part in it, after `SessionAttached`: the complete
+/// report, recorded or not. Only a viewer that negotiated
+/// `project_open_state_v1` is sent it; any other reads the state from its
+/// session list and machine list, which older schemas accept, and an older
+/// native build would drop its socket on this frame.
+///
+/// The connection has just passed the project's access checks. The frame
+/// reads its state as it is queued, like the instance set above, so a change
+/// broadcast meanwhile is never overtaken by an older copy.
+async fn replay_open_state_after_attach(state: &AppState, connection_id: &Uuid, project_id: &str) {
+    if !state
+        .sessions
+        .web_supports_capability(connection_id, shared::PROJECT_OPEN_STATE_CAPABILITY)
+    {
+        return;
+    }
+    // What the report reads from the database and the disk, as it is now.
+    // If reading it changed the report, the project's viewers were just told
+    // and this one may hear the same report twice; it is complete each time.
+    crate::open_state::refresh_basis(state, project_id).await;
+    state
+        .sessions
+        .send_to_web_with(connection_id, || {
+            state
+                .sessions
+                .project_open_view(project_id)
+                .map(|view| view.frame(project_id))
+        })
+        .await;
 }
 
 /// `ForgetMachinePanes`: drop the tabs of a machine that will not come back.
@@ -5247,6 +5786,7 @@ async fn lifecycle_target(
         .flatten();
     Err(not_running_message(
         state,
+        session_id,
         nameable.then_some(machine_id),
         tab_host,
     ))
@@ -5337,7 +5877,7 @@ async fn handle_reboot_cli(
         .await;
     if !outcome.delivered() {
         let message = match outcome {
-            CliRouteOutcome::MachineNotRunning { .. } => undelivered_message(state, &outcome),
+            CliRouteOutcome::MachineNotRunning { .. } => undelivered_message(state, &session_id, &outcome),
             _ => "The CLI reboot request could not be delivered. Reboot the CLI manually on the project host, then try again.".to_string(),
         };
         send_policy_error(state, connection_id, message).await;
@@ -5495,7 +6035,7 @@ async fn handle_cli_lifecycle_request(
                 .await;
             if !outcome.delivered() {
                 let message = match outcome {
-                    CliRouteOutcome::MachineNotRunning { .. } => undelivered_message(state, &outcome),
+                    CliRouteOutcome::MachineNotRunning { .. } => undelivered_message(state, &session_id, &outcome),
                     _ => "The request could not be delivered. Start or restart the CLI manually on the project host.".to_string(),
                 };
                 if let Some(failed) = state.sessions.update_lifecycle_request(
@@ -5706,7 +6246,7 @@ async fn handle_web_input(
                     sid,
                     target_pane,
                     client_msg_id.as_deref(),
-                    undelivered_message(state, &outcome),
+                    undelivered_message(state, &sid, &outcome),
                 )
                 .await;
             }
@@ -5804,7 +6344,7 @@ async fn handle_remove_pane(
         // Its machine stopped meanwhile: the tab stays,
         // stopped there, and so does what it last showed.
         CliRouteOutcome::MachineNotRunning { .. } => {
-            send_policy_error(state, connection_id, undelivered_message(state, &outcome)).await
+            send_policy_error(state, connection_id, undelivered_message(state, &sid, &outcome)).await
         }
         CliRouteOutcome::NoInstance | CliRouteOutcome::Undelivered => {
             state.sessions.clear_terminal_scrollback(&sid, pane_id)
@@ -6048,7 +6588,7 @@ async fn route_decision_answer(
     if outcome.delivered() {
         Ok(())
     } else {
-        Err(undelivered_message(state, &outcome))
+        Err(undelivered_message(state, session_id, &outcome))
     }
 }
 
@@ -6118,7 +6658,7 @@ async fn handle_approval_decision(
             if outcome.delivered() {
                 Ok(())
             } else {
-                Err(undelivered_message(state, &outcome))
+                Err(undelivered_message(state, &sid, &outcome))
             }
         }
     };
@@ -7249,6 +7789,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                                     | shared::PROJECT_INSTANCES_CAPABILITY
                                                     | shared::TAB_AUTOPILOT_CAPABILITY
                                                     | shared::PROJECT_AUTOPILOT_PROMPTS_CAPABILITY
+                                                    | shared::PROJECT_OPEN_STATE_CAPABILITY
                                                     | "mobile_bootstrap_v1"
                                                     | "mobile_coding_mutations_v1"
                                                     | "mobile_terminal_v1"
@@ -8325,7 +8866,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                 if outcome.delivered() {
                                     Ok(())
                                 } else {
-                                    Err(undelivered_message(&state, &outcome))
+                                    Err(undelivered_message(&state, &sid, &outcome))
                                 }
                             }
                         };
@@ -9065,7 +9606,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                         continue;
                     }
 
-                    let Ok((_project_id, _project_guard)) =
+                    let Ok((attached_project_id, _project_guard)) =
                         state.active_session_operation(&sid.to_string()).await
                     else {
                         reject_session_attachment(
@@ -9123,6 +9664,12 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             .await;
 
                         replay_instances_after_attach(&state, &connection_id, sid).await;
+                        replay_open_state_after_attach(
+                            &state,
+                            &connection_id,
+                            &attached_project_id,
+                        )
+                        .await;
 
                         // Replay current usage stats so the Overview panel is
                         // populated immediately on attach / hard refresh.
@@ -9444,6 +9991,8 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                         session.instances =
                             viewer_session_instances(&state, &session.id, &uid).await;
                     }
+                    crate::open_state::fill_session_open_states(&state, sessions.iter_mut())
+                        .await;
 
                     state
                         .sessions
@@ -10339,8 +10888,15 @@ mod project_instance_tests {
             .collect()
     }
 
+    /// The refusal for a tab whose machine is not running the project while
+    /// that machine's daemon is not connected.
     fn not_running(host: &str) -> String {
-        format!("{host} is not running this project. Start it on {host} first.")
+        format!("{host} is not running this project because it is offline.")
+    }
+
+    /// The same refusal while that machine's daemon is connected.
+    fn not_following(host: &str) -> String {
+        format!("{host} is not running this project. Open the project again to start it there.")
     }
 
     fn started(daemon: &mut Endpoint<ServerToDaemon>) -> bool {
@@ -12009,6 +12565,26 @@ mod project_instance_tests {
         assert_eq!(lifecycle_refusal(&p, &mut web, foreign).await, anonymous);
 
         // The requester's own machine, and a machine a tab is tagged for.
+        // Both daemons are connected, so opening the project again is what
+        // would start it there.
+        assert_eq!(
+            reboot_refusal(&p, &mut web, p.m6).await,
+            not_following(HOST_B)
+        );
+        assert_eq!(
+            lifecycle_refusal(&p, &mut web, p.m6).await,
+            not_following(HOST_B)
+        );
+        assert_eq!(
+            reboot_refusal(&p, &mut web, tagged).await,
+            not_following("zoo-008")
+        );
+        assert_eq!(
+            lifecycle_refusal(&p, &mut web, tagged).await,
+            not_following("zoo-008")
+        );
+        // Once its daemon is gone, the machine is offline.
+        p.state.sessions.unregister_daemon(&p.m6);
         assert_eq!(
             reboot_refusal(&p, &mut web, p.m6).await,
             not_running(HOST_B)
@@ -12016,14 +12592,6 @@ mod project_instance_tests {
         assert_eq!(
             lifecycle_refusal(&p, &mut web, p.m6).await,
             not_running(HOST_B)
-        );
-        assert_eq!(
-            reboot_refusal(&p, &mut web, tagged).await,
-            not_running("zoo-008")
-        );
-        assert_eq!(
-            lifecycle_refusal(&p, &mut web, tagged).await,
-            not_running("zoo-008")
         );
         assert!(a.drain().is_empty(), "nothing reached the running instance");
     }
@@ -12205,7 +12773,27 @@ mod project_instance_tests {
             .unwrap(),
         )
         .unwrap();
+        // The sentence is pinned here, in both its forms (design Decision
+        // 11). zoo-005's daemon is not connected, so this one is the offline
+        // form, which is also the one the protocol package's fixture
+        // carries: the whole frame must match it.
+        assert_eq!(sent["error"], serde_json::json!(not_running(HOST_A)));
         assert_eq!(sent, fixture);
+
+        // The same input once zoo-005's daemon is connected.
+        let _d5 = p.daemon(p.m5, HOST_A, CAPABLE_DAEMON);
+        web.drain();
+        typed(&p, &web.id, Some(4), Some("msg-2")).await;
+        let refused: Vec<String> = web
+            .drain()
+            .into_iter()
+            .filter_map(|message| match message {
+                ServerToWeb::MutationAck { error, .. } => error,
+                ServerToWeb::Error { message } => Some(message),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(refused, vec![not_following(HOST_A); 2]);
 
         typed(&p, &web.id, Some(5), None).await;
         assert_eq!(
@@ -12358,7 +12946,7 @@ mod project_instance_tests {
         );
 
         handle_reboot_cli(&p.state, &web.id, p.session, Some(m7)).await;
-        assert_eq!(errors(&web.drain()), vec![not_running(HOST_C)]);
+        assert_eq!(errors(&web.drain()), vec![not_following(HOST_C)]);
         assert!(a.drain().is_empty() && b.drain().is_empty());
     }
 
@@ -14000,7 +14588,20 @@ mod project_instance_tests {
             vec![receipt(
                 "after-stop",
                 Refused,
-                Some("zoo-006 is not running this project. Start it on zoo-006 first.")
+                Some("zoo-006 is not running this project because it is offline.")
+            )]
+        );
+        // While its daemon is connected, opening the project again is what
+        // would start it there, and the refusal says so.
+        let _d6 = p.daemon(p.m6, HOST_B, CAPABLE_DAEMON);
+        web.drain();
+        autopilot(&p, &web.id, 4, "not-following", autopilot_stop()).await;
+        assert_eq!(
+            receipts(&web.drain()),
+            vec![receipt(
+                "not-following",
+                Refused,
+                Some(&not_following(HOST_B))
             )]
         );
         assert!(forwarded(&mut a).is_empty() && forwarded(&mut b).is_empty());
@@ -15400,5 +16001,2100 @@ mod project_instance_tests {
         );
         assert!(sent.elapsed() < AUTOPILOT_RECEIPT_WAIT);
         assert!(prompt_receipts(&web.drain()).is_empty());
+    }
+
+    /// A project's open state: recorded once, by whoever opened or closed
+    /// it, and applied to every machine that owns its tabs or runs it.
+    mod open_state {
+        use super::*;
+        use crate::db::ProjectOpenStateRecord;
+        use crate::open_state::{
+            beside_other_owners_refusal, project_tab_owners, recorded_actor_may_use_machine,
+            TabOwner, TabOwners, CLOSED_WITH_TABS_ELSEWHERE, PROJECT_DELETING, PROJECT_SUSPENDED,
+            RUNS_ON_OTHER_MACHINES,
+        };
+        use crate::session::open_state::MachineOutcome;
+        use shared::{OpenStateSetKind, ProjectOpenState, PROJECT_OPEN_STATE_CAPABILITY};
+
+        // 3.1: a machine follows the recorded state when its daemon registers.
+        mod follow;
+        // 3.2 to 3.4: machines' parts, what viewers are told, and the refusal
+        // for a tab whose machine is not running.
+        mod report;
+
+        /// A viewer that tells its user what opening and closing do.
+        const KNOWS: &[&str] = &[
+            shared::PROJECT_POLICY_CAPABILITY,
+            PROJECT_INSTANCES_CAPABILITY,
+            PROJECT_OPEN_STATE_CAPABILITY,
+        ];
+        /// A web bundle or native build from before the open state.
+        const OLDER_VIEWER: &[&str] = &[
+            shared::PROJECT_POLICY_CAPABILITY,
+            PROJECT_INSTANCES_CAPABILITY,
+        ];
+        /// A daemon that cannot run a project beside other machines.
+        const OLDER_DAEMON: &[&str] = &[shared::PROJECT_POLICY_CAPABILITY];
+        const LAPTOP: &str = "laptop";
+
+        async fn record(p: &Project) -> ProjectOpenStateRecord {
+            p.state
+                .db
+                .get_project_open_state(&p.project_id())
+                .await
+                .unwrap()
+                .expect("the project has a record")
+        }
+
+        async fn recorded(p: &Project) -> Option<ProjectOpenState> {
+            record(p).await.state
+        }
+
+        /// Record the state directly, as an earlier open or close left it.
+        async fn set_recorded(
+            p: &Project,
+            state: ProjectOpenState,
+            by: Uuid,
+            machine: Option<Uuid>,
+        ) {
+            assert!(p
+                .state
+                .db
+                .set_project_open_state(
+                    &p.project_id(),
+                    state,
+                    &by.to_string(),
+                    OpenStateSetKind::Request,
+                    machine.as_ref(),
+                )
+                .await
+                .unwrap());
+        }
+
+        /// The project view's Open: `StartMachineProjectCli` with
+        /// `all_instances`.
+        async fn open(p: &Project, web: &Endpoint<ServerToWeb>, user: Uuid, machine: Uuid) {
+            start_machine_project(&p.state, &web.id, &user, machine, &p.project_id(), true).await;
+        }
+
+        /// The project view's Close.
+        async fn close(p: &Project, web: &Endpoint<ServerToWeb>, user: Uuid, machine: Uuid) {
+            stop_machine_project(&p.state, &web.id, &user, machine, &p.project_id(), true).await;
+        }
+
+        /// A Start naming one machine, as an older Machines page sends it.
+        async fn start_one(p: &Project, web: &Endpoint<ServerToWeb>, user: Uuid, machine: Uuid) {
+            start_machine_project(&p.state, &web.id, &user, machine, &p.project_id(), false).await;
+        }
+
+        async fn stop_one(p: &Project, web: &Endpoint<ServerToWeb>, user: Uuid, machine: Uuid) {
+            stop_machine_project(&p.state, &web.id, &user, machine, &p.project_id(), false).await;
+        }
+
+        /// What a daemon was sent: the request id of each start and the
+        /// number of stops. Any other frame fails the test: an open or a
+        /// close sends a daemon nothing else.
+        fn sent(daemon: &mut Endpoint<ServerToDaemon>) -> (Vec<Option<Uuid>>, usize) {
+            let mut starts = Vec::new();
+            let mut stops = 0;
+            for message in daemon.drain() {
+                match message {
+                    ServerToDaemon::StartProjectCli {
+                        policy, request_id, ..
+                    } => {
+                        assert!(policy.is_some(), "a start carries the project's policy");
+                        starts.push(request_id);
+                    }
+                    ServerToDaemon::StopProjectCli { request_id, .. } => {
+                        assert_eq!(request_id, None, "the stop a project stop always sent");
+                        stops += 1;
+                    }
+                    other => panic!("an open or close sent a daemon {other:?}"),
+                }
+            }
+            (starts, stops)
+        }
+
+        fn nothing_sent(daemon: &mut Endpoint<ServerToDaemon>) -> bool {
+            sent(daemon) == (Vec::new(), 0)
+        }
+
+        fn started_once(daemon: &mut Endpoint<ServerToDaemon>) -> bool {
+            let (starts, stops) = sent(daemon);
+            starts.len() == 1 && stops == 0
+        }
+
+        fn stopped_once(daemon: &mut Endpoint<ServerToDaemon>) -> bool {
+            let (starts, stops) = sent(daemon);
+            starts.is_empty() && stops == 1
+        }
+
+        fn outcome(p: &Project, machine: Uuid) -> Option<MachineOutcome> {
+            p.state.sessions.machine_outcome(&p.project_id(), &machine)
+        }
+
+        fn older_apas(host: &str) -> String {
+            format!(
+                "{host} runs an older APAS that cannot run this project beside other machines. Reboot {host} to update it."
+            )
+        }
+
+        fn may_not_use(account: Uuid, host: &str) -> String {
+            format!("{account}@example.test may not use {host} for this project.")
+        }
+
+        /// A project member who is also a member of the hosting cluster,
+        /// allowed on `machines` only.
+        async fn cluster_member(p: &Project, machines: &[Uuid]) -> Uuid {
+            let member = Uuid::new_v4();
+            p.state.db.create_user(&user(member)).await.unwrap();
+            p.state
+                .db
+                .add_project_member(&p.owner.to_string(), &p.project_id(), &member.to_string())
+                .await
+                .unwrap();
+            let token_hash = Uuid::new_v4().to_string();
+            p.state
+                .db
+                .create_shared_cluster_invitation(
+                    &Uuid::new_v4().to_string(),
+                    &token_hash,
+                    &p.host.to_string(),
+                    &format!("{member}@example.test"),
+                    &(chrono::Utc::now() + chrono::Duration::hours(1))
+                        .format("%Y-%m-%d %H:%M:%S")
+                        .to_string(),
+                )
+                .await
+                .unwrap();
+            p.state
+                .db
+                .accept_shared_cluster_invitation(&token_hash, &member.to_string())
+                .await
+                .unwrap()
+                .unwrap();
+            p.state
+                .db
+                .update_cluster_member_policy(
+                    &p.host.to_string(),
+                    &member.to_string(),
+                    Some(machines.iter().map(Uuid::to_string).collect()),
+                    None,
+                )
+                .await
+                .unwrap()
+                .unwrap();
+            member
+        }
+
+        /// An account that may read the project and use none of its machines.
+        async fn reader(p: &Project) -> Uuid {
+            let reader = Uuid::new_v4();
+            p.state.db.create_user(&user(reader)).await.unwrap();
+            p.state
+                .db
+                .add_project_member(&p.owner.to_string(), &p.project_id(), &reader.to_string())
+                .await
+                .unwrap();
+            reader
+        }
+
+        /// Mark the project running on `machine`, as its daemon's next
+        /// heartbeat would.
+        fn reports_running(p: &Project, machine: Uuid, host: &str) {
+            p.state
+                .sessions
+                .update_daemon_projects(&machine, vec![listed(p, host, true)]);
+        }
+
+        /// Set the project's roster. The session must be in memory, as it
+        /// is once a viewer or an instance has attached; otherwise nothing
+        /// would hold the roster and the test would run without one.
+        fn tabs(p: &Project, panes: Vec<PaneConfig>) {
+            assert!(
+                p.state.sessions.has_session_state(&p.session),
+                "attach a viewer or an instance before setting the roster"
+            );
+            p.roster(panes);
+        }
+
+        fn two_machine_roster(p: &Project) {
+            tabs(
+                p,
+                vec![
+                    pane(3, Some(p.m5), Some(HOST_A)),
+                    pane(4, Some(p.m6), Some(HOST_B)),
+                ],
+            );
+        }
+
+        /// A web client that advertises `project_open_state_v1` is told the
+        /// server has it, and the server knows it of that connection alone:
+        /// the same project-view Start records the project from that client
+        /// and records nothing from one that did not ask.
+        #[tokio::test]
+        async fn a_viewer_that_asks_negotiates_the_open_state_for_its_connection() {
+            use jsonwebtoken::{encode, EncodingKey, Header};
+            use tokio_tungstenite::{connect_async, tungstenite::Message};
+
+            type Socket = tokio_tungstenite::WebSocketStream<
+                tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+            >;
+            async fn send(socket: &mut Socket, message: WebToServer) {
+                socket
+                    .send(Message::Text(serde_json::to_string(&message).unwrap()))
+                    .await
+                    .unwrap();
+            }
+            async fn connect(
+                url: &str,
+                token: &str,
+                capabilities: &[&str],
+            ) -> (Socket, Vec<String>) {
+                let (mut socket, _) = connect_async(url).await.unwrap();
+                send(
+                    &mut socket,
+                    WebToServer::Authenticate {
+                        token: token.to_string(),
+                        capabilities: capabilities
+                            .iter()
+                            .map(|capability| capability.to_string())
+                            .collect(),
+                        client_kind: None,
+                        app_version: None,
+                        protocol_version: None,
+                    },
+                )
+                .await;
+                let negotiated = tokio::time::timeout(Duration::from_secs(5), async {
+                    loop {
+                        let Message::Text(text) = socket.next().await.unwrap().unwrap() else {
+                            continue;
+                        };
+                        if let ServerToWeb::Authenticated {
+                            negotiated_capabilities,
+                            ..
+                        } = serde_json::from_str(&text).unwrap()
+                        {
+                            return negotiated_capabilities;
+                        }
+                    }
+                })
+                .await
+                .expect("timed out waiting for the server");
+                (socket, negotiated)
+            }
+            /// The daemon's next start, once the server has handled a request.
+            async fn next_start(daemon: &mut Endpoint<ServerToDaemon>) -> Option<Uuid> {
+                match tokio::time::timeout(Duration::from_secs(5), daemon.rx.recv())
+                    .await
+                    .expect("the daemon is asked to start the project")
+                    .unwrap()
+                {
+                    ServerToDaemon::StartProjectCli { request_id, .. } => request_id,
+                    other => panic!("expected a start, got {other:?}"),
+                }
+            }
+
+            let p = project().await;
+            let mut d5 = p.daemon(p.m5, HOST_A, CAPABLE_DAEMON);
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let router = crate::routes::create_router(p.state.clone());
+            let server = tokio::spawn(async move {
+                axum::serve(listener, router).await.unwrap();
+            });
+            let url = format!("ws://{address}/ws/web");
+            let token = encode(
+                &Header::default(),
+                &crate::routes::auth::Claims {
+                    sub: p.owner.to_string(),
+                    exp: (chrono::Utc::now() + chrono::Duration::hours(1)).timestamp() as usize,
+                    device_session_id: None,
+                    token_kind: None,
+                    credential_version: None,
+                },
+                &EncodingKey::from_secret(p.state.config.auth.jwt_secret.as_bytes()),
+            )
+            .unwrap();
+            let open_project = WebToServer::StartMachineProjectCli {
+                machine_id: p.m5,
+                project_id: p.project_id(),
+                all_instances: true,
+            };
+
+            let (mut older, negotiated) = connect(&url, &token, OLDER_VIEWER).await;
+            assert!(!negotiated.contains(&PROJECT_OPEN_STATE_CAPABILITY.to_string()));
+            send(&mut older, open_project.clone()).await;
+            assert_eq!(next_start(&mut d5).await, None, "the start it always sent");
+            assert_eq!(recorded(&p).await, None);
+
+            let (mut knows, negotiated) = connect(&url, &token, KNOWS).await;
+            assert!(negotiated.contains(&PROJECT_OPEN_STATE_CAPABILITY.to_string()));
+            send(&mut knows, open_project).await;
+            assert!(next_start(&mut d5).await.is_some());
+            assert_eq!(recorded(&p).await, Some(ProjectOpenState::Open));
+            server.abort();
+        }
+
+        // --- 2.2: tab owners and which of them can run together ---
+
+        /// The tab owners are the machines tabs are recorded for and the
+        /// hosts untagged tabs are attributed to: a machine the server knows
+        /// by id when one that lists the project has that host name, else
+        /// the host by name alone. A tab no host is known for has no owner.
+        #[tokio::test]
+        async fn tab_owners_are_read_from_the_roster() {
+            let p = project().await;
+            let _d6 = p.daemon(p.m6, HOST_B, CAPABLE_DAEMON);
+            let _web = p.viewer(p.owner, &[]);
+            tabs(
+                &p,
+                vec![
+                    pane(3, Some(p.m5), Some(HOST_A)),
+                    pane(4, Some(p.m5), Some(HOST_A)),
+                    pane(5, None, Some("ZOO-006")),
+                    pane(6, None, Some(LAPTOP)),
+                    pane(7, None, None),
+                ],
+            );
+            let owners = project_tab_owners(&p.state, &p.project_id(), Some(Uuid::new_v4())).await;
+            let mut expected = vec![
+                TabOwner {
+                    machine_id: Some(p.m5),
+                    hostname: HOST_A.to_string(),
+                    stand_in: false,
+                },
+                TabOwner {
+                    machine_id: Some(p.m6),
+                    hostname: HOST_B.to_string(),
+                    stand_in: false,
+                },
+            ];
+            expected.sort_by_key(|owner| owner.machine_id);
+            expected.push(TabOwner {
+                machine_id: None,
+                hostname: LAPTOP.to_string(),
+                stand_in: false,
+            });
+            assert_eq!(owners, TabOwners::Known(expected));
+            assert!(owners.owns(&p.m5) && owners.owns(&p.m6));
+            assert_eq!(owners.others_than(&p.m5).len(), 2);
+            assert!(owners.is_known());
+        }
+
+        /// While the roster is known and no machine owns a tab, the machine
+        /// an open named stands in as the one owner; a roster with a hosted
+        /// tab leaves it out. A project the server holds no roster for has
+        /// unknown owners, which is not the same as none.
+        #[tokio::test]
+        async fn the_named_machine_stands_in_only_while_no_machine_owns_a_tab() {
+            let p = project().await;
+            let _d5 = p.daemon(p.m5, HOST_A, CAPABLE_DAEMON);
+            let _web = p.viewer(p.owner, &[]);
+            let project_id = p.project_id();
+
+            assert_eq!(
+                project_tab_owners(&p.state, &project_id, Some(p.m5)).await,
+                TabOwners::Unknown,
+                "no roster is held"
+            );
+            assert!(!TabOwners::Unknown.is_known());
+            assert!(TabOwners::Unknown.others_than(&p.m5).is_empty());
+
+            tabs(&p, Vec::new());
+            assert_eq!(
+                project_tab_owners(&p.state, &project_id, None).await,
+                TabOwners::Known(Vec::new())
+            );
+            assert_eq!(
+                project_tab_owners(&p.state, &project_id, Some(p.m5)).await,
+                TabOwners::Known(vec![TabOwner {
+                    machine_id: Some(p.m5),
+                    hostname: HOST_A.to_string(),
+                    stand_in: true,
+                }])
+            );
+            // A tab no host is known for is owned by no machine.
+            tabs(&p, vec![pane(3, None, None)]);
+            assert!(
+                project_tab_owners(&p.state, &project_id, Some(p.m5))
+                    .await
+                    .list()[0]
+                    .stand_in
+            );
+
+            tabs(&p, vec![pane(4, Some(p.m6), Some(HOST_B))]);
+            assert_eq!(
+                project_tab_owners(&p.state, &project_id, Some(p.m5)).await,
+                TabOwners::Known(vec![TabOwner {
+                    machine_id: Some(p.m6),
+                    hostname: HOST_B.to_string(),
+                    stand_in: false,
+                }])
+            );
+        }
+
+        /// The owners are known right after a server restart, with nothing
+        /// attached and nothing in memory: the persisted roster carries each
+        /// tab's machine.
+        #[tokio::test]
+        async fn tab_owners_are_known_from_the_persisted_roster_with_nothing_attached() {
+            let p = project().await;
+            p.state
+                .storage
+                .save_pane_list(
+                    &p.session,
+                    &[
+                        pane(3, Some(p.m5), Some(HOST_A)),
+                        pane(4, Some(p.m6), Some(HOST_B)),
+                    ],
+                )
+                .await
+                .unwrap();
+            assert!(p.state.sessions.session_attachments(&p.session).is_empty());
+            let owners = project_tab_owners(&p.state, &p.project_id(), None).await;
+            assert!(owners.owns(&p.m5) && owners.owns(&p.m6));
+            assert_eq!(owners.list().len(), 2);
+        }
+
+        /// Which owners can run together is decided from the roster and each
+        /// daemon's support, with nothing attached: a daemon without
+        /// multi-instance support runs the project only as its sole owner.
+        #[tokio::test]
+        async fn an_older_daemon_runs_the_project_only_as_its_sole_tab_owner() {
+            let p = project().await;
+            let laptop = Uuid::new_v4();
+            let _d5 = p.daemon(p.m5, HOST_A, CAPABLE_DAEMON);
+            let _dl = p.daemon(laptop, LAPTOP, OLDER_DAEMON);
+            let _web = p.viewer(p.owner, &[]);
+            let project_id = p.project_id();
+            assert!(p.state.sessions.session_attachments(&p.session).is_empty());
+
+            tabs(
+                &p,
+                vec![
+                    pane(3, Some(p.m5), Some(HOST_A)),
+                    pane(4, Some(laptop), Some(LAPTOP)),
+                ],
+            );
+            let owners = project_tab_owners(&p.state, &project_id, None).await;
+            assert_eq!(
+                beside_other_owners_refusal(&p.state, &owners, &laptop),
+                Some(older_apas(LAPTOP))
+            );
+            assert_eq!(beside_other_owners_refusal(&p.state, &owners, &p.m5), None);
+            // The check that reads attached instances sees nothing to refuse.
+            assert_eq!(
+                older_daemon_beside_instance_refusal(&p.state, &project_id, &laptop),
+                None
+            );
+
+            tabs(&p, vec![pane(4, Some(laptop), Some(LAPTOP))]);
+            let alone = project_tab_owners(&p.state, &project_id, None).await;
+            assert_eq!(beside_other_owners_refusal(&p.state, &alone, &laptop), None);
+            assert_eq!(
+                beside_other_owners_refusal(&p.state, &TabOwners::Unknown, &laptop),
+                None
+            );
+        }
+
+        // --- 2.4: Open ---
+
+        /// Scenario "Open a project whose tabs span machines": the project is
+        /// recorded open, by the requester and naming the machine the request
+        /// named, and every machine that owns tabs is sent a correlated,
+        /// policy-bound start. A machine that owns no tab is not started,
+        /// although the request named it.
+        #[tokio::test]
+        async fn opening_records_the_project_open_and_starts_every_machine_that_owns_tabs() {
+            let p = project().await;
+            let m7 = Uuid::new_v4();
+            let mut d5 = p.daemon(p.m5, HOST_A, CAPABLE_DAEMON);
+            let mut d6 = p.daemon(p.m6, HOST_B, CAPABLE_DAEMON);
+            let mut d7 = p.daemon(m7, HOST_C, CAPABLE_DAEMON);
+            let mut web = p.viewer(p.owner, KNOWS);
+            tabs(
+                &p,
+                vec![
+                    pane(3, Some(p.m5), Some(HOST_A)),
+                    pane(4, None, Some(HOST_B)),
+                ],
+            );
+            set_recorded(&p, ProjectOpenState::Closed, p.owner, None).await;
+
+            open(&p, &web, p.owner, m7).await;
+
+            let opened = record(&p).await;
+            assert_eq!(opened.state, Some(ProjectOpenState::Open));
+            assert_eq!(opened.set_by_account(), Some(p.owner));
+            assert_eq!(opened.set_kind, Some(OpenStateSetKind::Request));
+            assert_eq!(opened.machine_id, Some(m7));
+            assert!(opened.set_at.is_some());
+            for (daemon, machine) in [(&mut d5, p.m5), (&mut d6, p.m6)] {
+                let (starts, stops) = sent(daemon);
+                assert_eq!(stops, 0);
+                assert!(matches!(starts.as_slice(), [Some(_)]), "{starts:?}");
+                assert!(matches!(
+                    outcome(&p, machine),
+                    Some(MachineOutcome::StartAsked { request_id, .. }) if request_id == starts[0]
+                ));
+                assert_eq!(
+                    p.state.sessions.machine_start_request(&starts[0].unwrap()),
+                    Some((p.project_id(), machine))
+                );
+            }
+            assert!(nothing_sent(&mut d7), "zoo-007 owns no tab");
+            assert_eq!(outcome(&p, m7), None);
+            assert!(errors(&web.drain()).is_empty());
+        }
+
+        /// A viewer that negotiated the open state also records a project
+        /// nobody had recorded: that click is how following begins.
+        #[tokio::test]
+        async fn a_viewer_that_knows_the_open_state_records_a_project_nobody_recorded() {
+            let p = project().await;
+            let mut d5 = p.daemon(p.m5, HOST_A, CAPABLE_DAEMON);
+            let web = p.viewer(p.owner, KNOWS);
+            tabs(&p, vec![pane(3, Some(p.m5), Some(HOST_A))]);
+            assert_eq!(recorded(&p).await, None);
+
+            open(&p, &web, p.owner, p.m5).await;
+            assert_eq!(recorded(&p).await, Some(ProjectOpenState::Open));
+            assert!(started_once(&mut d5));
+
+            // "Keep open" on a project that already runs records it and
+            // changes nothing on the machine that runs it.
+            let q = project().await;
+            let mut q5 = q.daemon(q.m5, HOST_A, CAPABLE_DAEMON);
+            let _running = q.instance(q.m5, HOST_A);
+            let web = q.viewer(q.owner, KNOWS);
+            tabs(&q, vec![pane(3, Some(q.m5), Some(HOST_A))]);
+            open(&q, &web, q.owner, q.m5).await;
+            assert_eq!(recorded(&q).await, Some(ProjectOpenState::Open));
+            assert!(nothing_sent(&mut q5));
+            assert_eq!(outcome(&q, q.m5), Some(MachineOutcome::Started));
+        }
+
+        /// Scenario "Open a project with no tabs": it starts on the machine
+        /// the request names only, and that machine counts as the owner of
+        /// its tabs for as long as no machine owns one.
+        #[tokio::test]
+        async fn opening_a_project_with_no_tabs_starts_the_named_machine() {
+            let p = project().await;
+            let mut d5 = p.daemon(p.m5, HOST_A, CAPABLE_DAEMON);
+            let mut d6 = p.daemon(p.m6, HOST_B, CAPABLE_DAEMON);
+            let web = p.viewer(p.owner, KNOWS);
+            tabs(&p, Vec::new());
+            set_recorded(&p, ProjectOpenState::Closed, p.owner, None).await;
+
+            open(&p, &web, p.owner, p.m5).await;
+
+            assert!(started_once(&mut d5));
+            assert!(nothing_sent(&mut d6));
+            let opened = record(&p).await;
+            assert_eq!(opened.state, Some(ProjectOpenState::Open));
+            assert_eq!(opened.stand_in_machine(), Some(p.m5));
+            let owners =
+                project_tab_owners(&p.state, &p.project_id(), opened.stand_in_machine()).await;
+            assert!(owners.owns(&p.m5) && owners.list()[0].stand_in);
+
+            // Opening it again from another machine's entry keeps zoo-005 as
+            // the machine that follows it, and starts nothing elsewhere.
+            sent(&mut d5);
+            open(&p, &web, p.owner, p.m6).await;
+            assert!(started_once(&mut d5), "zoo-005 is not reported running yet");
+            assert!(nothing_sent(&mut d6));
+            assert_eq!(record(&p).await, opened);
+        }
+
+        /// A project the server holds no roster for has unknown tab owners:
+        /// opening starts the machine the request names, and only that one.
+        #[tokio::test]
+        async fn opening_a_project_with_no_roster_starts_the_named_machine_only() {
+            let p = project().await;
+            let mut d5 = p.daemon(p.m5, HOST_A, CAPABLE_DAEMON);
+            let mut d6 = p.daemon(p.m6, HOST_B, CAPABLE_DAEMON);
+            let web = p.viewer(p.owner, KNOWS);
+            assert_eq!(
+                project_tab_owners(&p.state, &p.project_id(), None).await,
+                TabOwners::Unknown
+            );
+
+            open(&p, &web, p.owner, p.m6).await;
+
+            assert!(started_once(&mut d6));
+            assert!(nothing_sent(&mut d5));
+            assert_eq!(recorded(&p).await, Some(ProjectOpenState::Open));
+        }
+
+        /// Scenario "Open while one tab owner is offline": the project is
+        /// recorded open and the connected owner starts. Nothing is sent for
+        /// the machine that is away and nothing is held against it: it is
+        /// started when its daemon registers.
+        #[tokio::test]
+        async fn opening_while_a_tab_owner_is_offline_records_open_and_starts_the_others() {
+            let p = project().await;
+            let laptop = Uuid::new_v4();
+            let never_seen = Uuid::new_v4();
+            let mut d5 = p.daemon(p.m5, HOST_A, CAPABLE_DAEMON);
+            let mut dl = p.daemon(laptop, LAPTOP, CAPABLE_DAEMON);
+            p.state.sessions.unregister_daemon(&laptop);
+            let mut web = p.viewer(p.owner, KNOWS);
+            tabs(
+                &p,
+                vec![
+                    pane(3, Some(p.m5), Some(HOST_A)),
+                    pane(4, Some(laptop), Some(LAPTOP)),
+                    pane(5, Some(never_seen), Some("zoo-009")),
+                ],
+            );
+            set_recorded(&p, ProjectOpenState::Closed, p.owner, None).await;
+            p.state
+                .sessions
+                .record_machine_not_started(&p.project_id(), laptop, "an old reason");
+
+            open(&p, &web, p.owner, p.m5).await;
+
+            assert_eq!(recorded(&p).await, Some(ProjectOpenState::Open));
+            assert!(started_once(&mut d5));
+            assert!(nothing_sent(&mut dl));
+            assert_eq!(outcome(&p, laptop), None);
+            assert_eq!(outcome(&p, never_seen), None);
+            assert!(errors(&web.drain()).is_empty());
+        }
+
+        /// Scenario "Open again to retry one machine": opening an open
+        /// project asks the tab owner that is not running it and changes
+        /// nothing on the machine that runs it, and leaves the recorded
+        /// opener, time and named machine as they were.
+        #[tokio::test]
+        async fn opening_again_retries_a_machine_and_changes_nothing_on_one_that_runs() {
+            let p = project().await;
+            let mut d5 = p.daemon(p.m5, HOST_A, CAPABLE_DAEMON);
+            let mut d6 = p.daemon(p.m6, HOST_B, CAPABLE_DAEMON);
+            let web = p.viewer(p.owner, KNOWS);
+            two_machine_roster(&p);
+            open(&p, &web, p.owner, p.m5).await;
+            let opened = record(&p).await;
+            assert!(started_once(&mut d5) && started_once(&mut d6));
+            // zoo-005 runs it; zoo-006 failed to start.
+            let _running = p.instance(p.m5, HOST_A);
+            p.state
+                .sessions
+                .record_machine_not_started(&p.project_id(), p.m6, "zoo-006 refused");
+
+            open(&p, &web, p.owner, p.m6).await;
+
+            assert!(started_once(&mut d6), "zoo-006 is asked to start");
+            assert!(nothing_sent(&mut d5), "nothing changes on zoo-005");
+            assert!(matches!(
+                outcome(&p, p.m6),
+                Some(MachineOutcome::StartAsked { .. })
+            ));
+            assert_eq!(outcome(&p, p.m5), Some(MachineOutcome::Started));
+            assert_eq!(record(&p).await, opened);
+
+            // A daemon's own report of running it counts the same.
+            reports_running(&p, p.m6, HOST_B);
+            open(&p, &web, p.owner, p.m5).await;
+            assert!(nothing_sent(&mut d5) && nothing_sent(&mut d6));
+        }
+
+        /// Scenario "An older daemon among the tab owners", with nothing
+        /// attached: zoo-005 starts and the project is recorded open; the
+        /// laptop is sent nothing and keeps the instruction to reboot it for
+        /// its part. A viewer that shows no parts is told as before.
+        #[tokio::test]
+        async fn an_older_daemon_among_the_tab_owners_is_sent_nothing() {
+            let p = project().await;
+            let laptop = Uuid::new_v4();
+            let mut d5 = p.daemon(p.m5, HOST_A, CAPABLE_DAEMON);
+            let mut dl = p.daemon(laptop, LAPTOP, OLDER_DAEMON);
+            // As after a server restart: only the persisted roster.
+            p.state
+                .storage
+                .save_pane_list(
+                    &p.session,
+                    &[
+                        pane(3, Some(p.m5), Some(HOST_A)),
+                        pane(4, Some(laptop), Some(LAPTOP)),
+                    ],
+                )
+                .await
+                .unwrap();
+            assert!(p.state.sessions.session_attachments(&p.session).is_empty());
+            let mut web = p.viewer(p.owner, KNOWS);
+            set_recorded(&p, ProjectOpenState::Closed, p.owner, None).await;
+
+            open(&p, &web, p.owner, p.m5).await;
+
+            assert_eq!(recorded(&p).await, Some(ProjectOpenState::Open));
+            assert!(started_once(&mut d5));
+            assert!(nothing_sent(&mut dl), "the laptop is sent nothing");
+            assert_eq!(
+                outcome(&p, laptop),
+                Some(MachineOutcome::NotStarted(older_apas(LAPTOP)))
+            );
+            assert!(
+                errors(&web.drain()).is_empty(),
+                "a machine's refusal fails nothing"
+            );
+
+            let mut older = p.viewer(p.owner, OLDER_VIEWER);
+            reports_running(&p, p.m5, HOST_A);
+            sent(&mut d5);
+            open(&p, &older, p.owner, p.m5).await;
+            assert!(nothing_sent(&mut d5) && nothing_sent(&mut dl));
+            assert_eq!(
+                errors(&older.drain()),
+                vec![format!("{LAPTOP}: {}", older_apas(LAPTOP))]
+            );
+        }
+
+        /// The hole a check of attached instances leaves open: after a server
+        /// restart an older daemon is connected before the other tab owner's
+        /// daemon and instance are back. Nothing is attached, so that check
+        /// refuses nothing; the roster still says another machine owns tabs,
+        /// and the older daemon is not started, by an open or by a start
+        /// naming it.
+        #[tokio::test]
+        async fn an_older_daemon_registered_before_a_capable_instance_reattaches_is_not_started() {
+            let p = project().await;
+            let laptop = Uuid::new_v4();
+            let mut dl = p.daemon(laptop, LAPTOP, OLDER_DAEMON);
+            p.state
+                .storage
+                .save_pane_list(
+                    &p.session,
+                    &[
+                        pane(3, Some(p.m5), Some(HOST_A)),
+                        pane(4, Some(laptop), Some(LAPTOP)),
+                    ],
+                )
+                .await
+                .unwrap();
+            let mut web = p.viewer(p.owner, OLDER_VIEWER);
+            set_recorded(&p, ProjectOpenState::Open, p.owner, Some(p.m5)).await;
+            assert!(p.state.sessions.session_attachments(&p.session).is_empty());
+            assert!(!p.state.sessions.is_daemon_connected(&p.m5));
+
+            open(&p, &web, p.owner, laptop).await;
+            assert!(nothing_sent(&mut dl));
+            assert_eq!(
+                errors(&web.drain()),
+                vec![format!("{LAPTOP}: {}", older_apas(LAPTOP))]
+            );
+
+            start_one(&p, &web, p.owner, laptop).await;
+            assert!(nothing_sent(&mut dl));
+            assert_eq!(errors(&web.drain()), vec![older_apas(LAPTOP)]);
+        }
+
+        /// Scenario "An older daemon as the only tab owner": it starts the
+        /// project as its only runtime, as it does today, with the start it
+        /// was always sent.
+        #[tokio::test]
+        async fn an_older_daemon_as_the_only_tab_owner_starts() {
+            let p = project().await;
+            let laptop = Uuid::new_v4();
+            let mut d5 = p.daemon(p.m5, HOST_A, CAPABLE_DAEMON);
+            let mut dl = p.daemon(laptop, LAPTOP, OLDER_DAEMON);
+            let mut web = p.viewer(p.owner, KNOWS);
+            tabs(&p, vec![pane(4, Some(laptop), Some(LAPTOP))]);
+
+            open(&p, &web, p.owner, p.m5).await;
+
+            assert_eq!(sent(&mut dl), (vec![None], 0), "it answers no start");
+            assert!(nothing_sent(&mut d5));
+            assert_eq!(recorded(&p).await, Some(ProjectOpenState::Open));
+            assert!(errors(&web.drain()).is_empty());
+        }
+
+        /// Scenario "A request from an account that may use none of its
+        /// machines", and "A reader cannot close a project while its machines
+        /// are away": an account that may read the project and neither owns
+        /// nor hosts it can neither open nor close it, whether its machines
+        /// are connected or not. The answer names no host and nothing is
+        /// recorded or sent.
+        #[tokio::test]
+        async fn a_reader_can_neither_open_nor_close_the_project() {
+            let p = project().await;
+            let reader = reader(&p).await;
+            let mut d5 = p.daemon(p.m5, HOST_A, CAPABLE_DAEMON);
+            let mut d6 = p.daemon(p.m6, HOST_B, CAPABLE_DAEMON);
+            let _a = p.instance(p.m5, HOST_A);
+            two_machine_roster(&p);
+            let mut web = p.viewer(reader, KNOWS);
+
+            open(&p, &web, reader, p.m5).await;
+            close(&p, &web, reader, p.m5).await;
+            assert_eq!(
+                errors(&web.drain()),
+                vec!["Machine not found".to_string(); 2]
+            );
+            assert_eq!(recorded(&p).await, None);
+
+            set_recorded(&p, ProjectOpenState::Open, p.owner, Some(p.m5)).await;
+            let before = record(&p).await;
+            p.state.sessions.unregister_daemon(&p.m5);
+            p.state.sessions.unregister_daemon(&p.m6);
+            close(&p, &web, reader, p.m5).await;
+            open(&p, &web, reader, p.m5).await;
+            assert_eq!(
+                errors(&web.drain()),
+                vec!["Machine not found".to_string(); 2]
+            );
+            assert_eq!(record(&p).await, before, "the project stays recorded open");
+            assert!(nothing_sent(&mut d5) && nothing_sent(&mut d6));
+        }
+
+        /// Who may set the state (design Decision 6): while a machine of the
+        /// project is connected, an account that may use the runtime on one
+        /// of them; while none is, the project's owner or an account that
+        /// hosts it. Another account's connected checkout that carries the
+        /// same project id is not a machine of the project.
+        #[tokio::test]
+        async fn who_may_set_the_open_state() {
+            use crate::open_state::may_set_open_state;
+            let p = project().await;
+            let project_id = p.project_id();
+            let member = cluster_member(&p, &[p.m5]).await;
+            let reader = reader(&p).await;
+            let host = Uuid::new_v4();
+            let stranger = Uuid::new_v4();
+            for account in [host, stranger] {
+                p.state.db.create_user(&user(account)).await.unwrap();
+            }
+            p.state
+                .db
+                .add_project_cluster_placement(
+                    &project_id,
+                    &host.to_string(),
+                    &host.to_string(),
+                    "test",
+                )
+                .await
+                .unwrap();
+            let allowed = |account: Uuid| {
+                let state = p.state.clone();
+                let project_id = project_id.clone();
+                async move { may_set_open_state(&state, &account, &project_id).await }
+            };
+
+            // Nothing connected: the owner and the host, nobody else.
+            assert!(allowed(p.owner).await && allowed(host).await);
+            assert!(!allowed(member).await && !allowed(reader).await && !allowed(stranger).await);
+
+            // Another account's checkout with the same id changes nothing.
+            let _df = foreign_daemon(
+                &p,
+                stranger,
+                Uuid::new_v4(),
+                "zoo-009",
+                vec![listed(&p, "zoo-009", true)],
+            );
+            assert!(allowed(p.owner).await && allowed(host).await);
+            assert!(!allowed(stranger).await);
+
+            // zoo-006 connected: whoever may use the runtime there.
+            let _d6 = p.daemon(p.m6, HOST_B, CAPABLE_DAEMON);
+            assert!(allowed(p.owner).await);
+            assert!(!allowed(member).await, "the member may use zoo-005 only");
+            assert!(
+                !allowed(host).await,
+                "hosting it elsewhere is not using zoo-006"
+            );
+            assert!(!allowed(reader).await && !allowed(stranger).await);
+
+            let _d5 = p.daemon(p.m5, HOST_A, CAPABLE_DAEMON);
+            assert!(allowed(member).await);
+            assert!(!allowed(reader).await);
+        }
+
+        /// Each machine is started only where the opening account may use
+        /// the project's runtime on it; the machine it may not use is left
+        /// alone and keeps that reason, and the request does not fail. A
+        /// later open by another account starts what that account may start
+        /// and does not change the recorded opener.
+        #[tokio::test]
+        async fn a_machine_the_opener_may_not_use_keeps_its_reason_and_the_opener_is_kept() {
+            let p = project().await;
+            let member = cluster_member(&p, &[p.m5]).await;
+            let mut d5 = p.daemon(p.m5, HOST_A, CAPABLE_DAEMON);
+            let mut d6 = p.daemon(p.m6, HOST_B, CAPABLE_DAEMON);
+            let mut member_web = p.viewer(member, KNOWS);
+            two_machine_roster(&p);
+            set_recorded(&p, ProjectOpenState::Closed, p.owner, None).await;
+
+            open(&p, &member_web, member, p.m5).await;
+
+            assert!(started_once(&mut d5));
+            assert!(nothing_sent(&mut d6));
+            assert_eq!(
+                outcome(&p, p.m6),
+                Some(MachineOutcome::NotStarted(may_not_use(member, HOST_B)))
+            );
+            let opened = record(&p).await;
+            assert_eq!(opened.state, Some(ProjectOpenState::Open));
+            assert_eq!(opened.set_by_account(), Some(member));
+            assert_eq!(opened.machine_id, Some(p.m5));
+            assert!(errors(&member_web.drain()).is_empty());
+
+            // A viewer that shows no parts is told as it always was.
+            let mut older = p.viewer(member, OLDER_VIEWER);
+            reports_running(&p, p.m5, HOST_A);
+            open(&p, &older, member, p.m5).await;
+            assert_eq!(
+                errors(&older.drain()),
+                vec![format!("{HOST_B}: Machine not found")]
+            );
+            assert!(nothing_sent(&mut d5) && nothing_sent(&mut d6));
+
+            // The owner's retry starts zoo-006 and leaves the opener.
+            let owner_web = p.viewer(p.owner, KNOWS);
+            open(&p, &owner_web, p.owner, p.m6).await;
+            assert!(started_once(&mut d6));
+            assert!(nothing_sent(&mut d5));
+            assert_eq!(record(&p).await, opened);
+        }
+
+        /// Whose authority a follow step uses: the opener's for a start and
+        /// the closer's for a stop, as they stand at that moment, on each
+        /// machine; an administrative stop is followed on every machine; and
+        /// another account's checkout that carries the same project id is
+        /// never a machine either may use.
+        #[tokio::test]
+        async fn the_recorded_actor_is_checked_per_machine() {
+            let p = project().await;
+            let member = cluster_member(&p, &[p.m5]).await;
+            let stranger = Uuid::new_v4();
+            p.state.db.create_user(&user(stranger)).await.unwrap();
+            let foreign = Uuid::new_v4();
+            let _d5 = p.daemon(p.m5, HOST_A, CAPABLE_DAEMON);
+            let _d6 = p.daemon(p.m6, HOST_B, CAPABLE_DAEMON);
+            let _df = foreign_daemon(
+                &p,
+                stranger,
+                foreign,
+                "zoo-009",
+                vec![listed(&p, "zoo-009", true)],
+            );
+
+            for state in [ProjectOpenState::Open, ProjectOpenState::Closed] {
+                set_recorded(&p, state, member, Some(p.m5)).await;
+                let by_member = record(&p).await;
+                assert_eq!(
+                    recorded_actor_may_use_machine(&p.state, &by_member, &p.m5).await,
+                    Ok(())
+                );
+                assert_eq!(
+                    recorded_actor_may_use_machine(&p.state, &by_member, &p.m6).await,
+                    Err(may_not_use(member, HOST_B))
+                );
+                assert_eq!(
+                    recorded_actor_may_use_machine(&p.state, &by_member, &foreign).await,
+                    Err(may_not_use(member, "zoo-009"))
+                );
+                set_recorded(&p, state, p.owner, Some(p.m5)).await;
+                let by_owner = record(&p).await;
+                assert_eq!(
+                    recorded_actor_may_use_machine(&p.state, &by_owner, &p.m6).await,
+                    Ok(())
+                );
+                assert!(
+                    recorded_actor_may_use_machine(&p.state, &by_owner, &foreign)
+                        .await
+                        .is_err(),
+                    "the project is not placed in that account's cluster"
+                );
+            }
+
+            // The member lost the machine since: checked as it stands now.
+            set_recorded(&p, ProjectOpenState::Open, member, Some(p.m5)).await;
+            p.state
+                .db
+                .update_cluster_member_policy(
+                    &p.host.to_string(),
+                    &member.to_string(),
+                    Some(vec![p.m6.to_string()]),
+                    None,
+                )
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                recorded_actor_may_use_machine(&p.state, &record(&p).await, &p.m5).await,
+                Err(may_not_use(member, HOST_A))
+            );
+
+            crate::open_state::record_administrative_close(
+                &p.state,
+                crate::db::SYSTEM_ADMIN_ACTOR,
+                &p.project_id(),
+                "stop_runtime",
+            )
+            .await
+            .unwrap();
+            let administrative = record(&p).await;
+            for machine in [p.m5, p.m6, foreign] {
+                assert_eq!(
+                    recorded_actor_may_use_machine(&p.state, &administrative, &machine).await,
+                    Ok(())
+                );
+            }
+        }
+
+        /// Scenario "Opening a suspended project": refused with the reason,
+        /// and the recorded state does not change. The same for a project
+        /// being deleted. Nothing is started.
+        #[tokio::test]
+        async fn opening_a_suspended_project_or_one_being_deleted_is_refused() {
+            let p = project().await;
+            let mut d5 = p.daemon(p.m5, HOST_A, CAPABLE_DAEMON);
+            let mut web = p.viewer(p.owner, KNOWS);
+            tabs(&p, vec![pane(3, Some(p.m5), Some(HOST_A))]);
+            let project_id = p.project_id();
+
+            assert!(p
+                .state
+                .db
+                .set_project_lifecycle(
+                    &p.owner.to_string(),
+                    &project_id,
+                    crate::db::ProjectLifecycle::Suspended,
+                )
+                .await
+                .unwrap());
+            let suspended = record(&p).await;
+            open(&p, &web, p.owner, p.m5).await;
+            assert_eq!(errors(&web.drain()), vec![PROJECT_SUSPENDED.to_string()]);
+            assert_eq!(record(&p).await, suspended);
+            // A start naming one machine opens nothing either.
+            start_one(&p, &web, p.owner, p.m5).await;
+            assert_eq!(errors(&web.drain()), vec![PROJECT_SUSPENDED.to_string()]);
+            assert_eq!(record(&p).await, suspended);
+
+            // Reactivated, it is still closed, and nothing has started it.
+            assert!(p
+                .state
+                .db
+                .set_project_lifecycle(
+                    &p.owner.to_string(),
+                    &project_id,
+                    crate::db::ProjectLifecycle::Active,
+                )
+                .await
+                .unwrap());
+            assert_eq!(recorded(&p).await, Some(ProjectOpenState::Closed));
+            assert!(nothing_sent(&mut d5));
+
+            assert!(p
+                .state
+                .db
+                .begin_project_deletion(&p.owner.to_string(), &project_id, &project_id)
+                .await
+                .unwrap());
+            let deleting = record(&p).await;
+            open(&p, &web, p.owner, p.m5).await;
+            assert_eq!(errors(&web.drain()), vec![PROJECT_DELETING.to_string()]);
+            assert_eq!(record(&p).await, deleting);
+            assert!(nothing_sent(&mut d5));
+        }
+
+        /// Scenario "The state survives a server restart": a server started
+        /// over the same database finds the project recorded as it was, and
+        /// starts or stops nothing by starting up.
+        #[tokio::test]
+        async fn the_recorded_state_survives_a_server_restart() {
+            let p = project().await;
+            let mut d5 = p.daemon(p.m5, HOST_A, CAPABLE_DAEMON);
+            let web = p.viewer(p.owner, KNOWS);
+            tabs(&p, vec![pane(3, Some(p.m5), Some(HOST_A))]);
+            open(&p, &web, p.owner, p.m5).await;
+            let opened = record(&p).await;
+            sent(&mut d5);
+
+            let db_path = p.state.config.database.path.clone();
+            let db = Database::new(&db_path).await.unwrap();
+            db.run_migrations().await.unwrap();
+            let mut config = Config::default();
+            config.database.path = db_path;
+            let restarted = AppState::new(db, config);
+            assert_eq!(
+                restarted
+                    .db
+                    .get_project_open_state(&p.project_id())
+                    .await
+                    .unwrap(),
+                Some(opened)
+            );
+            assert_eq!(
+                restarted
+                    .db
+                    .list_recorded_project_open_states()
+                    .await
+                    .unwrap()
+                    .get(&p.project_id()),
+                Some(&ProjectOpenState::Open)
+            );
+            assert!(restarted
+                .sessions
+                .project_machine_outcomes(&p.project_id())
+                .is_empty());
+            assert!(nothing_sent(&mut d5));
+        }
+
+        /// An open waits for the project's open-state lock, so it is applied
+        /// on the state as it is once whoever held the lock has sent its last
+        /// frame.
+        #[tokio::test]
+        async fn an_open_and_a_close_are_applied_one_at_a_time() {
+            let p = project().await;
+            let mut d5 = p.daemon(p.m5, HOST_A, CAPABLE_DAEMON);
+            let web = p.viewer(p.owner, KNOWS);
+            tabs(&p, vec![pane(3, Some(p.m5), Some(HOST_A))]);
+            let project_id = p.project_id();
+
+            let held = p.state.sessions.project_open_state_guard(&project_id).await;
+            let state = p.state.clone();
+            let (viewer, owner, machine) = (web.id, p.owner, p.m5);
+            let opening = {
+                let project_id = project_id.clone();
+                tokio::spawn(async move {
+                    start_machine_project(&state, &viewer, &owner, machine, &project_id, true).await
+                })
+            };
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            assert_eq!(recorded(&p).await, None, "the open is waiting");
+            assert!(nothing_sent(&mut d5));
+            // What the holder decided is in place before the open reads.
+            set_recorded(&p, ProjectOpenState::Closed, p.owner, None).await;
+            drop(held);
+            tokio::time::timeout(Duration::from_secs(5), opening)
+                .await
+                .expect("the open went ahead")
+                .unwrap();
+            assert_eq!(recorded(&p).await, Some(ProjectOpenState::Open));
+            assert!(started_once(&mut d5));
+        }
+
+        // --- 2.5: Close ---
+
+        /// Scenario "Close a project running on two machines": the project
+        /// is recorded closed by the requester and both instances are sent
+        /// the stop a project stop always sent. A machine that lists the
+        /// project and does not run it is sent nothing, and no instance is
+        /// sent anything.
+        #[tokio::test]
+        async fn closing_records_the_project_closed_and_stops_every_machine_that_runs_it() {
+            let p = project().await;
+            let m7 = Uuid::new_v4();
+            let mut d5 = p.daemon(p.m5, HOST_A, CAPABLE_DAEMON);
+            let mut d6 = p.daemon(p.m6, HOST_B, CAPABLE_DAEMON);
+            let mut d7 = p.daemon(m7, HOST_C, CAPABLE_DAEMON);
+            let mut a = p.instance(p.m5, HOST_A);
+            let mut b = p.instance(p.m6, HOST_B);
+            two_machine_roster(&p);
+            let mut web = p.viewer(p.owner, KNOWS);
+            set_recorded(&p, ProjectOpenState::Open, p.owner, Some(p.m5)).await;
+
+            close(&p, &web, p.owner, p.m5).await;
+
+            let closed = record(&p).await;
+            assert_eq!(closed.state, Some(ProjectOpenState::Closed));
+            assert_eq!(closed.set_by_account(), Some(p.owner));
+            assert_eq!(closed.set_kind, Some(OpenStateSetKind::Request));
+            assert_eq!(closed.machine_id, None);
+            assert!(stopped_once(&mut d5) && stopped_once(&mut d6));
+            assert!(nothing_sent(&mut d7), "listed, not running");
+            assert!(a.drain().is_empty() && b.drain().is_empty());
+            assert!(errors(&web.drain()).is_empty());
+
+            // Closing again while a machine still runs it sends the stop
+            // again and leaves the recorded closer and time.
+            close(&p, &web, p.owner, p.m6).await;
+            assert!(stopped_once(&mut d5) && stopped_once(&mut d6));
+            assert_eq!(record(&p).await, closed);
+        }
+
+        /// Scenario "Close while one machine is still starting": a machine
+        /// the server asked to start and has not heard from is stopped too,
+        /// whether an open asked it or a tab is waiting for it.
+        #[tokio::test]
+        async fn closing_stops_a_machine_that_is_still_starting() {
+            let p = project().await;
+            let m7 = Uuid::new_v4();
+            let mut d5 = p.daemon(p.m5, HOST_A, CAPABLE_DAEMON);
+            let mut d6 = p.daemon(p.m6, HOST_B, CAPABLE_DAEMON);
+            let mut d7 = p.daemon(m7, HOST_C, CAPABLE_DAEMON);
+            let web = p.viewer(p.owner, KNOWS);
+            two_machine_roster(&p);
+            open(&p, &web, p.owner, p.m5).await;
+            assert!(started_once(&mut d5) && started_once(&mut d6));
+            // zoo-005 runs it now; zoo-006 has not answered.
+            let _a = p.instance(p.m5, HOST_A);
+            // A tab is waiting for zoo-007's instance to start.
+            let waiting =
+                p.state
+                    .sessions
+                    .wait_for_instance_start(p.session, m7, Some(&p.project_id()));
+            assert!(matches!(
+                waiting,
+                InstanceStartWait::Waiting { start: Some(_), .. }
+            ));
+
+            close(&p, &web, p.owner, p.m5).await;
+
+            assert!(stopped_once(&mut d5), "running");
+            assert!(stopped_once(&mut d6), "asked to start by the open");
+            assert!(stopped_once(&mut d7), "being started for a tab");
+            assert_eq!(recorded(&p).await, Some(ProjectOpenState::Closed));
+            assert!(p
+                .state
+                .sessions
+                .project_machine_outcomes(&p.project_id())
+                .is_empty());
+        }
+
+        /// Scenario "Close a project whose machines are all offline": the
+        /// owner's close is recorded and nothing is sent; each machine is
+        /// stopped when its daemon registers still running it.
+        #[tokio::test]
+        async fn closing_with_every_machine_offline_records_the_project_closed() {
+            let p = project().await;
+            let mut d5 = p.daemon(p.m5, HOST_A, CAPABLE_DAEMON);
+            let mut d6 = p.daemon(p.m6, HOST_B, CAPABLE_DAEMON);
+            let mut web = p.viewer(p.owner, KNOWS);
+            two_machine_roster(&p);
+            set_recorded(&p, ProjectOpenState::Open, p.owner, Some(p.m5)).await;
+            p.state.sessions.unregister_daemon(&p.m5);
+            p.state.sessions.unregister_daemon(&p.m6);
+
+            close(&p, &web, p.owner, p.m5).await;
+
+            assert_eq!(recorded(&p).await, Some(ProjectOpenState::Closed));
+            assert_eq!(record(&p).await.set_by_account(), Some(p.owner));
+            assert!(nothing_sent(&mut d5) && nothing_sent(&mut d6));
+            assert!(errors(&web.drain()).is_empty());
+        }
+
+        /// Each machine is stopped only where the closing account may use
+        /// the project's runtime on it. The machine it may not use keeps
+        /// running and keeps that reason for its part; a viewer that shows
+        /// no parts is told as before.
+        #[tokio::test]
+        async fn a_machine_the_closer_may_not_use_keeps_running_with_the_reason() {
+            let p = project().await;
+            let member = cluster_member(&p, &[p.m5]).await;
+            let mut d5 = p.daemon(p.m5, HOST_A, CAPABLE_DAEMON);
+            let mut d6 = p.daemon(p.m6, HOST_B, CAPABLE_DAEMON);
+            let _a = p.instance(p.m5, HOST_A);
+            let _b = p.instance(p.m6, HOST_B);
+            two_machine_roster(&p);
+            set_recorded(&p, ProjectOpenState::Open, p.owner, Some(p.m5)).await;
+            let mut web = p.viewer(member, KNOWS);
+
+            close(&p, &web, member, p.m5).await;
+
+            assert!(stopped_once(&mut d5));
+            assert!(nothing_sent(&mut d6));
+            assert_eq!(
+                outcome(&p, p.m6),
+                Some(MachineOutcome::NotStopped(may_not_use(member, HOST_B)))
+            );
+            let closed = record(&p).await;
+            assert_eq!(closed.state, Some(ProjectOpenState::Closed));
+            assert_eq!(closed.set_by_account(), Some(member));
+            assert!(errors(&web.drain()).is_empty());
+
+            let mut older = p.viewer(member, OLDER_VIEWER);
+            close(&p, &older, member, p.m5).await;
+            assert!(stopped_once(&mut d5));
+            assert!(nothing_sent(&mut d6));
+            assert_eq!(
+                errors(&older.drain()),
+                vec![format!("{HOST_B}: Machine not found")]
+            );
+        }
+
+        /// A close never stops another account's checkout that carries the
+        /// same project id, and reports nothing about it.
+        #[tokio::test]
+        async fn closing_leaves_another_accounts_checkout_alone() {
+            let p = project().await;
+            let stranger = Uuid::new_v4();
+            p.state.db.create_user(&user(stranger)).await.unwrap();
+            let foreign = Uuid::new_v4();
+            let mut d5 = p.daemon(p.m5, HOST_A, CAPABLE_DAEMON);
+            let mut df = foreign_daemon(
+                &p,
+                stranger,
+                foreign,
+                "zoo-009",
+                vec![listed(&p, "zoo-009", true)],
+            );
+            reports_running(&p, p.m5, HOST_A);
+            let mut web = p.viewer(p.owner, KNOWS);
+
+            close(&p, &web, p.owner, foreign).await;
+
+            assert!(stopped_once(&mut d5));
+            assert!(df.drain().is_empty());
+            assert_eq!(outcome(&p, foreign), None);
+            assert_eq!(recorded(&p).await, Some(ProjectOpenState::Closed));
+            assert!(errors(&web.drain()).is_empty());
+        }
+
+        // --- Decision 3: a client that does not know the open state ---
+
+        /// Scenarios "An older web bundle starts one machine of a project
+        /// nobody has recorded" and "An older web bundle's project-view
+        /// button on a project nobody has recorded": every request of a
+        /// client from before the open state does what it did, with the
+        /// frames it always sent, and the project stays not recorded.
+        #[tokio::test]
+        async fn an_older_viewer_records_nothing_on_a_project_nobody_recorded() {
+            let p = project().await;
+            let mut d5 = p.daemon(p.m5, HOST_A, CAPABLE_DAEMON);
+            let mut d6 = p.daemon(p.m6, HOST_B, CAPABLE_DAEMON);
+            let _a = p.instance(p.m5, HOST_A);
+            two_machine_roster(&p);
+            let mut web = p.viewer(p.owner, OLDER_VIEWER);
+
+            // The project view's Start reaches the machines it always did.
+            open(&p, &web, p.owner, p.m5).await;
+            assert_eq!(sent(&mut d5), (vec![None], 0));
+            assert_eq!(sent(&mut d6), (vec![None], 0));
+            assert_eq!(recorded(&p).await, None);
+
+            // "Start on zoo-006" while zoo-005 runs it.
+            start_one(&p, &web, p.owner, p.m6).await;
+            assert_eq!(sent(&mut d6), (vec![None], 0));
+            assert!(nothing_sent(&mut d5));
+            assert_eq!(recorded(&p).await, None);
+
+            stop_one(&p, &web, p.owner, p.m6).await;
+            assert!(stopped_once(&mut d6));
+            assert!(nothing_sent(&mut d5));
+            assert_eq!(recorded(&p).await, None);
+
+            // The project view's Close.
+            close(&p, &web, p.owner, p.m6).await;
+            assert!(stopped_once(&mut d5) && stopped_once(&mut d6));
+            assert_eq!(recorded(&p).await, None);
+
+            // A tab on a machine that is not running the project.
+            p.add_pane(&web, Some(p.m6), Some("older-tab")).await;
+            assert!(matches!(sent(&mut d6).0.as_slice(), [Some(_)]));
+            assert!(nothing_sent(&mut d5));
+            assert_eq!(recorded(&p).await, None);
+            assert!(errors(&web.drain()).is_empty());
+            assert!(
+                p.state
+                    .db
+                    .list_cluster_audit_events(&p.owner.to_string(), 50, 0)
+                    .await
+                    .unwrap()
+                    .iter()
+                    .all(|event| !event.action.starts_with("project.opened")
+                        && !event.action.starts_with("project.closed")),
+                "nothing was opened or closed"
+            );
+
+            // A per-machine request is treated the same from a viewer that
+            // knows the open state: it never said what opening does.
+            let knows = p.viewer(p.owner, KNOWS);
+            start_one(&p, &knows, p.owner, p.m6).await;
+            stop_one(&p, &knows, p.owner, p.m6).await;
+            assert_eq!(sent(&mut d6), (vec![None], 1));
+            assert_eq!(recorded(&p).await, None);
+        }
+
+        /// The table of design Decision 3, the starts: on an open project a
+        /// start naming one machine starts that machine (scenario "An older
+        /// web bundle retries a machine of an open project"); on a closed
+        /// one it opens the project when no other machine owns tabs of it
+        /// (scenario "An older client starts a single-machine project") and
+        /// is otherwise refused with nothing started. No start ever sends a
+        /// frame to a machine it did not name.
+        #[tokio::test]
+        async fn a_start_naming_one_machine_never_reaches_another() {
+            let p = project().await;
+            let mut d5 = p.daemon(p.m5, HOST_A, CAPABLE_DAEMON);
+            let mut d6 = p.daemon(p.m6, HOST_B, CAPABLE_DAEMON);
+            let mut web = p.viewer(p.owner, OLDER_VIEWER);
+
+            // Open: zoo-005 and zoo-006 own tabs, neither runs it.
+            two_machine_roster(&p);
+            set_recorded(&p, ProjectOpenState::Open, p.owner, Some(p.m5)).await;
+            let open_record = record(&p).await;
+            start_one(&p, &web, p.owner, p.m6).await;
+            assert!(matches!(sent(&mut d6).0.as_slice(), [Some(_)]));
+            assert!(nothing_sent(&mut d5), "zoo-005 is not started with it");
+            assert!(matches!(
+                outcome(&p, p.m6),
+                Some(MachineOutcome::StartAsked { .. })
+            ));
+            assert_eq!(record(&p).await, open_record);
+            assert!(errors(&web.drain()).is_empty());
+
+            // Closed, tabs on both machines: refused, nothing started.
+            set_recorded(&p, ProjectOpenState::Closed, p.owner, None).await;
+            let closed_record = record(&p).await;
+            start_one(&p, &web, p.owner, p.m5).await;
+            assert_eq!(
+                errors(&web.drain()),
+                vec![CLOSED_WITH_TABS_ELSEWHERE.to_string()]
+            );
+            assert!(nothing_sent(&mut d5) && nothing_sent(&mut d6));
+            assert_eq!(record(&p).await, closed_record);
+
+            // The other owner known only by its host name counts too.
+            tabs(
+                &p,
+                vec![
+                    pane(3, Some(p.m5), Some(HOST_A)),
+                    pane(4, None, Some(LAPTOP)),
+                ],
+            );
+            start_one(&p, &web, p.owner, p.m5).await;
+            assert_eq!(
+                errors(&web.drain()),
+                vec![CLOSED_WITH_TABS_ELSEWHERE.to_string()]
+            );
+            assert!(nothing_sent(&mut d5) && nothing_sent(&mut d6));
+            assert_eq!(record(&p).await, closed_record);
+
+            // Closed, every tab on zoo-005: the start opens the project.
+            tabs(&p, vec![pane(3, Some(p.m5), Some(HOST_A))]);
+            start_one(&p, &web, p.owner, p.m5).await;
+            assert!(started_once(&mut d5));
+            assert!(nothing_sent(&mut d6));
+            let opened = record(&p).await;
+            assert_eq!(opened.state, Some(ProjectOpenState::Open));
+            assert_eq!(opened.set_by_account(), Some(p.owner));
+            assert_eq!(opened.machine_id, Some(p.m5));
+            assert!(errors(&web.drain()).is_empty());
+
+            // An account that may not use the machine learns nothing.
+            let stranger = Uuid::new_v4();
+            p.state.db.create_user(&user(stranger)).await.unwrap();
+            let mut stranger_web = p.viewer(stranger, OLDER_VIEWER);
+            set_recorded(&p, ProjectOpenState::Closed, p.owner, None).await;
+            two_machine_roster(&p);
+            start_one(&p, &stranger_web, stranger, p.m5).await;
+            assert_eq!(
+                errors(&stranger_web.drain()),
+                vec!["Machine not found".to_string()]
+            );
+            assert!(nothing_sent(&mut d5) && nothing_sent(&mut d6));
+        }
+
+        /// The table of design Decision 3, the stops: on an open project a
+        /// stop naming one machine closes the project when no other machine
+        /// owns tabs of it or runs it, and is otherwise refused with nothing
+        /// stopped (scenario "An older client stops one machine of two"); on
+        /// a closed one it stops that machine. No stop ever sends a frame to
+        /// a machine it did not name.
+        #[tokio::test]
+        async fn a_stop_naming_one_machine_never_reaches_another() {
+            let p = project().await;
+            let mut d5 = p.daemon(p.m5, HOST_A, CAPABLE_DAEMON);
+            let mut d6 = p.daemon(p.m6, HOST_B, CAPABLE_DAEMON);
+            let a = p.instance(p.m5, HOST_A);
+            let b = p.instance(p.m6, HOST_B);
+            let mut web = p.viewer(p.owner, OLDER_VIEWER);
+
+            // Open on zoo-005 and zoo-006: refused, neither stops.
+            two_machine_roster(&p);
+            set_recorded(&p, ProjectOpenState::Open, p.owner, Some(p.m5)).await;
+            let open_record = record(&p).await;
+            stop_one(&p, &web, p.owner, p.m6).await;
+            assert_eq!(
+                errors(&web.drain()),
+                vec![RUNS_ON_OTHER_MACHINES.to_string()]
+            );
+            assert!(nothing_sent(&mut d5) && nothing_sent(&mut d6));
+            assert_eq!(record(&p).await, open_record);
+
+            // zoo-006 owns tabs and does not run them: still refused.
+            p.state
+                .sessions
+                .detach_cli_instance(&p.session, &b.id)
+                .unwrap();
+            stop_one(&p, &web, p.owner, p.m5).await;
+            assert_eq!(
+                errors(&web.drain()),
+                vec![RUNS_ON_OTHER_MACHINES.to_string()]
+            );
+            assert!(nothing_sent(&mut d5) && nothing_sent(&mut d6));
+
+            // zoo-006 owns no tab and runs it: refused as well.
+            tabs(&p, vec![pane(3, Some(p.m5), Some(HOST_A))]);
+            reports_running(&p, p.m6, HOST_B);
+            stop_one(&p, &web, p.owner, p.m5).await;
+            assert_eq!(
+                errors(&web.drain()),
+                vec![RUNS_ON_OTHER_MACHINES.to_string()]
+            );
+            assert!(nothing_sent(&mut d5) && nothing_sent(&mut d6));
+            assert_eq!(record(&p).await, open_record);
+
+            // No other machine owns tabs or runs it: the stop is the close.
+            p.state
+                .sessions
+                .update_daemon_projects(&p.m6, vec![listed(&p, HOST_B, false)]);
+            stop_one(&p, &web, p.owner, p.m5).await;
+            assert!(stopped_once(&mut d5));
+            assert!(nothing_sent(&mut d6));
+            let closed = record(&p).await;
+            assert_eq!(closed.state, Some(ProjectOpenState::Closed));
+            assert_eq!(closed.set_by_account(), Some(p.owner));
+            assert!(errors(&web.drain()).is_empty());
+
+            // Closed, zoo-006 still running it: stop that machine alone.
+            reports_running(&p, p.m6, HOST_B);
+            stop_one(&p, &web, p.owner, p.m6).await;
+            assert!(stopped_once(&mut d6));
+            assert!(nothing_sent(&mut d5));
+            assert_eq!(record(&p).await, closed);
+            assert!(errors(&web.drain()).is_empty());
+            drop(a);
+        }
+
+        /// A tab request from a viewer that does not know the open state
+        /// follows the same table: on an open project it starts the machine
+        /// it names and no other; on a closed one it opens the project when
+        /// no other machine owns tabs of it, and otherwise fails with the
+        /// reason, having started nothing and left no start pending.
+        #[tokio::test]
+        async fn a_tab_request_from_an_older_viewer_never_reaches_another_machine() {
+            let p = project().await;
+            let mut d5 = p.daemon(p.m5, HOST_A, CAPABLE_DAEMON);
+            let mut d6 = p.daemon(p.m6, HOST_B, CAPABLE_DAEMON);
+            let mut web = p.viewer(p.owner, OLDER_VIEWER);
+            let pending = |p: &Project| {
+                p.state
+                    .sessions
+                    .machines_with_pending_instance_start(&[p.session])
+            };
+
+            // Open, zoo-005 owns tabs and does not run them.
+            tabs(&p, vec![pane(3, Some(p.m5), Some(HOST_A))]);
+            set_recorded(&p, ProjectOpenState::Open, p.owner, Some(p.m5)).await;
+            let open_record = record(&p).await;
+            p.add_pane(&web, Some(p.m6), Some("tab-open")).await;
+            let starting = only(add_results(&web.drain()));
+            assert_eq!(starting.status, shared::AddPaneStatus::Starting);
+            assert!(matches!(sent(&mut d6).0.as_slice(), [Some(_)]));
+            assert!(nothing_sent(&mut d5), "zoo-005 is not started with it");
+            assert_eq!(record(&p).await, open_record);
+            // That start is abandoned with its daemon's connection.
+            p.state.sessions.unregister_daemon(&p.m6);
+            assert_eq!(
+                next_add_result(&mut web).await.status,
+                shared::AddPaneStatus::Failed
+            );
+            let mut d6 = p.daemon(p.m6, HOST_B, CAPABLE_DAEMON);
+            web.drain();
+
+            // Closed, zoo-005 owns tabs: refused, nothing started.
+            set_recorded(&p, ProjectOpenState::Closed, p.owner, None).await;
+            let closed_record = record(&p).await;
+            p.add_pane(&web, Some(p.m6), Some("tab-closed")).await;
+            let failed = only(add_results(&web.drain()));
+            assert_eq!(
+                (failed.status, failed.machine_id, failed.error.as_deref()),
+                (
+                    shared::AddPaneStatus::Failed,
+                    Some(p.m6),
+                    Some(CLOSED_WITH_TABS_ELSEWHERE)
+                )
+            );
+            assert!(nothing_sent(&mut d5) && nothing_sent(&mut d6));
+            assert!(pending(&p).is_empty());
+            assert_eq!(record(&p).await, closed_record);
+
+            // Closed, no tab anywhere else: the tab opens the project.
+            tabs(&p, vec![pane(4, Some(p.m6), Some(HOST_B))]);
+            p.add_pane(&web, Some(p.m6), Some("tab-single")).await;
+            let starting = only(add_results(&web.drain()));
+            assert_eq!(starting.status, shared::AddPaneStatus::Starting);
+            assert!(matches!(sent(&mut d6).0.as_slice(), [Some(_)]));
+            assert!(nothing_sent(&mut d5));
+            let opened = record(&p).await;
+            assert_eq!(opened.state, Some(ProjectOpenState::Open));
+            assert_eq!(opened.set_by_account(), Some(p.owner));
+            assert_eq!(opened.machine_id, Some(p.m6));
+        }
+
+        // --- 2.8: a tab that needs a machine started, from a viewer that
+        // knows the open state ---
+
+        /// Scenario "New tab in a closed project": the project is recorded
+        /// open by the requester, the other machine that owns tabs is
+        /// started as an open starts it, the chosen machine is started for
+        /// the tab, and the correlated answer is for the chosen machine only.
+        #[tokio::test]
+        async fn a_new_tab_in_a_closed_project_opens_it() {
+            let p = project().await;
+            let m7 = Uuid::new_v4();
+            let mut d5 = p.daemon(p.m5, HOST_A, CAPABLE_DAEMON);
+            let mut d6 = p.daemon(p.m6, HOST_B, CAPABLE_DAEMON);
+            let mut d7 = p.daemon(m7, HOST_C, CAPABLE_DAEMON);
+            let mut web = p.viewer(p.owner, KNOWS);
+            two_machine_roster(&p);
+            set_recorded(&p, ProjectOpenState::Closed, p.owner, None).await;
+
+            p.add_pane(&web, Some(p.m5), Some("tab-opens")).await;
+
+            let answer = only(add_results(&web.drain()));
+            assert_eq!(
+                (answer.status, answer.machine_id),
+                (shared::AddPaneStatus::Starting, Some(p.m5))
+            );
+            let opened = record(&p).await;
+            assert_eq!(opened.state, Some(ProjectOpenState::Open));
+            assert_eq!(opened.set_by_account(), Some(p.owner));
+            assert_eq!(opened.machine_id, Some(p.m5));
+            let (chosen, _) = sent(&mut d5);
+            assert!(
+                matches!(chosen.as_slice(), [Some(_)]),
+                "started for the tab"
+            );
+            assert_eq!(
+                p.state.sessions.machine_start_request(&chosen[0].unwrap()),
+                Some((p.project_id(), p.m5))
+            );
+            assert!(started_once(&mut d6), "zoo-006's tabs start too");
+            assert!(nothing_sent(&mut d7), "zoo-007 owns no tab");
+
+            // The tab is created once zoo-005's instance has started.
+            let mut a = p.instance(p.m5, HOST_A);
+            p.state.sessions.instance_started(p.session, p.m5, a.id);
+            let routed = next_add_result(&mut web).await;
+            assert_eq!(
+                (routed.status, routed.machine_id),
+                (shared::AddPaneStatus::Routed, Some(p.m5))
+            );
+            assert_eq!(next_added_pane(&mut a).await.machine_id, Some(p.m5));
+        }
+
+        /// A tab on a machine that is not running a project nobody recorded
+        /// records it open: the viewer said that choosing the machine opens
+        /// the project.
+        #[tokio::test]
+        async fn a_new_tab_from_a_viewer_that_knows_records_a_project_nobody_recorded() {
+            let p = project().await;
+            let mut d5 = p.daemon(p.m5, HOST_A, CAPABLE_DAEMON);
+            let mut d6 = p.daemon(p.m6, HOST_B, CAPABLE_DAEMON);
+            let _a = p.instance(p.m5, HOST_A);
+            two_machine_roster(&p);
+            let mut web = p.viewer(p.owner, KNOWS);
+
+            p.add_pane(&web, Some(p.m6), Some("tab-records")).await;
+
+            assert_eq!(
+                only(add_results(&web.drain())).status,
+                shared::AddPaneStatus::Starting
+            );
+            assert_eq!(recorded(&p).await, Some(ProjectOpenState::Open));
+            assert!(matches!(sent(&mut d6).0.as_slice(), [Some(_)]));
+            assert!(nothing_sent(&mut d5), "zoo-005 runs it already");
+        }
+
+        /// Scenario "New tab on a machine that joins an open project": the
+        /// laptop starts its instance for the tab, nothing changes on the
+        /// machine that runs the project, and the recorded opener stays.
+        #[tokio::test]
+        async fn a_new_tab_on_a_machine_that_joins_an_open_project_starts_only_that_machine() {
+            let p = project().await;
+            let laptop = Uuid::new_v4();
+            let mut d5 = p.daemon(p.m5, HOST_A, CAPABLE_DAEMON);
+            let mut dl = p.daemon(laptop, LAPTOP, CAPABLE_DAEMON);
+            let _a = p.instance(p.m5, HOST_A);
+            tabs(&p, vec![pane(3, Some(p.m5), Some(HOST_A))]);
+            set_recorded(&p, ProjectOpenState::Open, p.owner, Some(p.m5)).await;
+            let opened = record(&p).await;
+            let mut web = p.viewer(p.owner, KNOWS);
+
+            p.add_pane(&web, Some(laptop), Some("tab-joins")).await;
+
+            let answer = only(add_results(&web.drain()));
+            assert_eq!(
+                (answer.status, answer.machine_id),
+                (shared::AddPaneStatus::Starting, Some(laptop))
+            );
+            assert!(matches!(sent(&mut dl).0.as_slice(), [Some(_)]));
+            assert!(nothing_sent(&mut d5), "nothing changes on zoo-005");
+            assert_eq!(record(&p).await, opened);
+        }
+
+        /// Scenario "The chosen machine cannot take the tab": the request
+        /// fails with the reason, the project stays closed and no machine
+        /// starts, the other tab owner included.
+        #[tokio::test]
+        async fn a_refused_tab_request_records_nothing_and_starts_no_machine() {
+            let p = project().await;
+            let mut d5 = p.daemon(p.m5, HOST_A, CAPABLE_DAEMON);
+            let mut d6 = p.daemon(p.m6, HOST_B, OLDER_DAEMON);
+            let mut web = p.viewer(p.owner, KNOWS);
+            two_machine_roster(&p);
+            set_recorded(&p, ProjectOpenState::Closed, p.owner, None).await;
+            let closed = record(&p).await;
+
+            p.add_pane(&web, Some(p.m6), Some("tab-refused")).await;
+
+            let failed = only(add_results(&web.drain()));
+            assert_eq!(
+                (failed.status, failed.machine_id, failed.error),
+                (
+                    shared::AddPaneStatus::Failed,
+                    Some(p.m6),
+                    Some(older_apas(HOST_B))
+                )
+            );
+            assert_eq!(record(&p).await, closed);
+            assert!(nothing_sent(&mut d5) && nothing_sent(&mut d6));
+            assert!(p
+                .state
+                .sessions
+                .project_machine_outcomes(&p.project_id())
+                .is_empty());
+
+            // The same for a project nobody recorded: it stays not recorded.
+            let q = project().await;
+            let mut q5 = q.daemon(q.m5, HOST_A, CAPABLE_DAEMON);
+            let mut web = q.viewer(q.owner, KNOWS);
+            two_machine_roster(&q);
+            // zoo-006 is not connected.
+            q.add_pane(&web, Some(q.m6), Some("tab-offline")).await;
+            assert_eq!(
+                only(add_results(&web.drain())).status,
+                shared::AddPaneStatus::Failed
+            );
+            assert_eq!(recorded(&q).await, None);
+            assert!(nothing_sent(&mut q5));
+        }
+
+        // --- 2.7: audit ---
+
+        /// Scenario "Opening is audited": the audit history of every cluster
+        /// that hosts the project shows who opened or closed it and which
+        /// machines were asked to start or stop.
+        #[tokio::test]
+        async fn opening_and_closing_are_audited_for_every_hosting_cluster() {
+            let p = project().await;
+            let other_host = Uuid::new_v4();
+            let bystander = Uuid::new_v4();
+            for account in [other_host, bystander] {
+                p.state.db.create_user(&user(account)).await.unwrap();
+            }
+            p.state
+                .db
+                .add_project_cluster_placement(
+                    &p.project_id(),
+                    &other_host.to_string(),
+                    &other_host.to_string(),
+                    "test",
+                )
+                .await
+                .unwrap();
+            let _d5 = p.daemon(p.m5, HOST_A, CAPABLE_DAEMON);
+            let _d6 = p.daemon(p.m6, HOST_B, CAPABLE_DAEMON);
+            let web = p.viewer(p.owner, KNOWS);
+            two_machine_roster(&p);
+
+            open(&p, &web, p.owner, p.m5).await;
+            let _a = p.instance(p.m5, HOST_A);
+            close(&p, &web, p.owner, p.m5).await;
+
+            let events = |cluster: Uuid| {
+                let db = p.state.db.clone();
+                let project_id = p.project_id();
+                async move {
+                    db.list_cluster_audit_events(&cluster.to_string(), 50, 0)
+                        .await
+                        .unwrap()
+                        .into_iter()
+                        .filter(|event| {
+                            event.project_id.as_deref() == Some(project_id.as_str())
+                                && (event.action == "project.opened"
+                                    || event.action == "project.closed")
+                        })
+                        .map(|event| {
+                            let details: serde_json::Value =
+                                serde_json::from_str(event.details.as_deref().unwrap()).unwrap();
+                            let mut machines: Vec<String> = details["machines"]
+                                .as_array()
+                                .unwrap()
+                                .iter()
+                                .map(|machine| machine["hostname"].as_str().unwrap().to_string())
+                                .collect();
+                            machines.sort();
+                            (
+                                event.action,
+                                event.actor_user_id,
+                                details["source"].as_str().unwrap().to_string(),
+                                machines,
+                                event.created_at.is_some(),
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                }
+            };
+            // Newest first.
+            let expected = vec![
+                (
+                    "project.closed".to_string(),
+                    p.owner.to_string(),
+                    "close".to_string(),
+                    vec![HOST_A.to_string(), HOST_B.to_string()],
+                    true,
+                ),
+                (
+                    "project.opened".to_string(),
+                    p.owner.to_string(),
+                    "open".to_string(),
+                    vec![HOST_A.to_string(), HOST_B.to_string()],
+                    true,
+                ),
+            ];
+            assert_eq!(events(p.owner).await, expected);
+            assert_eq!(events(other_host).await, expected);
+            assert!(events(bystander).await.is_empty());
+        }
+
+        // --- 2.9: closing deletes nothing ---
+
+        /// Design Decision 12 and scenarios "Close and open again" and
+        /// "Close does not delete": closing a project with tabs on two
+        /// machines, by a close, by a stop naming its last machine or by an
+        /// administrative stop, sends its daemons nothing but the stop and
+        /// its instances no pane close; and after the open that follows, the
+        /// roster (tab ids and machine tags), the stored history, the
+        /// members, the policy, the placements and the saved prompts are
+        /// what they were.
+        #[tokio::test]
+        async fn closing_and_reopening_keeps_every_tab_its_history_and_the_projects_settings() {
+            let p = project().await;
+            let member = cluster_member(&p, &[p.m5]).await;
+            let mut d5 = p.daemon(p.m5, HOST_A, CAPABLE_DAEMON);
+            let mut d6 = p.daemon(p.m6, HOST_B, CAPABLE_DAEMON);
+            let mut a = p.instance_with(p.m5, HOST_A, PROMPTS_CLI);
+            let mut b = p.instance(p.m6, HOST_B);
+            tabs(
+                &p,
+                vec![
+                    pane(3, Some(p.m5), Some(HOST_A)),
+                    pane(4, Some(p.m5), Some(HOST_A)),
+                    pane(5, Some(p.m5), Some(HOST_A)),
+                    pane(6, Some(p.m6), Some(HOST_B)),
+                    pane(7, Some(p.m6), Some(HOST_B)),
+                ],
+            );
+            crate::routes::ws_cli::persist_pane_roster(&p.state, &p.session).await;
+            for (index, pane_id) in [3u32, 6].into_iter().enumerate() {
+                p.state
+                    .storage
+                    .append_message(
+                        &p.session,
+                        &crate::storage::StoredMessage {
+                            id: format!("message-{index}"),
+                            role: "assistant".to_string(),
+                            content: format!("history of tab {pane_id}"),
+                            message_type: "text".to_string(),
+                            created_at: chrono::Utc::now().to_rfc3339(),
+                            pane_type: Some(pane_id.to_string()),
+                        },
+                    )
+                    .await
+                    .unwrap();
+            }
+            report_prompts(&p, &a, vec![saved("nightly")], Some("nightly"), false);
+            let mut web = p.viewer(p.owner, KNOWS);
+            set_recorded(&p, ProjectOpenState::Open, p.owner, Some(p.m5)).await;
+
+            #[derive(Debug, PartialEq)]
+            struct Kept {
+                roster: Vec<(u32, Option<Uuid>, Option<String>)>,
+                persisted: Vec<(u32, Option<Uuid>, Option<String>)>,
+                forgotten: usize,
+                history: Vec<String>,
+                members: Vec<String>,
+                policy: shared::EffectiveProjectPolicy,
+                hosted_by_owner: bool,
+                owner: String,
+                lifecycle: crate::db::ProjectLifecycle,
+                session_row: bool,
+                prompts: Option<crate::session::autopilot_prompts::AutopilotPromptsView>,
+            }
+            async fn kept(p: &Project) -> Kept {
+                let tags = |panes: Vec<PaneConfig>| {
+                    panes
+                        .into_iter()
+                        .map(|pane| (pane.pane_id, pane.machine_id, pane.hostname))
+                        .collect::<Vec<_>>()
+                };
+                let project_id = p.project_id();
+                let project = p.state.db.get_project(&project_id).await.unwrap().unwrap();
+                Kept {
+                    roster: tags(p.state.sessions.get_session_panes(&p.session)),
+                    persisted: tags(
+                        p.state
+                            .storage
+                            .load_pane_roster(&p.session)
+                            .await
+                            .unwrap()
+                            .expect("a persisted roster"),
+                    ),
+                    forgotten: p
+                        .state
+                        .storage
+                        .load_forgotten_panes(&p.session)
+                        .await
+                        .unwrap()
+                        .len(),
+                    history: p
+                        .state
+                        .storage
+                        .get_messages(&p.session)
+                        .await
+                        .unwrap()
+                        .into_iter()
+                        .map(|message| serde_json::to_string(&message).unwrap())
+                        .collect(),
+                    members: p
+                        .state
+                        .db
+                        .list_project_members(&project_id)
+                        .await
+                        .unwrap()
+                        .into_iter()
+                        .map(|entry| entry.user_id)
+                        .collect(),
+                    policy: p
+                        .state
+                        .db
+                        .get_effective_project_policy(&project_id)
+                        .await
+                        .unwrap(),
+                    hosted_by_owner: p
+                        .state
+                        .db
+                        .project_is_placed_in_cluster(&project_id, &p.owner.to_string())
+                        .await
+                        .unwrap(),
+                    owner: project.owner_user_id.clone(),
+                    lifecycle: project.lifecycle(),
+                    session_row: p
+                        .state
+                        .db
+                        .get_session(&p.session.to_string())
+                        .await
+                        .unwrap()
+                        .is_some(),
+                    prompts: p.state.sessions.autopilot_prompts(&p.session),
+                }
+            }
+            let before = kept(&p).await;
+            assert_eq!(before.roster.len(), 5);
+            assert_eq!(before.history.len(), 2);
+            assert_eq!(before.members, vec![member.to_string()]);
+            assert!(before.prompts.is_some());
+            a.drain();
+            b.drain();
+            web.drain();
+
+            // The project view's Close.
+            close(&p, &web, p.owner, p.m5).await;
+            assert!(stopped_once(&mut d5) && stopped_once(&mut d6));
+            assert!(
+                a.drain().is_empty() && b.drain().is_empty(),
+                "no instance is told to close a tab"
+            );
+            assert_eq!(kept(&p).await, before);
+            assert_eq!(recorded(&p).await, Some(ProjectOpenState::Closed));
+
+            // Open again: every tab is where it was.
+            open(&p, &web, p.owner, p.m5).await;
+            assert!(
+                nothing_sent(&mut d5) && nothing_sent(&mut d6),
+                "still attached"
+            );
+            assert_eq!(kept(&p).await, before);
+
+            // A stop naming the project's last machine closes it the same.
+            p.state
+                .sessions
+                .detach_cli_instance(&p.session, &b.id)
+                .unwrap();
+            tabs(
+                &p,
+                p.state
+                    .sessions
+                    .get_session_panes(&p.session)
+                    .into_iter()
+                    .filter(|pane| pane.machine_id == Some(p.m5))
+                    .collect(),
+            );
+            crate::routes::ws_cli::persist_pane_roster(&p.state, &p.session).await;
+            let one_machine = kept(&p).await;
+            assert_eq!(one_machine.roster.len(), 3);
+            stop_one(&p, &web, p.owner, p.m5).await;
+            assert_eq!(recorded(&p).await, Some(ProjectOpenState::Closed));
+            assert!(stopped_once(&mut d5));
+            assert!(nothing_sent(&mut d6));
+            assert!(a.drain().is_empty());
+            assert_eq!(kept(&p).await, one_machine);
+
+            // An administrative stop ends the instances as it always did,
+            // and still removes no tab and nothing the server stores.
+            open(&p, &web, p.owner, p.m5).await;
+            sent(&mut d5);
+            crate::open_state::record_administrative_close(
+                &p.state,
+                &p.owner.to_string(),
+                &p.project_id(),
+                "stop_runtime",
+            )
+            .await
+            .unwrap();
+            p.state.sessions.stop_project_runtime(&p.project_id()).await;
+            assert!(stopped_once(&mut d5) && stopped_once(&mut d6));
+            let told = a.drain();
+            assert!(
+                told.iter()
+                    .all(|message| matches!(message, ServerToCli::SessionRejected { .. })),
+                "{told:?}"
+            );
+            assert!(removed_panes(&told).is_empty());
+            let after = kept(&p).await;
+            assert_eq!(
+                Kept {
+                    // The saved prompts are the instance's report, which
+                    // leaves with the instance and returns with it.
+                    prompts: after.prompts.clone(),
+                    ..one_machine
+                },
+                after
+            );
+
+            // Opened again with nothing attached, both starts are asked for
+            // and the roster is the one that was closed.
+            tabs(
+                &p,
+                before
+                    .roster
+                    .iter()
+                    .map(|(pane_id, machine, host)| pane(*pane_id, *machine, host.as_deref()))
+                    .collect(),
+            );
+            let web = p.viewer(p.owner, KNOWS);
+            open(&p, &web, p.owner, p.m5).await;
+            assert!(started_once(&mut d5) && started_once(&mut d6));
+            assert_eq!(kept(&p).await.roster, before.roster);
+        }
     }
 }

@@ -76,10 +76,18 @@ export function sortMachines(machines: MachineWithProjects[]): MachineWithProjec
     || a.machine.hostname.localeCompare(b.machine.hostname));
 }
 
+/** A row that needs a look: the daemon reported an error, or the server
+ *  says why this machine did not start a project it should run. */
+function rowHasError(row: MachineProject): boolean {
+  return Boolean(row.lastError) || (row.part === "not_started" && Boolean(row.partReason));
+}
+
 /**
  * A machine's project rows in the order the card shows them: rows with an
- * error first, then running, then stopped, each by name. Rows with an error
- * are never folded. More than three stopped rows fold unless `open`.
+ * error first, then running, then stopped, each by name. "Running" and
+ * "stopped" are about this machine, whatever the project's open state. Rows
+ * with an error are never folded. More than three stopped rows fold unless
+ * `open`.
  */
 export function machineRowsToShow(rows: MachineProject[], pendingCount: number, open: boolean): {
   shown: MachineProject[];
@@ -87,9 +95,9 @@ export function machineRowsToShow(rows: MachineProject[], pendingCount: number, 
   hiddenStopped: number;
   empty: boolean;
 } {
-  const errored = rows.filter((row) => row.lastError).sort(byName);
-  const running = rows.filter((row) => !row.lastError && row.isRunning).sort(byName);
-  const stopped = rows.filter((row) => !row.lastError && !row.isRunning).sort(byName);
+  const errored = rows.filter(rowHasError).sort(byName);
+  const running = rows.filter((row) => !rowHasError(row) && row.isRunning).sort(byName);
+  const stopped = rows.filter((row) => !rowHasError(row) && !row.isRunning).sort(byName);
   const foldable = stopped.length > STOPPED_FOLD_THRESHOLD;
   const folded = foldable && !open;
   return {

@@ -2,6 +2,7 @@ import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import type { MobileBootstrapResponse, ServerToWeb } from "@apas/protocol";
 
+import { MOBILE_CAPABILITIES } from "@/config/endpoints";
 import { ConnectionSupervisor, MutationRefusedError, type SocketLike } from "./supervisor";
 
 // The server frames added for multi-machine project instances, as the shared
@@ -128,6 +129,93 @@ describe("ConnectionSupervisor", () => {
     sockets[0].receive({ type: "session_instances_v2", session_id: emptyBootstrap.user_id });
     expect(sockets[0].closed).toBe(true);
     expect(onMessage).toHaveBeenCalledTimes(frames.length);
+  });
+
+  it("asks for no open-state frame and stays connected while a project is closed and opened", async () => {
+    // This app shows no open state and has no control for it, so it leaves
+    // project_open_state_v1 out. The server then sends it no frame of that
+    // kind; what an open and a close do reach it as the frames it already
+    // reads, some of whose entries carry the new optional fields.
+    const sessionsFrame = fixture("server-sessions-open-state.json") as Extract<ServerToWeb, { type: "sessions" }>;
+    const machinesFrame = fixture("server-machines-open-state.json") as Extract<ServerToWeb, { type: "machines" }>;
+    const instancesFrame = fixture("server-session-instances.json") as Extract<ServerToWeb, { type: "session_instances" }>;
+    const sessionId = instancesFrame.session_id;
+    expect(sessionsFrame.sessions.map((session) => session.open_state)).toEqual(["open", "closed", undefined]);
+    expect(machinesFrame.machines[0].projects[0]).toMatchObject({ open_state: "open", part: "not_started" });
+    expect(machinesFrame.machines[0].projects[0].part_reason).toBeTruthy();
+    expect(machinesFrame.machines[0].projects[0].other_hosts).toHaveLength(2);
+    // The bootstrap's session entries flatten the same entry, and its machine
+    // list is the same list.
+    const bootstrapValue: MobileBootstrapResponse = {
+      ...emptyBootstrap,
+      sessions: sessionsFrame.sessions.map((session) => ({ ...session, project_name: "project", attention_count: 0 })),
+      machines: machinesFrame.machines,
+    };
+
+    const sockets: FakeSocket[] = [];
+    const phases: string[] = [];
+    const onMessage = jest.fn();
+    const applyBootstrap = jest.fn();
+    const supervisor = new ConnectionSupervisor({
+      createSocket: () => { const socket = new FakeSocket(); sockets.push(socket); return socket; },
+      accessToken: async () => "access",
+      bootstrap: async () => bootstrapValue,
+      persistBootstrap: async () => undefined,
+      setPhase: (phase) => phases.push(phase),
+      setMutationsAllowed: jest.fn(),
+      applyBootstrap,
+      onMessage,
+      random: () => 0.5,
+    });
+    supervisor.start();
+    sockets[0].open();
+    await Promise.resolve();
+    expect(MOBILE_CAPABILITIES).not.toContain("project_open_state_v1");
+    expect(JSON.parse(sockets[0].sent[0]).capabilities).toEqual([...MOBILE_CAPABILITIES]);
+    expect(JSON.parse(sockets[0].sent[0]).capabilities).not.toContain("project_open_state_v1");
+    sockets[0].receive({
+      type: "authenticated",
+      user_id: emptyBootstrap.user_id,
+      mutations_allowed: true,
+      negotiated_capabilities: ["project_instances_v1"],
+    });
+    await Promise.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(applyBootstrap).toHaveBeenCalledWith(bootstrapValue);
+    expect(phases.at(-1)).toBe("ready");
+    const attached = sockets[0].sent.map((value) => JSON.parse(value)).filter((value) => value.type === "attach_session");
+    // Attachment still follows what runs, not the recorded state: the closed
+    // project is not attached, and the open and the not-recorded one are.
+    expect(attached.map((value) => value.session_id)).toEqual(
+      sessionsFrame.sessions.filter((session) => session.is_active).map((session) => session.id),
+    );
+
+    const [zoo005, zoo006] = instancesFrame.instances;
+    const frames: ServerToWeb[] = [
+      // Sent to every viewer once it has authenticated.
+      machinesFrame,
+      sessionsFrame,
+      // A close: each machine's instance leaves, then nothing is attached.
+      { type: "session_instances", session_id: sessionId, instances: [zoo005] },
+      { type: "session_instances", session_id: sessionId, instances: [] },
+      { type: "session_attached", session_id: sessionId, has_active_cli: false },
+      { type: "sessions", sessions: sessionsFrame.sessions.map((session) => session.id === sessionId ? { ...session, is_active: false, open_state: "closed" } : session) },
+      // An open: the tab owners attach again, one after the other.
+      { type: "session_attached", session_id: sessionId, has_active_cli: true },
+      { type: "session_instances", session_id: sessionId, instances: [zoo005] },
+      { type: "session_instances", session_id: sessionId, instances: [zoo005, zoo006] },
+      fixture("server-pane-list-instances.json"),
+      sessionsFrame,
+      machinesFrame,
+    ];
+    for (const frame of frames) sockets[0].receive(frame);
+    expect(onMessage.mock.calls.map(([message]) => message)).toEqual(frames);
+    expect(onMessage.mock.calls.some(([message]) => (message as ServerToWeb).type === "project_open_state")).toBe(false);
+    expect(sockets[0].closed).toBe(false);
+    expect(sockets).toHaveLength(1);
+    expect(phases.at(-1)).toBe("ready");
+    supervisor.stop();
   });
 
   it("carries negotiated worker read subscriptions without acknowledged mutation replay", async () => {

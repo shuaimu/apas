@@ -5,5 +5,5 @@
   "pane_id": 4,
   "mutation": "input",
   "accepted": false,
-  "error": "zoo-005 is not running this project. Start it on zoo-005 first."
+  "error": "zoo-005 is not running this project because it is offline."
 }

@@ -13,6 +13,7 @@ import {
 } from "@apas/protocol";
 
 import { paneStatusIsWorking } from "./paneStatus";
+import { knownMachines, type KnownMachine } from "./projectInstances";
 
 export type ConnectionPhase = "offline" | "connecting" | "authenticating" | "synchronizing" | "ready";
 export const PANE_WORK_SUMMARY_CAPABILITY = "pane_work_summary_v1";
@@ -43,6 +44,11 @@ interface MobileState {
   lastUpdatedAt: string | null;
   sessions: MobileSessionSummary[];
   launchTargets: MobileLaunchTarget[];
+  /**
+   * The bootstrap's machines and whether each daemon was connected then. Not
+   * cached on the device: a cold start knows none until it synchronizes.
+   */
+  knownMachines: KnownMachine[];
   features: MobileFeatureFlags;
   activeSessionId: string | null;
   eventsBySession: Record<string, CodeEvent[]>;
@@ -106,6 +112,7 @@ const initialState = {
   lastUpdatedAt: null,
   sessions: [] as MobileSessionSummary[],
   launchTargets: [] as MobileLaunchTarget[],
+  knownMachines: [] as KnownMachine[],
   features: {} as MobileFeatureFlags,
   activeSessionId: null,
   eventsBySession: {} as Record<string, CodeEvent[]>,
@@ -135,6 +142,7 @@ export const useMobileStore = create<MobileState>((set) => ({
         userEmail: bootstrap.user_email,
         sessions: bootstrap.sessions,
         launchTargets: bootstrap.launch_targets,
+        knownMachines: knownMachines(bootstrap.machines),
         features: bootstrap.features,
         panesBySession: Object.fromEntries(
           Object.entries(state.panesBySession).filter(([sessionId]) => allowed.has(sessionId)),

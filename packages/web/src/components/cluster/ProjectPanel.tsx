@@ -19,7 +19,10 @@ import { UsagePeriodControl, type UsagePeriod } from "@/components/overview/Usag
 import { Disclosure } from "./Disclosure";
 import { UsageStatCards } from "./UsageStatCards";
 import { JOB_REASON_LABELS } from "./jobReasonLabels";
-import { ConnectionChip, SuspendedChip } from "./ProjectList";
+import { DELETE_PROJECT_LABEL, DeleteProjectDialog } from "@/components/project/DeleteProjectDialog";
+import { ConnectionChip, OpenStateChip, SuspendedChip } from "./ProjectList";
+import { clusterProjectOpenModel, type ClusterOpenStateSource } from "./clusterOpenState";
+import { STOP_RUNTIME_CLOSES_PROJECT, SUSPEND_CLOSES_PROJECT } from "@/lib/projectOpenState";
 import type { ConfirmRequest } from "./ConfirmDialog";
 import type { ClusterPolicy, ClusterProject, ClusterProjectDetail, ClusterRequest, UsageWindows } from "./types";
 
@@ -30,8 +33,9 @@ const INPUT = "h-8 min-w-0 flex-1 rounded border border-gray-300 bg-white px-2 t
 export type ProjectWrite = (path: string, init: RequestInit, success: string) => Promise<boolean>;
 
 /**
- * The selected project: its usage, and for the cluster's owner its runtime,
- * owner, members and policies. Everything here is about this one project.
+ * The selected project: its open state and usage, for the cluster's owner
+ * its runtime, owner, members and policies, and for the project's owner
+ * "Delete project…". Everything here is about this one project.
  */
 export function ProjectPanel({
   detail,
@@ -41,6 +45,9 @@ export function ProjectPanel({
   error,
   notice,
   sharedView,
+  userId,
+  openState,
+  onDeleted,
   usagePeriod,
   onUsagePeriod,
   profiles,
@@ -58,6 +65,12 @@ export function ProjectPanel({
   error: string | null;
   notice: string | null;
   sharedView: boolean;
+  /** The viewer's account. Only the project's owner is offered Delete. */
+  userId?: string | null;
+  /** Where the project's Open / Closed comes from. */
+  openState?: ClusterOpenStateSource;
+  /** The owner deleted the project and the server reported it done. */
+  onDeleted?: (projectId: string) => void;
   usagePeriod: UsagePeriod;
   onUsagePeriod: (value: UsagePeriod) => void;
   profiles: LaunchProfile[];
@@ -93,6 +106,9 @@ export function ProjectPanel({
           summary={summary}
           usage={usage}
           sharedView={sharedView}
+          userId={userId}
+          openState={openState}
+          onDeleted={onDeleted}
           usagePeriod={usagePeriod}
           onUsagePeriod={onUsagePeriod}
           profiles={profiles}
@@ -111,6 +127,9 @@ function ProjectDetail({
   summary,
   usage,
   sharedView,
+  userId,
+  openState,
+  onDeleted,
   usagePeriod,
   onUsagePeriod,
   profiles,
@@ -123,6 +142,9 @@ function ProjectDetail({
   summary?: ClusterProject;
   usage: UsageWindows | null;
   sharedView: boolean;
+  userId?: string | null;
+  openState?: ClusterOpenStateSource;
+  onDeleted?: (projectId: string) => void;
   usagePeriod: UsagePeriod;
   onUsagePeriod: (value: UsagePeriod) => void;
   profiles: LaunchProfile[];
@@ -139,6 +161,15 @@ function ProjectDetail({
   const suspended = project.lifecycle_status === "suspended";
   const ownerTrimmed = newOwner.trim();
   const memberTrimmed = newMember.trim();
+  // Deleting is the owner's alone; hosting a project does not grant it.
+  const isOwner = Boolean(userId) && project.owner_user_id === userId;
+  const [deleteOpen, setDeleteOpen] = useState(false);
+  const open = openState
+    ? clusterProjectOpenModel({ id: project.id, name: project.project_name }, openState, isOwner)
+    : null;
+  // A server that records open states records a stopped or suspended
+  // project as closed. An older one records nothing, and nothing is said.
+  const closesProject = openState?.supported === true;
 
   const usageSection = (
     <OverviewSection title="Usage" level={3} aside={<UsagePeriodControl value={usagePeriod} onChange={onUsagePeriod} />}>
@@ -152,10 +183,32 @@ function ProjectDetail({
       <div className="select-all break-all font-mono text-[11px] text-gray-500 dark:text-gray-400">{project.id}</div>
       <div className="flex flex-wrap items-center gap-2">
         {summary && <ConnectionChip connected={summary.connected} />}
+        {open && <OpenStateChip label={open.stateLabel} derived={openState?.supported === true && !open.recorded} />}
         {suspended && <SuspendedChip />}
       </div>
     </div>
   );
+
+  // A control of its own, never part of closing or stopping the project.
+  const deleteSection = isOwner ? (
+    <OverviewSection title="Delete" level={3}>
+      <p className={`mb-2 ${overviewMuted}`}>
+        Erases the project from the APAS server. Folders and files on the machines stay.
+      </p>
+      <button type="button" className={overviewDangerButton} onClick={() => setDeleteOpen(true)}>
+        {DELETE_PROJECT_LABEL}
+      </button>
+      {deleteOpen && (
+        <DeleteProjectDialog
+          project={{ id: project.id, name: project.project_name ?? "" }}
+          stoppedFirstHosts={open?.stoppedFirstHosts}
+          offlineTabOwnerHosts={open?.offlineTabOwnerHosts}
+          onClose={() => setDeleteOpen(false)}
+          onDeleted={onDeleted}
+        />
+      )}
+    </OverviewSection>
+  ) : null;
 
   if (sharedView) {
     return (
@@ -163,6 +216,7 @@ function ProjectDetail({
         {header}
         <p className={overviewMuted}>Owned by {project.owner_email}. Cluster membership does not expose any other hosted projects.</p>
         {usageSection}
+        {deleteSection}
       </>
     );
   }
@@ -182,7 +236,12 @@ function ProjectDetail({
             className={overviewDangerButton}
             onClick={() => requestConfirm({
               title: "Stop this project's runtime?",
-              body: <p>Project data and future access are preserved.</p>,
+              body: (
+                <>
+                  {closesProject && <p>{STOP_RUNTIME_CLOSES_PROJECT}</p>}
+                  <p>Project data and future access are preserved.</p>
+                </>
+              ),
               confirmLabel: "Stop runtime",
               tone: "danger",
               onConfirm: () => void write(`${base}/stop-runtime`, { method: "POST" }, "Runtime stop requested."),
@@ -204,7 +263,12 @@ function ProjectDetail({
               className={overviewDangerButton}
               onClick={() => requestConfirm({
                 title: `Suspend ${name}?`,
-                body: <p>This stops its runtime. Project data is preserved.</p>,
+                body: (
+                  <>
+                    <p>This stops its runtime. Project data is preserved.</p>
+                    {closesProject && <p>{SUSPEND_CLOSES_PROJECT}</p>}
+                  </>
+                ),
                 confirmLabel: "Suspend project",
                 tone: "danger",
                 onConfirm: () => void write(`${base}/lifecycle`, { method: "PATCH", body: JSON.stringify({ status: "suspended" }) }, "Project suspended."),
@@ -312,6 +376,8 @@ function ProjectDetail({
           )}
         </Disclosure>
       </div>
+
+      {deleteSection}
     </>
   );
 }

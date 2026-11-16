@@ -258,10 +258,10 @@ describe("sending", () => {
       pane_id: PANE,
       request_id: frame.client_msg_id,
       accepted: false,
-      error: "zoo-005 is not running this project. Start it on zoo-005 first.",
+      error: "zoo-005 is not running this project. Open the project again to start it there.",
     }, useStore.setState, useStore.getState));
     expect(view.outcome()?.getAttribute("data-outcome")).toBe("refused");
-    expect(view.outcome()?.textContent).toBe("Not delivered: zoo-005 is not running this project. Start it on zoo-005 first.");
+    expect(view.outcome()?.textContent).toBe("Not delivered: zoo-005 is not running this project. Open the project again to start it there.");
     expect(sentInputs()).toHaveLength(1);
   });
 

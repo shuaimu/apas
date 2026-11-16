@@ -66,7 +66,7 @@ vi.mock("@/lib/useTheme", () => ({
 
 import { TerminalPane } from "./TerminalPane";
 
-const STOPPED = "zoo-006 is not running this project. Start it on zoo-006 first.";
+const STOPPED = "zoo-006 is not running this project. Open the project again to start it there.";
 
 /** The keystroke handler the pane registered with xterm. */
 let typed: (data: string) => void;

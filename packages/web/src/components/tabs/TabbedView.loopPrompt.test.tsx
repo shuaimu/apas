@@ -210,7 +210,7 @@ describe("where the loop prompt is offered", () => {
     ], 4);
     render(<TabbedView />);
     await screen.findByTestId("loop-prompt-control");
-    const reason = "zoo-005 is not running this project. Start it on zoo-005 first.";
+    const reason = "zoo-005 is not running this project. Open the project again to start it there.";
     expect(loopButton().disabled).toBe(true);
     expect(loopButton().title).toBe(reason);
     expect(within(screen.getByTestId("loop-prompt-control")).getByRole("note").textContent).toBe(reason);

@@ -3,7 +3,7 @@
 import { useStore } from "@/lib/store";
 import { ThemePicker } from "@/components/ThemePicker";
 import { PaneStatusDots } from "@/components/PaneStatusDots";
-import { FolderOpen, RefreshCw, Share2, Users, X, Crown, Trash2, ChevronLeft, ChevronDown, ChevronRight, BarChart3, Server, Plus, LogOut, ArrowRightLeft, AlertTriangle, MoreHorizontal, GripVertical } from "lucide-react";
+import { FolderOpen, RefreshCw, Share2, Users, X, Crown, Trash2, ChevronLeft, ChevronDown, ChevronRight, BarChart3, Server, Plus, LogOut, ArrowRightLeft, MoreHorizontal, GripVertical } from "lucide-react";
 import { CreateInstanceModal } from "./CreateInstanceModal";
 import Link from "next/link";
 import { useMemo, useState, useEffect, type DragEvent, type KeyboardEvent } from "react";
@@ -18,12 +18,16 @@ import {
   buildProjectList,
   groupProjectsByRepo,
   projectNameFor,
+  projectStateLabel,
   type ProjectRole,
 } from "@/lib/projectList";
 import { useProjectOrder } from "@/lib/useProjectOrder";
 import { projectHostLabel } from "@/lib/tabHosts";
-import { paneNotRunning } from "@/lib/projectInstances";
+import { instancesNegotiated, paneNotRunning } from "@/lib/projectInstances";
 import { autopilotListStatus } from "@/lib/autopilot";
+import { PROJECT_API_URL } from "@/lib/projectDeletion";
+import { buildProjectOpenModel, openStateNegotiated } from "@/lib/projectOpenState";
+import { DELETE_PROJECT_LABEL, DeleteProjectDialog } from "@/components/project/DeleteProjectDialog";
 
 // Truncate path in the middle to preserve the folder name at the end
 // e.g., "/home/shuai/workspace/long-project" -> "/home/.../long-project"
@@ -66,7 +70,7 @@ interface SidebarProps {
   width?: number;
 }
 
-const API_URL = process.env.NEXT_PUBLIC_API_URL || "https://apas.mpaxos.com";
+const API_URL = PROJECT_API_URL;
 type SidebarView = "projects" | "idle";
 type SidebarItem = { groupKey: string; projectId?: string };
 type DropPlacement = "before" | "after";
@@ -150,8 +154,13 @@ export function Sidebar({ onClose, onCollapse, width }: SidebarProps) {
   const [removingUserId, setRemovingUserId] = useState<string | null>(null);
   const [transferringUserId, setTransferringUserId] = useState<string | null>(null);
   const [lifecycleLoading, setLifecycleLoading] = useState(false);
-  const [deleteConfirmation, setDeleteConfirmation] = useState("");
-  const [deletionInProgress, setDeletionInProgress] = useState(false);
+  // The project the shared Delete project dialog is open for. It is opened
+  // only from the owner's "Delete project…" in the project-access dialog,
+  // which closes first.
+  const [deleteProjectTarget, setDeleteProjectTarget] = useState<{ id: string; sessionId: string; name: string } | null>(null);
+  const openStateSupported = useStore(openStateNegotiated);
+  const instancesSupported = useStore(instancesNegotiated);
+  const projectOpenStates = useStore((s) => s.projectOpenStates);
 
   // Shared with the collapsed icon rail, so both views list the same projects
   // in the same order (see `lib/projectList.ts`).
@@ -430,8 +439,6 @@ export function Sidebar({ onClose, onCollapse, width }: SidebarProps) {
       viewerRole: role,
       canManage: role === "owner",
     });
-    setDeleteConfirmation("");
-    setDeletionInProgress(false);
     setShareModalOpen(true);
     if (role !== "owner") return;
     setShareLoading(true);
@@ -624,51 +631,43 @@ export function Sidebar({ onClose, onCollapse, width }: SidebarProps) {
     }
   };
 
-  const waitForDeletion = async (projectId: string) => {
-    for (let attempt = 0; attempt < 120; attempt += 1) {
-      await new Promise((resolve) => setTimeout(resolve, 500));
-      const response = await fetch(`${API_URL}/projects/${projectId}/deletion`, {
-        headers: { Authorization: `Bearer ${token}` },
-      });
-      if (response.status === 404) {
-        forgetProject(projectId);
-        setShareModalOpen(false);
-        listSessions();
-        return;
-      }
-      if (!response.ok && response.status !== 409) {
-        const error = await response.json().catch(() => null);
-        throw new Error(error?.error || error?.message || "Failed to check deletion status");
-      }
-    }
-    throw new Error("Deletion is still in progress. You can safely close this dialog.");
+  // Deleting is the shared Delete project dialog's: it says what is erased,
+  // names the machines and takes the project's name. The access dialog only
+  // leads to it, and closes so the two never sit on top of each other.
+  const openDeleteProject = () => {
+    if (!shareProjectId || !shareSessionId) return;
+    const entry = projects.find((project) => project.projectId === shareProjectId);
+    const session = sessions.find((candidate) => candidate.id === shareSessionId);
+    setDeleteProjectTarget({
+      id: shareProjectId,
+      sessionId: shareSessionId,
+      name: entry?.name ?? (session ? projectNameFor(session) : ""),
+    });
+    setShareModalOpen(false);
   };
 
-  const handleDeleteProject = async () => {
-    if (!shareProjectId || deleteConfirmation !== shareProjectId) return;
-    setLifecycleLoading(true);
-    setShareError(null);
-    try {
-      const response = await fetch(`${API_URL}/projects/${shareProjectId}/delete`, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${token}`,
-        },
-        body: JSON.stringify({ confirmation: deleteConfirmation }),
-      });
-      if (response.status !== 202) {
-        const error = await response.json().catch(() => null);
-        throw new Error(error?.error || error?.message || "Failed to delete project");
-      }
-      setDeletionInProgress(true);
-      setLifecycleLoading(false);
-      await waitForDeletion(shareProjectId);
-    } catch (err) {
-      setShareError(err instanceof Error ? err.message : "Failed to delete project");
-      setLifecycleLoading(false);
-    }
-  };
+  // The machines the Delete project dialog names: those whose agents are
+  // stopped first, and offline ones that own tabs. Built only while the
+  // dialog is open.
+  const deleteProjectModel = useMemo(() => {
+    if (!deleteProjectTarget) return null;
+    const session = sessions.find((candidate) => candidate.id === deleteProjectTarget.sessionId)
+      ?? sessions.find((candidate) => (candidate.projectId ?? candidate.id) === deleteProjectTarget.id);
+    return buildProjectOpenModel({
+      supported: openStateSupported,
+      projectIds: [deleteProjectTarget.id, deleteProjectTarget.sessionId],
+      projectName: deleteProjectTarget.name,
+      report: projectOpenStates[deleteProjectTarget.id] ?? projectOpenStates[deleteProjectTarget.sessionId],
+      session: session ?? null,
+      // The session list's roster summary says which machines own tabs,
+      // and only a server that reports instances tags them.
+      panes: instancesSupported ? session?.panes : undefined,
+      instances: instancesSupported ? session?.instances : undefined,
+      machines,
+      target: null,
+      isOwner: true,
+    });
+  }, [deleteProjectTarget, instancesSupported, machines, openStateSupported, projectOpenStates, sessions]);
 
   const handleTabChange = (tab: "invite" | "manage") => {
     setShareTab(tab);
@@ -923,7 +922,13 @@ export function Sidebar({ onClose, onCollapse, width }: SidebarProps) {
                       <GripVertical aria-hidden="true" className="h-3.5 w-3.5" />
                     </button>
                   )}
+                  {/* Green while something runs the project. That is not its
+                      state: an open project whose machines are away runs
+                      nowhere, and a closed one can still run on a machine
+                      the close could not reach. The state is the word below. */}
                   <div
+                    data-testid="project-running-dot"
+                    title={project.isActive ? "A machine is running this project" : "No machine is running this project"}
                     className={`w-2 h-2 rounded-full flex-shrink-0 ${
                       project.isActive ? "bg-green-500" : "bg-gray-400"
                     }`}
@@ -962,14 +967,14 @@ export function Sidebar({ onClose, onCollapse, width }: SidebarProps) {
                       </div>
                     )}
                     <div className="flex items-center gap-2 text-xs text-gray-500">
-                      <span className="shrink-0">
-                        {project.sessionId === null
-                          ? project.isActive ? "Running" : "Stopped"
-                          : project.isActive
-                          ? "Active"
-                          : project.createdAt
-                            ? new Date(project.createdAt).toLocaleDateString()
-                            : ""}
+                      {/* The project's state, Open or Closed: what the server
+                          recorded, or, while nobody has recorded one, open
+                          while something runs it. */}
+                      <span className="shrink-0" data-testid="project-open-state">
+                        {projectStateLabel(project)}
+                        {project.sessionId !== null && project.openState === "closed" && project.createdAt
+                          ? ` · ${new Date(project.createdAt).toLocaleDateString()}`
+                          : ""}
                       </span>
                       {project.sessionId !== null && <PaneStatusDots panes={project.panes} isActive={project.isActive} instances={project.instances} machines={machines} />}
                     </div>
@@ -1232,43 +1237,24 @@ export function Sidebar({ onClose, onCollapse, width }: SidebarProps) {
                         })
                       )}
 
-                      <div className="mt-6 border-t border-red-200 pt-4 dark:border-red-900/60">
-                        <div className="flex items-center gap-2 text-red-600 dark:text-red-400">
-                          <AlertTriangle className="h-4 w-4" />
-                          <h4 className="font-semibold">Danger zone</h4>
-                        </div>
-                        <p className="mt-2 text-xs text-gray-600 dark:text-gray-400">
-                          Permanently deletes APAS project sessions, messages, terminal state, invitations, and audit records. Type the canonical project ID to confirm:
+                      {/* The owner's only. Deleting has a dialog of its own,
+                          shared with the project view and the cluster page;
+                          leaving a project is the other branch above. */}
+                      {shareUsers.viewerRole === "owner" && <div className="mt-6 border-t border-gray-200 pt-4 dark:border-gray-700">
+                        <h4 className="font-medium">Delete project</h4>
+                        <p className="mt-1 text-xs text-gray-600 dark:text-gray-400">
+                          Deleting erases the project from the APAS server and cannot be undone. Closing a project deletes nothing. The next step says what is erased and asks for the project&apos;s name.
                         </p>
-                        <code className="mt-2 block break-all rounded bg-gray-100 p-2 text-xs dark:bg-gray-900">
-                          {shareProjectId}
-                        </code>
-                        <input
-                          aria-label="Project deletion confirmation"
-                          value={deleteConfirmation}
-                          onChange={(event) => setDeleteConfirmation(event.target.value)}
-                          disabled={deletionInProgress}
-                          className="mt-2 w-full rounded border border-red-300 bg-transparent px-3 py-2 text-sm dark:border-red-800"
-                          placeholder="Type the project ID"
-                        />
                         <button
-                          onClick={handleDeleteProject}
-                          disabled={
-                            lifecycleLoading ||
-                            deletionInProgress ||
-                            !shareProjectId ||
-                            deleteConfirmation !== shareProjectId
-                          }
-                          className="mt-2 flex w-full items-center justify-center gap-2 rounded bg-red-600 px-4 py-2 text-sm font-medium text-white hover:bg-red-700 disabled:opacity-50"
+                          type="button"
+                          onClick={openDeleteProject}
+                          disabled={!shareProjectId}
+                          className="mt-2 flex w-full items-center justify-center gap-2 rounded border border-red-300 px-4 py-2 text-sm font-medium text-red-700 hover:bg-red-50 disabled:opacity-50 dark:border-red-800 dark:text-red-300 dark:hover:bg-red-950/40"
                         >
                           <Trash2 className="h-4 w-4" />
-                          {deletionInProgress
-                            ? "Deletion in progress…"
-                            : lifecycleLoading
-                              ? "Starting deletion…"
-                              : "Permanently delete project"}
+                          {DELETE_PROJECT_LABEL}
                         </button>
-                      </div>
+                      </div>}
                     </div>
                   )}
                 </>
@@ -1277,6 +1263,18 @@ export function Sidebar({ onClose, onCollapse, width }: SidebarProps) {
           </div>
         </div>,
         document.body
+      )}
+
+      {/* In a portal like the access dialog: the sidebar sits in a
+          transformed container, which would otherwise position the dialog. */}
+      {deleteProjectTarget && mounted && createPortal(
+        <DeleteProjectDialog
+          project={{ id: deleteProjectTarget.id, name: deleteProjectTarget.name }}
+          stoppedFirstHosts={deleteProjectModel?.stoppedFirstHosts}
+          offlineTabOwnerHosts={deleteProjectModel?.offlineTabOwnerHosts}
+          onClose={() => setDeleteProjectTarget(null)}
+        />,
+        document.body,
       )}
 
       {newInstanceRepo && (

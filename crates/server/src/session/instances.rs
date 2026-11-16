@@ -49,7 +49,9 @@ pub enum PaneOwner {
     Instance(InstanceAttachment),
     /// The pane belongs to a machine that runs no instance of the project, so
     /// its state lives where nothing can act on it. Refuse with
-    /// "<host> is not running this project. Start it on <host> first."
+    /// "<host> is not running this project. Open the project again to start
+    /// it there." while that machine's daemon is connected, and "<host> is
+    /// not running this project because it is offline." while it is not.
     NotRunning {
         machine_id: Option<Uuid>,
         hostname: Option<String>,
@@ -546,6 +548,15 @@ impl SessionManager {
             // Viewers are not told an instance's capabilities, so they hear
             // here whether each OMP tab's instance can run autopilot.
             self.broadcast_pane_autopilot(&session_id, None);
+            // The machine runs the project: a start pending there is over,
+            // and its part changed.
+            let project_id = self
+                .project_for_session(&session_id)
+                .unwrap_or_else(|| session_id.to_string());
+            if let Some(machine_id) = machine_id {
+                self.note_machine_runs(&project_id, &machine_id);
+            }
+            self.report_project_open_state(&project_id);
         }
         outcome
     }
@@ -757,6 +768,8 @@ impl SessionManager {
         }
         self.broadcast_session_instances(session_id);
         self.broadcast_pane_autopilot(session_id, None);
+        // The departing machine's part in the project changed.
+        self.report_session_open_state(session_id);
         if prompts_changed {
             self.broadcast_autopilot_prompts(session_id);
         }

@@ -254,6 +254,14 @@ async fn finalize(
         pending.machine_id,
     );
     registered.preferred_machine_id = Some(pending.machine_id);
+    // The open state on the entry is the server's, as in a machine list:
+    // read for this project now, and overwritten whatever the entry held.
+    crate::open_state::refresh_basis(state, &registered.project_id).await;
+    state.sessions.fill_project_open_state(
+        &pending.user_id,
+        &pending.machine_id,
+        &mut registered,
+    );
     state
         .sessions
         .broadcast_machines_update_for_user(&pending.user_id);

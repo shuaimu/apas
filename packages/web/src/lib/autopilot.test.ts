@@ -374,7 +374,7 @@ describe("what a tab's control offers", () => {
 
   it("puts a machine that is not running the project before what autopilot lacks", () => {
     const tabRefusal = stoppedOnHostReason("zoo-005");
-    expect(tabRefusal).toBe("zoo-005 is not running this project. Start it on zoo-005 first.");
+    expect(tabRefusal).toBe("zoo-005 is not running this project. Open the project again to start it there.");
     expect(autopilotControlModel({ ...usable, tabRefusal, entry: { support: "needs_agent_reboot" } }).disabledReason)
       .toBe(tabRefusal);
     // Stop is refused, never redirected, while that machine is stopped.
@@ -833,9 +833,9 @@ describe("confirmations", () => {
   it("names the tabs on autopilot when the project is closed", () => {
     expect(closeProjectAutopilotNote([])).toBeUndefined();
     expect(closeProjectAutopilotNote(["OMP 1"]))
-      .toBe("OMP 1 is on autopilot. Its autopilot comes back paused when the project is started again.");
+      .toBe("OMP 1 is on autopilot. Its autopilot comes back paused when the project is opened again.");
     expect(closeProjectAutopilotNote(["OMP 1", "OMP 2", "Nightly"])).toBe(
-      "OMP 1, OMP 2 and Nightly are on autopilot. Their autopilots come back paused when the project is started again.",
+      "OMP 1, OMP 2 and Nightly are on autopilot. Their autopilots come back paused when the project is opened again.",
     );
   });
 });

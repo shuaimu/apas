@@ -20,6 +20,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import { ArrowLeft, Plus, RefreshCw } from "lucide-react";
 import { useStore } from "@/lib/store";
+import { openStateNegotiated } from "@/lib/projectOpenState";
 import { CreateInstanceModal } from "@/components/CreateInstanceModal";
 import type { LaunchProfile } from "@/components/PolicyEditor";
 import { isRetiredLaunchProfileKey } from "@/lib/providerOptions";
@@ -97,9 +98,11 @@ export default function MachinesPage() {
     connect,
     token,
     machines,
+    sessions,
+    negotiatedCapabilities,
     listMachines,
-    startMachineProjectCli,
-    stopMachineProjectCli,
+    openProject,
+    closeProject,
     setMachineDeepseekConfig,
     pendingInstances,
     rebootDaemon,
@@ -209,6 +212,12 @@ export default function MachinesPage() {
       ?? [];
     return profiles.filter((profile) => allowed.includes(profile.key));
   }, [clusterPolicy, profiles]);
+  // Open states come with the machine and session lists; nothing here
+  // attaches to a project to learn them.
+  const openState = useMemo(
+    () => ({ supported: openStateNegotiated({ negotiatedCapabilities }), machines, sessions }),
+    [machines, negotiatedCapabilities, sessions],
+  );
   const activeClusterMembers = useMemo(
     () => clusterMembers.filter((member) => member.status === "active"),
     [clusterMembers],
@@ -607,8 +616,10 @@ export default function MachinesPage() {
               canRebootAll={!sharedView && rebootableMachines.length > 0}
               onReboot={openReboot}
               onRebootAll={openRebootAll}
-              onStart={(machineId, projectId) => startMachineProjectCli(machineId, projectId)}
-              onStop={(machineId, projectId) => stopMachineProjectCli(machineId, projectId)}
+              openStateSupported={openState.supported}
+              projectMachines={machines}
+              onOpen={(machineId, projectId) => openProject(machineId, projectId)}
+              onClose={(machineId, projectId) => closeProject(machineId, projectId)}
               setMachineDeepseekConfig={setMachineDeepseekConfig}
               requestConfirm={requestConfirm}
             />
@@ -619,9 +630,15 @@ export default function MachinesPage() {
               projects={clusterProjects}
               load={projectsLoad}
               userId={userId}
+              openState={openState}
               selectedId={selectedId}
               onSelect={selectProject}
               onClear={clearProject}
+              onDeleted={() => {
+                clearProject();
+                listMachines();
+                void loadCluster();
+              }}
               detail={selected}
               detailUsage={selectedUsage}
               detailLoading={detailLoading}

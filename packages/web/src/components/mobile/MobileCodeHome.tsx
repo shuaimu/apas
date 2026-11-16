@@ -21,7 +21,8 @@ import type {
 import { installedProvidersSummary, parseMachineProviders } from "@/lib/machineChoice";
 import { writeSelectedPane } from "@/lib/mobileSelectedPane";
 import { compareRecentlyIdle } from "@/lib/idlePaneOrdering";
-import { buildProjectList } from "@/lib/projectList";
+import { buildProjectList, projectStateLabel } from "@/lib/projectList";
+import { parseOpenState } from "@/lib/projectOpenState";
 import { paneNotRunning, parseSessionInstances, type SessionInstance } from "@/lib/projectInstances";
 import { projectHostLabel } from "@/lib/tabHosts";
 import { autopilotListStatus } from "@/lib/autopilot";
@@ -69,6 +70,9 @@ interface MobileSessionSummary {
   /** Attached instances, one per machine, parsed from the wire. Absent from
    *  older servers and when nothing is attached. */
   instances?: SessionInstance[];
+  /** The project's recorded state, "open" or "closed". Absent while nobody
+   *  has recorded one and from older servers; read with `parseOpenState`. */
+  open_state?: string | null;
 }
 
 interface MobileMachineProject {
@@ -77,6 +81,8 @@ interface MobileMachineProject {
   path?: string;
   is_running?: boolean;
   preferred_machine_id?: string;
+  /** As on a session entry; the server fills it in, never the daemon. */
+  open_state?: string | null;
 }
 
 interface MobileMachineSummary {
@@ -150,6 +156,7 @@ function adaptMachine(entry: MachineWithProjects): MobileMachineSummary {
       path: project.path,
       is_running: project.isRunning,
       preferred_machine_id: project.preferredMachineId,
+      open_state: project.openState,
     })),
     cluster_owner_user_id: entry.clusterOwnerUserId,
     cluster_access: entry.clusterAccess,
@@ -190,6 +197,7 @@ function adaptSession(session: SessionInfo): MobileSessionSummary {
     owner_email: session.ownerEmail,
     panes: session.panes,
     instances: session.instances,
+    open_state: session.openState,
   };
 }
 
@@ -207,8 +215,13 @@ function compareSessionRecency(left: MobileSessionSummary, right: MobileSessionS
     || left.id.localeCompare(right.id);
 }
 
+/// A project card's badge. While something runs the project it says what its
+/// agents do, also for a closed project a machine still runs. While nothing
+/// runs it, it says the project's state: "Closed", which is also how a
+/// project nobody has recorded reads, or "Not running" for a project that is
+/// recorded open and that no machine runs.
 function statusLabel(session: MobileSessionSummary, allPanesUsageLimited = false): string {
-  if (!session.is_active) return "Offline";
+  if (!session.is_active) return parseOpenState(session.open_state) === "open" ? "Not running" : "Closed";
   if (session.panes?.some((pane) => pane.awaiting_answer)) return "Pending answer";
   if (session.is_working) return "Working";
   return allPanesUsageLimited ? "Usage limited" : "Idle";
@@ -362,6 +375,7 @@ export function MobileCodeHome({
         path: project.path ?? "",
         isRunning: project.is_running === true,
         preferredMachineId: project.preferred_machine_id,
+        openState: parseOpenState(project.open_state),
       })),
       clusterOwnerUserId: entry.cluster_owner_user_id,
       clusterAccess: entry.cluster_access,
@@ -446,6 +460,9 @@ export function MobileCodeHome({
         // The live list says which instances are attached now, including
         // none; a bootstrap snapshot only stands in until it arrives.
         instances: live.instances,
+        // Likewise the state: absent in the live list means nobody has
+        // recorded one, whatever an earlier snapshot said.
+        open_state: live.openState,
       };
     }), ...legacySessions.filter((session) => !remoteIds.has(session.id)).map(adaptSession)];
   }, [legacySessions, remoteSessions]);
@@ -879,8 +896,10 @@ export function MobileCodeHome({
                         ? "bg-amber-100 text-amber-800 dark:bg-amber-950/60 dark:text-amber-200"
                         : session.is_working
                         ? "bg-emerald-100 text-emerald-700 dark:bg-emerald-950/60 dark:text-emerald-300"
-                        : session.is_active
+                        : session.is_active || parseOpenState(session.open_state) !== "open"
+                          // Idle, or closed: neither needs anyone.
                           ? "bg-[#efeff5] text-[#686873] dark:bg-[#25252d] dark:text-[#aaaab6]"
+                          // Recorded open, and no machine runs it.
                           : "bg-red-100 text-red-700 dark:bg-red-950/60 dark:text-red-300"
                     }`}>
                       {statusLabel(session, fullyLimitedSessionIds.has(session.id))}
@@ -911,11 +930,11 @@ export function MobileCodeHome({
                 <div className="flex items-center justify-between gap-2.5">
                   <span className="min-w-0 flex-1 truncate text-base font-bold">{project.name}</span>
                   <span className={`shrink-0 rounded-full px-2.5 py-1 text-[0.7rem] font-bold ${
-                    project.isActive
+                    project.openState === "open"
                       ? "bg-emerald-100 text-emerald-700 dark:bg-emerald-950/60 dark:text-emerald-300"
                       : "bg-[#efeff5] text-[#686873] dark:bg-[#25252d] dark:text-[#aaaab6]"
                   }`}>
-                    {project.isActive ? "Running" : "Stopped"}
+                    {projectStateLabel(project)}
                   </span>
                 </div>
                 <p className="mt-2 truncate text-sm text-[#686873] dark:text-[#aaaab6]">{project.hostname}</p>
@@ -1032,7 +1051,7 @@ export function MobileCodeHome({
               })}
               {activeSessions.length === 0 && (
                 <div className="rounded-2xl border border-[#dedee7] bg-white p-4 text-sm text-[#686873] dark:border-[#383842] dark:bg-[#1b1b21] dark:text-[#aaaab6]">
-                  No running projects are available. Start one from Machines first.
+                  No project is running. Open one from its project screen or from Machines first.
                 </div>
               )}
             </div>

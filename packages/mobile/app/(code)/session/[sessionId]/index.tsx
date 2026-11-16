@@ -17,6 +17,7 @@ import { paneIsRetiredBot, paneStatusIsPendingAnswer } from "@/state/paneStatus"
 import {
   instancesForSession,
   paneHostname,
+  paneMachineConnected,
   paneReachability,
   paneUnavailableReason,
   rosterSpansHosts,
@@ -45,6 +46,7 @@ export default function SessionActivityScreen() {
   const livePanes = useMobileStore((state) => state.panesBySession[sessionId]);
   const liveInstances = useMobileStore((state) => state.instancesBySession[sessionId]);
   const instancesSupported = useMobileStore((state) => state.negotiatedCapabilities.includes(PROJECT_INSTANCES_CAPABILITY));
+  const machines = useMobileStore((state) => state.knownMachines);
   const paneStatuses = useMobileStore((state) => state.paneStatusesBySession[sessionId]);
   const setEvents = useMobileStore((state) => state.setEvents);
   const connection = useMobileStore((state) => state.connection);
@@ -84,14 +86,19 @@ export default function SessionActivityScreen() {
       kind: "agent" | "terminal";
       label: string;
       host: string | null;
+      // Whether the last bootstrap listed this tab's machine as connected,
+      // which decides how a stopped machine is described.
+      machineConnected: boolean;
       reachability: PaneReachability;
     }[] = roster.map((pane) => {
       seen.add(pane.pane_id);
+      const host = paneHostname(pane, instances);
       return {
         id: pane.pane_id,
         kind: pane.kind ?? "agent",
         label: pane.label?.trim() || `${pane.kind === "terminal" ? "Terminal" : "Pane"} ${pane.pane_id}`,
-        host: paneHostname(pane, instances),
+        host,
+        machineConnected: paneMachineConnected(pane, host, machines),
         reachability: paneReachability(pane, instances, instancesLive),
       };
     });
@@ -103,6 +110,7 @@ export default function SessionActivityScreen() {
         kind: event.kind === "terminal" ? "terminal" : "agent",
         label: `Pane ${event.pane_id}`,
         host: null,
+        machineConnected: false,
         reachability: "usable",
       });
     }
@@ -115,7 +123,7 @@ export default function SessionActivityScreen() {
         ? `${option.label} · ${option.host}`
         : option.label,
     }));
-  }, [bootstrapPanes, events, instances, instancesLive, livePanes]);
+  }, [bootstrapPanes, events, instances, instancesLive, livePanes, machines]);
   const preferredPane = panes.find((pane) => pane.kind !== "terminal") ?? panes[0];
   const deepLinkedPaneId = eventId ? events.find((event) => event.id === eventId)?.pane_id : undefined;
   const desiredPaneId = requestedSelection ?? deepLinkedPaneId ?? null;
@@ -132,7 +140,7 @@ export default function SessionActivityScreen() {
   const selectedIsRetiredBot = paneIsRetiredBot(selectedConfig);
   const selectedUnavailable = selectedIsRetiredBot
     ? "Earlier bot history is read-only. Create and approve a fresh worker separately; no old process or authority is adopted."
-    : selectedPane ? paneUnavailableReason(selectedPane.reachability, selectedPane.host) : null;
+    : selectedPane ? paneUnavailableReason(selectedPane.reachability, selectedPane.host, selectedPane.machineConnected) : null;
   const selectedIsTerminal = selectedPane?.kind === "terminal";
   const selectedStatus = activePaneId === null ? null : paneStatuses?.[String(activePaneId)] ?? null;
   const selectedAwaitingAnswer = paneStatusIsPendingAnswer(selectedStatus);

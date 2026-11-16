@@ -889,11 +889,29 @@ pub async fn update_lifecycle(
         "suspended" => ProjectLifecycle::Suspended,
         _ => return Err(AppError::BadRequest("Invalid project status".to_string())),
     };
+    // A suspension records the project closed in the transaction that
+    // suspends it; the open-state lock is held from there to the last stop
+    // sent. Reactivating records nothing and starts nothing.
+    let _open_state = match lifecycle {
+        ProjectLifecycle::Suspended => {
+            Some(state.sessions.project_open_state_guard(&project_id).await)
+        }
+        _ => None,
+    };
     let changed = state
         .db
         .set_project_lifecycle(&actor.id, &project_id, lifecycle)
         .await?;
     if lifecycle == ProjectLifecycle::Suspended {
+        if changed {
+            crate::open_state::note_administrative_close(
+                &state,
+                &actor.id,
+                &project_id,
+                "suspension",
+            )
+            .await;
+        }
         crate::jobs::cancel_project_jobs(&state, &project_id, "project_suspended").await?;
         state.sessions.stop_project_runtime(&project_id).await;
     }
@@ -910,6 +928,11 @@ pub async fn stop_runtime(
 ) -> Result<Json<serde_json::Value>, AppError> {
     let actor = require_cluster_operator(&headers, &state, &project_id).await?;
     crate::jobs::cancel_project_jobs(&state, &project_id, "project_stopped").await?;
+    // Stopping the runtime closes the project, or the next registration
+    // would start what the operator just stopped. Held to the last stop sent.
+    let _open_state = state.sessions.project_open_state_guard(&project_id).await;
+    crate::open_state::record_administrative_close(&state, &actor.id, &project_id, "stop_runtime")
+        .await?;
     let stopped = state.sessions.stop_project_runtime(&project_id).await;
     state
         .db

@@ -71,7 +71,7 @@ function seedStore(overrides: Record<string, unknown> = {}) {
       ),
     }));
   });
-  const startMachineProjectCli = vi.fn();
+  const openProject = vi.fn(() => true);
 
   act(() => {
     useStore.setState({
@@ -123,7 +123,7 @@ function seedStore(overrides: Record<string, unknown> = {}) {
       removePane,
       rebootPane,
       updatePaneLabel,
-      startMachineProjectCli,
+      openProject,
       ...overrides,
     });
   });
@@ -145,7 +145,7 @@ function seedStore(overrides: Record<string, unknown> = {}) {
     sendMessageToPane,
     sendTerminalConversationMessage,
     sendTerminalInput,
-    startMachineProjectCli,
+    openProject,
     updatePaneLabel,
   };
 }
@@ -297,8 +297,10 @@ describe("MobileSessionActivity", () => {
     expect(within(sheet).getByRole("button", { name: "Close this pane" })).toHaveProperty("disabled", true);
     expect(within(sheet).getByRole("button", { name: "Reboot this pane" })).toHaveProperty("disabled", true);
     fireEvent.click(within(sheet).getByRole("button", { name: "Open project" }));
-    expect(screen.getByRole("dialog", { name: "Open alpha" })).toBeTruthy();
-    expect(actions.startMachineProjectCli).not.toHaveBeenCalled();
+    expect(screen.getByRole("dialog", { name: "Open alpha?" })).toBeTruthy();
+    expect(actions.openProject).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    expect(actions.openProject).not.toHaveBeenCalled();
 
     fireEvent.click(screen.getByRole("button", { name: "More actions" }));
     fireEvent.click(screen.getByRole("button", { name: "Manage project" }));
@@ -941,7 +943,7 @@ describe("MobileSessionActivity", () => {
   });
 
   it("shows the server's reason for a refused message at once, and restores its draft", () => {
-    const reason = "zoo-005 is not running this project. Start it on zoo-005 first.";
+    const reason = "zoo-005 is not running this project. Open the project again to start it there.";
     const actions = seedStore({
       paneConfigs: [pane({ pane_id: 3, kind: "terminal" })],
       paneMessages: { "3": [] },
@@ -1024,17 +1026,70 @@ describe("MobileSessionActivity", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "More actions" }));
     fireEvent.click(screen.getByRole("button", { name: "Open project" }));
-    expect(actions.startMachineProjectCli).not.toHaveBeenCalled();
+    expect(actions.openProject).not.toHaveBeenCalled();
 
-    const dialog = screen.getByRole("dialog", { name: "Open alpha" });
-    expect(within(dialog).getByText(/saved panes become available again/)).toBeTruthy();
+    // This server reports neither the roster's machines nor instances, so
+    // the sheet says what the request does and names the machine it names.
+    const dialog = screen.getByRole("dialog", { name: "Open alpha?" });
+    expect(within(dialog).getByText("It starts on each online machine that has its tabs, or on builder-b when none has.")).toBeTruthy();
     fireEvent.click(within(dialog).getByRole("button", { name: "Open project" }));
 
-    expect(actions.startMachineProjectCli).toHaveBeenCalledWith(
-      "machine-b",
-      "project-a",
-      { allInstances: true },
-    );
+    // One request for the whole project (`openProject` always sends
+    // `all_instances: true`), naming the session's own host.
+    expect(actions.openProject).toHaveBeenCalledTimes(1);
+    expect(actions.openProject).toHaveBeenCalledWith("machine-b", "project-a");
+    expect(screen.queryByRole("dialog", { name: "Open alpha?" })).toBeNull();
+  });
+
+  it("says nothing was sent when the Open could not leave the browser, and keeps nothing for later", () => {
+    const openProject = vi.fn(() => false);
+    seedStore({
+      openProject,
+      sessions: [{
+        id: "session-a",
+        projectId: "project-a",
+        workingDir: "/workspace/alpha",
+        hostname: "builder-a",
+        status: "offline",
+        isActive: false,
+      }],
+      isAttached: false,
+      machines: [{
+        machine: { machineId: "machine-a", hostname: "builder-a", os: "linux", arch: "x86_64" },
+        projects: [{ projectId: "project-a", path: "/workspace/alpha", isRunning: false }],
+      }],
+    });
+    renderActivity();
+
+    fireEvent.click(screen.getByRole("button", { name: "More actions" }));
+    fireEvent.click(screen.getByRole("button", { name: "Open project" }));
+    fireEvent.click(within(screen.getByRole("dialog", { name: "Open alpha?" })).getByRole("button", { name: "Open project" }));
+
+    expect(openProject).toHaveBeenCalledTimes(1);
+    expect(screen.getByText("Not connected to the server. Nothing was sent.")).toBeTruthy();
+    expect(screen.queryByRole("dialog", { name: "Open alpha?" })).toBeNull();
+  });
+
+  it("shows the project's state in the header, from what runs while nobody has recorded one", () => {
+    seedStore();
+    const view = render(<MobileSessionActivity connected onBack={vi.fn()} onReconnect={vi.fn()} />);
+    expect(screen.getByTestId("project-open-state").textContent).toBe("Open");
+    view.unmount();
+
+    seedStore({
+      sessions: [{
+        id: "session-a",
+        projectId: "project-a",
+        workingDir: "/workspace/alpha",
+        hostname: "builder",
+        status: "offline",
+        isActive: false,
+      }],
+      isAttached: false,
+    });
+    renderActivity();
+    // Not the session's raw status word.
+    expect(screen.getByTestId("project-open-state").textContent).toBe("Closed");
   });
 
   it("does not offer Open project while the project is running", () => {
@@ -1043,6 +1098,9 @@ describe("MobileSessionActivity", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "More actions" }));
     expect(screen.queryByRole("button", { name: "Open project" })).toBeNull();
+    // This server did not negotiate the open state: never "Keep open".
+    expect(screen.queryByRole("button", { name: "Keep project open" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Open project again" })).toBeNull();
   });
 
   it("confirms before rebooting, and says the conversation survives", () => {

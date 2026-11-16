@@ -7,6 +7,7 @@ mod error;
 mod jobs;
 mod mobile_metrics;
 mod notifications;
+mod open_state;
 mod project_lifecycle;
 mod routes;
 mod session;

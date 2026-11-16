@@ -22,7 +22,7 @@ const SID = "20000000-0000-4000-8000-000000000001";
 const ZOO5 = "50000000-0000-4000-8000-000000000005";
 const ZOO6 = "50000000-0000-4000-8000-000000000006";
 const LAPTOP = "50000000-0000-4000-8000-000000000007";
-const STOPPED = "zoo-006 is not running this project. Start it on zoo-006 first.";
+const STOPPED = "zoo-006 is not running this project. Open the project again to start it there.";
 const initialStore = useStore.getInitialState();
 
 function terminal(pane_id: number, label: string, machine_id: string, hostname: string): PaneConfig {
@@ -175,7 +175,7 @@ describe("where mobile panes run", () => {
     expect(state.className.split(" ")).toEqual(expect.arrayContaining(["shrink-0", "whitespace-pre"]));
   });
 
-  it("explains a stopped machine's pane and offers to start or forget that machine", () => {
+  it("explains a stopped machine's pane and offers to forget that machine's tabs, not to start it alone", () => {
     seed(11);
     renderScreen();
     expect(screen.getByRole("button", { name: "Claude 2 · zoo-006 (stopped)" }).getAttribute("title")).toBe(STOPPED);
@@ -183,10 +183,10 @@ describe("where mobile panes run", () => {
     expect(banner).toBeTruthy();
     expect((screen.getByRole("button", { name: "Send conversation message" }) as HTMLButtonElement).disabled).toBe(true);
 
-    fireEvent.click(within(banner).getByRole("button", { name: "Start on zoo-006" }));
-    const [start] = sent("start_machine_project_cli");
-    expect(start).toEqual({ type: "start_machine_project_cli", machine_id: ZOO6, project_id: SID });
-    expectValid(start);
+    // One machine is never started alone; the banner says to open the
+    // project again.
+    expect(within(banner).queryByRole("button", { name: /^Start on/ })).toBeNull();
+    expect(sent("start_machine_project_cli")).toEqual([]);
 
     fireEvent.click(within(banner).getByRole("button", { name: "Forget zoo-006's tabs" }));
     const confirmSheet = screen.getByRole("dialog", { name: "Forget zoo-006's tabs?" });
@@ -297,6 +297,9 @@ describe("where mobile panes run", () => {
   });
 });
 
+// On a server that reports instances but records no open state: the sheet
+// names the machines from the roster. The same screen against a server that
+// records the state is in MobileSessionActivity.openState.test.tsx.
 describe("opening a stopped project", () => {
   function stoppedOn(zoo5: Partial<MachineWithProjects>) {
     // Every tab is zoo-005's. The laptop joined with no tabs and was the
@@ -317,23 +320,31 @@ describe("opening a stopped project", () => {
     fireEvent.click(screen.getByRole("button", { name: "More actions" }));
     fireEvent.click(screen.getByRole("button", { name: "Open project" }));
     // The project is named after its repository, "project".
-    return screen.getByRole("dialog", { name: "Open project" });
+    return screen.getByRole("dialog", { name: "Open project?" });
   }
 
   it("names the machine with the tabs, which is the one the server starts", () => {
     const sheet = stoppedOn({});
-    expect(sheet.textContent).toContain("Its APAS process starts on zoo-005, and its saved panes become available again.");
+    expect(Array.from(sheet.querySelectorAll("p")).map((line) => line.textContent)).toEqual(["Its tabs start on zoo-005."]);
     expect(sheet.textContent).not.toContain("laptop");
 
     fireEvent.click(within(sheet).getByRole("button", { name: "Open project" }));
-    const [start] = sent("start_machine_project_cli");
-    expect(start).toEqual({ type: "start_machine_project_cli", machine_id: LAPTOP, project_id: SID, all_instances: true });
-    expectValid(start);
+    const starts = sent("start_machine_project_cli");
+    expect(starts).toEqual([{ type: "start_machine_project_cli", machine_id: LAPTOP, project_id: SID, all_instances: true }]);
+    expectValid(starts[0]);
   });
 
   it("names the machine the request names when no machine with tabs can start", () => {
     const sheet = stoppedOn({ daemonConnected: false, projectInstancesAvailable: false });
-    expect(sheet.textContent).toContain("Its APAS process starts on laptop, and its saved panes become available again.");
+    expect(Array.from(sheet.querySelectorAll("p")).map((line) => line.textContent))
+      .toEqual(["It starts on laptop.", "zoo-005 is offline and is not started."]);
+  });
+
+  it("sends nothing when the sheet is cancelled", () => {
+    const sheet = stoppedOn({});
+    fireEvent.click(within(sheet).getByRole("button", { name: "Cancel" }));
+    expect(screen.queryByRole("dialog", { name: "Open project?" })).toBeNull();
+    expect(sent("start_machine_project_cli")).toEqual([]);
   });
 });
 

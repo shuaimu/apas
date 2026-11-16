@@ -1,4 +1,4 @@
-import type { MobileSessionSummary, SessionInstanceInfo } from "@apas/protocol";
+import type { MachineWithProjects, MobileSessionSummary, SessionInstanceInfo } from "@apas/protocol";
 
 /**
  * The machine fields of one roster entry. A live `pane_list` carries them on
@@ -8,6 +8,18 @@ import type { MobileSessionSummary, SessionInstanceInfo } from "@apas/protocol";
 export interface PaneMachineFields {
   machine_id?: string | null;
   hostname?: string | null;
+}
+
+/**
+ * A machine as the last bootstrap listed it. `connected` is the server's
+ * `daemon_connected`: that machine's daemon held a connection to the server
+ * then. This app asks for no live machine list, so the answer is as old as
+ * the last synchronization.
+ */
+export interface KnownMachine {
+  machine_id: string;
+  hostname: string;
+  connected: boolean;
 }
 
 /**
@@ -113,16 +125,51 @@ function paneOwner(
   return instances[0].machine_id ? "unknown" : instances[0];
 }
 
+/** The machines of a bootstrap, reduced to what a tab's refusal needs. */
+export function knownMachines(machines: MachineWithProjects[] | null | undefined): KnownMachine[] {
+  return (machines ?? []).map((entry) => ({
+    machine_id: entry.machine.machine_id,
+    hostname: entry.machine.hostname,
+    connected: entry.daemon_connected === true,
+  }));
+}
+
+/**
+ * Whether the machine a tab is recorded for is listed with a connected
+ * daemon. A tagged tab is matched by its machine id alone, an untagged one by
+ * the host it is shown under. A machine the list does not carry counts as not
+ * connected: the server knows a machine only once its daemon has registered,
+ * and lists it only for an account that may use it.
+ */
+export function paneMachineConnected(
+  pane: PaneMachineFields,
+  host: string | null,
+  machines: KnownMachine[],
+): boolean {
+  if (pane.machine_id) {
+    return machines.some((machine) => machine.connected && machine.machine_id === pane.machine_id);
+  }
+  return host !== null && machines.some((machine) => machine.connected && machine.hostname.trim() === host);
+}
+
 /**
  * Why a tab cannot take input here, or null when it can. A stopped machine is
- * described the way the server refuses its tabs' controls, word for word.
+ * described the way the server refuses its tabs' controls, word for word: one
+ * sentence while that machine's daemon is connected, another while it is
+ * offline. This app has no control that opens a project; the sentence says
+ * what has to happen, as the server's does.
  */
-export function paneUnavailableReason(reachability: PaneReachability, host: string | null): string | null {
+export function paneUnavailableReason(
+  reachability: PaneReachability,
+  host: string | null,
+  machineConnected: boolean,
+): string | null {
   switch (reachability) {
     case "stopped":
-      return host
-        ? `${host} is not running this project. Start it on ${host} first.`
-        : "This tab's machine is not running this project.";
+      if (!host) return "This tab's machine is not running this project.";
+      return machineConnected
+        ? `${host} is not running this project. Open the project again to start it there.`
+        : `${host} is not running this project because it is offline.`;
     case "no_access":
       return host
         ? `Your access does not cover ${host}, so this tab is read-only here.`
@@ -135,13 +182,20 @@ export function paneUnavailableReason(reachability: PaneReachability, host: stri
 /**
  * Why one tab cannot take input here, or null when it can or when nothing
  * says otherwise: a tab missing from the roster is left to the server.
- * `live` as for `paneReachability`.
+ * `live` as for `paneReachability`; `machines` as the last bootstrap listed
+ * them.
  */
 export function tabUnavailableReason(
   pane: PaneMachineFields | undefined,
   instances: SessionInstanceInfo[],
   live: boolean,
+  machines: KnownMachine[],
 ): string | null {
   if (!pane) return null;
-  return paneUnavailableReason(paneReachability(pane, instances, live), paneHostname(pane, instances));
+  const host = paneHostname(pane, instances);
+  return paneUnavailableReason(
+    paneReachability(pane, instances, live),
+    host,
+    paneMachineConnected(pane, host, machines),
+  );
 }

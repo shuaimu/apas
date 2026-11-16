@@ -13,7 +13,7 @@ function entry(extra: Partial<MachineWithProjects> = {}, projects: MachineProjec
   };
 }
 
-function renderCard(machine: MachineWithProjects, { behind = false, stoppedOpen = false } = {}) {
+function renderCard(machine: MachineWithProjects, { behind = false, stoppedOpen = false, openStateSupported = false } = {}) {
   const onToggleStopped = vi.fn();
   render(
     <MachineCard
@@ -25,9 +25,11 @@ function renderCard(machine: MachineWithProjects, { behind = false, stoppedOpen 
       pending={[]}
       stoppedOpen={stoppedOpen}
       onToggleStopped={onToggleStopped}
+      openStateSupported={openStateSupported}
+      requestConfirm={vi.fn()}
       onReboot={vi.fn()}
-      onStart={vi.fn()}
-      onStop={vi.fn()}
+      onOpen={vi.fn()}
+      onClose={vi.fn()}
     />,
   );
   return { onToggleStopped };
@@ -82,25 +84,51 @@ describe("MachineCard", () => {
     expect(screen.getByText("Providers not reported")).toBeTruthy();
   });
 
+  it("counts what this machine runs, whatever the projects' open states", () => {
+    renderCard(entry({ daemonConnected: true }, [
+      // Open, with its tabs on another machine: this machine does not run it.
+      { ...stopped("elsewhere"), openState: "open", otherHosts: [{ hostname: "zoo-006", connected: true, running: true, ownsTabs: true }] },
+      // Closed, and still running here.
+      { projectId: "s", name: "still", path: "/srv/s", isRunning: true, openState: "closed", part: "still_running" },
+      { projectId: "r", name: "running", path: "/srv/r", isRunning: true, openState: "open", part: "running" },
+    ]), { openStateSupported: true });
+    expect(screen.getByText("2 of 3 projects running")).toBeTruthy();
+    const states = Array.from(document.querySelectorAll("[data-testid=project-open-state]")).map((node) => node.textContent);
+    const parts = Array.from(document.querySelectorAll("[data-testid=machine-part]")).map((node) => node.textContent);
+    // Running rows first, then the one this machine is not running.
+    expect(states).toEqual(["Open", "Closed", "Open"]);
+    expect(parts).toEqual(["Running", "Still running", "No tabs here"]);
+  });
+
+  it("keeps a row the server says did not start out of the fold, with its reason", () => {
+    renderCard(entry({ daemonConnected: true }, [
+      stopped("a"), stopped("b"), stopped("c"), stopped("d"),
+      { ...stopped("refused"), openState: "open", part: "not_started", partReason: "zoo-005 is not allowed to run it." },
+    ]), { openStateSupported: true });
+    expect(screen.getByText("Not started: zoo-005 is not allowed to run it.")).toBeTruthy();
+    expect(screen.queryByText("a")).toBeNull();
+    expect(screen.getByRole("button", { name: "Show 4 projects not running here" })).toBeTruthy();
+  });
+
   it("says when a machine has no projects", () => {
     renderCard(entry());
     expect(screen.getByText("No projects on this machine.")).toBeTruthy();
   });
 
-  it("folds stopped projects only when there are more than three", () => {
+  it("folds the projects this machine is not running only when there are more than three", () => {
     renderCard(entry({}, [stopped("a"), stopped("b"), stopped("c")]));
-    expect(screen.queryByRole("button", { name: /stopped projects/ })).toBeNull();
+    expect(screen.queryByRole("button", { name: /projects not running here/ })).toBeNull();
     expect(screen.getByText("a")).toBeTruthy();
     cleanup();
 
     const { onToggleStopped } = renderCard(entry({}, [stopped("a"), stopped("b"), stopped("c"), stopped("d")]));
     expect(screen.queryByText("a")).toBeNull();
-    fireEvent.click(screen.getByRole("button", { name: "Show 4 stopped projects" }));
+    fireEvent.click(screen.getByRole("button", { name: "Show 4 projects not running here" }));
     expect(onToggleStopped).toHaveBeenCalledTimes(1);
     cleanup();
 
     renderCard(entry({}, [stopped("a"), stopped("b"), stopped("c"), stopped("d")]), { stoppedOpen: true });
     expect(screen.getByText("d")).toBeTruthy();
-    expect(screen.getByRole("button", { name: "Hide stopped projects" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Hide projects not running here" })).toBeTruthy();
   });
 });

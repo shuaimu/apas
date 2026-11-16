@@ -1,11 +1,19 @@
 import type { MachineProject, MachineWithProjects, SessionInfo } from "./store";
 import { primaryInstance, sameHost, type SessionInstance } from "./projectInstances";
+import type { OpenState } from "./projectOpenState";
 
 export interface MachineProjectTarget {
   machineId: string;
   projectId: string;
+  /** This one machine runs the project. It says nothing about the project
+   *  as a whole: whether that is open or closed, and what to offer, is
+   *  `buildProjectOpenModel`'s answer (`lib/projectOpenState.ts`). */
   isRunning: boolean;
   hostname?: string;
+  /** The project's recorded state as this machine's entry carries it:
+   *  "open" or "closed". Absent while nobody has recorded one, for a legacy
+   *  path match, and from an older server. */
+  openState?: OpenState;
 }
 
 /** Inspect one registered placement; visiting this URL never starts it. */
@@ -44,18 +52,24 @@ function targetOf(placement: Placement, attached: boolean): MachineProjectTarget
     // caught up with it yet.
     isRunning: placement.project.isRunning || attached,
     hostname: placement.entry.machine.hostname,
+    ...(placement.project.openState ? { openState: placement.project.openState } : {}),
   };
 }
 
 /**
- * The machine the project view's Start, Close and boot controls address.
+ * The machine the project view's Open and Close requests name.
+ *
+ * Open and Close act on the project as a whole: the server starts every
+ * machine that owns its tabs and stops every machine that runs it. The
+ * machine named here is only the one an Open starts while no machine owns a
+ * tab, and the one that places a project nothing but a registration knows.
  *
  * A project may be registered on several machines and run an instance on each,
  * so this matches by stable project identity and then prefers, in order: the
  * primary attached instance's machine, any other attached instance's, a
  * running placement, the preferred registration machine, the session's
  * recorded host, and finally hostname order, so the answer is deterministic
- * rather than `null`. Start and Close then act on the project as a whole.
+ * rather than `null`.
  *
  * Only legacy rows whose inventory knows the project under another id fall
  * back to matching the working directory, and that guess is made only when

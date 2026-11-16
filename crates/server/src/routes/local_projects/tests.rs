@@ -1251,3 +1251,59 @@ async fn closed_dispatch_channel_and_unauthenticated_requests_fail_with_correlat
     .await;
     assert!(failure(f.result("anonymous").await).contains("authenticated"));
 }
+
+/// The open-state fields of a registered entry are the server's, as on a
+/// machine list. Whatever the daemon put in them, in its inventory or in its
+/// result, is discarded, and the result carries what the server recorded
+/// for the project.
+#[tokio::test]
+async fn a_registration_result_carries_the_servers_open_state_not_the_daemons() {
+    let mut f = Fixture::new().await;
+    let lying = || MachineProjectInfo {
+        open_state: Some(shared::ProjectOpenState::Open),
+        part: Some(shared::MachinePart::Running),
+        part_reason: Some("a daemon's word".to_string()),
+        other_hosts: vec![shared::ProjectHostSummary {
+            hostname: "elsewhere".to_string(),
+            connected: true,
+            running: true,
+            owns_tabs: true,
+        }],
+        ..project("plain-no-git")
+    };
+    let wire = f.dispatch("first").await;
+    f.success(wire, lying()).await;
+    let LocalProjectRegistrationResult::Registered { project: confirmed } = f.result("first").await
+    else {
+        panic!("owner registration should succeed");
+    };
+    assert_eq!(confirmed.open_state, None, "nobody has recorded the project");
+    assert_eq!(confirmed.part, None);
+    assert_eq!(confirmed.part_reason, None);
+    assert!(confirmed.other_hosts.is_empty());
+
+    // Registering the folder again once the project is recorded closed.
+    assert!(f
+        .state
+        .db
+        .set_project_open_state(
+            "plain-no-git",
+            shared::ProjectOpenState::Closed,
+            &f.owner.to_string(),
+            shared::OpenStateSetKind::Request,
+            None,
+        )
+        .await
+        .unwrap());
+    let wire = f.dispatch("second").await;
+    f.success(wire, lying()).await;
+    let LocalProjectRegistrationResult::Registered { project: confirmed } =
+        f.result("second").await
+    else {
+        panic!("registering the same folder again should succeed");
+    };
+    assert_eq!(confirmed.open_state, Some(shared::ProjectOpenState::Closed));
+    assert_eq!(confirmed.part, None, "it owns no tab and runs nothing");
+    assert_eq!(confirmed.part_reason, None);
+    assert!(confirmed.other_hosts.is_empty());
+}

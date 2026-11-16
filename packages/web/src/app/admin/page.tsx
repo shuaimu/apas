@@ -16,6 +16,8 @@
 import { isRetiredLaunchProfileKey } from "@/lib/providerOptions";
 import { EffectivePolicy, LaunchProfile, PolicyEditor } from "@/components/PolicyEditor";
 import { AutonomousJobPolicyEditor } from "@/components/AutonomousJobPolicyEditor";
+import { useConfirmDialog } from "@/components/cluster/ConfirmDialog";
+import { STOP_RUNTIME_CLOSES_PROJECT, SUSPEND_CLOSES_PROJECT } from "@/lib/projectOpenState";
 import { useCallback, useEffect, useState } from "react";
 import { Activity, FolderOpen, RefreshCw, Server, Shield } from "lucide-react";
 
@@ -191,6 +193,9 @@ export default function SystemAdminPage() {
   const [inviteUrl, setInviteUrl] = useState("");
   const [memberUserId, setMemberUserId] = useState("");
   const [ownerUserId, setOwnerUserId] = useState("");
+  // Suspending and stopping a runtime end running agents; both ask first,
+  // in the page.
+  const { requestConfirm, confirmDialog } = useConfirmDialog();
   const [currentPassword, setCurrentPassword] = useState("");
   const [newPassword, setNewPassword] = useState("");
 
@@ -470,13 +475,40 @@ export default function SystemAdminPage() {
                   <div className="mb-3 break-all font-mono text-xs">{selectedProject.project.id}</div>
                   <div className="flex flex-wrap gap-2">
                     <button onClick={() => {
+                      const projectId = selectedProject.project.id;
                       const suspending = selectedProject.project.lifecycle_status === "active";
-                      if (suspending && !window.confirm("Suspend this project and stop its connected runtime? Project data is preserved.")) return;
-                      void mutate(`/admin/projects/${selectedProject.project.id}/lifecycle`, { method: "PATCH", body: JSON.stringify({ status: suspending ? "suspended" : "active" }) }, () => loadProject(selectedProject.project.id));
+                      const send = () => void mutate(`/admin/projects/${projectId}/lifecycle`, { method: "PATCH", body: JSON.stringify({ status: suspending ? "suspended" : "active" }) }, () => loadProject(projectId));
+                      if (!suspending) {
+                        send();
+                        return;
+                      }
+                      requestConfirm({
+                        title: "Suspend this project?",
+                        body: (
+                          <>
+                            <p>This stops its connected runtime. Project data is preserved.</p>
+                            <p>{SUSPEND_CLOSES_PROJECT}</p>
+                          </>
+                        ),
+                        confirmLabel: "Suspend project",
+                        tone: "danger",
+                        onConfirm: send,
+                      });
                     }} className="rounded-lg border border-gray-300 px-3 py-2 text-sm dark:border-gray-700">{selectedProject.project.lifecycle_status === "active" ? "Suspend project" : "Reactivate project"}</button>
                     <button onClick={() => {
-                      if (!window.confirm("Stop this project's current runtime? Project data and future access are preserved.")) return;
-                      void mutate(`/admin/projects/${selectedProject.project.id}/stop-runtime`, { method: "POST" }, () => loadProject(selectedProject.project.id));
+                      const projectId = selectedProject.project.id;
+                      requestConfirm({
+                        title: "Stop this project's current runtime?",
+                        body: (
+                          <>
+                            <p>{STOP_RUNTIME_CLOSES_PROJECT}</p>
+                            <p>Project data and future access are preserved.</p>
+                          </>
+                        ),
+                        confirmLabel: "Stop runtime",
+                        tone: "danger",
+                        onConfirm: () => void mutate(`/admin/projects/${projectId}/stop-runtime`, { method: "POST" }, () => loadProject(projectId)),
+                      });
                     }} className="rounded-lg border border-red-300 px-3 py-2 text-sm text-red-600 dark:border-red-800">Stop runtime</button>
                   </div>
                   <form className="mt-4 flex gap-2" onSubmit={(event) => { event.preventDefault(); void mutate(`/admin/projects/${selectedProject.project.id}/owner`, { method: "PATCH", body: JSON.stringify({ user_id: ownerUserId }) }, () => loadProject(selectedProject.project.id)); }}>
@@ -526,6 +558,7 @@ export default function SystemAdminPage() {
 
         {loading && <div className="mt-6 flex items-center justify-center gap-2 text-sm text-gray-500"><Activity className="h-4 w-4 animate-pulse" /> Loading…</div>}
       </div>
+      {confirmDialog}
     </main>
   );
 }

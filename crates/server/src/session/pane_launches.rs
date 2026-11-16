@@ -597,6 +597,25 @@ impl SessionManager {
         }
     }
 
+    /// The machines an instance of one of `session_ids` is being started on
+    /// for a new pane or task: a start the server sent and has not finished.
+    /// Sorted. A close stops these too.
+    pub fn machines_with_pending_instance_start(&self, session_ids: &[Uuid]) -> Vec<Uuid> {
+        let starts = self
+            .instance_starts
+            .lock()
+            .expect("instance starts poisoned");
+        let mut machines: Vec<Uuid> = starts
+            .pending
+            .iter()
+            .filter(|(key, pending)| session_ids.contains(&key.0) && pending.request_id.is_some())
+            .map(|(key, _)| key.1)
+            .collect();
+        machines.sort();
+        machines.dedup();
+        machines
+    }
+
     /// `machine_id`'s daemon connection closed or was replaced. Starts sent
     /// on it will not be answered on another, so the panes waiting on them
     /// fail now rather than at their timeout.

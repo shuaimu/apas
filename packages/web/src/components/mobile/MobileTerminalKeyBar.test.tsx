@@ -62,7 +62,7 @@ describe("MobileTerminalKeyBar", () => {
   it("disables every key, with the reason, while the pane cannot take input", () => {
     // Its machine is not running the project: the server would refuse each
     // key, and each refusal would be an error toast.
-    const reason = "zoo-006 is not running this project. Start it on zoo-006 first.";
+    const reason = "zoo-006 is not running this project. Open the project again to start it there.";
     const sendTerminalInput = vi.fn();
     act(() => {
       useStore.setState({

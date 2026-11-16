@@ -6,14 +6,12 @@ import type {
 } from "./store";
 import {
   instanceHostSummary,
-  instanceIsLegacy,
   LEGACY_MACHINE_KEY,
   projectPlacement,
-  sameHost,
   type PaneMachineFields,
   type SessionInstance,
 } from "./projectInstances";
-import { rebootToUpdateReason, type MachineChoice } from "./machineChoice";
+import type { MachineChoice } from "./machineChoice";
 
 /**
  * What the tab bar and the mobile pane chips say about where each tab runs.
@@ -26,12 +24,17 @@ import { rebootToUpdateReason, type MachineChoice } from "./machineChoice";
 /**
  * The server's refusal for a control on a tab whose machine is not running
  * the project, word for word, so a disabled control and a refused request
- * read the same.
+ * read the same. The server words it by whether that machine's daemon is
+ * connected: a connected machine is started by opening the project again,
+ * and an offline one by nothing a viewer can do. A machine this viewer
+ * cannot see reads as connected, which is what the server assumes until it
+ * knows better.
  */
-export function stoppedOnHostReason(hostname: string | undefined): string {
-  return hostname
-    ? `${hostname} is not running this project. Start it on ${hostname} first.`
-    : "This tab's machine is not running this project.";
+export function stoppedOnHostReason(hostname: string | undefined, offline = false): string {
+  if (!hostname) return "This tab's machine is not running this project.";
+  return offline
+    ? `${hostname} is not running this project because it is offline.`
+    : `${hostname} is not running this project. Open the project again to start it there.`;
 }
 
 /**
@@ -67,22 +70,18 @@ export function reconnectingOnHostReason(hostname: string): string {
  */
 export type TabHostState = "running" | "disconnected" | "stopped" | "offline" | "no_access";
 
-/** Start and forget for the tabs of a machine that is not running the
- *  project here, or whose instance is reconnecting. */
+/**
+ * What can be done about the tabs of a machine that is not running the
+ * project here, or whose instance is reconnecting: forget them. Starting one
+ * machine alone is not offered. A machine that owns tabs of an open project
+ * is started by opening the project again, which the project's own controls
+ * and its not-following notice offer (`lib/projectOpenState.ts`).
+ */
 export interface StoppedMachineActions {
   machineId: string;
   hostname: string;
-  /** The project's id in that machine's inventory: what Start sends. */
-  projectId?: string;
-  /** Why Start on <host> cannot be used now; absent when it can. Start is
-   *  not offered at all for a machine missing from the viewer's machine
-   *  list, since the viewer could not start anything there. */
-  startDisabledReason?: string;
   /** Only the project's owner may forget a machine's tabs. */
   canForget: boolean;
-  /** Whether the machine is in the viewer's machine list at all, and not
-   *  still running the project while its instance reconnects. */
-  canStart: boolean;
 }
 
 export interface TabHost {
@@ -130,31 +129,6 @@ export function sessionIsOwned(session: Pick<SessionInfo, "shareRole" | "isShare
   return session.shareRole ? session.shareRole === "owner" : session.isShared !== true;
 }
 
-function startAvailability(
-  entry: MachineWithProjects,
-  hostname: string,
-  projectIds: string[],
-  othersAttached: boolean,
-  legacy: SessionInstance | undefined,
-): { projectId?: string; reason?: string } {
-  const projectId = projectIds
-    .find((id) => entry.projects.some((project) => project.projectId === id));
-  // An attached CLI without multi-machine support owns the whole project: the
-  // server refuses another machine's instance beside it, so a Start here
-  // would only start that machine's agents and stop them again. The new-tab
-  // picker (`buildMachineChoices`) disables the same machine the same way.
-  if (legacy) return { projectId, reason: rebootToUpdateReason(legacy.hostname) };
-  if (!entry.daemonConnected) return { projectId, reason: `${hostname} is offline.` };
-  // An older daemon cannot start the project beside a running instance: the
-  // claim guard keeps it out. With nothing attached it starts as it always
-  // has.
-  if (!entry.projectInstancesAvailable && othersAttached) {
-    return { projectId, reason: rebootToUpdateReason(hostname) };
-  }
-  if (!projectId) return { reason: `This project is not registered on ${hostname}.` };
-  return { projectId };
-}
-
 export function describeTabHosts(input: TabHostsInput): TabHosts {
   const { panes, instances, machines, instancesSupported, projectIds, isOwner } = input;
   const placement = projectPlacement(panes, instances, machines);
@@ -163,7 +137,6 @@ export function describeTabHosts(input: TabHostsInput): TabHosts {
   // project look the same, and neither has anything to say per tab.
   const known = instances.length > 0 || (instancesSupported && placement.spansMachines);
   if (!known) return { tabs, spansMachines: placement.spansMachines };
-  const legacy = instances.find((instance) => instanceIsLegacy(instance, machines));
 
   for (const pane of panes) {
     const place = placement.panes.get(pane.pane_id);
@@ -187,9 +160,10 @@ export function describeTabHosts(input: TabHostsInput): TabHosts {
     ) {
       // The daemon still runs the project, so its instance lost only its own
       // connection (or has not reattached after a server restart) and comes
-      // back by itself. Calling that stopped offered a Start that can only
-      // answer "already running". The daemon's report lags a real stop by up
-      // to one heartbeat, so a stopped machine reads this way for that long.
+      // back by itself. Calling that stopped would tell the user to open a
+      // project that is running there. The daemon's report lags a real stop
+      // by up to one heartbeat, so a stopped machine reads this way for that
+      // long.
       state = "disconnected";
     } else {
       state = "stopped";
@@ -200,27 +174,17 @@ export function describeTabHosts(input: TabHostsInput): TabHosts {
         ? noRuntimeAccessReason(hostname ?? place.instance?.hostname ?? "that machine")
         : state === "disconnected"
           ? reconnectingOnHostReason(hostname ?? entry?.machine.hostname ?? "This tab's machine")
-          : stoppedOnHostReason(hostname);
+          : stoppedOnHostReason(hostname, state === "offline");
 
     let stopped: StoppedMachineActions | undefined;
     if ((state === "stopped" || state === "offline" || state === "disconnected") && place.machineId && hostname) {
-      // A machine still running the project has nothing to start. It can be
-      // forgotten all the same: the server sees no instance there, and a
-      // daemon that dropped silently (a laptop gone to sleep) keeps reading
-      // as connected and running until its socket errors, which can take
-      // hours. Forgetting touches only the roster, and its tabs come back
-      // when that machine reports them again.
-      const start = entry && state !== "disconnected"
-        ? startAvailability(entry, hostname, projectIds, instances.length > 0, legacy)
-        : undefined;
-      stopped = {
-        machineId: place.machineId,
-        hostname,
-        projectId: start?.projectId,
-        startDisabledReason: start?.reason,
-        canStart: Boolean(entry) && state !== "disconnected",
-        canForget: isOwner,
-      };
+      // A machine whose instance is reconnecting can be forgotten all the
+      // same: the server sees no instance there, and a daemon that dropped
+      // silently (a laptop gone to sleep) keeps reading as connected and
+      // running until its socket errors, which can take hours. Forgetting
+      // touches only the roster, and its tabs come back when that machine
+      // reports them again.
+      stopped = { machineId: place.machineId, hostname, canForget: isOwner };
     }
 
     tabs.set(pane.pane_id, {
@@ -233,34 +197,6 @@ export function describeTabHosts(input: TabHostsInput): TabHosts {
     });
   }
   return { tabs, spansMachines: placement.spansMachines };
-}
-
-/**
- * The hosts the project view's Open starts, as the server picks them for a
- * project-wide Start: each machine that owns tabs of the project (an untagged
- * tab counts for the machine its attributed host names), lists `projectId`,
- * is online, and can run an instance beside others. Empty when none
- * qualifies; the server then starts only the machine the request names.
- * Tabs never move between machines, so this is not necessarily the host the
- * session last recorded: an instance with no tabs may have been the last
- * primary.
- */
-export function projectStartHosts(input: {
-  panes: PaneMachineFields[];
-  machines: MachineWithProjects[];
-  /** The id the Start request sends, as the machines' inventory knows it. */
-  projectId: string;
-}): string[] {
-  const { panes, machines, projectId } = input;
-  return machines
-    .filter((entry) => entry.daemonConnected
-      && entry.projectInstancesAvailable
-      && entry.projects.some((project) => project.projectId === projectId)
-      && panes.some((pane) => pane.machine_id
-        ? pane.machine_id === entry.machine.machineId
-        : sameHost(pane.hostname, entry.machine.hostname)))
-    .map((entry) => entry.machine.hostname)
-    .sort((a, b) => a.localeCompare(b));
 }
 
 /** "zoo-005", "zoo-005 and zoo-006", "zoo-005, zoo-006 and zoo-007". */
@@ -352,14 +288,21 @@ export interface MachineChoiceGroup {
 
 /**
  * The machine step's groups, in the order `buildMachineChoices` ranks them:
- * machines running the project, machines where it is registered (started
- * first), owned machines to clone onto, then unavailable machines with their
- * reasons. Empty groups are left out.
+ * machines running the project, machines where it is registered, owned
+ * machines to clone onto, then unavailable machines with their reasons.
+ * Empty groups are left out.
+ *
+ * A tab on a registered machine that is not running the project opens the
+ * project: the server starts every machine that owns its tabs, then adds the
+ * tab. Against a server that records no open state it starts that machine
+ * alone, as it always did, and the group keeps its old name. The choices say
+ * which (`MachineChoice.alsoStarts`).
  */
 export function groupMachineChoices(choices: MachineChoice[]): MachineChoiceGroup[] {
+  const opensProject = choices.some((choice) => choice.kind === "registered" && choice.alsoStarts !== undefined);
   const groups: MachineChoiceGroup[] = [
     { key: "instance", label: "Running", choices: [] },
-    { key: "registered", label: "Starts the project first", choices: [] },
+    { key: "registered", label: opensProject ? "Opens the project" : "Starts the project first", choices: [] },
     { key: "clone", label: "Clone here", choices: [] },
     { key: "unavailable", label: "Unavailable", choices: [] },
   ];
@@ -378,7 +321,10 @@ export function machineChoiceDetail(choice: MachineChoice): string {
     case "instance":
       return choice.primary ? "Running this project · primary" : "Running this project";
     case "registered":
-      return "Registered · the project starts there, then the tab opens";
+      if (choice.alsoStarts === undefined) return "Registered · the project starts there, then the tab opens";
+      return choice.alsoStarts.length > 0
+        ? `Registered · opens the project, which also starts its tabs on ${hostList(choice.alsoStarts)}, then the tab opens`
+        : "Registered · opens the project, then the tab opens";
     case "clone":
       return "Not there yet · clone the repository, then start it";
   }

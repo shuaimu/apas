@@ -178,7 +178,7 @@ export function CreateInstanceModal({ open, onClose, gitRemote, cloneUrl, cluste
               <p className="font-medium">Folder registered</p>
               <p className="break-all font-mono text-sm">{registered.path}</p>
               <p className="text-sm text-gray-500">
-                {registered.isRunning ? "This project was already running; its runtime is unchanged." : "The project is stopped. Use Start on Machines when you are ready. Saved agents only run when you explicitly start the project."}
+                {registered.isRunning ? "This project was already running; its runtime is unchanged." : "Nothing was started. Opening the project is a separate step: use Open on the Machines page when you are ready. Its saved agents run only once the project is open."}
               </p>
               <a className="inline-block rounded bg-emerald-600 px-3 py-2 text-sm text-white"
                 href={machineProjectHref({ machineId: operation!.machineId, projectId: registered.projectId, clusterOwnerUserId: operation?.clusterOwnerUserId })}>
@@ -232,7 +232,7 @@ export function CreateInstanceModal({ open, onClose, gitRemote, cloneUrl, cluste
                       className="w-full rounded border border-gray-300 bg-white px-3 py-2 font-mono text-xs dark:border-gray-600 dark:bg-gray-700" />
                   </Field>
                   <p id="local-folder-help" className="text-xs text-gray-500">
-                    Use an absolute path or ~/ relative to the daemon user&apos;s home on {selectedMachine?.machine.hostname}. The folder must already exist. Registration does not start projects or agents; Start is a separate action on Machines.
+                    Use an absolute path or ~/ relative to the daemon user&apos;s home on {selectedMachine?.machine.hostname}. The folder must already exist. Registration does not open the project or start agents; Open is a separate action on Machines.
                   </p>
                   {path && !validPath && <p role="alert" className="text-sm text-red-600">Use an absolute path or a path starting with ~/.</p>}
                 </>

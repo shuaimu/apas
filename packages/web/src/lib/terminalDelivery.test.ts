@@ -23,7 +23,7 @@ describe("terminal delivery recovery", () => {
   });
 
   it("reports a refused send with its reason at once, never as unconfirmed", () => {
-    const refused = { ...pending, id: "send-2", error: "zoo-005 is not running this project. Start it on zoo-005 first." };
+    const refused = { ...pending, id: "send-2", error: "zoo-005 is not running this project. Open the project again to start it there." };
     expect(unconfirmedDeliveries([pending, refused], pending.sentAt + DELIVERY_GRACE_MS)).toEqual([pending]);
     expect(refusedDeliveries([pending, refused])).toEqual([refused]);
     saveTerminalDeliveries([refused]);

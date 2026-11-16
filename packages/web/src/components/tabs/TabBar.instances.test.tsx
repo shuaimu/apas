@@ -1,10 +1,16 @@
 import { act, fireEvent, render, screen, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { TabBar } from "./TabBar";
+import { TabBar, type ProjectControls } from "./TabBar";
 import { useStore, type CliLifecycleInventory, type MachineWithProjects, type PaneConfig } from "@/lib/store";
 import { buildMachineChoices, type MachineChoiceModel } from "@/lib/machineChoice";
 import type { SessionInstance } from "@/lib/projectInstances";
 import { describeTabHosts, instanceRebootTargets, type RebootTarget, type TabHost } from "@/lib/tabHosts";
+import {
+  buildProjectOpenModel,
+  type ProjectMachinePartInfo,
+  type ProjectOpenModelInput,
+  type ProjectOpenReport,
+} from "@/lib/projectOpenState";
 
 /**
  * The tab bar of a project whose tabs run on several machines. The host
@@ -65,7 +71,6 @@ function renderBar(props: Partial<Parameters<typeof TabBar>[0]> = {}) {
     onSelectTab: vi.fn(),
     onCloseTab: vi.fn(),
     onAddTab: vi.fn(),
-    onStartMachine: vi.fn(),
     onForgetMachine: vi.fn(),
     onRebootCli: vi.fn(),
   };
@@ -134,7 +139,7 @@ describe("host badges", () => {
       ),
     });
     const stopped = tabElement(container, 2);
-    const reason = "zoo-006 is not running this project. Start it on zoo-006 first.";
+    const reason = "zoo-006 is not running this project. Open the project again to start it there.";
     expect(stopped.getAttribute("title")).toBe(reason);
     // Named with its host's state, and the state is in words, not only colour.
     expect(screen.getByRole("button", { name: "Claude 2 — zoo-006 is not running this project" })).toBe(stopped);
@@ -161,8 +166,8 @@ describe("host badges", () => {
 });
 
 describe("a stopped machine's tab menu", () => {
-  it("offers Start on <host> and Forget <host>'s tabs, and disables pane controls with the reason", () => {
-    const { container, onStartMachine, onForgetMachine, onCloseTab } = renderBar({
+  it("offers Forget <host>'s tabs but no Start on <host>, and disables pane controls with the reason", () => {
+    const { container, onForgetMachine, onCloseTab } = renderBar({
       onRenameTab: vi.fn(),
       tabHosts: hostsFor(
         [instance(ZOO5, "zoo-005", { primary: true })],
@@ -170,23 +175,23 @@ describe("a stopped machine's tab menu", () => {
       ),
     });
     fireEvent.contextMenu(tabElement(container, 2));
-    expect(screen.getByText("zoo-006 is not running this project. Start it on zoo-006 first.")).toBeTruthy();
+    expect(screen.getByText("zoo-006 is not running this project. Open the project again to start it there.")).toBeTruthy();
     expect((screen.getByRole("button", { name: "Rename" }) as HTMLButtonElement).disabled).toBe(true);
     const close = screen.getByRole("button", { name: "Close" }) as HTMLButtonElement;
     expect(close.disabled).toBe(true);
     fireEvent.click(close);
     expect(onCloseTab).not.toHaveBeenCalled();
 
-    fireEvent.click(screen.getByRole("button", { name: "Start on zoo-006" }));
-    expect(onStartMachine).toHaveBeenCalledWith(ZOO6, PROJECT, "zoo-006");
+    // One machine is never started alone: opening the project again is
+    // what starts it, and the refusal above says so.
+    expect(screen.queryByRole("button", { name: /^Start on/ })).toBeNull();
 
-    fireEvent.contextMenu(tabElement(container, 2));
     fireEvent.click(screen.getByRole("button", { name: "Forget zoo-006's tabs…" }));
     expect(onForgetMachine).toHaveBeenCalledWith(ZOO6, "zoo-006");
   });
 
-  it("disables Start on <host> with the reason when that machine cannot start it", () => {
-    const { container, onStartMachine } = renderBar({
+  it("says an offline machine's tabs wait for it, with no Start on <host>", () => {
+    const { container } = renderBar({
       tabHosts: hostsFor(
         [instance(ZOO5, "zoo-005", { primary: true })],
         [machine(ZOO5, "zoo-005"), machine(ZOO6, "zoo-006", { daemonConnected: false })],
@@ -194,11 +199,8 @@ describe("a stopped machine's tab menu", () => {
       ),
     });
     fireEvent.contextMenu(tabElement(container, 2));
-    const start = screen.getByRole("button", { name: "Start on zoo-006" }) as HTMLButtonElement;
-    expect(start.disabled).toBe(true);
-    expect(start.title).toBe("zoo-006 is offline.");
-    fireEvent.click(start);
-    expect(onStartMachine).not.toHaveBeenCalled();
+    expect(screen.getByText("zoo-006 is not running this project because it is offline.")).toBeTruthy();
+    expect(screen.queryByRole("button", { name: /^Start on/ })).toBeNull();
     // Only the owner may forget a machine's tabs.
     expect(screen.queryByRole("button", { name: /^Forget/ })).toBeNull();
   });
@@ -318,6 +320,39 @@ describe("the new-tab machine step", () => {
     expect(onAddTab).toHaveBeenCalledWith(
       "claude", undefined, undefined, "terminal",
       expect.objectContaining({ machineId: ZOO5, kind: "registered" }),
+    );
+  });
+
+  it("says a tab on a machine that is not running opens the project, naming the other machines", () => {
+    // Against a server that records open states, a tab on laptop opens the
+    // project, which also starts zoo-006's tabs.
+    const laptop = machine(LAPTOP, "laptop");
+    const { onAddTab } = renderBar({
+      machineChoices: choices({
+        machines: [machine(ZOO5, "zoo-005"), machine(ZOO6, "zoo-006"), laptop],
+        canClone: false,
+        openStateSupported: true,
+        projectMachines: [
+          { machineId: ZOO5, hostname: "zoo-005", part: "running", ownsTabs: true, connected: true },
+          { machineId: ZOO6, hostname: "zoo-006", part: "not_started", ownsTabs: true, connected: true },
+        ],
+      }),
+    });
+    openInteractive();
+    const step = screen.getByRole("group", { name: "Run on" });
+    expect(within(step).queryByRole("group", { name: "Starts the project first" })).toBeNull();
+    const opens = within(step).getByRole("group", { name: "Opens the project" });
+    expect(within(opens).getByText(
+      "Registered · opens the project, which also starts its tabs on zoo-006, then the tab opens",
+    )).toBeTruthy();
+    // zoo-006 itself starts no other machine: zoo-005 already runs it.
+    expect(within(opens).getByText("Registered · opens the project, then the tab opens")).toBeTruthy();
+
+    fireEvent.click(within(opens).getByRole("radio", { name: /^laptop/ }));
+    fireEvent.click(screen.getByText("Claude"));
+    expect(onAddTab).toHaveBeenCalledWith(
+      "claude", undefined, undefined, "terminal",
+      expect.objectContaining({ machineId: LAPTOP, kind: "registered", alsoStarts: ["zoo-006"] }),
     );
   });
 
@@ -538,18 +573,231 @@ describe("rebooting one machine's instance", () => {
 });
 
 describe("opening and closing a project on several machines", () => {
-  it("says Open and Close act on every machine", () => {
-    const confirm = vi.spyOn(window, "confirm").mockReturnValue(false);
-    renderBar({
-      multiMachine: true,
-      showBootButton: true,
-      onBootCli: vi.fn(),
-      showCloseProjectButton: true,
-      onCloseProject: vi.fn(),
+  const NOTHING_DELETED = "Nothing is deleted. Its tabs come back when you open it again.";
+
+  function part(
+    machineId: string,
+    hostname: string,
+    state: ProjectMachinePartInfo["part"],
+    overrides: Partial<ProjectMachinePartInfo> = {},
+  ): ProjectMachinePartInfo {
+    return { machineId, hostname, part: state, ownsTabs: true, connected: true, ...overrides };
+  }
+
+  /** The controls the project view builds for a server report. */
+  function controlsFor(
+    report: Partial<ProjectOpenReport> | undefined,
+    overrides: Partial<ProjectOpenModelInput> = {},
+    extra: Partial<ProjectControls> = {},
+  ) {
+    const model = buildProjectOpenModel({
+      supported: true,
+      projectIds: [PROJECT],
+      projectName: "apas",
+      report: report ? { projectId: PROJECT, machines: [], ...report } : undefined,
+      // The session list carries the same state as the frame; a frame that
+      // disagrees with it is not used.
+      session: { openState: report?.state },
+      machines: [machine(ZOO5, "zoo-005"), machine(ZOO6, "zoo-006")],
+      target: { machineId: ZOO5, projectId: PROJECT, hostname: "zoo-005" },
+      ...overrides,
     });
-    fireEvent.click(screen.getByTitle("Open this project"));
-    expect(String(confirm.mock.calls[0][0])).toContain("each online machine that has its tabs");
-    fireEvent.click(screen.getByTitle("Close this project and shut down its agents"));
-    expect(String(confirm.mock.calls[1][0])).toContain("on every machine running it");
+    const onOpen = vi.fn();
+    const onClose = vi.fn();
+    const view = renderBar({
+      projectControls: {
+        recordedState: model.recorded ? model.stateLabel : undefined,
+        openAction: model.openAction,
+        closeAction: model.closeAction,
+        onOpen,
+        onClose,
+        ...extra,
+      },
+    });
+    return { ...view, model, onOpen, onClose };
+  }
+
+  function dialogLines(): (string | null)[] {
+    return Array.from(screen.getByRole("dialog").querySelectorAll("p")).map((line) => line.textContent);
+  }
+
+  function projectButtons(): string[] {
+    return ["Open", "Keep open", "Open again", "Close", "Close again"]
+      .filter((name) => screen.queryByRole("button", { name }) !== null);
+  }
+
+  it("offers Open for a closed project and names the machines whose tabs start", () => {
+    const confirm = vi.spyOn(window, "confirm").mockReturnValue(false);
+    const { onOpen } = controlsFor({
+      state: "closed",
+      machines: [part(ZOO5, "zoo-005", "not_started"), part(ZOO6, "zoo-006", "not_started")],
+    });
+    expect(projectButtons()).toEqual(["Open"]);
+    expect(screen.getByTestId("project-open-state").textContent).toBe("Closed");
+
+    fireEvent.click(screen.getByRole("button", { name: "Open" }));
+    expect(screen.getByRole("dialog", { name: "Open apas?" })).toBeTruthy();
+    expect(dialogLines()).toEqual(["Its tabs start on zoo-005 and zoo-006."]);
+    expect(onOpen).not.toHaveBeenCalled();
+    fireEvent.click(within(screen.getByRole("dialog")).getByRole("button", { name: "Open" }));
+    expect(onOpen).toHaveBeenCalledTimes(1);
+    expect(confirm).not.toHaveBeenCalled();
+  });
+
+  it("says of an offline tab owner that its tabs start when it reconnects", () => {
+    controlsFor({
+      state: "closed",
+      machines: [part(ZOO5, "zoo-005", "not_started"), part(ZOO6, "zoo-006", "not_started", { connected: false })],
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Open" }));
+    expect(dialogLines()).toEqual([
+      "Its tabs start on zoo-005.",
+      "zoo-006 is offline. Its tabs start when zoo-006 reconnects.",
+    ]);
+  });
+
+  it("offers only Close for an open project that every tab owner runs, naming the machines", () => {
+    const confirm = vi.spyOn(window, "confirm").mockReturnValue(false);
+    const { onClose } = controlsFor({
+      state: "open",
+      machines: [part(ZOO5, "zoo-005", "running"), part(ZOO6, "zoo-006", "running")],
+    });
+    expect(projectButtons()).toEqual(["Close"]);
+    expect(screen.getByTestId("project-open-state").textContent).toBe("Open");
+
+    fireEvent.click(screen.getByRole("button", { name: "Close" }));
+    expect(screen.getByRole("dialog", { name: "Close apas?" })).toBeTruthy();
+    expect(dialogLines()).toEqual(["This stops its agents on zoo-005 and zoo-006.", NOTHING_DELETED]);
+
+    // Declining stops nothing.
+    fireEvent.click(within(screen.getByRole("dialog")).getByRole("button", { name: "Cancel" }));
+    expect(onClose).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByRole("button", { name: "Close" }));
+    fireEvent.click(within(screen.getByRole("dialog")).getByRole("button", { name: "Close" }));
+    expect(onClose).toHaveBeenCalledTimes(1);
+    expect(confirm).not.toHaveBeenCalled();
+  });
+
+  it("puts the autopilot note before the line that says nothing is deleted", () => {
+    const note = "Claude 1 is on autopilot. Its autopilot comes back paused when the project is opened again.";
+    controlsFor(
+      { state: "open", machines: [part(ZOO5, "zoo-005", "running")] },
+      {},
+      { closeNote: note },
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Close" }));
+    expect(dialogLines()).toEqual(["This stops its agents on zoo-005.", note, NOTHING_DELETED]);
+  });
+
+  it("offers Open again and Close while a connected tab owner is not running an open project", () => {
+    controlsFor({
+      state: "open",
+      machines: [
+        part(ZOO5, "zoo-005", "running"),
+        part(ZOO6, "zoo-006", "not_started", { reason: "zoo-006 refused the start." }),
+      ],
+    });
+    expect(projectButtons()).toEqual(["Open again", "Close"]);
+    // No control starts or stops one machine alone.
+    expect(screen.queryByRole("button", { name: /zoo-006/ })).toBeNull();
+
+    fireEvent.click(screen.getByRole("button", { name: "Open again" }));
+    expect(screen.getByRole("dialog", { name: "Open apas again?" })).toBeTruthy();
+    expect(dialogLines()).toEqual(["zoo-005 already runs it.", "Its tabs start on zoo-006."]);
+  });
+
+  it("does not offer Open again for a machine that is only waiting to reconnect", () => {
+    controlsFor({
+      state: "open",
+      machines: [
+        part(ZOO5, "zoo-005", "running"),
+        part(ZOO6, "zoo-006", "waiting_offline", { connected: false }),
+      ],
+    });
+    expect(projectButtons()).toEqual(["Close"]);
+  });
+
+  it("offers Open again and Close for an open project that runs nowhere", () => {
+    controlsFor({ state: "open", machines: [part(ZOO5, "zoo-005", "not_started")] });
+    expect(projectButtons()).toEqual(["Open again", "Close"]);
+  });
+
+  it("offers Keep open, with what it changes, for a running project nobody has recorded", () => {
+    const { onOpen } = controlsFor({
+      machines: [part(ZOO5, "zoo-005", "running"), part(ZOO6, "zoo-006", "running")],
+    });
+    expect(projectButtons()).toEqual(["Keep open", "Close"]);
+    // Nobody has recorded a state, so none is shown as recorded.
+    expect(screen.queryByTestId("project-open-state")).toBeNull();
+    const sentence = "Its tabs start again on zoo-005 and zoo-006 after those machines have been away.";
+    const keep = screen.getByRole("button", { name: "Keep open" });
+    expect(keep.getAttribute("title")).toBe(sentence);
+
+    fireEvent.click(keep);
+    expect(screen.getByRole("dialog", { name: "Keep apas open?" })).toBeTruthy();
+    expect(dialogLines()).toEqual(["This records the project as open. Nothing starts now.", sentence]);
+    fireEvent.click(within(screen.getByRole("dialog")).getByRole("button", { name: "Keep open" }));
+    expect(onOpen).toHaveBeenCalledTimes(1);
+  });
+
+  it("offers Open and Close for a project nobody has recorded that runs on one of two machines", () => {
+    controlsFor({
+      machines: [part(ZOO5, "zoo-005", "running"), part(ZOO6, "zoo-006", "not_started")],
+    });
+    expect(projectButtons()).toEqual(["Open", "Close"]);
+    fireEvent.click(screen.getByRole("button", { name: "Open" }));
+    expect(dialogLines()).toEqual([
+      "zoo-005 already runs it.",
+      "Its tabs start on zoo-006.",
+      "Its tabs start again on zoo-005 and zoo-006 after those machines have been away.",
+    ]);
+  });
+
+  it("offers Close again while a machine still runs a closed project", () => {
+    controlsFor({
+      state: "closed",
+      machines: [
+        part(ZOO5, "zoo-005", "not_started"),
+        part(ZOO6, "zoo-006", "still_running", { reason: "The account that closed it may not use zoo-006." }),
+      ],
+    });
+    expect(projectButtons()).toEqual(["Open", "Close again"]);
+    fireEvent.click(screen.getByRole("button", { name: "Close again" }));
+    expect(screen.getByRole("dialog", { name: "Close apas again?" })).toBeTruthy();
+    const lines = dialogLines();
+    expect(lines[0]).toBe("zoo-006 still runs this project.");
+    expect(lines.at(-1)).toBe(NOTHING_DELETED);
+  });
+
+  it("never offers Keep open against a server that records no open state", () => {
+    // No frame and no capability: the project is shown from what runs.
+    controlsFor(undefined, {
+      supported: false,
+      session: { isActive: true },
+      panes: TABS,
+      instances: [instance(ZOO5, "zoo-005", { primary: true }), instance(ZOO6, "zoo-006")],
+    });
+    expect(projectButtons()).toEqual(["Close"]);
+    expect(screen.queryByTestId("project-open-state")).toBeNull();
+  });
+
+  it("offers Delete project… only where the project view passes it, and closing never calls it", () => {
+    const onDelete = vi.fn();
+    const report = { state: "open" as const, machines: [part(ZOO5, "zoo-005", "running")] };
+    const owner = controlsFor(report, {}, { onDelete });
+    fireEvent.click(screen.getByRole("button", { name: "Close" }));
+    fireEvent.click(within(screen.getByRole("dialog")).getByRole("button", { name: "Close" }));
+    expect(owner.onClose).toHaveBeenCalledTimes(1);
+    expect(onDelete).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByRole("button", { name: "Delete project…" }));
+    expect(onDelete).toHaveBeenCalledTimes(1);
+    // Deleting is its own dialog, which the project view owns.
+    expect(screen.queryByRole("dialog")).toBeNull();
+    owner.unmount();
+
+    controlsFor(report);
+    expect(screen.queryByRole("button", { name: /Delete/ })).toBeNull();
   });
 });

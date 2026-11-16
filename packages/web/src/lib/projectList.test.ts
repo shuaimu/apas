@@ -1,5 +1,12 @@
 import { describe, expect, it } from "vitest";
-import { buildProjectList, groupProjectsByRepo, NO_REMOTE_KEY, projectHue, projectInitials } from "./projectList";
+import {
+  buildProjectList,
+  groupProjectsByRepo,
+  NO_REMOTE_KEY,
+  projectHue,
+  projectInitials,
+  projectStateLabel,
+} from "./projectList";
 import type { MachineWithProjects, SessionInfo } from "./store";
 
 describe("projectInitials", () => {
@@ -216,5 +223,78 @@ describe("repository grouping", () => {
       [],
     );
     expect(project.instances).toBe(instances);
+  });
+});
+
+describe("a project's open state", () => {
+  function session(id: string, overrides: Partial<SessionInfo> = {}): SessionInfo {
+    return { id, projectId: id, workingDir: `/work/${id}`, status: "active", createdAt: "2026-11-16T00:00:00Z", ...overrides };
+  }
+  function host(machineId: string, hostname: string, projects: MachineWithProjects["projects"]): MachineWithProjects {
+    return { machine: { machineId, hostname, os: "linux", arch: "x64" }, clusterAccess: "owner", projects };
+  }
+  const byId = (projects: ReturnType<typeof buildProjectList>) =>
+    Object.fromEntries(projects.map((project) => [project.projectId, project]));
+
+  it("words the recorded state as Open or Closed, whatever runs", () => {
+    const projects = byId(buildProjectList([
+      // Open, and its machine is still starting it: nothing runs yet.
+      session("open-idle", { openState: "open", isActive: false }),
+      // Closed, and a machine that could not be stopped still runs it.
+      session("closed-running", { openState: "closed", isActive: true }),
+    ], [], []));
+    expect(projects["open-idle"]).toMatchObject({ openState: "open", openStateRecorded: true, isActive: false });
+    expect(projectStateLabel(projects["open-idle"])).toBe("Open");
+    // `isActive` stays what runs, so its tabs keep their real status.
+    expect(projects["closed-running"]).toMatchObject({ openState: "closed", openStateRecorded: true, isActive: true });
+    expect(projectStateLabel(projects["closed-running"])).toBe("Closed");
+  });
+
+  it("shows a project nobody has recorded from what runs, as before", () => {
+    const projects = byId(buildProjectList(
+      [session("running", { isActive: true }), session("stopped", { isActive: false }), session("elsewhere")],
+      [],
+      [host("m1", "zoo-005", [{ projectId: "elsewhere", path: "/work/elsewhere", isRunning: true }])],
+    ));
+    expect(projects.running).toMatchObject({ openState: "open", openStateRecorded: false });
+    expect(projects.stopped).toMatchObject({ openState: "closed", openStateRecorded: false });
+    // Any machine running it makes it open.
+    expect(projects.elsewhere).toMatchObject({ openState: "open", openStateRecorded: false, isActive: true });
+    expect(projectStateLabel(projects.stopped)).toBe("Closed");
+  });
+
+  it("takes the state of a registration-only project from the machine list", () => {
+    const projects = byId(buildProjectList([], [], [
+      host("m1", "zoo-005", [
+        { projectId: "kept-open", path: "/work/kept-open", isRunning: false, openState: "open", part: "not_started" },
+        { projectId: "never-ran", path: "/work/never-ran", isRunning: false },
+        { projectId: "runs", path: "/work/runs", isRunning: true, part: "running" },
+      ]),
+      // Another machine's entry for the same project carries the same state.
+      host("m2", "zoo-006", [{ projectId: "kept-open", path: "/work/kept-open", isRunning: false, openState: "open" }]),
+    ]));
+    expect(projects["kept-open"]).toMatchObject({ sessionId: null, openState: "open", openStateRecorded: true, isActive: false });
+    expect(projects["never-ran"]).toMatchObject({ openState: "closed", openStateRecorded: false });
+    expect(projects.runs).toMatchObject({ openState: "open", openStateRecorded: false });
+  });
+
+  it("lets a machine entry record the state of a session whose own entry lacks it", () => {
+    const [project] = buildProjectList(
+      [session("p", { isActive: true })],
+      [],
+      [host("m1", "zoo-005", [{ projectId: "p", path: "/work/p", isRunning: true, openState: "closed", part: "still_running" }])],
+    );
+    expect(project).toMatchObject({ openState: "closed", openStateRecorded: true, isActive: true });
+  });
+
+  it("never turns a shared machine's entry into a project row, with or without a state", () => {
+    const shared: MachineWithProjects = {
+      ...host("m1", "zoo-005", [
+        { projectId: "theirs", path: "/work/theirs", isRunning: true },
+        { projectId: "theirs-too", path: "/work/theirs-too", isRunning: false, openState: "open" },
+      ]),
+      clusterAccess: "member",
+    };
+    expect(buildProjectList([], [], [shared])).toEqual([]);
   });
 });

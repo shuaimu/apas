@@ -47,6 +47,15 @@ import { AutopilotControl } from "./AutopilotControl";
 import { LoopPromptControl } from "./LoopPromptControl";
 import { LOOP_PROMPT_OFFLINE_TEXT, paneCanHaveLoopPrompt } from "@/lib/loopPrompt";
 import { AutopilotRequestNotices, AutopilotStatusLine } from "./AutopilotStatus";
+import {
+  buildProjectOpenModel,
+  NOTHING_SENT_TEXT,
+  openStateNegotiated,
+  selectProjectOpenReport,
+} from "@/lib/projectOpenState";
+import { projectNameFor } from "@/lib/projectList";
+import { DeleteProjectDialog } from "../project/DeleteProjectDialog";
+import { ProjectOpenNotice } from "./ProjectOpenNotice";
 
 // xterm.js touches `document` at import time, so it can't be part of the
 // server bundle. Loading it lazily also keeps the ~300 KB emulator out of
@@ -433,8 +442,8 @@ export function TabbedView({
   const updatePaneModel = useStore((s) => s.updatePaneModel);
   const interruptPane = useStore((s) => s.interruptPane);
   const reorderPanes = useStore((s) => s.reorderPanes);
-  const startMachineProjectCli = useStore((s) => s.startMachineProjectCli);
-  const stopMachineProjectCli = useStore((s) => s.stopMachineProjectCli);
+  const openProject = useStore((s) => s.openProject);
+  const closeProject = useStore((s) => s.closeProject);
   const rebootCli = useStore((s) => s.rebootCli);
   const cloneAndAddPane = useStore((s) => s.cloneAndAddPane);
   const dismissAddPaneRequest = useStore((s) => s.dismissAddPaneRequest);
@@ -448,6 +457,9 @@ export function TabbedView({
   // unchanged set keeps its identity.
   const instances = useStore((s) => selectSessionInstances(s, s.sessionId));
   const instancesSupported = useStore(instancesNegotiated);
+  // Whether the server records a project's open state. Without it the
+  // project is shown from what runs, as before.
+  const openStateSupported = useStore(openStateNegotiated);
   const lifecycleInventoriesByMachine = useStore((s) =>
     s.sessionId ? s.cliLifecycleInventories[s.sessionId] : undefined,
   );
@@ -588,11 +600,45 @@ export function TabbedView({
     isOwner: sessionIsOwned(currentSession),
   }), [currentSession, effectiveTabs, instances, instancesSupported, machines, sessionId]);
 
+  // The project's open state as the server reports it: the state to show,
+  // the Open and Close to offer with their confirmations, and the machines
+  // that are not following. From a server that records no state it is
+  // derived from what runs, and "Keep open" is never offered.
+  const projectOpenReport = useStore((s) => selectProjectOpenReport(s, [currentSession?.projectId, sessionId]));
+  const projectName = currentSession ? projectNameFor(currentSession) : undefined;
+  const projectOpenModel = useMemo(() => buildProjectOpenModel({
+    supported: openStateSupported,
+    projectIds: [currentSession?.projectId, sessionId],
+    projectName,
+    report: projectOpenReport,
+    session: currentSession ?? null,
+    // Only a roster the server sent says which machines own tabs, and only
+    // a server that reports instances says which of them run the project.
+    panes: paneListReceived && instancesSupported ? paneConfigs : undefined,
+    instances: instancesSupported ? instances : undefined,
+    machines,
+    target: bootTarget,
+    isOwner: sessionIsOwned(currentSession),
+  }), [
+    bootTarget,
+    currentSession,
+    instances,
+    instancesSupported,
+    machines,
+    openStateSupported,
+    paneConfigs,
+    paneListReceived,
+    projectName,
+    projectOpenReport,
+    sessionId,
+  ]);
+
   const selectedTabConfig = activeTabId != null
     ? effectiveTabs.find((tab) => tab.pane_id === activeTabId)
     : undefined;
   // The new-tab menu's machine step; a new tab defaults to the selected tab's
-  // machine.
+  // machine. A tab on a machine that is not running the project opens the
+  // project, and the step names the other machines that start with it.
   const machineChoices = useMemo(() => buildMachineChoices({
     projectId: currentSession?.projectId ?? sessionId ?? "",
     instances,
@@ -601,7 +647,19 @@ export function TabbedView({
     canClone: sessionCanCloneJoin(currentSession),
     selectedPane: selectedTabConfig ?? null,
     fallbackMachineId: bootTarget?.machineId,
-  }), [bootTarget?.machineId, currentSession, instances, instancesSupported, machines, selectedTabConfig, sessionId]);
+    openStateSupported,
+    projectMachines: projectOpenModel.machines,
+  }), [
+    bootTarget?.machineId,
+    currentSession,
+    instances,
+    instancesSupported,
+    machines,
+    openStateSupported,
+    projectOpenModel.machines,
+    selectedTabConfig,
+    sessionId,
+  ]);
 
   const rebootTargets = useMemo(
     () => instanceRebootTargets(instances, lifecycleInventoriesByMachine),
@@ -882,13 +940,6 @@ export function TabbedView({
     }
   }, [addPane, cloneAndAddPane, currentSession, effectiveTabs.length, machineChoices, showTabError]);
 
-  // Start on <host> starts that machine only, as the Machines page's Start
-  // does; the project's other machines are untouched.
-  const handleStartMachine = useCallback((machineId: string, projectId: string, hostname: string) => {
-    startMachineProjectCli(machineId, projectId);
-    useStore.getState().showToast(`Starting this project on ${hostname}…`, "info");
-  }, [startMachineProjectCli]);
-
   const handleForgetMachine = useCallback((machineId: string, hostname: string) => {
     if (!sessionId) return;
     if (!confirm(confirmationText(forgetMachineTabsCopy(hostname)))) return;
@@ -1025,22 +1076,31 @@ export function TabbedView({
     return "Claude Usage";
   }, [activeUsageProvider]);
 
-  const canBootCurrentProject = !isAttached && bootTarget != null && !bootTarget.isRunning;
+  // Open and Close act on the project as a whole. Each request is sent
+  // once; what happened is what the server reports afterwards, through the
+  // model above. A request that could not be sent says so and is not kept
+  // for later.
+  const [projectRequestNotSent, setProjectRequestNotSent] = useState<string | null>(null);
+  const openCloseRequest = projectOpenModel.request;
+  const handleOpenProject = useCallback(() => {
+    if (!openCloseRequest) return;
+    const sent = openProject(openCloseRequest.machineId, openCloseRequest.projectId);
+    setProjectRequestNotSent(sent ? null : sessionId);
+  }, [openCloseRequest, openProject, sessionId]);
 
-  // Closing is the same target as opening, in the other direction.
-  const canCloseCurrentProject = bootTarget != null && bootTarget.isRunning;
-
-  // The project view starts and stops the project as a whole, on every
-  // machine with an instance of it, not only on the resolved machine.
   const handleCloseProject = useCallback(() => {
-    if (!bootTarget) return;
-    stopMachineProjectCli(bootTarget.machineId, bootTarget.projectId, { allInstances: true });
-  }, [bootTarget, stopMachineProjectCli]);
+    if (!openCloseRequest) return;
+    const sent = closeProject(openCloseRequest.machineId, openCloseRequest.projectId);
+    setProjectRequestNotSent(sent ? null : sessionId);
+  }, [closeProject, openCloseRequest, sessionId]);
 
-  const handleBootCli = useCallback(() => {
-    if (!bootTarget) return;
-    startMachineProjectCli(bootTarget.machineId, bootTarget.projectId, { allInstances: true });
-  }, [bootTarget, startMachineProjectCli]);
+  // "Delete project…" is the owner's, and a control of its own: nothing
+  // else opens this dialog, closing the project included.
+  const deletableProjectId = projectOpenModel.canDelete
+    ? currentSession?.projectId ?? sessionId ?? null
+    : null;
+  const [deleteDialogProjectId, setDeleteDialogProjectId] = useState<string | null>(null);
+  const deleteDialogOpen = deletableProjectId != null && deleteDialogProjectId === deletableProjectId;
 
   const handleLoadMore = useCallback(() => {
     if (activeTabId == null) return;
@@ -1193,27 +1253,59 @@ export function TabbedView({
         overviewTab={workspace.overviewTab}
         onRenameTab={handleRenameTab}
         onReorderTabs={handleReorderTabs}
-        onBootCli={handleBootCli}
-        onCloseProject={handleCloseProject}
+        projectControls={{
+          recordedState: projectOpenModel.recorded ? projectOpenModel.stateLabel : undefined,
+          recordedBy: projectOpenModel.setBy,
+          openAction: projectOpenModel.openAction,
+          closeAction: projectOpenModel.closeAction,
+          onOpen: handleOpenProject,
+          onClose: handleCloseProject,
+          closeNote: closeProjectNote,
+          onDelete: deletableProjectId
+            ? () => setDeleteDialogProjectId(deletableProjectId)
+            : undefined,
+        }}
         onRebootCli={rebootCli}
         lifecycleInventory={lifecycleInventory}
         lifecycleStatus={lifecycleStatus}
         rebootTargets={rebootTargets}
-        showBootButton={canBootCurrentProject}
-        showCloseProjectButton={canCloseCurrentProject}
         showRebootButton={isAttached}
-        multiMachine={tabHosts.spansMachines || instances.length > 1}
         tabHosts={tabHosts.tabs}
-        onStartMachine={handleStartMachine}
         onForgetMachine={handleForgetMachine}
         machineChoices={machineChoices}
         autopilotTabs={autopilotStatuses}
-        closeProjectNote={closeProjectNote}
         paneStatuses={paneStatuses}
         pausedPanes={pausedPanes}
         leading={mobileLeading}
         trailing={mobileTrailing}
       />
+
+      {/* An Open or Close that did not leave this browser. It is not sent
+          later; the person asks again. */}
+      {projectRequestNotSent === sessionId && (
+        <div
+          role="alert"
+          className="flex flex-shrink-0 items-center gap-2 border-b border-red-200 bg-red-50 px-3 py-1.5 text-xs text-red-700 dark:border-red-800 dark:bg-red-900/30 dark:text-red-300"
+        >
+          <span className="min-w-0 flex-1">{NOTHING_SENT_TEXT}</span>
+          <button
+            type="button"
+            onClick={() => setProjectRequestNotSent(null)}
+            className="rounded px-1.5 py-0.5 font-medium hover:bg-red-100 dark:hover:bg-red-900/50"
+          >
+            Dismiss
+          </button>
+        </div>
+      )}
+      <ProjectOpenNotice lines={projectOpenModel.notice} />
+      {deleteDialogOpen && deletableProjectId && (
+        <DeleteProjectDialog
+          project={{ id: deletableProjectId, name: projectName ?? "" }}
+          stoppedFirstHosts={projectOpenModel.stoppedFirstHosts}
+          offlineTabOwnerHosts={projectOpenModel.offlineTabOwnerHosts}
+          onClose={() => setDeleteDialogProjectId(null)}
+        />
+      )}
 
       <AddPaneLaunches launches={launches} onDismiss={dismissAddPaneRequest} />
       <AutopilotRequestNotices
@@ -1446,31 +1538,14 @@ export function TabbedView({
 
       {/* The selected tab belongs to a machine that is not running the
           project (or that this viewer may not use). Its history still reads;
-          what it needs is that machine, so say which and offer it. */}
+          what it needs is that machine, so say which. That machine alone is
+          not started from here: opening the project again starts it. */}
       {activeRefusal && (
         <div
           role="status"
           className="flex flex-shrink-0 flex-wrap items-center gap-2 border-b border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-900 dark:border-amber-900 dark:bg-amber-950/30 dark:text-amber-200"
         >
           <span className="min-w-0 flex-1 basis-56">{activeRefusal}</span>
-          {stoppedActions?.canStart && (
-            <button
-              type="button"
-              disabled={Boolean(stoppedActions.startDisabledReason) || !stoppedActions.projectId}
-              title={stoppedActions.startDisabledReason ?? `Start this project on ${stoppedActions.hostname} only`}
-              onClick={() => {
-                if (stoppedActions.projectId) {
-                  handleStartMachine(stoppedActions.machineId, stoppedActions.projectId, stoppedActions.hostname);
-                }
-              }}
-              className="rounded bg-blue-600 px-2.5 py-1 text-xs font-medium text-white hover:bg-blue-700 disabled:cursor-not-allowed disabled:opacity-50"
-            >
-              Start on {stoppedActions.hostname}
-            </button>
-          )}
-          {stoppedActions?.startDisabledReason && stoppedActions.canStart && (
-            <span className="text-xs">{stoppedActions.startDisabledReason}</span>
-          )}
           {stoppedActions?.canForget && (
             <button
               type="button"

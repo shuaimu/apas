@@ -42,3 +42,16 @@ test("a refused launch target surfaces the server's reason and is never resent",
   expect(url).toBe("https://apas.example/mobile/v1/task-launches");
   expect(JSON.parse(String(init.body))).toEqual(request);
 });
+
+test.each([400, 403, 409])("a launch refused for a closed project surfaces the server's sentence as it is (HTTP %i)", async (status) => {
+  // The launch names one machine; in a project recorded closed of which
+  // another machine owns tabs the server starts nothing and says why.
+  const reason = "This project is closed and has tabs on other machines. Open it from the project.";
+  fetchMock.mockResolvedValueOnce({ ok: false, status, json: async () => ({ error: reason }) });
+
+  const launch = launchTask(request);
+  await expect(launch).rejects.toBeInstanceOf(ApiError);
+  await expect(launch).rejects.toMatchObject({ message: reason, status });
+  // Refused, not unconfirmed: one request, and no second attempt by itself.
+  expect(fetchMock).toHaveBeenCalledTimes(1);
+});

@@ -2239,8 +2239,9 @@ pub enum MutationKind {
     ///
     /// The server sends it when it refuses the input because of the tab's
     /// machine: that machine is not running the project ("<host> is not
-    /// running this project. Start it on <host> first."), or the sender may
-    /// not use it. It may send one for any other refusal of such an input
+    /// running this project. Open the project again to start it there."
+    /// while its daemon is connected, "<host> is not running this project
+    /// because it is offline." otherwise), or the sender may not use it. It may send one for any other refusal of such an input
     /// too. A refusal reported only as an `Error`, and every refusal from an
     /// older server, leaves the send unanswered, as before.
     ///
@@ -7370,7 +7371,7 @@ mod project_instances_tests {
     #[test]
     fn a_refused_input_is_acknowledged_by_its_client_msg_id() {
         let session_id = Uuid::new_v4();
-        let refusal = "zoo-005 is not running this project. Start it on zoo-005 first.";
+        let refusal = "zoo-005 is not running this project because it is offline.";
         let frame = serde_json::to_value(ServerToWeb::MutationAck {
             request_id: "msg-1".into(),
             session_id,

@@ -64,6 +64,18 @@ describe("machineRowsToShow", () => {
     expect(machineRowsToShow(four, 0, true).shown).toHaveLength(5);
   });
 
+  it("never folds a row the server says did not start, with its reason", () => {
+    const rows = [
+      row("a"), row("b"), row("c"), row("d"),
+      row("refused", { openState: "open", part: "not_started", partReason: "The policy does not allow it." }),
+      // A tab owner of a closed project has not failed at anything.
+      row("idle", { openState: "closed", part: "not_started" }),
+    ];
+    const folded = machineRowsToShow(rows, 0, false);
+    expect(folded.shown.map((entry) => entry.name)).toEqual(["refused"]);
+    expect(folded.hiddenStopped).toBe(5);
+  });
+
   it("is empty only with no rows and nothing being created", () => {
     expect(machineRowsToShow([], 0, false).empty).toBe(true);
     expect(machineRowsToShow([], 1, false).empty).toBe(false);

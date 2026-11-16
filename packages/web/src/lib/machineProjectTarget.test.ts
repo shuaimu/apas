@@ -160,6 +160,28 @@ describe("resolveMachineProjectTarget", () => {
     ])?.machineId).toBe("machine-b");
   });
 
+  it("carries the recorded state its machine's entry reports, and none while nobody recorded one", () => {
+    const closed = resolveMachineProjectTarget(session(), [
+      machine("machine-b", "builder-b", "project-a", "/workspace/alpha", { openState: "closed", isRunning: true, part: "still_running" }),
+    ]);
+    // The machine still runs a closed project: both facts are kept apart.
+    expect(closed).toEqual({
+      machineId: "machine-b",
+      projectId: "project-a",
+      isRunning: true,
+      hostname: "builder-b",
+      openState: "closed",
+    });
+    const open = resolveMachineProjectTarget(session(), [
+      machine("machine-b", "builder-b", "project-a", "/workspace/alpha", { openState: "open" }),
+    ]);
+    expect(open).toMatchObject({ isRunning: false, openState: "open" });
+    const unrecorded = resolveMachineProjectTarget(session(), [
+      machine("machine-b", "builder-b", "project-a", "/workspace/alpha"),
+    ]);
+    expect(unrecorded).not.toHaveProperty("openState");
+  });
+
   it("returns null without a session or a match", () => {
     expect(resolveMachineProjectTarget(undefined, [])).toBeNull();
     expect(resolveMachineProjectTarget(session(), [

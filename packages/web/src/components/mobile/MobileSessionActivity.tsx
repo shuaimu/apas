@@ -36,15 +36,20 @@ import { ProjectWorkersWorkspace } from "@/components/workers/ProjectWorkersWork
 import { OverviewEmpty, OverviewSection, overviewCard, overviewMuted } from "@/components/overview/OverviewElements";
 import { readSelectedPane, writeSelectedPane } from "@/lib/mobileSelectedPane";
 import { isOmpQuestionInput, ompQuestionKey, parseOmpQuestionResult } from "@/lib/ompQuestions";
+import { resolveMachineProjectTarget } from "@/lib/machineProjectTarget";
 import {
-  resolveMachineProjectTarget,
-  type MachineProjectTarget,
-} from "@/lib/machineProjectTarget";
+  buildProjectOpenModel,
+  NOTHING_SENT_TEXT,
+  openStateNegotiated,
+  selectProjectOpenReport,
+  type ProjectOpenAction,
+  type ProjectOpenNoticeLine,
+} from "@/lib/projectOpenState";
 import {
   refusedDeliveries,
   unconfirmedDeliveries,
 } from "@/lib/terminalDelivery";
-import { instancesNegotiated, primaryInstance, selectSessionInstances } from "@/lib/projectInstances";
+import { instancesNegotiated, primaryInstance, sameHost, selectSessionInstances } from "@/lib/projectInstances";
 import { buildMachineChoices, providerOfferOn, sessionCanCloneJoin, type MachineChoice, type ProviderOffer } from "@/lib/machineChoice";
 import {
   cloneHereCopy,
@@ -52,10 +57,8 @@ import {
   describeTabHosts,
   forgetMachineTabsCopy,
   groupMachineChoices,
-  hostList,
   machineChoiceDetail,
   projectHostLabel,
-  projectStartHosts,
   sessionIsOwned,
   tabHostStateLabel,
   type ConfirmationCopy,
@@ -172,6 +175,28 @@ export interface MobileSessionActivityProps {
   connected: boolean;
   onBack: () => void;
   onReconnect: () => void;
+}
+
+/** How the pane-actions sheet and its confirmation name the project's Open:
+ *  "Open project", "Open project again" while a connected machine is not
+ *  following an open project, and "Keep project open" for a running project
+ *  nobody has recorded. All three send the same request. */
+function openProjectActionLabel(action: ProjectOpenAction | undefined): string {
+  return action?.kind === "open_again"
+    ? "Open project again"
+    : action?.kind === "keep_open" ? "Keep project open" : "Open project";
+}
+
+/** The server's reason why the selected tab's machine is not in line with the
+ *  project's state, from the model's notice. `undefined` when it gave none. */
+function stoppedActionsReason(
+  notice: ProjectOpenNoticeLine[],
+  host: TabHost | undefined,
+): string | undefined {
+  if (!host || host.state === "running" || host.state === "no_access") return undefined;
+  return notice.find((line) => host.machineId && line.machineId
+    ? line.machineId === host.machineId
+    : sameHost(line.hostname, host.hostname))?.reason;
 }
 
 function displayProjectName(workingDir?: string, gitRemote?: string): string {
@@ -459,8 +484,9 @@ export function MobileSessionActivity({ connected, onBack, onReconnect }: Mobile
   const addPaneRequests = useStore((state) => state.addPaneRequests);
   const instances = useStore((state) => selectSessionInstances(state, state.sessionId));
   const instancesSupported = useStore(instancesNegotiated);
-  const showToast = useStore((state) => state.showToast);
-  const startMachineProjectCli = useStore((state) => state.startMachineProjectCli);
+  const openProject = useStore((state) => state.openProject);
+  const openStateSupported = useStore(openStateNegotiated);
+  const paneListReceived = useStore((state) => state.paneListReceived);
   const summarySupported = useStore((state) => state.negotiatedCapabilities.has("pane_work_summary_v1"));
   // Autopilot of the project's OMP terminal tabs. On a server without it,
   // nothing about it is shown at all.
@@ -484,7 +510,12 @@ export function MobileSessionActivity({ connected, onBack, onReconnect }: Mobile
   const [renameDraft, setRenameDraft] = useState("");
   const [closeTarget, setCloseTarget] = useState<PaneConfig | null>(null);
   const [rebootTarget, setRebootTarget] = useState<PaneConfig | null>(null);
-  const [openProjectTarget, setOpenProjectTarget] = useState<MachineProjectTarget | null>(null);
+  // The Open the person is asked to confirm, as it read when they chose it,
+  // with the machine and project its request names.
+  const [openProjectConfirm, setOpenProjectConfirm] = useState<{
+    action: ProjectOpenAction;
+    request: { machineId: string; projectId: string };
+  } | null>(null);
   // The new-agent sheet's machine step, and the two confirmations that act on
   // a machine rather than a pane.
   const [machineKey, setMachineKey] = useState<string | null>(null);
@@ -530,6 +561,40 @@ export function MobileSessionActivity({ connected, onBack, onReconnect }: Mobile
   }), [instances, instancesSupported, machines, paneConfigs, session, sessionId]);
   const selectedHost = selectedPaneId === null ? undefined : tabHosts.tabs.get(selectedPaneId);
   const selectedRefusal = selectedHost?.refusal;
+  // The project's open state, as the desktop project view models it: the
+  // state to show, the Open to offer with its confirmation, and the machines
+  // that are not following. This screen offers no Close and no Delete. From
+  // a server that records no state it is derived from what runs.
+  const projectOpenReport = useStore((state) => selectProjectOpenReport(state, [session?.projectId, state.sessionId]));
+  const sessionProjectName = session ? displayProjectName(session.workingDir, session.gitRemote) : undefined;
+  const projectOpenModel = useMemo(() => buildProjectOpenModel({
+    supported: openStateSupported,
+    projectIds: [session?.projectId, sessionId],
+    projectName: sessionProjectName,
+    report: projectOpenReport,
+    session: session ?? null,
+    // Only a roster the server sent says which machines own tabs, and only
+    // a server that reports instances says which of them run the project.
+    panes: paneListReceived && instancesSupported ? paneConfigs : undefined,
+    instances: instancesSupported ? instances : undefined,
+    machines,
+    target: machineProjectTarget,
+    isOwner: sessionIsOwned(session),
+  }), [
+    instances,
+    instancesSupported,
+    machineProjectTarget,
+    machines,
+    openStateSupported,
+    paneConfigs,
+    paneListReceived,
+    projectOpenReport,
+    session,
+    sessionId,
+    sessionProjectName,
+  ]);
+  // A new agent on a machine that is not running the project opens the
+  // project; the machine step names the other machines that start with it.
   const machineChoices = useMemo(() => buildMachineChoices({
     projectId: session?.projectId ?? sessionId ?? "",
     instances,
@@ -538,7 +603,9 @@ export function MobileSessionActivity({ connected, onBack, onReconnect }: Mobile
     canClone: sessionCanCloneJoin(session),
     selectedPane: selectedPane ?? null,
     fallbackMachineId: machineProjectTarget?.machineId,
-  }), [instances, instancesSupported, machineProjectTarget?.machineId, machines, selectedPane, session, sessionId]);
+    openStateSupported,
+    projectMachines: projectOpenModel.machines,
+  }), [instances, instancesSupported, machineProjectTarget?.machineId, machines, openStateSupported, projectOpenModel.machines, selectedPane, session, sessionId]);
   // The user's pick, else the default (the selected pane's machine), derived
   // so a default that arrives while the sheet is open still counts. A pick
   // that disappears while the sheet is open (an instance detaches) is no pick.
@@ -896,14 +963,6 @@ export function MobileSessionActivity({ connected, onBack, onReconnect }: Mobile
     setActionError(result.success ? null : result.error || "The clone could not be requested.");
   };
 
-  // Start on <host> starts that machine only, as the Machines page's Start
-  // does; the project's other machines are untouched.
-  const startOnMachine = (machineId: string, projectId: string, hostname: string) => {
-    startMachineProjectCli(machineId, projectId);
-    setActionError(null);
-    showToast(`Starting this project on ${hostname}…`, "info");
-  };
-
   const confirmForget = () => {
     if (!forgetTarget || !sessionId) return;
     forgetMachinePanes(sessionId, forgetTarget.machineId);
@@ -966,10 +1025,16 @@ export function MobileSessionActivity({ connected, onBack, onReconnect }: Mobile
   const selectedIsBot = selectedPane?.mode === "deadloop";
   // A saved Pi tab, or any other retired provider's: listed, never running.
   const selectedIsRetired = isRetiredProviderModel(selectedPane?.provider, selectedPane?.model);
-  const canOpenProject = connected
-    && !sessionIsRunning
-    && machineProjectTarget !== null
-    && !machineProjectTarget.isRunning;
+  // Open is offered by the project's state, not by whether one machine runs
+  // it: for a closed project, for one nobody has recorded, and again while a
+  // connected machine that owns tabs is not running an open one. Never for a
+  // machine that is offline, which nothing here can start.
+  const openAction = projectOpenModel.openAction;
+  const openRequest = projectOpenModel.request;
+  const canOpenProject = connected && openAction !== undefined && openRequest !== null;
+  const openProjectLabel = openProjectActionLabel(openAction);
+  // The server's reason for the selected tab's machine, when it gave one.
+  const selectedMachineReason = stoppedActionsReason(projectOpenModel.notice, selectedHost);
   const canCompose = selectedPaneId !== null && !selectedIsBot && !selectedIsRetired;
   const canSend = canCompose && connected && sessionIsRunning && !selectedRefusal;
   const hostLabel = projectHostLabel(instances, session.hostname);
@@ -993,11 +1058,6 @@ export function MobileSessionActivity({ connected, onBack, onReconnect }: Mobile
     ? readOnlyTabReason(paneConfigs.find((pane) => pane.pane_id === retainedTerminal.paneId))
       ?? tabHosts.tabs.get(retainedTerminal.paneId)?.refusal
     : undefined;
-  // The machines the Open sheet's request starts; empty means only the one it
-  // names, which is all an older server ever starts.
-  const openProjectStartHosts = openProjectTarget && instancesSupported
-    ? projectStartHosts({ panes: paneConfigs, machines, projectId: openProjectTarget.projectId })
-    : [];
   // Closing a tab ends its agent, and its autopilot with it; rebooting the
   // agent brings the autopilot back paused. Each confirmation says so.
   const closeAutopilotNote = closeTarget
@@ -1158,8 +1218,10 @@ export function MobileSessionActivity({ connected, onBack, onReconnect }: Mobile
               {hostLabel.text || session.workingDir || "Unknown target"}
             </span>
           </div>
-          <span className={`shrink-0 rounded-full px-2.5 py-1 text-[0.68rem] font-extrabold ${session.isActive ? "bg-emerald-100 text-emerald-700 dark:bg-emerald-950/60 dark:text-emerald-300" : "bg-[#efeff5] text-[#686873] dark:bg-[#25252d] dark:text-[#aaaab6]"}`}>
-            {session.isActive ? "Active" : session.status}
+          {/* The project's state: what the server recorded, or, while nobody
+              has recorded one, open while something runs it. */}
+          <span data-testid="project-open-state" className={`shrink-0 rounded-full px-2.5 py-1 text-[0.68rem] font-extrabold ${projectOpenModel.state === "open" ? "bg-emerald-100 text-emerald-700 dark:bg-emerald-950/60 dark:text-emerald-300" : "bg-[#efeff5] text-[#686873] dark:bg-[#25252d] dark:text-[#aaaab6]"}`}>
+            {projectOpenModel.stateLabel}
           </span>
         </div>
       </div>
@@ -1184,22 +1246,9 @@ export function MobileSessionActivity({ connected, onBack, onReconnect }: Mobile
           say which machine it needs and offer it. */}
       {selectedRefusal && !workspace.active && !terminalIsOpen && (
         <div role="status" className="mx-4 mt-3 shrink-0 rounded-xl border border-amber-300 bg-amber-50 px-3 py-2 text-xs text-amber-900 dark:border-amber-900 dark:bg-amber-950/40 dark:text-amber-200">
-          <p className="flex items-start gap-2"><AlertTriangle aria-hidden="true" className="mt-px h-4 w-4 shrink-0" /> {selectedRefusal}</p>
-          {(stoppedActions?.canStart || stoppedActions?.canForget) && (
+          <p className="flex items-start gap-2"><AlertTriangle aria-hidden="true" className="mt-px h-4 w-4 shrink-0" /> {selectedRefusal}{selectedMachineReason ? ` ${selectedMachineReason}` : ""}</p>
+          {stoppedActions?.canForget && (
             <div className="mt-2 flex flex-wrap gap-2">
-              {stoppedActions.canStart && (
-                <button
-                  type="button"
-                  disabled={!connected || Boolean(stoppedActions.startDisabledReason) || !stoppedActions.projectId}
-                  title={stoppedActions.startDisabledReason}
-                  onClick={() => {
-                    if (stoppedActions.projectId) startOnMachine(stoppedActions.machineId, stoppedActions.projectId, stoppedActions.hostname);
-                  }}
-                  className="min-h-11 rounded-xl bg-[#6d5efc] px-3 py-2 text-xs font-bold text-white disabled:opacity-40"
-                >
-                  Start on {stoppedActions.hostname}
-                </button>
-              )}
               {stoppedActions.canForget && (
                 <button
                   type="button"
@@ -1215,9 +1264,6 @@ export function MobileSessionActivity({ connected, onBack, onReconnect }: Mobile
                 </button>
               )}
             </div>
-          )}
-          {stoppedActions?.canStart && stoppedActions.startDisabledReason && (
-            <p className="mt-1.5">{stoppedActions.startDisabledReason}</p>
           )}
         </div>
       )}
@@ -1478,27 +1524,46 @@ export function MobileSessionActivity({ connected, onBack, onReconnect }: Mobile
               <button type="button" aria-label="Close actions" onClick={() => setMoreOpen(false)} className="rounded-lg p-2 hover:bg-[#efeff5] dark:hover:bg-[#25252d]"><X className="h-5 w-5" /></button>
             </div>
             <div className="mt-3 space-y-2">
-              {!sessionIsRunning && (
+              {/* One Open for the whole project. It is shown while there is
+                  something to open, and, disabled with the reason, while
+                  nothing runs the project and it cannot be opened from here. */}
+              {(openAction !== undefined || !sessionIsRunning) && (
                 <button
                   type="button"
-                  aria-label="Open project"
+                  aria-label={openProjectLabel}
                   disabled={!canOpenProject}
                   title={!connected
                     ? "Reconnect before opening this project"
-                    : !machineProjectTarget
+                    : !openRequest
                       ? "No unambiguous machine was found for this project"
-                      : machineProjectTarget.isRunning
-                        ? "This project is already starting"
-                        : "Open this project"}
+                      : !openAction
+                        // A machine runs it or was asked to, and this
+                        // screen has not heard from its instance yet.
+                        ? projectOpenModel.machines.some((machine) => machine.part === "starting" || machine.part === "running")
+                          ? "This project is already starting"
+                          : "No connected machine of this project can be started now"
+                        : openAction.note ?? (openAction.kind === "open_again" ? "Open this project again" : "Open this project")}
                   onClick={() => {
-                    if (!canOpenProject || !machineProjectTarget) return;
+                    if (!canOpenProject || !openAction || !openRequest) return;
                     setMoreOpen(false);
-                    setOpenProjectTarget(machineProjectTarget);
+                    setOpenProjectConfirm({ action: openAction, request: openRequest });
                   }}
                   className="flex w-full items-center gap-3 rounded-2xl border border-[#dedee7] bg-white p-3.5 text-left font-bold disabled:opacity-40 dark:border-[#383842] dark:bg-[#1b1b21]"
                 >
-                  <FolderOpen className="h-5 w-5 shrink-0 text-[#6d5efc]" /> Open project
+                  <FolderOpen className="h-5 w-5 shrink-0 text-[#6d5efc]" /> {openProjectLabel}
                 </button>
+              )}
+              {/* Which machines are not in line with the project's state,
+                  each with the server's reason. No machine is started or
+                  stopped alone from here. */}
+              {projectOpenModel.notice.length > 0 && (
+                <ul role="status" aria-label="Machines not following this project" className="space-y-1 rounded-2xl border border-amber-300 bg-amber-50 px-3.5 py-2.5 text-xs leading-5 text-amber-900 dark:border-amber-900 dark:bg-amber-950/40 dark:text-amber-200">
+                  {projectOpenModel.notice.map((line) => (
+                    <li key={line.key} data-notice-kind={line.kind} className="break-words">
+                      {line.text}{line.reason ? ` ${line.reason}` : ""}
+                    </li>
+                  ))}
+                </ul>
               )}
               <button type="button" aria-label="Open raw terminal" disabled={!selectedIsTerminal || selectedIsRetired} onClick={() => {
                 if (selectedPaneId === null) return;
@@ -1622,29 +1687,26 @@ export function MobileSessionActivity({ connected, onBack, onReconnect }: Mobile
         </div>
       )}
 
-      {openProjectTarget && (
-        <div className="fixed inset-0 z-[96] flex items-end bg-black/45" onClick={() => setOpenProjectTarget(null)}>
-          <div role="dialog" aria-modal="true" aria-label={`Open ${projectName}`} onClick={(event) => event.stopPropagation()} className="w-full rounded-t-[1.4rem] border-t border-[#dedee7] bg-[#f7f7fa] p-4 pb-[max(1rem,env(safe-area-inset-bottom))] shadow-2xl dark:border-[#383842] dark:bg-[#111115]">
-            <h2 className="text-lg font-extrabold">Open {projectName}?</h2>
-            <p className="mt-1.5 text-sm leading-5 text-[#686873] dark:text-[#aaaab6]">
-              {/* Name the machines the server will start: every online one
-                  that has the project's tabs, else the one the request names.
-                  Not the session's recorded host, which may be a machine with
-                  no tabs that was the last to stop. An older server starts
-                  only the named machine. */}
-              {`Its APAS process starts on ${hostList(openProjectStartHosts) || openProjectTarget.hostname || session.hostname || "the selected host"}, and its saved panes become available again.`}
-            </p>
+      {openProjectConfirm && (
+        <div className="fixed inset-0 z-[96] flex items-end bg-black/45" onClick={() => setOpenProjectConfirm(null)}>
+          <div role="dialog" aria-modal="true" aria-label={openProjectConfirm.action.confirmation.title} onClick={(event) => event.stopPropagation()} className="max-h-[82dvh] w-full overflow-y-auto rounded-t-[1.4rem] border-t border-[#dedee7] bg-[#f7f7fa] p-4 pb-[max(1rem,env(safe-area-inset-bottom))] shadow-2xl dark:border-[#383842] dark:bg-[#111115]">
+            <h2 className="break-words text-lg font-extrabold">{openProjectConfirm.action.confirmation.title}</h2>
+            {/* The model's own lines: the machines whose tabs start, the
+                ones that already run it, and, of an offline tab owner, that
+                its tabs start when it reconnects. */}
+            {openProjectConfirm.action.confirmation.body.map((paragraph) => (
+              <p key={paragraph} className="mt-1.5 break-words text-sm leading-5 text-[#686873] dark:text-[#aaaab6]">{paragraph}</p>
+            ))}
             <div className="mt-4 flex gap-2.5">
-              <button type="button" onClick={() => setOpenProjectTarget(null)} className="flex-1 rounded-xl border border-[#dedee7] px-4 py-2.5 text-sm font-bold dark:border-[#383842]">Cancel</button>
+              <button type="button" onClick={() => setOpenProjectConfirm(null)} className="flex-1 rounded-xl border border-[#dedee7] px-4 py-2.5 text-sm font-bold dark:border-[#383842]">Cancel</button>
               <button type="button" onClick={() => {
-                startMachineProjectCli(
-                  openProjectTarget.machineId,
-                  openProjectTarget.projectId,
-                  { allInstances: true },
-                );
-                setOpenProjectTarget(null);
-                setActionError(null);
-              }} className="flex-1 rounded-xl bg-[#6d5efc] px-4 py-2.5 text-sm font-bold text-white">Open project</button>
+                // Sent once. What became of it is the state the server
+                // reports afterwards; a request that did not leave this
+                // browser says so and is not kept for later.
+                const sent = openProject(openProjectConfirm.request.machineId, openProjectConfirm.request.projectId);
+                setOpenProjectConfirm(null);
+                setActionError(sent ? null : NOTHING_SENT_TEXT);
+              }} className="flex-1 rounded-xl bg-[#6d5efc] px-4 py-2.5 text-sm font-bold text-white">{openProjectActionLabel(openProjectConfirm.action)}</button>
             </div>
           </div>
         </div>

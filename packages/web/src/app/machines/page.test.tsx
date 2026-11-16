@@ -1,7 +1,15 @@
 import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import MachinesPage from "./page";
+import { validateClientMessage } from "@apas/protocol";
 import { useStore, type MachineInfo, type MachineWithProjects } from "@/lib/store";
+import {
+  CLOSE_DELETES_NOTHING,
+  NOTHING_SENT_TEXT,
+  PROJECT_OPEN_STATE_CAPABILITY,
+  STOP_RUNTIME_CLOSES_PROJECT,
+  SUSPEND_CLOSES_PROJECT,
+} from "@/lib/projectOpenState";
 
 const routerPush = vi.hoisted(() => vi.fn());
 
@@ -153,8 +161,8 @@ function seedMachines(machines: MachineWithProjects[] = [machineEntry()]) {
     connect: vi.fn(),
     listMachines: vi.fn(),
     // Each reports that it sent, as the store does while the socket is open.
-    startMachineProjectCli: vi.fn().mockReturnValue(true),
-    stopMachineProjectCli: vi.fn().mockReturnValue(true),
+    openProject: vi.fn().mockReturnValue(true),
+    closeProject: vi.fn().mockReturnValue(true),
     setMachineDeepseekConfig: vi.fn().mockReturnValue(true),
     rebootDaemon: vi.fn(),
     rebootDaemons: vi.fn(),
@@ -336,7 +344,10 @@ describe("MachinesPage", () => {
     expect(screen.getByText("Active API")).toBeTruthy();
     expect(screen.getByText("Stopped API")).toBeTruthy();
     expect(screen.getByText("Running · 2.0 GiB").getAttribute("title")).toBe("pid 4242");
-    expect(screen.getByText("Stopped")).toBeTruthy();
+    // The project's state, not "Running" / "Stopped": rows that run here
+    // come first.
+    expect(screen.getAllByTestId("project-open-state").map((chip) => chip.textContent)).toEqual(["Open", "Closed"]);
+    expect(screen.queryByText("Stopped")).toBeNull();
     expect(screen.getByText("My Cluster")).toBeTruthy();
     expect(screen.queryByText(/No machines reported yet/)).toBeNull();
     // The key is never shown, prefilled or put in an input.
@@ -388,7 +399,7 @@ describe("MachinesPage", () => {
     expect(actions.setMachineDeepseekConfig).not.toHaveBeenCalled();
   });
 
-  it("wires Refresh and project Start/Stop controls to store actions", () => {
+  it("wires Refresh and each project's Open and Close to the store, after a confirmation", () => {
     const actions = seedMachines();
 
     render(<MachinesPage />);
@@ -397,14 +408,183 @@ describe("MachinesPage", () => {
     fireEvent.click(screen.getByRole("button", { name: "Refresh machines" }));
     expect(actions.listMachines).toHaveBeenCalledTimes(1);
 
-    fireEvent.click(screen.getByRole("button", { name: "Start Stopped API on build-host" }));
-    expect(actions.startMachineProjectCli).toHaveBeenCalledWith("machine-1", "project-stopped");
-    const starting = screen.getByRole("button", { name: "Start Stopped API on build-host" }) as HTMLButtonElement;
-    expect(starting.textContent).toContain("Starting…");
-    expect(starting.disabled).toBe(true);
+    fireEvent.click(screen.getByRole("button", { name: "Open Stopped API (listed on build-host)" }));
+    // Nothing is sent before the confirmation.
+    expect(actions.openProject).not.toHaveBeenCalled();
+    expect(screen.getByRole("dialog", { name: "Open Stopped API?" })).toBeTruthy();
+    confirmInDialog("Open");
+    expect(actions.openProject).toHaveBeenCalledTimes(1);
+    expect(actions.openProject).toHaveBeenCalledWith("machine-1", "project-stopped");
+    const opening = screen.getByRole("button", { name: "Open Stopped API (listed on build-host)" }) as HTMLButtonElement;
+    expect(opening.textContent).toContain("Opening…");
+    expect(opening.disabled).toBe(true);
 
-    fireEvent.click(screen.getByRole("button", { name: "Stop Active API on build-host" }));
-    expect(actions.stopMachineProjectCli).toHaveBeenCalledWith("machine-1", "project-running");
+    fireEvent.click(screen.getByRole("button", { name: "Close Active API (listed on build-host)" }));
+    expect(actions.closeProject).not.toHaveBeenCalled();
+    const dialog = screen.getByRole("dialog", { name: "Close Active API?" });
+    expect(dialog.textContent).toContain(CLOSE_DELETES_NOTHING);
+    confirmInDialog("Close");
+    expect(actions.closeProject).toHaveBeenCalledTimes(1);
+    expect(actions.closeProject).toHaveBeenCalledWith("machine-1", "project-running");
+
+    // One machine alone is never started or stopped from this page.
+    expect(screen.queryByRole("button", { name: /^(Start|Stop) / })).toBeNull();
+  });
+
+  it("sends nothing when an Open or Close confirmation is dismissed", () => {
+    const actions = seedMachines();
+
+    render(<MachinesPage />);
+    fireEvent.click(screen.getByRole("button", { name: "Close Active API (listed on build-host)" }));
+    fireEvent.click(within(screen.getByRole("dialog")).getByRole("button", { name: "Cancel" }));
+    fireEvent.click(screen.getByRole("button", { name: "Open Stopped API (listed on build-host)" }));
+    fireEvent.keyDown(screen.getByRole("dialog", { name: "Open Stopped API?" }), { key: "Escape" });
+
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(actions.openProject).not.toHaveBeenCalled();
+    expect(actions.closeProject).not.toHaveBeenCalled();
+  });
+});
+
+describe("MachinesPage open state", () => {
+  const PROJECT = "30000000-0000-4000-8000-000000000001";
+  const ZOO5 = "50000000-0000-4000-8000-000000000001";
+  const ZOO6 = "50000000-0000-4000-8000-000000000002";
+
+  function listing(
+    machineId: string,
+    hostname: string,
+    project: Partial<MachineWithProjects["projects"][number]>,
+  ): MachineWithProjects {
+    return {
+      machine: { machineId, hostname, os: "linux", arch: "x64" },
+      projects: [{ projectId: PROJECT, name: "mako", path: "/work/mako", isRunning: false, ...project }],
+      clusterAccess: "owner",
+      daemonConnected: true,
+      projectInstancesAvailable: true,
+    };
+  }
+
+  /** The store's own `openProject` / `closeProject`, over a socket that
+   *  records what is sent. */
+  function seedOverSocket(machines: MachineWithProjects[], { capable = true } = {}) {
+    const send = vi.fn();
+    window.localStorage.setItem("apas_token", "test-token");
+    act(() => {
+      useStore.setState({
+        token: "test-token",
+        connected: true,
+        machines,
+        usageLimits: new Map(),
+        negotiatedCapabilities: new Set(capable ? [PROJECT_OPEN_STATE_CAPABILITY] : []),
+        ws: { readyState: WebSocket.OPEN, send } as unknown as WebSocket,
+        connect: vi.fn(),
+        listMachines: vi.fn(),
+      });
+    });
+    return () => send.mock.calls.map(([raw]) => JSON.parse(String(raw)) as Record<string, unknown>);
+  }
+
+  const dialogLines = () => Array.from(screen.getByRole("dialog").querySelectorAll("p")).map((line) => line.textContent);
+
+  it("opens the whole project from one machine's entry, naming the other machine first", () => {
+    const sent = seedOverSocket([
+      listing(ZOO5, "zoo-005", { openState: "closed", part: "not_started", otherHosts: [{ hostname: "zoo-006", connected: true, running: false, ownsTabs: true }] }),
+      listing(ZOO6, "zoo-006", { openState: "closed", part: "not_started", otherHosts: [{ hostname: "zoo-005", connected: true, running: false, ownsTabs: true }] }),
+    ]);
+    render(<MachinesPage />);
+
+    expect(screen.getAllByTestId("project-open-state").map((chip) => chip.textContent)).toEqual(["Closed", "Closed"]);
+    fireEvent.click(screen.getByRole("button", { name: "Open mako (listed on zoo-005)" }));
+    expect(dialogLines()).toEqual(["Its tabs start on zoo-005 and zoo-006."]);
+    expect(sent()).toEqual([]);
+    confirmInDialog("Open");
+
+    const frames = sent();
+    expect(frames).toEqual([{
+      type: "start_machine_project_cli",
+      machine_id: ZOO5,
+      project_id: PROJECT,
+      all_instances: true,
+    }]);
+    expect(validateClientMessage(frames[0]).valid).toBe(true);
+  });
+
+  it("closes the whole project from one machine's entry, naming both machines", () => {
+    const sent = seedOverSocket([
+      listing(ZOO5, "zoo-005", { isRunning: true, openState: "open", part: "running", otherHosts: [{ hostname: "zoo-006", connected: true, running: true, ownsTabs: true }] }),
+      listing(ZOO6, "zoo-006", { isRunning: true, openState: "open", part: "running", otherHosts: [{ hostname: "zoo-005", connected: true, running: true, ownsTabs: true }] }),
+    ]);
+    render(<MachinesPage />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Close mako (listed on zoo-006)" }));
+    expect(dialogLines()).toEqual(["This stops its agents on zoo-005 and zoo-006.", CLOSE_DELETES_NOTHING]);
+    confirmInDialog("Close");
+
+    const frames = sent();
+    expect(frames).toEqual([{
+      type: "stop_machine_project_cli",
+      machine_id: ZOO6,
+      project_id: PROJECT,
+      all_instances: true,
+    }]);
+    expect(validateClientMessage(frames[0]).valid).toBe(true);
+  });
+
+  it("offers to keep open and to close a project nobody has recorded, and records it with one request", () => {
+    const sent = seedOverSocket([listing(ZOO5, "zoo-005", { isRunning: true, part: "running" })]);
+    render(<MachinesPage />);
+
+    expect(screen.getByRole("button", { name: "Close mako (listed on zoo-005)" })).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Keep mako open (listed on zoo-005)" }));
+    expect(dialogLines()).toEqual([
+      "This records the project as open. Nothing starts now.",
+      "Its tabs start again on zoo-005 after those machines have been away.",
+    ]);
+    confirmInDialog("Keep open");
+    expect(sent()).toEqual([{
+      type: "start_machine_project_cli",
+      machine_id: ZOO5,
+      project_id: PROJECT,
+      all_instances: true,
+    }]);
+  });
+
+  it("shows the server's new state after a request, and sends nothing again", () => {
+    const sent = seedOverSocket([listing(ZOO5, "zoo-005", { openState: "closed", part: "not_started" })]);
+    render(<MachinesPage />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Open mako (listed on zoo-005)" }));
+    confirmInDialog("Open");
+    expect(screen.getByRole("button", { name: "Open mako (listed on zoo-005)" }).textContent).toContain("Opening…");
+
+    act(() => {
+      useStore.setState({ machines: [listing(ZOO5, "zoo-005", { isRunning: true, openState: "open", part: "running" })] });
+    });
+    expect(screen.getByTestId("project-open-state").textContent).toBe("Open");
+    expect(screen.getByTestId("machine-part").textContent).toBe("Running");
+    expect(screen.queryByRole("button", { name: /^Open/ })).toBeNull();
+    expect(screen.getByText("1 of 1 projects running")).toBeTruthy();
+    expect(sent()).toHaveLength(1);
+  });
+
+  it("never offers Keep open on a server that records no open state, and still asks for the whole project", () => {
+    const sent = seedOverSocket([
+      listing(ZOO5, "zoo-005", { isRunning: true }),
+      { ...listing(ZOO6, "zoo-006", {}), projects: [{ projectId: "other", name: "idle", path: "/work/idle", isRunning: false }] },
+    ], { capable: false });
+    render(<MachinesPage />);
+
+    expect(screen.queryByRole("button", { name: /^Keep/ })).toBeNull();
+    expect(screen.getAllByTestId("project-open-state").map((chip) => chip.textContent)).toEqual(["Open", "Closed"]);
+    fireEvent.click(screen.getByRole("button", { name: "Open idle (listed on zoo-006)" }));
+    confirmInDialog("Open");
+    fireEvent.click(screen.getByRole("button", { name: "Close mako (listed on zoo-005)" }));
+    confirmInDialog("Close");
+    expect(sent()).toEqual([
+      { type: "start_machine_project_cli", machine_id: ZOO6, project_id: "other", all_instances: true },
+      { type: "stop_machine_project_cli", machine_id: ZOO5, project_id: PROJECT, all_instances: true },
+    ]);
   });
 });
 
@@ -430,6 +610,9 @@ describe("MachinesPage cluster administration", () => {
       "https://apas.mpaxos.com/cluster/projects/project-a/lifecycle",
       expect.anything(),
     );
+    // This server did not say it records open states, so nothing is
+    // claimed about the project being closed.
+    expect(screen.getByRole("dialog").textContent).not.toContain("closes the project");
     confirmInDialog("Suspend project");
     await waitFor(() => expect(fetchMock).toHaveBeenCalledWith(
       "https://apas.mpaxos.com/cluster/projects/project-a/lifecycle",
@@ -659,7 +842,7 @@ describe("MachinesPage cluster administration", () => {
 });
 
 describe("registration completion navigation", () => {
-  it("overrides a remembered shared cluster and reveals the stopped target with an explicit Start", async () => {
+  it("overrides a remembered shared cluster and reveals the closed target with an explicit Open", async () => {
     const own = machineEntry();
     own.clusterOwnerUserId = "owner";
     own.clusterAccess = "owner";
@@ -681,8 +864,8 @@ describe("registration completion navigation", () => {
     const row = document.getElementById("project-machine-1-project-stopped");
     expect(row).toBeTruthy();
     expect(document.activeElement).toBe(row);
-    expect(screen.getByRole("button", { name: "Start Stopped API on build-host" })).toBeTruthy();
-    expect(actions.startMachineProjectCli).not.toHaveBeenCalled();
+    expect(screen.getByRole("button", { name: "Open Stopped API (listed on build-host)" })).toBeTruthy();
+    expect(actions.openProject).not.toHaveBeenCalled();
   });
 
   it("distinguishes clone and local pending operations without treating paths as remotes", () => {
@@ -724,7 +907,7 @@ describe("views and the address", () => {
     await waitFor(() => expect(document.activeElement).toBe(document.getElementById("project-machine-1-project-stopped")));
   });
 
-  it("unfolds a machine's stopped projects to reveal a linked row, and starts nothing", async () => {
+  it("unfolds the projects a machine is not running to reveal a linked row, and opens nothing", async () => {
     const actions = seedMachines([stoppedMachine(5)]);
     window.history.replaceState({}, "", "/machines?machine=machine-1&project=project-4#project-machine-1-project-4");
     render(<MachinesPage />);
@@ -732,18 +915,18 @@ describe("views and the address", () => {
     const row = document.getElementById("project-machine-1-project-4");
     expect(row).toBeTruthy();
     await waitFor(() => expect(document.activeElement).toBe(row));
-    expect(screen.getByRole("button", { name: "Hide stopped projects" })).toBeTruthy();
-    expect(actions.startMachineProjectCli).not.toHaveBeenCalled();
+    expect(screen.getByRole("button", { name: "Hide projects not running here" })).toBeTruthy();
+    expect(actions.openProject).not.toHaveBeenCalled();
   });
 
-  it("folds more than three stopped projects behind one line", () => {
+  it("folds more than three projects a machine is not running behind one line", () => {
     seedMachines([stoppedMachine(5)]);
     render(<MachinesPage />);
 
     expect(screen.queryByText("Stopped 1")).toBeNull();
-    fireEvent.click(screen.getByRole("button", { name: "Show 5 stopped projects" }));
+    fireEvent.click(screen.getByRole("button", { name: "Show 5 projects not running here" }));
     expect(screen.getByText("Stopped 1")).toBeTruthy();
-    expect(screen.getByRole("button", { name: "Hide stopped projects" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Hide projects not running here" })).toBeTruthy();
   });
 
   it("moves between views with the arrow, Home and End keys", () => {
@@ -1003,26 +1186,182 @@ describe("views and the address", () => {
     expect(document.activeElement).toBe(screen.getByRole("button", { name: "Edit access for member@example.com" }));
   });
 
-  it("disables Start and Stop while the page is not connected to the server", () => {
+  it("disables Open and Close while the page is not connected to the server", () => {
     seedMachines();
     act(() => { useStore.setState({ connected: false }); });
     render(<MachinesPage />);
 
-    const start = screen.getByRole("button", { name: "Start Stopped API on build-host" }) as HTMLButtonElement;
-    expect(start.disabled).toBe(true);
-    expect(start.title).toBe("Not connected to the server");
-    expect((screen.getByRole("button", { name: "Stop Active API on build-host" }) as HTMLButtonElement).disabled).toBe(true);
+    const open = screen.getByRole("button", { name: "Open Stopped API (listed on build-host)" }) as HTMLButtonElement;
+    expect(open.disabled).toBe(true);
+    expect(open.title).toBe("Not connected to the server");
+    expect((screen.getByRole("button", { name: "Close Active API (listed on build-host)" }) as HTMLButtonElement).disabled).toBe(true);
   });
 
-  it("says a Start the socket refused was not sent, and does not wait for it", () => {
+  it("says an Open the socket refused was not sent, does not wait for it, and does not send it later", () => {
     const actions = seedMachines();
-    actions.startMachineProjectCli.mockReturnValue(false);
+    actions.openProject.mockReturnValue(false);
     render(<MachinesPage />);
 
-    fireEvent.click(screen.getByRole("button", { name: "Start Stopped API on build-host" }));
-    const start = screen.getByRole("button", { name: "Start Stopped API on build-host" }) as HTMLButtonElement;
-    expect(start.textContent).not.toContain("Starting…");
-    expect(start.disabled).toBe(false);
-    expect(screen.getByText("Not connected to the server. Nothing was sent.")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Open Stopped API (listed on build-host)" }));
+    confirmInDialog("Open");
+    const open = screen.getByRole("button", { name: "Open Stopped API (listed on build-host)" }) as HTMLButtonElement;
+    expect(open.textContent).not.toContain("Opening…");
+    expect(open.disabled).toBe(false);
+    expect(screen.getByText(NOTHING_SENT_TEXT)).toBeTruthy();
+    expect(NOTHING_SENT_TEXT).toBe("Not connected to the server. Nothing was sent.");
+
+    // A new machine list does not send it for the user.
+    act(() => { useStore.setState({ machines: [machineEntry()] }); });
+    expect(actions.openProject).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("Projects view: open state and deletion", () => {
+  /** The cluster's one project, `project-a`, as a machine lists it. */
+  function hosting(project: Partial<MachineWithProjects["projects"][number]>): MachineWithProjects {
+    return {
+      machine: { machineId: "machine-1", hostname: "build-host", os: "linux", arch: "x64" },
+      projects: [{ projectId: "project-a", name: "mako-soumojit", path: "/srv/mako", isRunning: false, ...project }],
+      clusterAccess: "owner",
+      daemonConnected: true,
+    };
+  }
+
+  function capable() {
+    act(() => { useStore.setState({ negotiatedCapabilities: new Set([PROJECT_OPEN_STATE_CAPABILITY]) }); });
+  }
+
+  it("shows Open or Closed in the list and the panel, from the machine list", async () => {
+    seedMachines([hosting({ openState: "closed", part: "not_started" })]);
+    capable();
+    render(<MachinesPage />);
+    openView("Projects");
+
+    const row = await screen.findByRole("button", { name: "Manage mako-soumojit" });
+    expect(within(row).getByTestId("project-open-state").textContent).toBe("Closed");
+    fireEvent.click(row);
+    const panel = screen.getByRole("region", { name: "Selected project" });
+    expect((await within(panel).findByTestId("project-open-state")).textContent).toBe("Closed");
+
+    act(() => { useStore.setState({ machines: [hosting({ isRunning: true, openState: "open", part: "running" })] }); });
+    expect(within(row).getByTestId("project-open-state").textContent).toBe("Open");
+    expect(within(panel).getByTestId("project-open-state").textContent).toBe("Open");
+  });
+
+  it("takes the state from the session list when no machine lists the project", async () => {
+    seedMachines();
+    capable();
+    act(() => {
+      useStore.setState({ sessions: [{ id: "project-a", projectId: "project-a", status: "active", isActive: false, openState: "open" }] });
+    });
+    render(<MachinesPage />);
+    openView("Projects");
+
+    const row = await screen.findByRole("button", { name: "Manage mako-soumojit" });
+    expect(within(row).getByTestId("project-open-state").textContent).toBe("Open");
+  });
+
+  it("shows no state for a project nothing is known about", async () => {
+    seedMachines();
+    capable();
+    render(<MachinesPage />);
+    openView("Projects");
+
+    const row = await screen.findByRole("button", { name: "Manage mako-soumojit" });
+    expect(within(row).queryByTestId("project-open-state")).toBeNull();
+  });
+
+  it("offers Delete project… to the project's owner, naming the machines stopped first", async () => {
+    seedMachines([hosting({ isRunning: true, openState: "open", part: "running" })]);
+    capable();
+    act(() => { useStore.setState({ userId: "owner-1" }); });
+    render(<MachinesPage />);
+    openView("Projects");
+
+    fireEvent.click(await screen.findByRole("button", { name: "Manage mako-soumojit" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Delete project…" }));
+    const dialog = screen.getByRole("dialog", { name: "Delete project" });
+    expect(within(dialog).getByRole("heading", { name: "Delete mako-soumojit?" })).toBeTruthy();
+    expect(dialog.textContent).toContain("Agents running in the project are stopped first, on build-host.");
+    // Opening the dialog sends nothing, and it needs the name typed.
+    expect((within(dialog).getByRole("button", { name: "Delete project" }) as HTMLButtonElement).disabled).toBe(true);
+    expect(fetchMock.mock.calls.some(([url]) => String(url).includes("/delete"))).toBe(false);
+
+    fireEvent.click(within(dialog).getByRole("button", { name: "Cancel" }));
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(fetchMock.mock.calls.some(([url]) => String(url).includes("/delete"))).toBe(false);
+  });
+
+  it("offers no Delete for a project another account owns, and stopping its runtime opens none", async () => {
+    seedMachines([hosting({ isRunning: true, openState: "open", part: "running" })]);
+    capable();
+    act(() => { useStore.setState({ userId: "me" }); });
+    render(<MachinesPage />);
+    openView("Projects");
+
+    fireEvent.click(await screen.findByRole("button", { name: "Manage mako-soumojit" }));
+    expect(await screen.findByRole("button", { name: "Stop runtime" })).toBeTruthy();
+    expect(screen.queryByRole("button", { name: /Delete project/ })).toBeNull();
+
+    fireEvent.click(screen.getByRole("button", { name: "Stop runtime" }));
+    expect(screen.queryByRole("dialog", { name: "Delete project" })).toBeNull();
+    // On a server that records open states, stopping the runtime closes
+    // the project, and the confirmation says so before anything is sent.
+    expect(screen.getByRole("dialog").textContent).toContain(STOP_RUNTIME_CLOSES_PROJECT);
+    confirmInDialog("Stop runtime");
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith(
+      "https://apas.mpaxos.com/cluster/projects/project-a/stop-runtime",
+      expect.objectContaining({ method: "POST" }),
+    ));
+    expect(fetchMock.mock.calls.some(([url]) => String(url).includes("/delete"))).toBe(false);
+  });
+
+  it("says a suspension also closes the project, before anything is sent", async () => {
+    seedMachines([hosting({ isRunning: true, openState: "open", part: "running" })]);
+    capable();
+    render(<MachinesPage />);
+    openView("Projects");
+
+    fireEvent.click(await screen.findByRole("button", { name: "Manage mako-soumojit" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Suspend project" }));
+    expect(screen.getByRole("dialog").textContent).toContain(SUSPEND_CLOSES_PROJECT);
+    expect(fetchMock).not.toHaveBeenCalledWith(
+      "https://apas.mpaxos.com/cluster/projects/project-a/lifecycle",
+      expect.anything(),
+    );
+  });
+
+  it("leaves the project's panel and loads the list again once a deletion is done", async () => {
+    let deleted = false;
+    const fallback = fetchMock.getMockImplementation()!;
+    fetchMock.mockImplementation(async (input: string | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/projects/project-a/delete") && init?.method === "POST") {
+        deleted = true;
+        return { ok: true, status: 202, json: vi.fn().mockResolvedValue({}) };
+      }
+      if (url.endsWith("/projects/project-a/deletion")) return apiResponse({ message: "gone" }, false, 404);
+      if (deleted && url.includes("/cluster/projects?")) return apiResponse({ items: [], limit: 200, offset: 0 });
+      return fallback(input, init);
+    });
+    const actions = seedMachines([hosting({ openState: "closed", part: "not_started" })]);
+    capable();
+    act(() => { useStore.setState({ userId: "owner-1", forgetProject: vi.fn(), listSessions: vi.fn() }); });
+    render(<MachinesPage />);
+    openView("Projects");
+
+    fireEvent.click(await screen.findByRole("button", { name: "Manage mako-soumojit" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Delete project…" }));
+    const dialog = screen.getByRole("dialog", { name: "Delete project" });
+    fireEvent.change(within(dialog).getByLabelText("Project name"), { target: { value: "mako-soumojit" } });
+    actions.listMachines.mockClear();
+    fireEvent.click(within(dialog).getByRole("button", { name: "Delete project" }));
+
+    // The dialog asks the server whether the deletion is done before it says so.
+    expect(await screen.findByText("No projects are hosted in your cluster yet.", {}, { timeout: 5000 })).toBeTruthy();
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(actions.listMachines).toHaveBeenCalled();
+    expect(fetchMock.mock.calls.filter(([url]) => String(url).endsWith("/projects/project-a/delete"))).toHaveLength(1);
+    expect(new URL(window.location.href).searchParams.has("selected")).toBe(false);
   });
 });

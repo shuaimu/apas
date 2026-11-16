@@ -25,6 +25,37 @@ import {
   PI_RETIRED_MESSAGE,
 } from "@/lib/providerOptions";
 import { autopilotMarkerLabel, type AutopilotListStatus } from "@/lib/autopilot";
+import { withLinesBeforeLast, type ProjectCloseAction, type ProjectOpenAction } from "@/lib/projectOpenState";
+import { useConfirmDialog } from "@/components/cluster/ConfirmDialog";
+import { DELETE_PROJECT_LABEL } from "@/components/project/DeleteProjectDialog";
+
+/**
+ * The project's own controls in the tab bar: opening and closing it as a
+ * whole, and deleting it. The actions and their confirmation texts come from
+ * `buildProjectOpenModel`; a control is shown only when its action or
+ * handler is present. There is no control for one machine alone.
+ */
+export interface ProjectControls {
+  /** The state the server recorded. Absent while nobody has opened or
+   *  closed the project, and from a server that records no state: nothing
+   *  is then shown beside the buttons. */
+  recordedState?: "Open" | "Closed";
+  /** The account that set the recorded state, where the server said. */
+  recordedBy?: string;
+  /** "Open", "Keep open" or "Open again". */
+  openAction?: ProjectOpenAction;
+  /** "Close" or "Close again". */
+  closeAction?: ProjectCloseAction;
+  /** Called once, after the person confirmed. */
+  onOpen: () => void;
+  onClose: () => void;
+  /** Added to the Close confirmation, before its last line: which tabs are
+   *  on autopilot and what becomes of their autopilot. */
+  closeNote?: string;
+  /** Present for the project's owner only: opens the Delete project dialog.
+   *  Closing never calls it. */
+  onDelete?: () => void;
+}
 
 interface TabBarProps {
   tabs: PaneConfig[];
@@ -44,9 +75,9 @@ interface TabBarProps {
   overviewTab?: ReactNode;
   onRenameTab?: (paneId: number, newLabel: string) => void;
   onReorderTabs?: (orderedIds: number[]) => void;
-  onBootCli?: () => void;
-  /** Shut the project down: every agent in it stops. */
-  onCloseProject?: () => void;
+  /** Open, Close and Delete for the project as a whole. Absent: none of
+   *  them is shown. */
+  projectControls?: ProjectControls;
   /** Reboot one instance's CLI; absent machine = the primary's. */
   onRebootCli?: (machineId?: string) => void;
   lifecycleInventory?: CliLifecycleInventory;
@@ -55,17 +86,10 @@ interface TabBarProps {
    *  the CLI menu offers a reboot per machine, each confirmed against that
    *  machine's own inventory. */
   rebootTargets?: RebootTarget[];
-  showBootButton?: boolean;
-  showCloseProjectButton?: boolean;
   showRebootButton?: boolean;
-  /** The project has tabs on more than one machine, or runs on several:
-   *  Open and Close act on all of them, and say so. */
-  multiMachine?: boolean;
   /** Where each tab runs (see `describeTabHosts`). Without an entry a tab
    *  renders as it always has. */
   tabHosts?: Map<number, TabHost>;
-  /** Start the project on one machine that is not running it. */
-  onStartMachine?: (machineId: string, projectId: string, hostname: string) => void;
   /** Forget one stopped machine's tabs; the handler confirms first. */
   onForgetMachine?: (machineId: string, hostname: string) => void;
   /** The new-tab machine step. Shown only when `showChoice`; otherwise the
@@ -74,9 +98,6 @@ interface TabBarProps {
   /** The tabs with an autopilot to show. One that is on, or paused, marks
    *  its tab; a tab without an entry renders as it always has. */
   autopilotTabs?: Map<number, AutopilotListStatus>;
-  /** Added to the Close confirmation: which tabs are on autopilot and what
-   *  becomes of their autopilot. */
-  closeProjectNote?: string;
   paneStatuses: Record<string, string | null>;
   pausedPanes: number[];
   /** Mobile-only controls merged into the tab-bar row so the top header can
@@ -261,22 +282,16 @@ export function TabBar({
   overviewTab,
   onRenameTab,
   onReorderTabs,
-  onBootCli,
-  onCloseProject,
+  projectControls,
   onRebootCli,
   lifecycleInventory,
   lifecycleStatus,
   rebootTargets,
-  showBootButton = false,
-  showCloseProjectButton = false,
   showRebootButton = false,
-  multiMachine = false,
   tabHosts,
-  onStartMachine,
   onForgetMachine,
   machineChoices,
   autopilotTabs,
-  closeProjectNote,
   paneStatuses,
   pausedPanes,
   leading,
@@ -290,6 +305,7 @@ export function TabBar({
   const contextMenuRef = useRef<HTMLDivElement>(null);
   const lifecycleMenuRef = useRef<HTMLDivElement>(null);
   const [lifecycleMenuOpen, setLifecycleMenuOpen] = useState(false);
+  const { requestConfirm, confirmDialog } = useConfirmDialog();
 
   // Drag-and-drop state
   const [draggedPaneId, setDraggedPaneId] = useState<number | null>(null);
@@ -640,19 +656,6 @@ export function TabBar({
             {menuRefusal && (
               <p className="px-3 py-1.5 text-xs text-gray-500 dark:text-gray-400">{menuRefusal}</p>
             )}
-            {stopped?.canStart && onStartMachine && (
-              <button
-                disabled={Boolean(stopped.startDisabledReason) || !stopped.projectId}
-                title={stopped.startDisabledReason ?? `Start this project on ${stopped.hostname} only`}
-                onClick={() => {
-                  if (stopped.projectId) onStartMachine(stopped.machineId, stopped.projectId, stopped.hostname);
-                  setContextMenu(null);
-                }}
-                className="w-full text-left px-3 py-1.5 text-sm hover:bg-gray-100 dark:hover:bg-gray-700 disabled:opacity-50 disabled:hover:bg-transparent"
-              >
-                Start on {stopped.hostname}
-              </button>
-            )}
             {stopped?.canForget && onForgetMachine && (
               <button
                 onClick={() => {
@@ -695,37 +698,75 @@ export function TabBar({
           onAddTab={onAddTab}
           machineChoices={machineChoices}
         />
-        {/* One slot, two states: a project is either open or closed. Closing
-            stops every agent in it, so it is confirmed and says so — the
-            agents are the work, not the process hosting them. Both act on
-            every machine the project's tabs run on. */}
-        {showBootButton && onBootCli && (
-          <button
-            onClick={() => {
-              if (confirm(multiMachine
-                ? "Open this project? Its APAS CLI starts on each online machine that has its tabs."
-                : "Open this project? Its APAS CLI starts on the host.")) onBootCli();
-            }}
-            className="px-2.5 h-8 my-1 text-xs font-medium rounded transition-colors bg-blue-500 hover:bg-blue-600 text-white"
-            title="Open this project"
+        {/* The project as a whole: open or closed, on every machine that
+            owns its tabs. Each action is confirmed in the page, with the
+            machines named. Closing stops every agent in the project and
+            deletes nothing; deleting is its own control and its own dialog. */}
+        {projectControls?.recordedState && (
+          <span
+            title={projectControls.recordedBy
+              ? `${projectControls.recordedState === "Open" ? "Opened" : "Closed"} by ${projectControls.recordedBy}`
+              : undefined}
+            className="inline-flex items-center gap-1 px-1 text-xs text-gray-600 dark:text-gray-300"
           >
-            Open
-          </button>
+            <span
+              aria-hidden="true"
+              className={`h-1.5 w-1.5 rounded-full ${projectControls.recordedState === "Open" ? "bg-green-500" : "bg-gray-400"}`}
+            />
+            <span className="sr-only">Project state: </span>
+            <span data-testid="project-open-state">{projectControls.recordedState}</span>
+          </span>
         )}
-        {showCloseProjectButton && onCloseProject && (
+        {projectControls?.openAction && (() => {
+          const action = projectControls.openAction;
+          return (
+            <button
+              type="button"
+              onClick={() => requestConfirm({
+                title: action.confirmation.title,
+                body: action.confirmation.body.map((line, index) => <p key={index}>{line}</p>),
+                confirmLabel: action.label,
+                tone: "primary",
+                onConfirm: projectControls.onOpen,
+              })}
+              className="px-2.5 h-8 my-1 text-xs font-medium rounded transition-colors bg-blue-500 hover:bg-blue-600 text-white whitespace-nowrap"
+              title={action.note ?? (action.kind === "open_again" ? "Open this project again" : "Open this project")}
+            >
+              {action.label}
+            </button>
+          );
+        })()}
+        {projectControls?.closeAction && (() => {
+          const action = projectControls.closeAction;
+          const copy = withLinesBeforeLast(
+            action.confirmation,
+            projectControls.closeNote ? [projectControls.closeNote] : [],
+          );
+          return (
+            <button
+              type="button"
+              onClick={() => requestConfirm({
+                title: copy.title,
+                body: copy.body.map((line, index) => <p key={index}>{line}</p>),
+                confirmLabel: action.label,
+                tone: "danger",
+                onConfirm: projectControls.onClose,
+              })}
+              className="px-2.5 h-8 my-1 text-xs font-medium rounded border border-red-300 text-red-700 transition-colors hover:bg-red-50 dark:border-red-800 dark:text-red-300 dark:hover:bg-red-950/40 whitespace-nowrap"
+              title="Close this project and shut down its agents"
+            >
+              {action.label}
+            </button>
+          );
+        })()}
+        {projectControls?.onDelete && (
           <button
-            onClick={() => {
-              const question = multiMachine
-                ? "Close this project? Every agent in it is shut down on every machine running it, and it stops appearing in the idle list until you open it again."
-                : "Close this project? Every agent in it is shut down, and it stops appearing in the idle list until you open it again.";
-              if (confirm(closeProjectNote ? `${question}\n\n${closeProjectNote}` : question)) {
-                onCloseProject();
-              }
-            }}
-            className="px-2.5 h-8 my-1 text-xs font-medium rounded border border-red-300 text-red-700 transition-colors hover:bg-red-50 dark:border-red-800 dark:text-red-300 dark:hover:bg-red-950/40"
-            title="Close this project and shut down its agents"
+            type="button"
+            onClick={projectControls.onDelete}
+            className="px-2 h-8 my-1 text-xs font-medium rounded text-gray-500 transition-colors hover:bg-red-50 hover:text-red-700 dark:text-gray-400 dark:hover:bg-red-950/40 dark:hover:text-red-300 whitespace-nowrap"
+            title="Delete this project. It asks for the project's name first."
           >
-            Close
+            {DELETE_PROJECT_LABEL}
           </button>
         )}
         {showRebootButton && onRebootCli && (
@@ -813,13 +854,16 @@ export function TabBar({
         )}
       </div>
       {trailing}
+      {confirmDialog}
     </div>
   );
 }
 
 /**
  * Where a new tab runs: the project's running instances, machines where it is
- * registered (started first), and owned machines without it (cloned first).
+ * registered (the project is opened first; against a server that records no
+ * open state, that machine alone is started), and owned machines without it
+ * (cloned first).
  * Shown only when there is a real choice to make.
  */
 function MachineChoiceFieldset({

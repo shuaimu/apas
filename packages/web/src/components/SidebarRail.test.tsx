@@ -158,11 +158,11 @@ describe("SidebarRail", () => {
       ],
       unreadSessions: new Set(["p-q-index"]),
     });
-    const start = vi.fn();
-    act(() => useStore.setState({ startMachineProjectCli: start }));
+    const open = vi.fn();
+    act(() => useStore.setState({ openProject: open }));
     render(<SidebarRail onExpand={vi.fn()} />);
 
-    const link = screen.getByRole("link", { name: "View q-index on Machines — Stopped" });
+    const link = screen.getByRole("link", { name: "View q-index on Machines — Closed" });
     const destination = new URL(link.getAttribute("href")!, "https://apas.test");
     expect(destination.pathname).toBe("/machines");
     expect(destination.searchParams.get("cluster_owner")).toBe("owner-1");
@@ -177,7 +177,7 @@ describe("SidebarRail", () => {
     link.addEventListener("click", (event) => event.preventDefault(), { once: true });
     fireEvent.click(link);
     expect(attachSession).not.toHaveBeenCalled();
-    expect(start).not.toHaveBeenCalled();
+    expect(open).not.toHaveBeenCalled();
   });
 
   it("keeps identity and switches to the arriving real session with normal current selection", () => {
@@ -186,7 +186,7 @@ describe("SidebarRail", () => {
       machines: [makeMachine([{ projectId: "p-q-index", path: "/work/q-index", isRunning: true }])],
     });
     render(<SidebarRail onExpand={vi.fn()} />);
-    const registered = screen.getByRole("link", { name: "View q-index on Machines — Running" });
+    const registered = screen.getByRole("link", { name: "View q-index on Machines — Open" });
     const colour = registered.style.backgroundColor;
     expect(registered.querySelector('[data-testid="rail-active-dot"]')).not.toBeNull();
     act(() => useStore.setState({
