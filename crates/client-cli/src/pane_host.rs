@@ -1017,6 +1017,17 @@ impl HostedProcess {
 /// The uid of the process at the other end of `stream`. `None` when the
 /// platform cannot say, which the caller refuses: skipping the check on a
 /// platform without `SO_PEERCRED` used to drop it without a word.
+/// The listener is non-blocking so the loop can check its lease and the
+/// tombstone. On macOS and the BSDs an accepted socket inherits that mode
+/// (Linux's does not), and the controller's reads and writes then fail with
+/// "would block" whenever no frame is waiting: the host dropped every
+/// controller right after adopting it, and the tab read "pane-host controller
+/// disconnected: failed to fill whole buffer" while its agent ran on unseen
+/// (the owner's Mac, 2026-11-15). Every connection is served blocking.
+fn make_blocking(stream: &UnixStream) -> std::io::Result<()> {
+    stream.set_nonblocking(false)
+}
+
 fn peer_uid(stream: &UnixStream) -> Option<u32> {
     #[cfg(any(target_os = "macos", target_os = "freebsd"))]
     unsafe {
@@ -1384,6 +1395,10 @@ fn run_host_with_grace(
         }
         match listener.accept() {
             Ok((stream, _)) => {
+                if let Err(error) = make_blocking(&stream) {
+                    tracing::warn!(%error, pane_id = descriptor.pane_id, "pane-host controller rejected");
+                    continue;
+                }
                 match serve_controller(
                     stream,
                     &descriptor_path,
@@ -1482,6 +1497,26 @@ pub fn read_credential(path: &Path) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_connection_accepted_non_blocking_is_served_blocking() {
+        // macOS hands out accepted sockets non-blocking when the listener is;
+        // stand that in here, since Linux never does it by itself.
+        let (served, _client) = UnixStream::pair().unwrap();
+        served.set_nonblocking(true).unwrap();
+        make_blocking(&served).unwrap();
+        served
+            .set_read_timeout(Some(Duration::from_millis(300)))
+            .unwrap();
+        let started = Instant::now();
+        let mut byte = [0u8; 1];
+        let error = (&served).read(&mut byte).unwrap_err();
+        assert!(
+            started.elapsed() >= Duration::from_millis(250),
+            "a read with nothing waiting returned at once ({error})"
+        );
+    }
+
 
     #[test]
     fn host_log_path_mirrors_the_runtime_directory_identity() {
