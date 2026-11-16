@@ -250,9 +250,10 @@ export interface MachineInfo {
   os: string;
   arch: string;
   daemonVersion?: string;
+  /** Whether the machine has a DeepSeek key, never the key: the page that
+   *  sets one only needs to say whether it is there. */
   deepseekBackend?: {
     apiBaseUrl?: string;
-    apiKey?: string;
     apiKeyConfigured: boolean;
   };
   lastSeen?: string;
@@ -1012,19 +1013,22 @@ interface AppState {
   /** Start a project on a machine. `allInstances` is what the project view's
    *  Start means: every online machine that owns tabs of the project, with
    *  `machineId` as the fallback when none does. Without it only `machineId`
-   *  starts, which is what the Machines page's per-machine Start means. */
+   *  starts, which is what the Machines page's per-machine Start means.
+   *  Returns whether the request was sent: nothing is sent while the socket
+   *  is not open. */
   startMachineProjectCli: (
     machineId: string,
     projectId: string,
     options?: { allInstances?: boolean },
-  ) => void;
+  ) => boolean;
   /** Stop a project on a machine; `allInstances` stops every attached
-   *  instance, as the project view's Close means. */
+   *  instance, as the project view's Close means. Returns whether the
+   *  request was sent. */
   stopMachineProjectCli: (
     machineId: string,
     projectId: string,
     options?: { allInstances?: boolean },
-  ) => void;
+  ) => boolean;
   /** Drop a stopped machine's tabs from the project roster after the owner
    *  confirms. The server refuses while that machine runs the project, and
    *  the tabs come back if it runs the project again. Returns whether the
@@ -1041,11 +1045,13 @@ interface AppState {
   ) => boolean;
   registerLocalProject: (machineId: string, path: string, clusterOwnerUserId?: string) => string;
   dismissCreationOperation: (requestId: string) => void;
+  /** Returns whether the request was sent: nothing is sent, and nothing
+   *  changes here, while the socket is not open. */
   setMachineDeepseekConfig: (
     machineId: string,
     apiKey?: string,
     clearApiKey?: boolean,
-  ) => void;
+  ) => boolean;
   listSessions: () => void;
   loadSessionMessages: (sessionId: string) => void;
   /** Fetch a bounded newest slice across every pane without resetting the
@@ -2858,7 +2864,7 @@ export const useStore = create<AppState>((set, get) => ({
   ) => {
     const { ws } = get();
     if (!ws || ws.readyState !== WebSocket.OPEN) {
-      return;
+      return false;
     }
     ws.send(JSON.stringify({
       type: "start_machine_project_cli",
@@ -2868,6 +2874,7 @@ export const useStore = create<AppState>((set, get) => ({
       // the Machines page must never start other machines too.
       ...(options?.allInstances ? { all_instances: true } : {}),
     }));
+    return true;
   },
 
   stopMachineProjectCli: (
@@ -2877,7 +2884,7 @@ export const useStore = create<AppState>((set, get) => ({
   ) => {
     const { ws } = get();
     if (!ws || ws.readyState !== WebSocket.OPEN) {
-      return;
+      return false;
     }
     ws.send(JSON.stringify({
       type: "stop_machine_project_cli",
@@ -2885,6 +2892,7 @@ export const useStore = create<AppState>((set, get) => ({
       project_id: projectId,
       ...(options?.allInstances ? { all_instances: true } : {}),
     }));
+    return true;
   },
 
   forgetMachinePanes: (sessionId: string, machineId: string) => {
@@ -3001,7 +3009,7 @@ export const useStore = create<AppState>((set, get) => ({
   ) => {
     const { ws } = get();
     if (!ws || ws.readyState !== WebSocket.OPEN) {
-      return;
+      return false;
     }
     const normalizedApiKey =
       apiKey && apiKey.trim().length > 0 ? apiKey.trim() : undefined;
@@ -3010,17 +3018,17 @@ export const useStore = create<AppState>((set, get) => ({
       machines: state.machines.map((entry) => {
         if (entry.machine.machineId !== machineId) return entry;
         const existingBackend = entry.machine.deepseekBackend;
-        const nextApiKey = clearApiKey
-          ? undefined
-          : (normalizedApiKey ?? existingBackend?.apiKey);
         return {
           ...entry,
           machine: {
             ...entry.machine,
             deepseekBackend: {
               apiBaseUrl: DEEPSEEK_API_BASE_URL,
-              apiKey: nextApiKey,
-              apiKeyConfigured: Boolean(nextApiKey),
+              apiKeyConfigured: clearApiKey
+                ? false
+                : normalizedApiKey
+                ? true
+                : existingBackend?.apiKeyConfigured ?? false,
             },
           },
         };
@@ -3034,6 +3042,7 @@ export const useStore = create<AppState>((set, get) => ({
       api_key: normalizedApiKey,
       clear_api_key: clearApiKey,
     }));
+    return true;
   },
 
   listSessions: () => {
@@ -5541,8 +5550,9 @@ export function handleServerMessage(
             daemonVersion: machine.daemon_version as string | undefined,
             deepseekBackend: machine.deepseek_backend
               ? {
+                  // The server still sends the owner the key itself. It is
+                  // deliberately not read: nothing here shows it.
                   apiBaseUrl: ((machine.deepseek_backend as Record<string, unknown>).api_base_url as string | undefined),
-                  apiKey: ((machine.deepseek_backend as Record<string, unknown>).api_key as string | undefined),
                   apiKeyConfigured: Boolean(
                     (machine.deepseek_backend as Record<string, unknown>).api_key_configured
                   ),
@@ -5574,36 +5584,7 @@ export function handleServerMessage(
         };
       });
 
-      set((state) => {
-        const previousById = new Map(
-          state.machines.map((entry) => [entry.machine.machineId, entry])
-        );
-        const merged = parsed.map((entry) => {
-          const previous = previousById.get(entry.machine.machineId);
-          const deepseekBackend = entry.machine.deepseekBackend;
-          const previousDeepseekKey = previous?.machine.deepseekBackend?.apiKey;
-          const mergedDeepseek =
-            entry.clusterAccess === "owner" &&
-            deepseekBackend &&
-            deepseekBackend.apiKey === undefined &&
-            deepseekBackend.apiKeyConfigured &&
-            previousDeepseekKey
-              ? {
-                  ...deepseekBackend,
-                  apiKey: previousDeepseekKey,
-                }
-              : deepseekBackend;
-
-          return {
-            ...entry,
-            machine: {
-              ...entry.machine,
-              deepseekBackend: mergedDeepseek,
-            },
-          };
-        });
-        return { machines: merged, machineListReceived: true };
-      });
+      set({ machines: parsed, machineListReceived: true });
       break;
     }
 

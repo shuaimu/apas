@@ -47,3 +47,53 @@ describe("PolicyEditor and the retained team field", () => {
     });
   });
 });
+
+describe("PolicyEditor on the cluster page", () => {
+  it("draws a part of a section with each profile by name and the key in its title", () => {
+    render(
+      <PolicyEditor
+        appearance="overview"
+        title="Cluster default policy"
+        policy={{ team_available: true, allowed_launch_profiles: [PROFILES[0].key] }}
+        profiles={PROFILES}
+        bound={{ team_available: true, allowed_launch_profiles: [PROFILES[0].key], version: 1, project_suspended: false }}
+        onSave={vi.fn()}
+        saveLabel="Save cluster policy"
+      />,
+    );
+
+    expect(screen.getByRole("heading", { level: 3, name: "Cluster default policy" })).toBeTruthy();
+    expect(screen.queryByText(PROFILES[0].key)).toBeNull();
+    expect(screen.getByText("Claude terminal").closest("label")?.getAttribute("title")).toBe(PROFILES[0].key);
+    expect(screen.getByText("Codex terminal").closest("label")?.getAttribute("title")).toBe("Not permitted by the policy above this one");
+    expect(screen.getAllByRole("checkbox")).toHaveLength(PROFILES.length);
+    expect(screen.queryByText(/team/i)).toBeNull();
+    expect(screen.getByRole("button", { name: "Save cluster policy" })).toBeTruthy();
+  });
+});
+
+describe("PolicyEditor's unsaved choices", () => {
+  const stored = { team_available: false, allowed_launch_profiles: [PROFILES[0].key], version: 2 };
+
+  it("keeps them when the same policy arrives again as a new object", () => {
+    const { rerender } = render(
+      <PolicyEditor appearance="overview" title="Cluster default policy" policy={{ ...stored }} profiles={PROFILES} onSave={vi.fn()} />,
+    );
+    fireEvent.click(screen.getByRole("checkbox", { name: /Codex terminal/ }));
+    rerender(
+      <PolicyEditor appearance="overview" title="Cluster default policy" policy={{ ...stored, allowed_launch_profiles: [...stored.allowed_launch_profiles] }} profiles={PROFILES} onSave={vi.fn()} />,
+    );
+    expect((screen.getByRole("checkbox", { name: /Codex terminal/ }) as HTMLInputElement).checked).toBe(true);
+  });
+
+  it("drops them when the stored policy changes", () => {
+    const { rerender } = render(
+      <PolicyEditor appearance="panel" title="Project policy" policy={stored} profiles={PROFILES} onSave={vi.fn()} />,
+    );
+    fireEvent.click(screen.getByRole("checkbox", { name: /Codex terminal/ }));
+    rerender(
+      <PolicyEditor appearance="panel" title="Project policy" policy={{ ...stored, version: 3 }} profiles={PROFILES} onSave={vi.fn()} />,
+    );
+    expect((screen.getByRole("checkbox", { name: /Codex terminal/ }) as HTMLInputElement).checked).toBe(false);
+  });
+});

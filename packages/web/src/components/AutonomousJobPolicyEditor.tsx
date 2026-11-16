@@ -12,6 +12,13 @@ type Props = {
   endpoint: string;
   deployment?: boolean;
   request: PolicyRequest;
+  /** Inside another card, such as a closed-by-default part of the cluster
+   *  page: no border or padding of its own, and the heading only for screen
+   *  readers, since the surrounding control already names it. */
+  embedded?: boolean;
+  /** Plain names for the server's unavailable-reason codes. A code with no
+   *  name is shown as it came. Without it the codes are listed as before. */
+  reasonLabels?: Record<string, string>;
 };
 
 const limitFields: { key: keyof JobLimits; label: string }[] = [
@@ -52,7 +59,7 @@ function policyDocument(value: unknown): JobPolicyManagement {
   return value as JobPolicyManagement;
 }
 
-export function AutonomousJobPolicyEditor({ title, endpoint, deployment = false, request }: Props) {
+export function AutonomousJobPolicyEditor({ title, endpoint, deployment = false, request, embedded = false, reasonLabels }: Props) {
   const account = useStore((state) => state.userId);
   const generation = useRef(0);
   const [loaded, setLoaded] = useState<{ document: JobPolicyManagement; account: string | null; revision: number; endpoint: string } | null>(null);
@@ -85,8 +92,8 @@ export function AutonomousJobPolicyEditor({ title, endpoint, deployment = false,
   }, [endpoint, request, refresh, account]);
 
   return (
-    <section className="min-w-0 space-y-3 rounded-xl border border-gray-200 bg-white p-4 dark:border-gray-800 dark:bg-gray-900">
-      <h2 className="font-semibold">{title}</h2>
+    <section className={embedded ? "min-w-0 space-y-3" : "min-w-0 space-y-3 rounded-xl border border-gray-200 bg-white p-4 dark:border-gray-800 dark:bg-gray-900"}>
+      <h2 className={embedded ? "sr-only" : "font-semibold"}>{title}</h2>
       <p className="text-sm text-gray-600 dark:text-gray-300">
         Autonomous workers are separate from terminal panes. Recurring permission is independently default denied.
         Policies only narrow deployment and hosting-cluster bounds; permission never substitutes for a qualified, ready host.
@@ -96,9 +103,14 @@ export function AutonomousJobPolicyEditor({ title, endpoint, deployment = false,
         <p>{error}</p>
         <button type="button" className="min-h-11 rounded border px-3" onClick={() => setRefresh((value) => value + 1)}>Reload policy</button>
       </div> : !document ? <p role="status" className="text-sm">Loading job policy…</p> : <>
-        {document.unavailable_reasons.length > 0 && <ul className="list-inside list-disc break-words text-sm text-amber-800 dark:text-amber-300">
+        {document.unavailable_reasons.length > 0 && (reasonLabels ? <div className="rounded-lg border border-gray-200 bg-gray-50 px-3 py-2 text-sm text-gray-700 dark:border-gray-700 dark:bg-gray-800/40 dark:text-gray-300">
+          <p>Workers cannot run here yet:</p>
+          <ul className="list-disc break-words pl-5">
+            {document.unavailable_reasons.map((reason) => <li key={reason}>{reasonLabels[reason] ?? reason}</li>)}
+          </ul>
+        </div> : <ul className="list-inside list-disc break-words text-sm text-amber-800 dark:text-amber-300">
           {document.unavailable_reasons.map((reason) => <li key={reason}>{reason}</li>)}
-        </ul>}
+        </ul>)}
         <details>
           <summary className="min-h-11 cursor-pointer py-3 text-sm">Requested, inherited and effective policy</summary>
           <pre className="max-h-80 overflow-y-auto whitespace-pre-wrap break-words rounded bg-gray-50 p-3 text-xs dark:bg-gray-950">

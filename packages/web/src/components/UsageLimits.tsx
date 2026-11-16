@@ -241,68 +241,38 @@ export function UsageLimitsDisplay({ limits, compact = false }: UsageLimitsDispl
   );
 }
 
+/** The providers whose limits are shown. */
 const PROVIDER_LABELS: Record<string, string> = {
   claude: "Claude",
   codex: "Codex",
   deepseek: "DeepSeek",
 };
 
-const PROVIDER_COLORS: Record<string, string> = {
-  claude: "border-l-amber-500",
-  codex: "border-l-blue-500",
-  deepseek: "border-l-indigo-500",
-};
+/**
+ * The newest limits each provider reported, across every CLI client: one entry
+ * per provider that has a window, in the order the providers were first seen.
+ * The limits belong to the provider account, not to one machine, so the
+ * newest report from anywhere is the answer.
+ */
+export function latestLimitsByProvider(
+  usageLimits: Map<string, Partial<Record<string, UsageLimitsType>>>,
+): Array<{ provider: string; limits: UsageLimitsType }> {
+  const latest: Partial<Record<string, { limits: UsageLimitsType; fetchedAt?: string }>> = {};
 
-export function AllProvidersUsage() {
-  const usageLimits = useStore((s) => s.usageLimits);
-
-  // Aggregate usage across all CLI clients — take the most recently fetched entry per provider.
-  const aggregated = useMemo(() => {
-    const latest: Partial<Record<string, { limits: UsageLimitsType; fetchedAt?: string }>> = {};
-
-    for (const [, byProvider] of usageLimits) {
-      for (const [provider, limits] of Object.entries(byProvider)) {
-        if (!(provider in PROVIDER_LABELS)) continue;
-        const existing = latest[provider];
-        if (!limits.fiveHour && !limits.sevenDay) continue;
-        if (
-          !existing ||
-          (limits.fetchedAt && (!existing.fetchedAt || limits.fetchedAt > existing.fetchedAt))
-        ) {
-          latest[provider] = { limits, fetchedAt: limits.fetchedAt };
-        }
+  for (const [, byProvider] of usageLimits) {
+    for (const [provider, limits] of Object.entries(byProvider)) {
+      if (!limits || !(provider in PROVIDER_LABELS)) continue;
+      const existing = latest[provider];
+      if (!limits.fiveHour && !limits.sevenDay) continue;
+      if (
+        !existing ||
+        (limits.fetchedAt && (!existing.fetchedAt || limits.fetchedAt > existing.fetchedAt))
+      ) {
+        latest[provider] = { limits, fetchedAt: limits.fetchedAt };
       }
     }
-    return latest;
-  }, [usageLimits]);
-
-  const providers = Object.entries(aggregated);
-  if (providers.length === 0) {
-    return (
-      <div className="text-xs text-gray-500">
-        No usage data available. Start a session to see usage limits.
-      </div>
-    );
   }
-
-  return (
-    <div className="space-y-3">
-      {providers.map(([provider, entry]) => {
-        if (!entry) return null;
-        return (
-          <div
-            key={provider}
-            className={`border-l-4 ${PROVIDER_COLORS[provider] || "border-l-gray-400"} pl-3`}
-          >
-            <div className="mb-1 text-sm font-medium">
-              {PROVIDER_LABELS[provider] || provider}
-            </div>
-            <UsageLimitsDisplay limits={entry.limits} />
-          </div>
-        );
-      })}
-    </div>
-  );
+  return Object.entries(latest).flatMap(([provider, entry]) => entry ? [{ provider, limits: entry.limits }] : []);
 }
 
 export function UsageLimitsPanel() {

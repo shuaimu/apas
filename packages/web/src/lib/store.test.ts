@@ -1494,9 +1494,9 @@ describe('DeepSeek machine config', () => {
     const machine = useStore.getState().machines[0].machine;
     expect(machine.deepseekBackend).toEqual({
       apiBaseUrl: 'https://api.deepseek.com/anthropic',
-      apiKey: 'sk-deepseek',
       apiKeyConfigured: true,
     });
+    expect(machine.deepseekBackend).not.toHaveProperty('apiKey');
     expect(ws.send).toHaveBeenCalledWith(JSON.stringify({
       type: 'set_machine_deepseek_config',
       machine_id: 'machine-1',
@@ -1506,7 +1506,32 @@ describe('DeepSeek machine config', () => {
     }));
   });
 
-  it('normalizes DeepSeek machine backend and preserves a masked existing key', async () => {
+  it('marks a cleared key as not configured and keeps the state when no key is given', () => {
+    const ws = makeOpenWs();
+    useStore.setState({
+      ws,
+      machines: [{
+        machine: {
+          machineId: 'machine-1',
+          hostname: 'devbox',
+          os: 'linux',
+          arch: 'x86_64',
+          deepseekBackend: { apiBaseUrl: 'https://api.deepseek.com/anthropic', apiKeyConfigured: true },
+        },
+        projects: [],
+      }],
+    });
+
+    useStore.getState().setMachineDeepseekConfig('machine-1', '   ', false);
+    expect(useStore.getState().machines[0].machine.deepseekBackend?.apiKeyConfigured).toBe(true);
+    useStore.getState().setMachineDeepseekConfig('machine-1', undefined, true);
+    expect(useStore.getState().machines[0].machine.deepseekBackend).toEqual({
+      apiBaseUrl: 'https://api.deepseek.com/anthropic',
+      apiKeyConfigured: false,
+    });
+  });
+
+  it('keeps only whether a DeepSeek key is configured', async () => {
     useStore.getState().connect();
     await new Promise(resolve => setTimeout(resolve, 10));
     const ws = useStore.getState().ws as unknown as { onmessage?: (event: MessageEvent) => void };
@@ -1520,7 +1545,6 @@ describe('DeepSeek machine config', () => {
           arch: 'x86_64',
           deepseekBackend: {
             apiBaseUrl: 'https://api.deepseek.com/anthropic',
-            apiKey: 'sk-existing',
             apiKeyConfigured: true,
           },
         },
@@ -1539,6 +1563,7 @@ describe('DeepSeek machine config', () => {
             arch: 'x86_64',
             deepseek_backend: {
               api_base_url: 'https://api.deepseek.com/anthropic',
+              api_key: 'sk-from-the-server',
               api_key_configured: true,
             },
             minimax_backend: {
@@ -1562,9 +1587,10 @@ describe('DeepSeek machine config', () => {
     const entry = useStore.getState().machines[0];
     expect(entry.machine.deepseekBackend).toEqual({
       apiBaseUrl: 'https://api.deepseek.com/anthropic',
-      apiKey: 'sk-existing',
       apiKeyConfigured: true,
     });
+    expect(entry.machine.deepseekBackend).not.toHaveProperty('apiKey');
+    expect(JSON.stringify(useStore.getState().machines)).not.toContain('sk-from-the-server');
     expect(entry.machine).not.toHaveProperty('minimaxBackend');
     expect(entry.machine).not.toHaveProperty('glmBackend');
   });

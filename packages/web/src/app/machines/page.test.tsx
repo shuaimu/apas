@@ -1,7 +1,7 @@
 import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import MachinesPage from "./page";
-import { useStore, type MachineWithProjects } from "@/lib/store";
+import { useStore, type MachineInfo, type MachineWithProjects } from "@/lib/store";
 
 const routerPush = vi.hoisted(() => vi.fn());
 
@@ -114,11 +114,13 @@ function machineEntry(): MachineWithProjects {
       os: "linux",
       arch: "x64",
       lastSeen: "2026-06-17T05:00:00Z",
+      // A key the store should never hold, as if one slipped through: the
+      // page must still not show it anywhere.
       deepseekBackend: {
         apiBaseUrl: "https://api.deepseek.com/anthropic",
         apiKey: "sk-deepseek",
         apiKeyConfigured: true,
-      },
+      } as NonNullable<MachineInfo["deepseekBackend"]>,
     },
     projects: [
       {
@@ -150,9 +152,10 @@ function seedMachines(machines: MachineWithProjects[] = [machineEntry()]) {
   const actions = {
     connect: vi.fn(),
     listMachines: vi.fn(),
-    startMachineProjectCli: vi.fn(),
-    stopMachineProjectCli: vi.fn(),
-    setMachineDeepseekConfig: vi.fn(),
+    // Each reports that it sent, as the store does while the socket is open.
+    startMachineProjectCli: vi.fn().mockReturnValue(true),
+    stopMachineProjectCli: vi.fn().mockReturnValue(true),
+    setMachineDeepseekConfig: vi.fn().mockReturnValue(true),
     rebootDaemon: vi.fn(),
     rebootDaemons: vi.fn(),
   };
@@ -169,6 +172,14 @@ function seedMachines(machines: MachineWithProjects[] = [machineEntry()]) {
   });
 
   return actions;
+}
+
+function openView(name: string) {
+  fireEvent.click(screen.getByRole("tab", { name }));
+}
+
+function confirmInDialog(name: string) {
+  fireEvent.click(within(screen.getByRole("dialog")).getByRole("button", { name }));
 }
 
 beforeEach(() => {
@@ -246,7 +257,8 @@ describe("MachinesPage daemon restart", () => {
     expect(actions.rebootDaemon).not.toHaveBeenCalled();
 
     const dialog = screen.getByRole("dialog", { name: "Reboot and update the daemon on zoo-006" });
-    expect(dialog).toBeTruthy();
+    // The visible title names the machine too.
+    expect(within(dialog).getByRole("heading", { name: "Reboot and update the daemon on zoo-006?" })).toBeTruthy();
     // Projects run inside the daemon: the dialog must not promise they keep running.
     expect(within(dialog).getByText(/Every project running on zoo-006 restarts with it\. Terminal agents normally keep running/)).toBeTruthy();
     expect(within(dialog).queryByText(/does not own/)).toBeNull();
@@ -317,16 +329,19 @@ describe("MachinesPage", () => {
     expect(actions.listMachines).toHaveBeenCalledTimes(1);
     expect(screen.getAllByText("build-host").length).toBeGreaterThan(0);
     expect(screen.getByText(/linux\/x64/)).toBeTruthy();
-    expect(screen.getByText("DeepSeek Backend (Claude Runtime)")).toBeTruthy();
+    expect(screen.getByRole("heading", { name: "DeepSeek keys" })).toBeTruthy();
     expect(screen.getByText("API key configured")).toBeTruthy();
     expect(screen.queryByText(/MiniMax/i)).toBeNull();
     expect(screen.queryByText(/GLM/i)).toBeNull();
     expect(screen.getByText("Active API")).toBeTruthy();
     expect(screen.getByText("Stopped API")).toBeTruthy();
-    expect(screen.getByText(/Running.*pid 4242/)).toBeTruthy();
+    expect(screen.getByText("Running · 2.0 GiB").getAttribute("title")).toBe("pid 4242");
     expect(screen.getByText("Stopped")).toBeTruthy();
     expect(screen.getByText("My Cluster")).toBeTruthy();
     expect(screen.queryByText(/No machines reported yet/)).toBeNull();
+    // The key is never shown, prefilled or put in an input.
+    expect(screen.queryByDisplayValue("sk-deepseek")).toBeNull();
+    expect(document.body.textContent).not.toContain("sk-deepseek");
 
     unmount();
     seedMachines([]);
@@ -340,17 +355,37 @@ describe("MachinesPage", () => {
 
     render(<MachinesPage />);
 
-    fireEvent.change(screen.getByLabelText("DeepSeek API key for build-host"), {
-      target: { value: "  sk-deepseek-new  " },
-    });
-    fireEvent.click(screen.getByRole("button", { name: "Save DeepSeek API key for build-host" }));
+    fireEvent.click(screen.getByRole("button", { name: "Replace DeepSeek API key for build-host" }));
+    const input = screen.getByLabelText("DeepSeek API key for build-host") as HTMLInputElement;
+    expect(input.type).toBe("password");
+    expect(input.value).toBe("");
+    const save = screen.getByRole("button", { name: "Save DeepSeek API key for build-host" }) as HTMLButtonElement;
+    expect(save.disabled).toBe(true);
+    fireEvent.change(input, { target: { value: "  sk-deepseek-new  " } });
+    fireEvent.click(save);
     expect(actions.setMachineDeepseekConfig).toHaveBeenCalledWith(
       "machine-1",
       "sk-deepseek-new",
       false,
     );
+    expect(screen.queryByDisplayValue(/sk-deepseek-new/)).toBeNull();
+    expect(screen.getByText("Key sent to build-host.")).toBeTruthy();
+
     fireEvent.click(screen.getByRole("button", { name: "Clear DeepSeek API key for build-host" }));
+    expect(actions.setMachineDeepseekConfig).toHaveBeenCalledTimes(1);
+    confirmInDialog("Clear key");
     expect(actions.setMachineDeepseekConfig).toHaveBeenLastCalledWith("machine-1", undefined, true);
+  });
+
+  it("sends nothing when the Clear key confirmation is dismissed with Escape", () => {
+    const actions = seedMachines();
+
+    render(<MachinesPage />);
+    fireEvent.click(screen.getByRole("button", { name: "Clear DeepSeek API key for build-host" }));
+    fireEvent.keyDown(screen.getByRole("dialog", { name: "Clear the DeepSeek API key on build-host?" }), { key: "Escape" });
+
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(actions.setMachineDeepseekConfig).not.toHaveBeenCalled();
   });
 
   it("wires Refresh and project Start/Stop controls to store actions", () => {
@@ -364,6 +399,9 @@ describe("MachinesPage", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "Start Stopped API on build-host" }));
     expect(actions.startMachineProjectCli).toHaveBeenCalledWith("machine-1", "project-stopped");
+    const starting = screen.getByRole("button", { name: "Start Stopped API on build-host" }) as HTMLButtonElement;
+    expect(starting.textContent).toContain("Starting…");
+    expect(starting.disabled).toBe(true);
 
     fireEvent.click(screen.getByRole("button", { name: "Stop Active API on build-host" }));
     expect(actions.stopMachineProjectCli).toHaveBeenCalledWith("machine-1", "project-running");
@@ -374,6 +412,7 @@ describe("MachinesPage cluster administration", () => {
   it("lists the projects hosted in this cluster, including one another account owns", async () => {
     seedMachines();
     render(<MachinesPage />);
+    openView("Projects");
 
     expect(await screen.findByText("Projects in this cluster")).toBeTruthy();
     expect(await screen.findByText("mako-soumojit")).toBeTruthy();
@@ -382,17 +421,23 @@ describe("MachinesPage cluster administration", () => {
 
   it("suspends a hosted project and stops its runtime", async () => {
     seedMachines();
-    vi.spyOn(window, "confirm").mockReturnValue(true);
     render(<MachinesPage />);
+    openView("Projects");
 
     fireEvent.click(await screen.findByRole("button", { name: "Manage mako-soumojit" }));
     fireEvent.click(await screen.findByRole("button", { name: "Suspend project" }));
+    expect(fetchMock).not.toHaveBeenCalledWith(
+      "https://apas.mpaxos.com/cluster/projects/project-a/lifecycle",
+      expect.anything(),
+    );
+    confirmInDialog("Suspend project");
     await waitFor(() => expect(fetchMock).toHaveBeenCalledWith(
       "https://apas.mpaxos.com/cluster/projects/project-a/lifecycle",
       expect.objectContaining({ method: "PATCH", body: JSON.stringify({ status: "suspended" }) }),
     ));
 
-    fireEvent.click(screen.getByRole("button", { name: "Stop runtime" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Stop runtime" }));
+    confirmInDialog("Stop runtime");
     await waitFor(() => expect(fetchMock).toHaveBeenCalledWith(
       "https://apas.mpaxos.com/cluster/projects/project-a/stop-runtime",
       expect.objectContaining({ method: "POST" }),
@@ -402,6 +447,7 @@ describe("MachinesPage cluster administration", () => {
   it("manages members and ownership without joining the project", async () => {
     seedMachines();
     render(<MachinesPage />);
+    openView("Projects");
 
     fireEvent.click(await screen.findByRole("button", { name: "Manage mako-soumojit" }));
     expect(await screen.findByText("member@example.com")).toBeTruthy();
@@ -413,7 +459,8 @@ describe("MachinesPage cluster administration", () => {
       expect.objectContaining({ method: "POST", body: JSON.stringify({ user_id: "user-2" }) }),
     ));
 
-    fireEvent.click(screen.getByRole("button", { name: "Remove member@example.com" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Remove member@example.com" }));
+    confirmInDialog("Remove");
     await waitFor(() => expect(fetchMock).toHaveBeenCalledWith(
       "https://apas.mpaxos.com/cluster/projects/project-a/members/user-1",
       expect.objectContaining({ method: "DELETE" }),
@@ -423,6 +470,7 @@ describe("MachinesPage cluster administration", () => {
   it("adds a cluster member directly with selected machine and agent", async () => {
     seedMachines();
     render(<MachinesPage />);
+    openView("Sharing");
 
     expect(await screen.findByText("Share machine access")).toBeTruthy();
     expect(screen.getByText(/choose the machines it can run on/i)).toBeTruthy();
@@ -454,6 +502,7 @@ describe("MachinesPage cluster administration", () => {
   it("saves a cluster default policy and hides retired profiles", async () => {
     seedMachines();
     render(<MachinesPage />);
+    openView("Policies");
 
     expect(await screen.findByText("Cluster default policy")).toBeTruthy();
     expect(screen.getAllByText("Codex Terminal").length).toBeGreaterThan(0);
@@ -469,9 +518,12 @@ describe("MachinesPage cluster administration", () => {
   it("shows this cluster's activity", async () => {
     seedMachines();
     render(<MachinesPage />);
+    openView("Activity");
 
     expect(await screen.findByText("Cluster activity")).toBeTruthy();
-    expect(await screen.findByText("project.runtime_stopped")).toBeTruthy();
+    // In words, with the server's code kept in the title.
+    expect((await screen.findByText("Runtime stopped")).getAttribute("title")).toBe("project.runtime_stopped");
+    expect(screen.getByText("The latest event")).toBeTruthy();
   });
 
   it("refreshes owner membership state after revocation", async () => {
@@ -499,12 +551,13 @@ describe("MachinesPage cluster administration", () => {
       if (url.includes("/cluster/usage")) return apiResponse({ success: true });
       return apiResponse({ success: true });
     });
-    vi.spyOn(window, "confirm").mockReturnValue(true);
     seedMachines();
     render(<MachinesPage />);
+    openView("Sharing");
 
     expect(await screen.findByText("member@example.com")).toBeTruthy();
-    fireEvent.click(screen.getByRole("button", { name: "Revoke access" }));
+    fireEvent.click(screen.getByRole("button", { name: "Revoke access for member@example.com" }));
+    confirmInDialog("Revoke access");
     await waitFor(() => expect(fetchMock).toHaveBeenCalledWith(
       "https://apas.mpaxos.com/cluster/members/member-1",
       expect.objectContaining({ method: "DELETE" }),
@@ -547,18 +600,21 @@ describe("MachinesPage cluster administration", () => {
     });
     seedMachines();
     render(<MachinesPage />);
+    openView("Usage");
 
-    expect(await screen.findByText("Cluster usage")).toBeTruthy();
+    expect(await screen.findByRole("heading", { name: "Usage" })).toBeTruthy();
     expect(await screen.findByText("Member project")).toBeTruthy();
     expect(screen.getAllByText("Unavailable").length).toBeGreaterThan(0);
-    fireEvent.change(screen.getByLabelText("Usage window"), { target: { value: "today" } });
-    expect((screen.getByLabelText("Usage window") as HTMLSelectElement).value).toBe("today");
+    const today = within(screen.getByRole("group", { name: "Usage period" })).getByRole("button", { name: "Today" });
+    fireEvent.click(today);
+    expect(today.getAttribute("aria-pressed")).toBe("true");
   });
 
   it("surfaces the server's refusal for a project outside this cluster", async () => {
     seedMachines();
     installClusterApi({ projectDenied: true });
     render(<MachinesPage />);
+    openView("Projects");
 
     fireEvent.click(await screen.findByRole("button", { name: "Manage mako-soumojit" }));
     expect(await screen.findByText("That project is not in your cluster")).toBeTruthy();
@@ -590,7 +646,11 @@ describe("MachinesPage cluster administration", () => {
     const selector = await screen.findByLabelText("Selected cluster");
     fireEvent.change(selector, { target: { value: "host" } });
     expect(await screen.findByText("Trusted compute boundary")).toBeTruthy();
-    expect(screen.queryByText("DeepSeek Backend (Claude Runtime)")).toBeNull();
+    expect(screen.queryByRole("heading", { name: "DeepSeek keys" })).toBeNull();
+    const tabs = screen.getAllByRole("tab");
+    expect(tabs).toHaveLength(2);
+    expect(tabs[0]).toBe(screen.getByRole("tab", { name: "Machines" }));
+    expect(tabs[1]).toBe(screen.getByRole("tab", { name: "Projects" }));
     expect(screen.queryByText("Cluster default policy")).toBeNull();
     expect(screen.queryByText("Cluster activity")).toBeNull();
     expect(screen.queryByRole("button", { name: /Restart daemon on host-box/ })).toBeNull();
@@ -635,5 +695,334 @@ describe("registration completion navigation", () => {
     expect(screen.getByText("Cloning github.com/a/b…")).toBeTruthy();
     expect(screen.getByText("/plain/folder")).toBeTruthy();
     expect(screen.getByText("Registering existing folder…")).toBeTruthy();
+  });
+});
+
+describe("views and the address", () => {
+  function selectedTab() {
+    return screen.getAllByRole("tab").find((tab) => tab.getAttribute("aria-selected") === "true");
+  }
+
+  function stoppedMachine(count: number): MachineWithProjects {
+    return {
+      machine: { machineId: "machine-1", hostname: "build-host", os: "linux", arch: "x64" },
+      projects: Array.from({ length: count }, (_, index) => ({
+        projectId: `project-${index + 1}`,
+        name: `Stopped ${index + 1}`,
+        path: `/srv/stopped-${index + 1}`,
+        isRunning: false,
+      })),
+    };
+  }
+
+  it("opens Machines for a one-machine link even when another view is asked for", async () => {
+    seedMachines();
+    window.history.replaceState({}, "", "/machines?view=usage&machine=machine-1&project=project-stopped");
+    render(<MachinesPage />);
+
+    expect(selectedTab()).toBe(screen.getByRole("tab", { name: "Machines" }));
+    await waitFor(() => expect(document.activeElement).toBe(document.getElementById("project-machine-1-project-stopped")));
+  });
+
+  it("unfolds a machine's stopped projects to reveal a linked row, and starts nothing", async () => {
+    const actions = seedMachines([stoppedMachine(5)]);
+    window.history.replaceState({}, "", "/machines?machine=machine-1&project=project-4#project-machine-1-project-4");
+    render(<MachinesPage />);
+
+    const row = document.getElementById("project-machine-1-project-4");
+    expect(row).toBeTruthy();
+    await waitFor(() => expect(document.activeElement).toBe(row));
+    expect(screen.getByRole("button", { name: "Hide stopped projects" })).toBeTruthy();
+    expect(actions.startMachineProjectCli).not.toHaveBeenCalled();
+  });
+
+  it("folds more than three stopped projects behind one line", () => {
+    seedMachines([stoppedMachine(5)]);
+    render(<MachinesPage />);
+
+    expect(screen.queryByText("Stopped 1")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Show 5 stopped projects" }));
+    expect(screen.getByText("Stopped 1")).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Hide stopped projects" })).toBeTruthy();
+  });
+
+  it("moves between views with the arrow, Home and End keys", () => {
+    seedMachines();
+    render(<MachinesPage />);
+
+    const tablist = screen.getByRole("tablist", { name: "Cluster views" });
+    fireEvent.keyDown(tablist, { key: "ArrowRight" });
+    expect(selectedTab()).toBe(screen.getByRole("tab", { name: "Projects" }));
+    expect(document.activeElement).toBe(screen.getByRole("tab", { name: "Projects" }));
+    fireEvent.keyDown(tablist, { key: "End" });
+    expect(selectedTab()).toBe(screen.getByRole("tab", { name: "Activity" }));
+    fireEvent.keyDown(tablist, { key: "ArrowRight" });
+    expect(selectedTab()).toBe(screen.getByRole("tab", { name: "Machines" }));
+    fireEvent.keyDown(tablist, { key: "ArrowLeft" });
+    expect(selectedTab()).toBe(screen.getByRole("tab", { name: "Activity" }));
+    fireEvent.keyDown(tablist, { key: "Home" });
+    expect(selectedTab()).toBe(screen.getByRole("tab", { name: "Machines" }));
+  });
+
+  it("opens the view the address names", async () => {
+    seedMachines();
+    window.history.replaceState({}, "", "/machines?view=activity");
+    render(<MachinesPage />);
+
+    expect(selectedTab()).toBe(screen.getByRole("tab", { name: "Activity" }));
+    expect(await screen.findByText("Runtime stopped")).toBeTruthy();
+  });
+
+  it("writes the view into the address and drops the one-machine link", () => {
+    seedMachines();
+    window.history.replaceState({}, "", "/machines?cluster_owner=owned&machine=machine-1&project=project-stopped#project-machine-1-project-stopped");
+    render(<MachinesPage />);
+
+    openView("Projects");
+    const url = new URL(window.location.href);
+    expect(url.searchParams.get("view")).toBe("projects");
+    expect(url.searchParams.get("cluster_owner")).toBe("owned");
+    expect(url.searchParams.has("machine")).toBe(false);
+    expect(url.searchParams.has("project")).toBe(false);
+    expect(url.hash).toBe("");
+    expect(selectedTab()).toBe(screen.getByRole("tab", { name: "Projects" }));
+  });
+
+  it("shows Machines in a shared cluster that offers no asked-for owner view", async () => {
+    fetchMock.mockImplementation(async (input: string | URL) => {
+      const url = String(input);
+      if (url.endsWith("/cluster/contexts")) return apiResponse([
+        { owner_user_id: "me", owner_email: "me@example.com", access: "owner" },
+        { owner_user_id: "host", owner_email: "host@example.com", access: "member" },
+      ]);
+      if (url.includes("/cluster/contexts/host/projects?")) return apiResponse({ items: [], limit: 200, offset: 0 });
+      if (url.endsWith("/cluster/contexts/host/policy/default")) return apiResponse({ cluster: null, deployment: policy });
+      if (url.endsWith("/cluster/launch-profiles")) return apiResponse([]);
+      return apiResponse({ success: true });
+    });
+    const shared = machineAt("shared-machine", "host-box", "26.08.74");
+    shared.clusterOwnerUserId = "host";
+    shared.clusterAccess = "member";
+    seedMachines([shared]);
+    localStorage.setItem("apas_mobile_cluster_owner", "host");
+    window.history.replaceState({}, "", "/machines?view=policies");
+    render(<MachinesPage />);
+
+    expect(await screen.findByText("Trusted compute boundary")).toBeTruthy();
+    expect(screen.queryByRole("tab", { name: "Policies" })).toBeNull();
+    expect(selectedTab()).toBe(screen.getByRole("tab", { name: "Machines" }));
+    expect(screen.queryByText("Cluster default policy")).toBeNull();
+  });
+
+  it("opens the project the address selects", async () => {
+    seedMachines();
+    window.history.replaceState({}, "", "/machines?view=projects&selected=project-a");
+    render(<MachinesPage />);
+
+    expect(await screen.findByText("member@example.com")).toBeTruthy();
+    expect(fetchMock).toHaveBeenCalledWith("https://apas.mpaxos.com/cluster/projects/project-a", expect.anything());
+    expect(screen.getByRole("button", { name: "Manage mako-soumojit" }).getAttribute("aria-current")).toBe("true");
+  });
+
+  it("starts the owner transfer empty and confirms it before sending", async () => {
+    seedMachines();
+    render(<MachinesPage />);
+    openView("Projects");
+
+    fireEvent.click(await screen.findByRole("button", { name: "Manage mako-soumojit" }));
+    const input = await screen.findByLabelText("New owner user ID") as HTMLInputElement;
+    expect(input.value).toBe("");
+    const transfer = screen.getByRole("button", { name: "Transfer" }) as HTMLButtonElement;
+    expect(transfer.disabled).toBe(true);
+    fireEvent.change(input, { target: { value: "owner-1" } });
+    expect(transfer.disabled).toBe(true);
+    fireEvent.change(input, { target: { value: "user-9" } });
+    fireEvent.click(transfer);
+    confirmInDialog("Transfer");
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith(
+      "https://apas.mpaxos.com/cluster/projects/project-a/owner",
+      expect.objectContaining({ method: "PATCH", body: JSON.stringify({ user_id: "user-9" }) }),
+    ));
+    expect(await screen.findByText("Owner changed.")).toBeTruthy();
+  });
+
+  it("adds a member who inherits the cluster policy", async () => {
+    seedMachines();
+    render(<MachinesPage />);
+    openView("Sharing");
+
+    fireEvent.change(await screen.findByLabelText("Member account email"), { target: { value: "new-member@example.com" } });
+    fireEvent.click(screen.getByRole("checkbox", { name: "build-host" }));
+    const select = screen.getByLabelText("Default AI agent for new member projects") as HTMLSelectElement;
+    await waitFor(() => expect(select.value).toBe("terminal:codex:official:default"));
+    fireEvent.change(select, { target: { value: "" } });
+    expect(select.value).toBe("");
+    fireEvent.click(screen.getByRole("button", { name: "Add member" }));
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith(
+      "https://apas.mpaxos.com/cluster/members",
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({
+          email: "new-member@example.com",
+          allowed_machine_ids: ["machine-1"],
+          default_launch_profile: null,
+        }),
+      }),
+    ));
+    expect(await screen.findByText("Member added.")).toBeTruthy();
+  });
+
+  it("keeps an unsaved cluster policy change across an unrelated re-render", async () => {
+    seedMachines();
+    render(<MachinesPage />);
+    openView("Policies");
+
+    const checkbox = await screen.findByRole("checkbox", { name: /Codex Terminal/ }) as HTMLInputElement;
+    expect(checkbox.checked).toBe(true);
+    fireEvent.click(checkbox);
+    expect(checkbox.checked).toBe(false);
+    act(() => { useStore.setState({ serverVersion: "26.09.1" }); });
+    expect((screen.getByRole("checkbox", { name: /Codex Terminal/ }) as HTMLInputElement).checked).toBe(false);
+
+    fireEvent.click(screen.getByRole("button", { name: "Save cluster policy" }));
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith(
+      "https://apas.mpaxos.com/cluster/policy/default",
+      expect.objectContaining({
+        method: "PATCH",
+        body: JSON.stringify({ team_available: true, allowed_launch_profiles: [] }),
+      }),
+    ));
+  });
+
+  it("does not load the cluster autonomous worker policy until it is opened", async () => {
+    seedMachines();
+    render(<MachinesPage />);
+    openView("Policies");
+
+    const toggle = await screen.findByRole("button", { name: /Cluster autonomous worker policy/ });
+    expect(toggle.getAttribute("aria-expanded")).toBe("false");
+    expect(fetchMock.mock.calls.some(([url]) => String(url).endsWith("/cluster/job-policy"))).toBe(false);
+    fireEvent.click(toggle);
+    await waitFor(() => expect(fetchMock.mock.calls.some(([url]) => String(url).endsWith("/cluster/job-policy"))).toBe(true));
+  });
+
+  it("asks before inheriting the deployment policy", async () => {
+    seedMachines();
+    render(<MachinesPage />);
+    openView("Policies");
+
+    fireEvent.click(await screen.findByRole("button", { name: "Inherit from above" }));
+    expect(fetchMock.mock.calls.some(([, init]) => (init as RequestInit | undefined)?.method === "PATCH")).toBe(false);
+    confirmInDialog("Inherit from above");
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith(
+      "https://apas.mpaxos.com/cluster/policy/default",
+      expect.objectContaining({ body: JSON.stringify({ team_available: null, allowed_launch_profiles: null }) }),
+    ));
+  });
+
+  it("shows both limit windows for each provider in Resource use", async () => {
+    seedMachines();
+    act(() => {
+      useStore.setState({
+        usageLimits: new Map([["cli-1", {
+          claude: {
+            fiveHour: { utilization: 0.42, resetsAt: "2099-01-01T10:00:00Z" },
+            sevenDay: { utilization: 0.17, resetsAt: "2099-01-05T10:00:00Z" },
+            fetchedAt: "2026-06-17T05:00:00Z",
+          },
+        }]]),
+      });
+    });
+    render(<MachinesPage />);
+    openView("Usage");
+
+    const section = (await screen.findByRole("heading", { name: "Resource use" })).closest("section") as HTMLElement;
+    expect(within(section).getByText("Claude")).toBeTruthy();
+    expect(within(section).getByText("Weekly")).toBeTruthy();
+    expect(within(section).getByText("5-Hour")).toBeTruthy();
+    expect(within(section).getByText(/^42%/)).toBeTruthy();
+    expect(within(section).getByText(/^17%/)).toBeTruthy();
+  });
+
+  it("says a list could not be loaded instead of showing it empty", async () => {
+    seedMachines();
+    installClusterApi();
+    const answer = fetchMock.getMockImplementation()!;
+    fetchMock.mockImplementation(async (input: string | URL, init?: RequestInit) => {
+      if (String(input).endsWith("/cluster/members")) return apiResponse({ message: "members are down" }, false, 500);
+      return answer(input, init);
+    });
+    render(<MachinesPage />);
+    openView("Sharing");
+
+    expect(await screen.findByText("Could not load members.")).toBeTruthy();
+    expect(screen.queryByText("No members have access to this cluster.")).toBeNull();
+    expect(screen.getByRole("alert").textContent).toContain("members are down");
+    openView("Usage");
+    expect(screen.getByText("Could not load usage.")).toBeTruthy();
+    openView("Activity");
+    expect(screen.getByText("Could not load activity.")).toBeTruthy();
+  });
+
+  it("moves focus to the chosen project's panel and back to its row", async () => {
+    seedMachines();
+    render(<MachinesPage />);
+    openView("Projects");
+
+    fireEvent.click(await screen.findByRole("button", { name: "Manage mako-soumojit" }));
+    // The test page is narrow: the panel takes the list's place.
+    expect(document.activeElement).toBe(screen.getByRole("region", { name: "Selected project" }));
+    fireEvent.click(await screen.findByRole("button", { name: "All projects" }));
+    expect(document.activeElement).toBe(screen.getByRole("button", { name: "Manage mako-soumojit" }));
+  });
+
+  it("moves focus into the member editor and back to Edit", async () => {
+    fetchMock.mockImplementation(async (input: string | URL) => {
+      const url = String(input);
+      if (url.endsWith("/cluster/members")) return apiResponse([{
+        user_id: "member-1",
+        user_email: "member@example.com",
+        status: "active",
+        allowed_machine_ids: null,
+        default_launch_profile: null,
+      }]);
+      if (url.includes("/cluster/projects?")) return apiResponse({ items: [], limit: 200, offset: 0 });
+      if (url.endsWith("/cluster/policy/default")) return apiResponse({ cluster: null, deployment: policy });
+      if (url.endsWith("/cluster/launch-profiles")) return apiResponse([]);
+      if (url.includes("/cluster/audit")) return apiResponse({ items: [], limit: 25, offset: 0 });
+      return apiResponse({ success: true });
+    });
+    seedMachines();
+    render(<MachinesPage />);
+    openView("Sharing");
+
+    fireEvent.click(await screen.findByRole("button", { name: "Edit access for member@example.com" }));
+    expect(document.activeElement).toBe(screen.getByRole("checkbox", { name: "All current and future machines" }));
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    expect(document.activeElement).toBe(screen.getByRole("button", { name: "Edit access for member@example.com" }));
+  });
+
+  it("disables Start and Stop while the page is not connected to the server", () => {
+    seedMachines();
+    act(() => { useStore.setState({ connected: false }); });
+    render(<MachinesPage />);
+
+    const start = screen.getByRole("button", { name: "Start Stopped API on build-host" }) as HTMLButtonElement;
+    expect(start.disabled).toBe(true);
+    expect(start.title).toBe("Not connected to the server");
+    expect((screen.getByRole("button", { name: "Stop Active API on build-host" }) as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  it("says a Start the socket refused was not sent, and does not wait for it", () => {
+    const actions = seedMachines();
+    actions.startMachineProjectCli.mockReturnValue(false);
+    render(<MachinesPage />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Start Stopped API on build-host" }));
+    const start = screen.getByRole("button", { name: "Start Stopped API on build-host" }) as HTMLButtonElement;
+    expect(start.textContent).not.toContain("Starting…");
+    expect(start.disabled).toBe(false);
+    expect(screen.getByText("Not connected to the server. Nothing was sent.")).toBeTruthy();
   });
 });

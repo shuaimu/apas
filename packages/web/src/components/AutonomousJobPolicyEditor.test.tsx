@@ -63,3 +63,29 @@ it("does not repopulate policy after a late response crosses the purge barrier",
   expect(screen.queryByLabelText("Allow recurring autonomous workers")).toBeNull();
   expect(screen.getByRole("alert").textContent).toContain("Access changed");
 });
+
+it("names the unavailable reasons it has words for and keeps the rest as given", async () => {
+  const withCodes = { ...document, unavailable_reasons: ["job_policy_disabled", "something_new"] };
+  const request = vi.fn<PolicyRequest>().mockResolvedValue(withCodes);
+  render(<AutonomousJobPolicyEditor
+    title="Project policy"
+    endpoint="/policy"
+    request={request as PolicyRequest}
+    reasonLabels={{ job_policy_disabled: "Worker jobs are turned off for this deployment." }}
+  />);
+  expect(await screen.findByText("Workers cannot run here yet:")).toBeTruthy();
+  expect(screen.getByText("Worker jobs are turned off for this deployment.")).toBeTruthy();
+  expect(screen.queryByText("job_policy_disabled")).toBeNull();
+  expect(screen.getByText("something_new")).toBeTruthy();
+});
+
+it("keeps its heading for screen readers only when embedded", async () => {
+  const request = vi.fn<PolicyRequest>().mockResolvedValue(document);
+  const { container } = render(<AutonomousJobPolicyEditor title="Project policy" endpoint="/policy" request={request as PolicyRequest} embedded />);
+  const heading = screen.getByRole("heading", { name: "Project policy" });
+  expect(heading.className).toContain("sr-only");
+  expect((container.firstElementChild as HTMLElement).className).not.toContain("border");
+  // The form is the same: the nested recurring fieldset still governs its fields.
+  const recurring = await screen.findByLabelText("Allow recurring autonomous workers") as HTMLInputElement;
+  expect(recurring.closest("fieldset")?.disabled).toBe(true);
+});

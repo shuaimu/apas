@@ -12,9 +12,22 @@ export const overviewPage = "mx-auto flex w-full max-w-6xl flex-col gap-8 px-4 p
 
 export const overviewCard = "rounded-lg border border-gray-200 bg-white dark:border-gray-700 dark:bg-gray-800/40";
 
-// With a mouse it is the tab bar's small button. On a touch screen it is
-// taller (40px), so a finger can hit it on the phone's Overview.
-export const overviewButton = "inline-flex h-8 pointer-coarse:h-10 pointer-coarse:px-3 shrink-0 items-center justify-center gap-1 whitespace-nowrap rounded border border-gray-300 bg-white px-2.5 text-xs font-medium text-gray-700 transition-colors hover:bg-gray-50 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-500 disabled:cursor-not-allowed disabled:opacity-50 disabled:hover:bg-white dark:border-gray-600 dark:bg-gray-800 dark:text-gray-200 dark:hover:bg-gray-700 dark:disabled:hover:bg-gray-800";
+// The shape every bordered button shares: size, border, type and focus ring.
+// Each tone adds only its colours, so a tone never carries two hover colours
+// and leaves the winner to chance. With a mouse it is the tab bar's small
+// button. On a touch screen it is taller (40px), so a finger can hit it on the
+// phone's Overview.
+const buttonShape = "inline-flex h-8 pointer-coarse:h-10 pointer-coarse:px-3 shrink-0 items-center justify-center gap-1 whitespace-nowrap rounded border";
+const buttonType = "px-2.5 text-xs font-medium";
+const buttonFocus = "focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-500 disabled:cursor-not-allowed disabled:opacity-50";
+
+export const overviewButton = `${buttonShape} border-gray-300 bg-white ${buttonType} text-gray-700 transition-colors hover:bg-gray-50 ${buttonFocus} disabled:hover:bg-white dark:border-gray-600 dark:bg-gray-800 dark:text-gray-200 dark:hover:bg-gray-700 dark:disabled:hover:bg-gray-800`;
+
+/** The one button a form or dialog is for, such as Save or New project. */
+export const overviewPrimaryButton = `${buttonShape} ${buttonType} transition-colors ${buttonFocus} border-blue-600 bg-blue-600 text-white hover:bg-blue-700 disabled:hover:bg-blue-600 dark:border-blue-500 dark:bg-blue-600 dark:hover:bg-blue-500 dark:disabled:hover:bg-blue-600`;
+
+/** A bordered button for an action that stops or ends something. */
+export const overviewDangerButton = `${buttonShape} ${buttonType} transition-colors ${buttonFocus} border-red-300 bg-white text-red-700 hover:bg-red-50 dark:border-red-800 dark:bg-gray-800 dark:text-red-300 dark:hover:bg-red-950/40`;
 
 // A button that reads as text until it is pointed at: for the action a card
 // must offer but should not shout. The tone is kept apart from the shape so a

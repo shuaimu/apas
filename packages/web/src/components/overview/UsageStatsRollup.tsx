@@ -18,14 +18,7 @@ import { formatCompactCount, formatUsd } from "@/lib/formatCount";
 import { formatRelativeTime } from "@/lib/formatRelativeTime";
 import { providerDisplayName } from "@/lib/launchProfileLabels";
 import { OverviewEmpty, OverviewSection, overviewCard, overviewMuted } from "./OverviewElements";
-
-type Window = "lifetime" | "last_7d" | "today";
-
-const WINDOW_LABELS: Record<Window, string> = {
-  lifetime: "All time",
-  last_7d: "Last 7 days",
-  today: "Today",
-};
+import { StatCard, UsagePeriodControl, type UsagePeriod as Window } from "./UsagePeriodControl";
 
 function formatInt(n: number): string {
   return n.toLocaleString();
@@ -66,17 +59,6 @@ function sumCounters(rows: UsageCounters[]): UsageCounters {
 function lastActiveMs(pane: PaneUsageStats): number {
   const t = pane.last_active ? Date.parse(pane.last_active) : Number.NaN;
   return Number.isNaN(t) ? Number.NEGATIVE_INFINITY : t;
-}
-
-function StatCard({ label, value }: { label: string; value: string }) {
-  return (
-    <div className={`${overviewCard} px-3 py-2`}>
-      <dt className={overviewMuted}>{label}</dt>
-      <dd className="mt-0.5 text-lg font-semibold tabular-nums text-gray-900 dark:text-gray-100">
-        {value}
-      </dd>
-    </div>
-  );
 }
 
 const NUMBER_CELL = "px-2 py-2 text-right tabular-nums";
@@ -153,32 +135,7 @@ export function UsageStatsRollup() {
     <OverviewSection
       title="Usage"
       level={3}
-      aside={
-        <>
-          {window !== "lifetime" && <span className={overviewMuted}>UTC days</span>}
-          <div
-            role="group"
-            aria-label="Usage period"
-            className="inline-flex h-8 items-center rounded border border-gray-300 bg-white p-0.5 dark:border-gray-600 dark:bg-gray-800"
-          >
-            {(Object.keys(WINDOW_LABELS) as Window[]).map((w) => (
-              <button
-                key={w}
-                type="button"
-                aria-pressed={window === w}
-                onClick={() => setWindow(w)}
-                className={`h-full rounded-sm px-2.5 text-xs font-medium transition-colors focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-500 ${
-                  window === w
-                    ? "bg-blue-100 text-blue-700 dark:bg-blue-900/50 dark:text-blue-200"
-                    : "text-gray-600 hover:text-gray-900 dark:text-gray-300 dark:hover:text-gray-100"
-                }`}
-              >
-                {WINDOW_LABELS[w]}
-              </button>
-            ))}
-          </div>
-        </>
-      }
+      aside={<UsagePeriodControl value={window} onChange={setWindow} />}
     >
       {/* Project totals: every tab, open or closed. */}
       <dl className="mb-3 grid grid-cols-2 gap-2 sm:grid-cols-3 lg:grid-cols-6">

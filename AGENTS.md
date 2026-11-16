@@ -1174,6 +1174,59 @@ scopes every request through the hosting predicate. `routes/admin.rs` backs the
 deployment-wide surface and both call the same DB operations, so the two cannot
 drift.
 
+**The page is six views, redesigned on 2026-11-15.** `/machines` ("My
+Cluster") used to be one column about 10,000 px tall. It is now split by
+`?view=`: **Machines** (the default), **Projects**, **Sharing**, **Usage**,
+**Policies** and **Activity**; a shared cluster shows Machines and Projects.
+Every function it had is still there.
+
+- **Addresses.** `?view=projects&selected=<id>` opens that project.
+  `?machine=&project=` always opens Machines, unfolds that machine's stopped
+  projects and focuses the row; nothing starts. The page writes the view with
+  `history.replaceState`. The helpers (`parseClusterView`, `clusterViewUrl`,
+  `sortMachines`: connected first, then by name, used by every list of
+  machines on the page) are in `lib/clusterView.ts`; the views are in
+  `components/cluster/`.
+- **Machines.** One card per machine with a Connected or Offline chip, at
+  most one amber chip ("Update available", else "Older APAS"), its version,
+  the "Providers:" line and "r of t projects running". Rows are ordered
+  errors, running, stopped, and more than three stopped projects fold into
+  "Show N stopped projects". Start and Stop still never send
+  `all_instances`. Reboot stays per machine; its dialog title names the
+  machine, and "Reboot to update" and `rebootEffectNote` keep their wording.
+- **The DeepSeek API key is never shown, prefilled or kept in browser
+  state.** It used to sit in plain text in an input on every machine card.
+  One "DeepSeek keys" list says whether each machine has a key and offers Set
+  key, Replace key and Clear key (which asks first). **The server still sends
+  the key to the owner's browser** in the `machines` message; the web no
+  longer reads it. Removing it from that message is a separate server change.
+- **Nothing is claimed that was not sent.** `startMachineProjectCli`,
+  `stopMachineProjectCli` and `setMachineDeepseekConfig` return whether they
+  sent anything. The page shows "Starting…", "Stopping…" or "Key sent" only
+  for a request that went out, and otherwise "Not connected to the server.
+  Nothing was sent." It resends nothing.
+- **Loading and failure are said per view.** Cluster data is fetched after
+  `/cluster/contexts` answers; a view says "Loading…" until its own data
+  arrives and "Could not load …" on failure, never an empty state.
+- **Projects** is a filterable list with a panel for the selected project
+  (usage, runtime, owner, members, project policy, and the worker policy
+  closed). Below 1024 px the panel replaces the list. Projects that share a
+  name are told apart by machine in button names ("Manage mako on zoo-006").
+- **Usage** sorts by tokens, shows 15 rows and folds projects with no usage
+  into one line; a reported zero cost reads "$0.00" and an unreported one
+  "Unavailable". **Activity** says each event in words, raw code in the
+  tooltip. **Policies** keeps the cluster worker policy in a closed section
+  that sends no request until opened; unavailable-reason codes are shown as
+  sentences (`components/cluster/jobReasonLabels.ts`).
+- Every confirmation uses one in-page dialog
+  (`components/cluster/ConfirmDialog.tsx`); no `window.confirm` remains.
+  Inline editors take focus when opened and return it to their button.
+- Shared with other pages, with defaults that leave `/admin` unchanged:
+  `PolicyEditor appearance="overview" | "panel"`, `AutonomousJobPolicyEditor
+  embedded` / `reasonLabels`, and the Overview's period switch
+  (`components/overview/UsagePeriodControl.tsx`). `PolicyEditor` keeps unsaved
+  choices until the policy's version or profile list changes.
+
 **Cluster sharing is owner-administered and immediate.** The owner adds an
 existing active APAS account directly; the ordinary web flow has no invitation
 or acceptance step. Each active membership carries either an explicit machine

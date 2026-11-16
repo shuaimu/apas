@@ -1,9 +1,9 @@
-import { act, render, screen, within } from "@testing-library/react";
+import { act, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
-  AllProvidersUsage,
   UsageLimitsDisplay,
   UsageLimitsPanel,
+  latestLimitsByProvider,
 } from "./UsageLimits";
 import {
   useStore,
@@ -74,13 +74,6 @@ function session(
     status: "active",
     cliClientId,
   };
-}
-
-function providerCard(label: string): HTMLElement {
-  const labelNode = screen.getByText(label);
-  const card = labelNode.parentElement;
-  if (!card) throw new Error(`Missing provider card for ${label}`);
-  return card;
 }
 
 describe("UsageLimitsDisplay", () => {
@@ -243,53 +236,21 @@ describe("UsageLimitsDisplay", () => {
   });
 });
 
-describe("AllProvidersUsage", () => {
-  beforeEach(() => {
-    seedStore({
-      usageLimits: usageByClient([
-        [
-          "cli-old",
-          {
-            claude: usage(0.2, "2026-06-17T10:00:00Z"),
-            codex: {},
-          },
-        ],
-        [
-          "cli-new",
-          {
-            claude: usage(0.7, "2026-06-17T11:00:00Z"),
-            deepseek: {
-              fiveHour: { utilization: 0.5 },
-              fetchedAt: "2026-06-17T09:00:00Z",
-            },
-          },
-        ],
-        [
-          "cli-mixed",
-          ({
-            glm: usage(0.4, "2026-06-17T11:30:00Z"),
-            minimax: {},
-          } as unknown as UsageLimitsByProvider),
-        ],
-      ]),
-    });
+describe("latestLimitsByProvider", () => {
+  it("takes each provider's newest report with a window, from any client", () => {
+    const rows = latestLimitsByProvider(usageByClient([
+      ["cli-old", { claude: usage(0.2, "2026-06-17T10:00:00Z"), codex: {} }],
+      ["cli-new", { claude: usage(0.7, "2026-06-17T11:00:00Z"), deepseek: usage(0.5, "2026-06-17T09:00:00Z") }],
+      ["cli-mixed", ({ glm: usage(0.4, "2026-06-17T11:30:00Z") } as unknown as UsageLimitsByProvider)],
+    ]));
+    expect(rows.map(({ provider, limits }) => [provider, limits.sevenDay?.utilization])).toEqual([
+      ["claude", 0.7],
+      ["deepseek", 0.5],
+    ]);
   });
 
-  afterEach(() => {
-    act(() => {
-      useStore.setState(initialStore, true);
-    });
-  });
-
-  it("aggregates newest non-empty provider windows across CLI clients", () => {
-    render(<AllProvidersUsage />);
-
-    expect(within(providerCard("Claude")).getByText("70%")).toBeTruthy();
-    expect(within(providerCard("DeepSeek")).getByText("50%")).toBeTruthy();
-    expect(screen.queryByText("20%")).toBeNull();
-    expect(screen.queryByText("Codex")).toBeNull();
-    expect(screen.queryByText("MiniMax")).toBeNull();
-    expect(screen.queryByText("GLM")).toBeNull();
+  it("is empty without reports", () => {
+    expect(latestLimitsByProvider(usageByClient([]))).toEqual([]);
   });
 });
 
