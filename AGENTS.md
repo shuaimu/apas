@@ -3014,6 +3014,38 @@ prompts and **My own text**:
   `/opt/apas/backups/deploy-20261115T194926Z`. The whitepaper rule is in the prompt only,
   with a `git status` check before each commit that undoes only the agent's
   own edit; a project that wants it enforced can add a commit hook.
+  **It syncs its branch with the git remote** (owner, 2026-11-15); the other
+  three templates still never push. Only where a whitepaper exists, each turn
+  fetches, merges the upstream with `git merge --no-edit` (never a rebase or
+  a pull), and pushes with a plain `git push` after every merge and commit:
+  its own branch only, never by force, no tag, no pull request. Git runs with
+  `GIT_TERMINAL_PROMPT=0` and `GIT_EDITOR=true`. What it does when syncing
+  cannot go on:
+  - **No upstream, a detached HEAD, no network or credential, a refusal the
+    rules do not name, or other people's uncommitted changes in the way:** it
+    skips the sync that turn, works locally and says so in its reply.
+  - **A merge, rebase or cherry-pick already under way:** it may be a
+    person's, so it changes nothing and ends the run.
+  - **A conflict only in its notes** (`docs/apas-worker`): both sides'
+    entries are kept and the turn goes on, so two workers do not spend every
+    other turn merging notes.
+  - **A whitepaper conflict, a conflict it cannot resolve or whose checks it
+    cannot fix, or a forced update of the upstream:** it stops syncing,
+    aborts its merge, writes one report entry, asks the person, and neither
+    merges nor pushes until the person answers or the upstream contains the
+    branch. It never settles a whitepaper conflict itself.
+  - **A push rejected because the upstream moved:** left for the next turn,
+    and that reply may not end the run.
+  Known limits: two workers on one branch converge but do each step twice, so
+  run one worker per branch; a plain push sends every commit on that branch
+  in that checkout, also ones other tabs made there, and goes straight to a
+  branch that normally takes pull requests if the login may; a forced update
+  that something else in the checkout fetched first is not seen. A tab that
+  already ran the worker opens with its old prompt, and a saved project
+  prompt is a copy: neither gains these rules until the template is chosen
+  again. The wording went through two rounds of independent review, with the
+  git behaviour tried in throwaway repositories; it has not run on a real
+  tab.
 - **Implement from a design document**. Each iteration closes one
   gap between the design and the code, with tests and a commit. It uses
   `docs/design.md`, or else only the one document the README or `AGENTS.md`
@@ -3042,9 +3074,9 @@ scrolls, and Cancel and Start autopilot stay in view below it.
 
 The templates live in `packages/web/src/lib/autopilotTemplates.ts`, whose
 header says how such a prompt has to be written. The same text is submitted
-every iteration, so each describes one step. Each forbids pushing, rewriting
-history (stash, reset, clean, amend, rebase, skipping hooks) and touching
-changes the agent did not make. The first three also say where their notes are
+every iteration, so each describes one step. Each forbids rewriting history
+(stash, reset, clean, amend, rebase, skipping hooks) and touching changes the
+agent did not make, and each but the APAS worker forbids pushing. The first three also say where their notes are
 (`docs/apas-worker/progress.md`, `docs/autopilot-progress.md`, `TODO.md`)
 and how to mark a step that cannot be done, so the next iteration does not
 take it again. Keep the tests green

@@ -32,7 +32,61 @@ describe("the built-in autopilot templates", () => {
     expect(prompt).toContain("do one step of that work in this turn, then stop");
     expect(prompt).toContain("Pick the single most valuable step.");
     expect(prompt).toContain("Never disable, skip, delete or weaken a test or a check");
-    expect(prompt).toContain("Do not push.");
+  });
+
+  it("has the APAS worker sync its own branch with the git remote, and nothing more", () => {
+    const { prompt, description } = DEFAULT_AUTOPILOT_TEMPLATE;
+    expect(description).toContain("It merges what the branch's git remote has and pushes its commits there, so run one worker per branch.");
+    // It merges first and pushes after every commit.
+    expect(prompt).toContain("1. Find the whitepaper; only if one exists, sync as the remote rules say. Then read it in full.");
+    expect(prompt).toContain('To sync, run "git fetch", and go no further while a report entry has stopped the sync.');
+    expect(prompt).toContain('bring them in with "git merge --no-edit", never a rebase or a pull');
+    expect(prompt).toContain("Then push if the branch has commits its upstream lacks.");
+    expect(prompt).toContain('Push with a plain "git push" after every commit you make.');
+    expect(prompt).toContain("Then push as the remote rules say.");
+    expect(prompt).not.toContain("Do not push.");
+    // Only its own branch, never by force, and nothing else on the remote.
+    expect(prompt).toContain("Keep the branch you are on in step with its upstream, as git has it configured, and no other branch; never switch branches.");
+    expect(prompt).toContain("Never force, never push another branch or a tag, never delete anything on the remote, and open no pull request.");
+    // It never waits for input and never works around a refusal.
+    expect(prompt).toContain("Run git here with GIT_TERMINAL_PROMPT=0 and GIT_EDITOR=true.");
+    expect(prompt).toContain("or git refuses something these rules do not name, do not work around it: skip the sync this turn, work locally, and say so in your reply");
+    // Other people's work, uncommitted, under way or arriving, is kept.
+    expect(prompt).toContain("If step 1 finds a merge, rebase or cherry-pick already under way, it may be a person's: change and commit nothing, say so,");
+    expect(prompt).toContain("If git refuses because of uncommitted changes you did not make, leave them and skip the sync this turn.");
+    expect(prompt).toContain("Besides what git staged, stage only the files you resolved, and commit a merge without naming paths.");
+    expect(prompt).toContain("Whitepaper changes that came in with a merge are the person's, not yours.");
+    // A merge that needs a person stops the sync and is asked about; the
+    // agent never settles a whitepaper conflict or a forced update itself.
+    expect(prompt).not.toContain("take the upstream's side in the whitepaper");
+    expect(prompt).toContain("If it reports a forced update of the upstream, do not merge: stop the sync as the next rule says.");
+    expect(prompt).toContain('If the conflict is in the whitepaper, or you cannot resolve it or fix a check it breaks, stop the sync: before you commit anything, end an open merge with "git add" of the files you edited, then "git merge --abort"');
+    expect(prompt).toContain("Every step waits for that entry, and you neither merge nor push while it is open; resolve it once the person has answered it or the upstream contains this branch.");
+    // Two workers do not spend every other turn merging their notes.
+    expect(prompt).toContain("If the conflict is only under docs/apas-worker, keep both sides' entries, commit the merge and go on.");
+    expect(prompt).toContain("A note or report entry about what this machine lacks names the machine, and blocks no step on another one.");
+    // What arrived is checked before the turn builds on it.
+    expect(prompt).toContain("After a merge that brought code, run the checks of step 6 before step 2.");
+    // The history rules still hold for it.
+    expect(prompt).toContain("Do not stash, reset, clean, amend or rebase anything, and do not skip commit hooks.");
+  });
+
+  it("keeps the APAS worker's sync from breaking the two-turn ending", () => {
+    const { prompt } = DEFAULT_AUTOPILOT_TEMPLATE;
+    // The turn that must call no tool comes before anything that fetches.
+    const guard = prompt.indexOf("call no tool and reply only");
+    expect(guard).toBeGreaterThan(prompt.indexOf("Remote rules, for git:"));
+    expect(prompt.indexOf("only if one exists, sync as the remote rules say")).toBeGreaterThan(guard);
+    expect(prompt).not.toContain("Before step 1");
+    // A rejected push must not be followed by the sentence that ends the run.
+    expect(prompt).toContain('If a push is rejected because the upstream has moved, leave it and do not end this reply with "Nothing is left to do.": the next turn merges and pushes.');
+    // The reply, which is seen from anywhere, says when the branch is behind.
+    expect(prompt).toContain("and why if the branch is not in step with its upstream");
+    // Nobody else syncs.
+    for (const template of AUTOPILOT_TEMPLATES.filter((entry) => entry.id !== "apas_worker")) {
+      expect(template.prompt).not.toContain("git push");
+      expect(template.prompt).not.toContain("git fetch");
+    }
   });
 
   it("gives the APAS worker three layers, and the whitepaper to the person alone", () => {
@@ -117,10 +171,11 @@ describe("the built-in autopilot templates", () => {
       const checked = autopilotStartSpec({ ...autopilotStartForm(), prompt: template.prompt });
       expect(checked.error).toBeUndefined();
       expect(checked.spec?.prompt).toBe(template.prompt);
-      // Well under the limit, so there is room to add to it, and room for
-      // the loop prompt's instruction around it. The APAS worker, which
-      // states three layers, a report and the Verus rules, is the longest.
-      expect(bytes(template.prompt)).toBeLessThan(AUTOPILOT_PROMPT_MAX_BYTES * 0.7);
+      // Under the limit with room to add to it and for the loop prompt's
+      // instruction around it (loopPrompt.test.ts). The APAS worker, which
+      // states three layers, a report, the Verus rules and the remote
+      // rules, is the longest.
+      expect(bytes(template.prompt)).toBeLessThan(AUTOPILOT_PROMPT_MAX_BYTES * 0.85);
     },
   );
 
@@ -207,7 +262,9 @@ describe("the built-in autopilot templates", () => {
       const { prompt } = template;
       expect(prompt).toContain("Leave changes you did not make as they are, whether they are committed or not: do not undo them and do not commit them.");
       expect(prompt).toContain("Do not stash, reset, clean, amend or rebase anything, and do not skip commit hooks.");
-      expect(prompt).toContain("Do not push.");
+      // Only the APAS worker syncs with the remote; the others never push.
+      if (template.id === "apas_worker") expect(prompt).not.toContain("Do not push.");
+      else expect(prompt).toContain("Do not push.");
       expect(prompt).toContain("A failure that comes from uncommitted changes you did not make is not yours to fix: leave those changes alone, say so,");
     }
     // An earlier failure is the turn's step only when it is in committed code.
