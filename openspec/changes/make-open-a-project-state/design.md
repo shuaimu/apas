@@ -76,6 +76,13 @@ read of it on 2026-11-16:
 - A Close control in the mobile browser's project screen, which has none
   today. It gains "open again" only.
 - Autonomous workers. Closing a project neither cancels nor pauses them.
+- Changing what deletion erases. Delete project keeps the server-side
+  deletion of `project-lifecycle-management`: a machine's folder, its
+  `.apas` and its registration stay, so a deleted project's folder is still
+  listed as a registered folder on its machines. Removing that registration
+  needs a daemon request that does not exist; it is left as an open
+  question.
+- A Delete control on the phone.
 
 ## Decisions
 
@@ -364,6 +371,55 @@ For other viewers and for native launches, the table in Decision 3 applies.
   with "Its tabs start again on \<hosts\> after those machines have been
   away."
 
+### 12. Closing deletes nothing; deleting is a control of its own
+
+The owner's rule (2026-11-16): closing a project must not delete anything,
+and deletion is offered explicitly.
+
+- **Close.** A close sends what a project stop sends today
+  (`StopProjectCli`): the daemon ends the project's task and its pane hosts.
+  It removes no tab from `.apas` or the roster, no worktree, no provider
+  conversation and no registration, and the server removes no session,
+  message, share, policy or saved prompt. No path of this change may call
+  `ForgetMachinePanes`, a pane close or a deletion as part of a close. The
+  Close confirmation ends with "Nothing is deleted. Its tabs come back when
+  you open it again." A server test pins that the roster and the session's
+  history are the same before a close and after the open that follows.
+- **Delete.** The deletion that exists (`POST /projects/:id/delete`, owner
+  only, `begin_project_deletion`, then the resumable cleanup) is unchanged
+  on the server apart from recording the project closed (Decision 9). It is
+  hard to find and hard to use: a "Danger zone" at the bottom of the
+  project-access dialog that asks for the project's UUID. The web gains one
+  shared `DeleteProjectDialog`, opened from **Delete project…** beside Close
+  in the workspace's project controls and from the cluster page's project
+  panel, for the project's owner only. The dialog:
+  - says what is erased (the project on the APAS server: its tabs,
+    conversations shown in APAS, history, usage, sharing, invitations and
+    policy) and that it cannot be undone;
+  - says what stays: the folder and its files on every machine, and that
+    each of those machines keeps the folder registered, so it stays in the
+    lists as a registered folder, and opening it there creates a new, empty
+    project;
+  - says that agents running in the project are stopped first, naming the
+    machines;
+  - is confirmed by typing the project's name; the client then sends the
+    project id as the server's confirmation value;
+  - shows "Deleting…" until the server reports the deletion done, as the
+    old control did, and sends nothing twice.
+  The project-access dialog's danger zone becomes a button that opens the
+  same dialog. A user who is not the owner is offered no Delete; the
+  existing "leave project" stays where it is.
+- **A machine that is offline during a deletion** is not stopped by it, as
+  today, and when it returns still running the project its `SessionStart`
+  creates a new project under the same id, which Decision 9 records as
+  open. The dialog names an offline machine that owns tabs and says the
+  project comes back from it when it reconnects still running.
+
+*Alternative considered:* have Delete also remove the registration on each
+machine, so the folder leaves the lists. It needs a new daemon request, a
+capability and a daemon reboot per machine, and the lifecycle spec says a
+deletion leaves local APAS configuration alone. Not done here.
+
 ## Risks / Trade-offs
 
 - [A reconnecting machine has its agents ended] A project closed while a
@@ -437,3 +493,5 @@ not-recorded, an open and a closed two-machine project.
   measured.
 - Whether the phone's project screen should gain Close. It has none today
   and this change adds none.
+- Whether Delete project should also take the folder out of each machine's
+  registry, so a deleted project leaves the lists entirely (Decision 12).

@@ -31,6 +31,18 @@ does. The machine is not a place to make that choice.
   replaced by opening the project again, which starts every machine that is
   not following, on the desktop and on the phone. The refusal for such a tab
   changes its wording.
+- **Closing deletes nothing** (owner, 2026-11-16). A closed project keeps
+  its tabs, their conversations and worktrees, its history, sharing, policy
+  and saved prompts, and its registration on every machine, and stays listed
+  as closed. Opening it again brings its tabs back as a project start does
+  today. The Close confirmation says so.
+- **Delete project becomes an explicit control.** Permanent deletion exists
+  today only at the bottom of the project-access dialog, confirmed by typing
+  the project's id. The owner gets a **Delete project…** control beside
+  Close in the workspace and in the cluster page's project panel, with a
+  dialog that says what is erased and what stays and is confirmed by typing
+  the project's name. What deletion erases does not change: the server's
+  record of the project, never a folder or a machine's registration of it.
 - An open project names each machine that is not following it and why: it is
   offline, it runs an older APAS, the start was refused or failed, or the
   account that opened the project may not use that machine.
@@ -86,6 +98,9 @@ does. The machine is not a place to make that choice.
   start" name the registered project as closed and its control as Open.
 - `omp-tab-autopilot`: "Autopilot is offered only where every part supports
   it" quotes the reworded refusal.
+- `project-lifecycle-management`: "The web interface exposes
+  role-appropriate lifecycle controls" names Delete project as a control of
+  its own, where it is offered and what its dialog says.
 
 ## Impact
 
@@ -101,7 +116,8 @@ does. The machine is not a place to make that choice.
   every machine's part, sent only to viewers that negotiate a new
   capability, and regenerated schemas. No daemon or CLI frame changes.
 - **Web** (`packages/web`): the project view's Open and Close and its
-  not-following notice, the Machines page rows, the sidebar's and phone's
+  not-following notice, the Delete project control and its dialog, the
+  Machines page rows, the sidebar's and phone's
   Running/Stopped wording, tab host states and refusals, the new-tab machine
   choice, and the tests that pin per-machine Start and Stop.
 - **Native** (`packages/mobile`): no control changes; it must keep parsing

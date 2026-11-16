@@ -87,6 +87,25 @@ Closing SHALL record the project as closed and SHALL stop it on every connected 
 - **WHEN** an account that may read a project, neither owns nor hosts it, and may use none of its machines asks to close it while its machines are disconnected
 - **THEN** the request is refused and the project stays recorded open
 
+### Requirement: Closing a project deletes nothing
+
+Closing a project, by any path, SHALL remove nothing. Its tabs, their conversations and worktrees, its history on the server, its sharing, policy and saved prompts, and its registration on every machine SHALL remain as they were, and the project SHALL stay listed, as closed, wherever it was listed while open. Opening it again SHALL bring back every tab as a start of the project does today. A close SHALL NOT forget a machine's tabs, close a tab or begin a deletion. The confirmation for closing SHALL say that nothing is deleted. Removing a project SHALL be possible only through the separate, explicit deletion.
+
+#### Scenario: Close and open again
+- **WHEN** a project with three tabs on zoo-005 and two on zoo-006 is closed and later opened
+- **THEN** the same five tabs are listed, each on its machine, with the history they had
+- **AND** each tab's agent starts again as it does when a project is started today
+
+#### Scenario: A closed project stays listed
+- **WHEN** a user closes a project
+- **THEN** the project is still in the project list, shown as closed, with its tabs
+- **AND** its conversations can still be read
+
+#### Scenario: Close does not delete
+- **WHEN** a user confirms closing a project
+- **THEN** the confirmation said that nothing is deleted
+- **AND** no tab, worktree, message, share or registration of the project is removed
+
 ### Requirement: A machine follows the recorded state when its daemon registers
 
 When a machine's daemon has registered with the server, the server SHALL bring that machine in line with each recorded project the daemon lists. For a project recorded open, where the machine owns tabs and the daemon does not report running it, the server SHALL ask the daemon to start it, provided the project is active, the account that opened it may use the project's runtime on that machine at that moment, and the machine may run the project beside the other tab owners as an open decides it. For a project recorded closed that the daemon reports running, the server SHALL ask the daemon to stop it, provided the account that closed it may use the project's runtime on that machine at that moment; a close made by an administrative stop SHALL be followed on every machine that stop reaches today. A machine left as it is for want of that access SHALL be reported with the reason. The server SHALL do neither for a project that is not recorded. The server SHALL NOT, at any other time, start a machine by itself: a machine whose start was refused or failed SHALL stay as it is until its daemon registers again or someone opens the project again.
