@@ -7,7 +7,6 @@ import { stoppedOnHostReason } from "./tabHosts";
 import {
   buildProjectOpenModel,
   CLOSE_DELETES_NOTHING,
-  keepOpenNote,
   machinePartLabel,
   NOTHING_SENT_TEXT,
   olderApasReason,
@@ -142,9 +141,10 @@ describe("the wire", () => {
 });
 
 describe("machinePartLabel", () => {
-  const open = { state: "open" as const, recorded: true };
-  const closed = { state: "closed" as const, recorded: true };
-  const notRecorded = { state: "open" as const, recorded: false };
+  const open = { state: "open" as const, supported: true };
+  const closed = { state: "closed" as const, supported: true };
+  // A server that records no state: the project is shown from what runs.
+  const older = { state: "open" as const, supported: false };
 
   it("words each part as the design does", () => {
     expect(machinePartLabel({ part: "running", hostname: "zoo-005" }, open)).toBe("Running");
@@ -161,13 +161,13 @@ describe("machinePartLabel", () => {
     expect(machinePartLabel(inferred, open)).toBe("Not running yet");
     // Outside an open project the machine was asked nothing.
     expect(machinePartLabel(inferred, closed)).toBe("Not running");
-    expect(machinePartLabel(inferred, notRecorded)).toBe("Not running");
+    expect(machinePartLabel(inferred, older)).toBe("Not running");
   });
 
-  it("never words a tab owner of a closed or unrecorded project as a failure", () => {
+  it("never words a tab owner of a closed project, or on an older server, as a failure", () => {
     expect(machinePartLabel({ part: "not_started", hostname: "zoo-006" }, open)).toBe("Not started");
     expect(machinePartLabel({ part: "not_started", hostname: "zoo-006" }, closed)).toBe("Not running");
-    expect(machinePartLabel({ part: "not_started", hostname: "zoo-006" }, notRecorded)).toBe("Not running");
+    expect(machinePartLabel({ part: "not_started", hostname: "zoo-006" }, older)).toBe("Not running");
   });
 });
 
@@ -177,7 +177,7 @@ describe("buildProjectOpenModel", () => {
       report: report("closed", [part(ZOO5, "zoo-005", "not_started"), part(ZOO6, "zoo-006", "not_started")]),
       session: { openState: "closed", isActive: false },
     });
-    expect(result).toMatchObject({ state: "closed", recorded: true, stateLabel: "Closed" });
+    expect(result).toMatchObject({ state: "closed", stateLabel: "Closed" });
     expect(result.closeAction).toBeUndefined();
     expect(result.notice).toEqual([]);
     expect(result.openAction).toMatchObject({ kind: "open", label: "Open" });
@@ -197,7 +197,6 @@ describe("buildProjectOpenModel", () => {
     });
     expect(result).toMatchObject({
       state: "open",
-      recorded: true,
       stateLabel: "Open",
       setBy: "owner@example.com",
       setKind: "request",
@@ -274,33 +273,38 @@ describe("buildProjectOpenModel", () => {
     expect(result.stoppedFirstHosts).toEqual(["zoo-005", "zoo-006"]);
   });
 
-  it("offers Keep open, saying what starts, and Close for a project nobody has recorded that runs on one of two machines", () => {
+  it("offers Open again and Close for a running project the server has not recorded where a connected machine is not following", () => {
     const result = model({
       report: report(undefined, [part(ZOO5, "zoo-005", "running"), part(ZOO6, "zoo-006", "not_started")]),
       session: { isActive: true },
     });
-    expect(result).toMatchObject({ state: "open", recorded: false, stateLabel: "Open" });
+    // Shown and offered as a recorded open project is: the server records it
+    // open as soon as it sees it run, and an Open of it is an ordinary open.
+    // Its stopped tab says "Open the project again", so that button is there.
+    expect(result).toMatchObject({ state: "open", stateLabel: "Open" });
     expect(result.notice.map((line) => [line.kind, line.text]))
       .toEqual([["not_started", "zoo-006 is not running this project."]]);
-    expect(result.machines[1].label).toBe("Not running");
-    // It runs somewhere, so the offer reads "Keep open" (the state beside it
-    // already reads "Open"), as on every not-recorded project that runs.
-    expect(result.openAction).toMatchObject({
-      kind: "keep_open",
-      label: "Keep open",
-      note: keepOpenNote(["zoo-005", "zoo-006"]),
+    expect(result.machines[1].label).toBe("Not started");
+    expect(result.openAction).toEqual({
+      kind: "open_again",
+      label: "Open again",
+      confirmation: {
+        title: "Open mako again?",
+        body: ["zoo-005 already runs it.", "Its tabs start on zoo-006."],
+      },
     });
-    // What starts is said truthfully: confirming starts zoo-006.
-    expect(result.openAction?.confirmation).toEqual({
-      title: "Keep mako open?",
-      body: [
-        "zoo-005 already runs it.",
-        "Its tabs start on zoo-006.",
-        "Its tabs start again on zoo-005 and zoo-006 after those machines have been away.",
-      ],
+    expect(result.closeAction).toMatchObject({ kind: "close", label: "Close" });
+    expect(result.closeAction?.confirmation).toEqual({
+      title: "Close mako?",
+      body: ["This stops its agents on zoo-005.", CLOSE_DELETES_NOTHING],
     });
-    expect(result.openAction?.confirmation.body.join(" ")).not.toContain("Nothing starts now");
-    expect(result.closeAction?.kind).toBe("close");
+    // The same project recorded open is offered exactly the same.
+    const recordedOpen = model({
+      report: report("open", [part(ZOO5, "zoo-005", "running"), part(ZOO6, "zoo-006", "not_started")]),
+      session: { openState: "open", isActive: true },
+    });
+    expect([result.openAction, result.closeAction, result.notice, result.machines.map((entry) => entry.label)])
+      .toEqual([recordedOpen.openAction, recordedOpen.closeAction, recordedOpen.notice, recordedOpen.machines.map((entry) => entry.label)]);
   });
 
   describe("a machine whose daemon cannot run the project beside other machines", () => {
@@ -404,27 +408,23 @@ describe("buildProjectOpenModel", () => {
       ]);
     });
 
-    it("is not started by keeping a not-recorded project open, and the confirmation says so", () => {
+    // Open again would start nothing here: the server refuses zoo-006 as it
+    // does in a recorded open project.
+    it("keeps its reason shown in a running project the server has not recorded, which offers only Close", () => {
       const result = model({
         report: report(undefined, [part(ZOO5, "zoo-005", "running"), part(ZOO6, "zoo-006", "not_started")]),
         session: { isActive: true },
         machines: [machine(ZOO5, "zoo-005", { isRunning: true }), older()],
       });
-      expect(result.openAction).toMatchObject({ kind: "keep_open", label: "Keep open" });
-      expect(result.openAction?.confirmation).toEqual({
-        title: "Keep mako open?",
-        body: [
-          "This records the project as open. Nothing starts now.",
-          "Its tabs start again on zoo-005 and zoo-006 after those machines have been away.",
-          `zoo-006 is not started. ${OLDER}`,
-        ],
-      });
+      expect(result.openAction).toBeUndefined();
+      expect(result.closeAction?.kind).toBe("close");
+      expect(result.machines[1]).toMatchObject({ cannotStart: OLDER, label: `Not started: ${OLDER}` });
       expect(result.notice.map((line) => [line.text, line.reason]))
         .toEqual([["zoo-006 is not running this project.", OLDER]]);
     });
   });
 
-  it("says an offline tab owner of an unrecorded project is not running it, and keeps the project open", () => {
+  it("says an offline tab owner of a running project the server has not recorded is not running it, and offers only Close", () => {
     const result = model({
       report: report(undefined, [part(ZOO5, "zoo-005", "running"), part(undefined, "laptop", "not_started", { connected: false })]),
       session: { isActive: true },
@@ -437,41 +437,33 @@ describe("buildProjectOpenModel", () => {
       text: "laptop is not running this project because it is offline.",
       reason: undefined,
     }]);
-    // Nothing can be started now, so recording is all an Open does.
-    expect(result.openAction?.kind).toBe("keep_open");
-    expect(result.openAction?.confirmation.body).toEqual([
-      "This records the project as open. Nothing starts now.",
-      "Its tabs start again on laptop and zoo-005 after those machines have been away.",
-      "laptop is offline. Its tabs start when laptop reconnects.",
+    expect(result.openAction).toBeUndefined();
+    expect(result.closeAction?.kind).toBe("close");
+    expect(result.closeAction?.confirmation.body).toEqual([
+      "This stops its agents on zoo-005.",
+      "laptop is offline. If it still runs the project when it reconnects, its agents are stopped then.",
+      CLOSE_DELETES_NOTHING,
     ]);
   });
 
-  it("offers Keep open for a project nobody has recorded that runs everywhere", () => {
+  it("offers only Close for a running project the server has not recorded that runs everywhere", () => {
     const result = model({
       report: report(undefined, [part(ZOO5, "zoo-005", "running"), part(ZOO6, "zoo-006", "running")]),
       session: { isActive: true },
     });
-    expect(result).toMatchObject({ state: "open", recorded: false });
+    expect(result).toMatchObject({ state: "open", stateLabel: "Open" });
     expect(result.notice).toEqual([]);
-    expect(result.openAction).toMatchObject({
-      kind: "keep_open",
-      label: "Keep open",
-      note: "Its tabs start again on zoo-005 and zoo-006 after those machines have been away.",
-    });
-    expect(result.openAction?.note).toBe(keepOpenNote(["zoo-005", "zoo-006"]));
-    expect(result.openAction?.confirmation).toEqual({
-      title: "Keep mako open?",
-      body: [
-        "This records the project as open. Nothing starts now.",
-        "Its tabs start again on zoo-005 and zoo-006 after those machines have been away.",
-      ],
-    });
-    expect(result.closeAction?.kind).toBe("close");
+    expect(result.openAction).toBeUndefined();
+    expect(result.closeAction).toMatchObject({ kind: "close", label: "Close" });
+    expect(result.closeAction?.confirmation.body).toEqual([
+      "This stops its agents on zoo-005 and zoo-006.",
+      CLOSE_DELETES_NOTHING,
+    ]);
   });
 
-  it("offers Open for a project nobody has recorded that runs nowhere", () => {
+  it("offers only Open for a project the server has not recorded that runs nowhere", () => {
     const result = model({ report: report(undefined, [part(ZOO5, "zoo-005", "not_started")]), session: { isActive: false } });
-    expect(result).toMatchObject({ state: "closed", recorded: false, stateLabel: "Closed" });
+    expect(result).toMatchObject({ state: "closed", stateLabel: "Closed" });
     expect(result.openAction).toMatchObject({ kind: "open", label: "Open" });
     expect(result.openAction?.confirmation.body).toEqual(["Its tabs start on zoo-005."]);
     expect(result.closeAction).toBeUndefined();
@@ -517,7 +509,7 @@ describe("buildProjectOpenModel", () => {
       report: report("closed", [part(ZOO5, "zoo-005", "not_started"), part(ZOO6, "zoo-006", "still_running", { reason })]),
       session: { openState: "closed", isActive: true },
     });
-    expect(result).toMatchObject({ state: "closed", recorded: true, runningHosts: ["zoo-006"] });
+    expect(result).toMatchObject({ state: "closed", runningHosts: ["zoo-006"] });
     expect(result.notice).toEqual([{
       key: ZOO6,
       machineId: ZOO6,
@@ -554,13 +546,13 @@ describe("buildProjectOpenModel", () => {
       ],
     };
 
-    it("shows the project from what runs and never offers Keep open", () => {
+    it("shows the project from what runs and offers only Close while it runs", () => {
       const result = model({
         ...base,
         instances: [instance(ZOO5, "zoo-005", true), instance(ZOO6, "zoo-006")],
         machines: [machine(ZOO5, "zoo-005", { isRunning: true }), machine(ZOO6, "zoo-006", { isRunning: true })],
       });
-      expect(result).toMatchObject({ state: "open", recorded: false, runningHosts: ["zoo-005", "zoo-006"] });
+      expect(result).toMatchObject({ state: "open", runningHosts: ["zoo-005", "zoo-006"] });
       expect(result.openAction).toBeUndefined();
       expect(result.closeAction?.kind).toBe("close");
       expect(result.closeAction?.confirmation.body)
@@ -573,7 +565,7 @@ describe("buildProjectOpenModel", () => {
         session: { isActive: false },
         machines: [machine(ZOO5, "zoo-005"), machine(ZOO6, "zoo-006")],
       });
-      expect(result).toMatchObject({ state: "closed", recorded: false });
+      expect(result).toMatchObject({ state: "closed" });
       expect(result.openAction).toMatchObject({ kind: "open", label: "Open" });
       expect(result.openAction?.confirmation.body).toEqual(["Its tabs start on zoo-005 and zoo-006."]);
       expect(result.closeAction).toBeUndefined();
@@ -659,7 +651,7 @@ describe("buildProjectOpenModel", () => {
 
     it("judges a project it knows only as an active session as open", () => {
       const result = model({ supported: false, session: { isActive: true }, target: null });
-      expect(result).toMatchObject({ state: "open", recorded: false, request: null });
+      expect(result).toMatchObject({ state: "open", request: null });
       // No machine to name: no action is offered.
       expect(result.openAction).toBeUndefined();
       expect(result.closeAction).toBeUndefined();
@@ -682,7 +674,7 @@ describe("buildProjectOpenModel", () => {
         target: { machineId: ZOO6, projectId: PROJECT },
         fromMachineId: ZOO6,
       });
-      expect(result).toMatchObject({ state: "open", recorded: true });
+      expect(result).toMatchObject({ state: "open" });
       expect(result.thisMachine).toMatchObject({
         machineId: ZOO6,
         hostname: "zoo-006",
@@ -774,7 +766,7 @@ describe("buildProjectOpenModel", () => {
         target: { machineId: LAPTOP, projectId: PROJECT },
         fromMachineId: LAPTOP,
       });
-      expect(result).toMatchObject({ state: "closed", recorded: true });
+      expect(result).toMatchObject({ state: "closed" });
       expect(result.thisMachine).toMatchObject({ label: "No tabs here", ownsTabs: false, running: false });
       expect(result.thisMachine?.part).toBeUndefined();
       expect(result.openAction?.confirmation).toEqual({
@@ -811,25 +803,22 @@ describe("buildProjectOpenModel", () => {
         target: { machineId: ZOO5, projectId: PROJECT },
         fromMachineId: ZOO5,
       });
-      expect(result).toMatchObject({ state: "closed", recorded: false });
+      expect(result).toMatchObject({ state: "closed" });
       expect(result.openAction).toMatchObject({ kind: "open", label: "Open" });
       expect(result.openAction?.confirmation.body).toEqual(["It starts on zoo-005."]);
       expect(result.closeAction).toBeUndefined();
       expect(result.thisMachine?.label).toBe("No tabs here");
     });
 
-    it("offers to keep open and to close an unrecorded project this machine runs", () => {
+    it("offers only Close for a project the server has not recorded that this machine runs", () => {
       const result = model({
         machines: [machine(ZOO5, "zoo-005", { isRunning: true, part: "running" })],
         fromMachineId: ZOO5,
       });
-      expect(result).toMatchObject({ state: "open", recorded: false });
+      expect(result).toMatchObject({ state: "open", stateLabel: "Open" });
       expect(result.thisMachine).toMatchObject({ label: "Running", running: true });
-      expect(result.openAction).toMatchObject({
-        kind: "keep_open",
-        note: "Its tabs start again on zoo-005 after those machines have been away.",
-      });
-      expect(result.closeAction?.kind).toBe("close");
+      expect(result.openAction).toBeUndefined();
+      expect(result.closeAction).toMatchObject({ kind: "close", label: "Close" });
     });
 
     it("says a closed project another machine still runs is still running there", () => {
@@ -852,10 +841,10 @@ describe("buildProjectOpenModel", () => {
         machines: [machine(ZOO5, "zoo-005", { isRunning: true }, { clusterAccess: "member" })],
         fromMachineId: ZOO5,
       });
-      expect(result).toMatchObject({ state: "open", recorded: false, runningHosts: ["zoo-005"] });
+      expect(result).toMatchObject({ state: "open", runningHosts: ["zoo-005"] });
       expect(result.thisMachine).toMatchObject({ label: "Running", running: true });
       expect(result.closeAction?.kind).toBe("close");
-      expect(result.openAction?.kind).toBe("keep_open");
+      expect(result.openAction).toBeUndefined();
     });
 
     it("claims nothing about tabs for a shared machine's entry the server filled nothing in", () => {
@@ -881,7 +870,7 @@ describe("buildProjectOpenModel", () => {
       session: { openState: "closed", isActive: false },
       machines: [machine(ZOO5, "zoo-005", { openState: "closed", part: "not_started" })],
     });
-    expect(result).toMatchObject({ state: "closed", recorded: true, runningHosts: [] });
+    expect(result).toMatchObject({ state: "closed", runningHosts: [] });
     expect(result.openAction?.kind).toBe("open");
     expect(result.closeAction).toBeUndefined();
   });
@@ -920,7 +909,7 @@ describe("buildProjectOpenModel", () => {
         machines: [],
         target: null,
       });
-      expect(result).toMatchObject({ state: "open", recorded: true });
+      expect(result).toMatchObject({ state: "open" });
       expect(result.request).toEqual({ machineId: LAPTOP, projectId: PROJECT });
       expect(result.notice.map((line) => line.text))
         .toEqual(["laptop is offline. Its tabs start when laptop reconnects."]);
@@ -1007,14 +996,45 @@ describe("buildProjectOpenModel", () => {
   });
 });
 
+describe("a project the server has not recorded", () => {
+  // The owner's decision (2026-11-16): a project is Open or Closed, with one
+  // button for that state. Nothing offered for a project the server has not recorded yet
+  // may tell it apart from a recorded one, or offer to keep it open.
+  const REMOVED = [/Keep .*open/i, /Nobody has opened/, /after those machines have been away/, /Nothing starts now/];
+  // The buttons each case is offered, as for a recorded project in the
+  // state shown: Open again only beside Close, where a connected tab owner
+  // is not running it.
+  const cases: [string, Partial<ProjectOpenModelInput>, string[]][] = [
+    ["runs everywhere", { report: report(undefined, [part(ZOO5, "zoo-005", "running"), part(ZOO6, "zoo-006", "running")]), session: { isActive: true } }, ["Close"]],
+    ["runs on one of two", { report: report(undefined, [part(ZOO5, "zoo-005", "running"), part(ZOO6, "zoo-006", "not_started")]), session: { isActive: true } }, ["Open again", "Close"]],
+    ["runs beside an offline owner", { report: report(undefined, [part(ZOO5, "zoo-005", "running"), part(ZOO6, "zoo-006", "not_started", { connected: false })]), session: { isActive: true } }, ["Close"]],
+    ["runs, from the machine list alone", { machines: [machine(ZOO5, "zoo-005", { isRunning: true, part: "running" })], fromMachineId: ZOO5 }, ["Close"]],
+    ["runs nowhere", { report: report(undefined, [part(ZOO5, "zoo-005", "not_started")]), session: { isActive: false } }, ["Open"]],
+    ["runs nowhere, from the machine list alone", { machines: [machine(ZOO5, "zoo-005", { part: "not_started" })], fromMachineId: ZOO5 }, ["Open"]],
+  ];
+
+  it.each(cases)("offers the buttons of a recorded project in the state shown, with no Keep open: %s", (_name, input, buttons) => {
+    const result = model(input);
+    const labels = [result.openAction?.label, result.closeAction?.label].filter(Boolean);
+    expect(labels).toEqual(buttons);
+    expect(result.stateLabel).toBe(buttons.includes("Close") ? "Open" : "Closed");
+    expect(result.openAction && "note" in result.openAction).toBeFalsy();
+    const texts = [
+      result.stateLabel,
+      ...result.machines.map((entry) => entry.label),
+      ...result.notice.map((line) => line.text),
+      result.thisMachine?.label ?? "",
+      ...[result.openAction, result.closeAction].flatMap((action) =>
+        action ? [action.label, action.confirmation.title, ...action.confirmation.body] : []),
+    ].join("\n");
+    for (const pattern of REMOVED) expect(texts).not.toMatch(pattern);
+  });
+});
+
 describe("shared texts", () => {
   it("quotes the design's sentences exactly", () => {
     expect(CLOSE_DELETES_NOTHING).toBe("Nothing is deleted. Its tabs come back when you open it again.");
     expect(NOTHING_SENT_TEXT).toBe("Not connected to the server. Nothing was sent.");
-    expect(keepOpenNote(["zoo-005", "zoo-006"]))
-      .toBe("Its tabs start again on zoo-005 and zoo-006 after those machines have been away.");
-    // The quoted sentence is kept word for word with one host too.
-    expect(keepOpenNote(["zoo-005"])).toBe("Its tabs start again on zoo-005 after those machines have been away.");
   });
 
   it("words a machine that is offline as a tab on it is refused", () => {

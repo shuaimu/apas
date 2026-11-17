@@ -110,23 +110,61 @@ deleted is refused and records nothing; suspending and beginning a deletion
 record closed (Decision 9). So "open and suspended" never exists, and
 reactivation finds the project closed.
 
-### 2. "Not recorded" is a third value, and the server leaves such projects alone
+### 2. A project nobody has recorded is recorded open when it is seen running, and reads closed otherwise
 
-At deployment the server cannot know what the owner wants for a project that
-runs on one of its two machines. Recording it open because something runs
-would start the other machine's agents at its next registration, unasked.
-So nothing is recorded until someone opens or closes the project from a
-client that says what that does, creates it with a start, or an
-administrator stops it. Until then the project is displayed from what runs,
-as today, each machine's part is still reported, and the server neither
-starts nor stops it. Its workspace and its Machines row always offer Open,
-which records it; while the project already runs, that offer reads as
-keeping it open, because recording is all it does. On the first day every
-project of the deployment is in this state, so this one click per project
-is how following begins.
+`NULL` in `open_state` means nobody has recorded the project yet. It is not a
+third state anyone is shown: a person sees Open or Closed, and one button.
 
-*Alternative considered:* record every running project as open at the first
-instance attach after the upgrade. Rejected for the reason above.
+*History.* The first release (`20261116T224049Z`) treated `NULL` as a third
+value, "not recorded": the server neither started nor stopped such a
+project, showed it from what ran, and every project of the deployment
+started in that state. Its Open read "Keep open" while the project ran,
+because recording was all it did, and one click per project was how
+following began. The reason was that at deployment the server cannot know
+what the owner wants for a project that runs on one of its two machines:
+recording it open because something runs would start the other machine's
+agents at its next registration, unasked. On 2026-11-16, after that release,
+the owner asked for one Open/Close button and no third state ("remove this
+button and its functions, we don't need this, we just need a single button
+of open/close").
+
+*Now.* In the `SessionStart` handler, once the instance has attached (its
+`SessionStart` has passed the session-owner and attach checks), a project
+whose row is active and whose `open_state` is `NULL` is recorded open under
+the per-project open-state lock (re-read under the lock; only if still
+`NULL`), set by the account the attaching CLI runs under, kind request,
+naming that instance's machine, and audited with the source `first_seen`. A
+`SessionStart` for such a project that a check refuses records nothing and
+writes no audit row.
+Only an active project is recorded: the writer refuses open for a suspended
+project or one being deleted. Every running instance attaches again at a
+server deploy, so every running project that is not recorded is recorded
+open within seconds of the deploy that brings this rule; a project already
+recorded keeps its record. A project whose `open_state` is `NULL` and
+that nothing runs is treated as closed: in the table of Decision 3, with the
+one exception kept there for an older viewer's Start naming one machine, and
+in its parts (Decision 7). The follow step still sends nothing for a project
+nobody has recorded, also when a registering daemon reports running it: that
+instance's attach records it open.
+`ProjectOpenState` keeps `state` optional on the wire and leaves it absent for
+such a project. The web shows it as Open while any machine runs it and as
+Closed otherwise, and gives it the controls and sentences of a recorded-open
+or recorded-closed project accordingly (Decision 11), so no sentence names a
+button that is not there.
+
+*The consequence the owner accepted* is the reason the first release gave
+for not doing this. A project that runs on one of its two tab-owner machines
+is recorded open when that instance attaches, and the other machine starts
+it at its next registration: its next daemon reboot or a server deploy. In
+the deploy that brings this rule that depends on order. If the running
+instance attaches first, the other machine's registration in the same
+deploy starts it; if the other machine's daemon registers first, the follow
+step finds nothing recorded, and the machine starts at its following
+registration.
+
+*Alternative considered:* keep "not recorded" as a third state and let a
+person record it ("Keep open"). That was the first release; the owner
+removed it.
 
 ### 3. No new request: `all_instances: true` is Open and Close; anything else reaches one machine at most
 
@@ -144,16 +182,29 @@ start or stop a machine other than the one they name:
 
 | Project | Start / tab / task naming one machine | Stop naming one machine |
 | --- | --- | --- |
-| not recorded | as before the change; nothing recorded | as before; nothing recorded |
 | open | start that machine | Close if no other machine owns tabs or runs it, else refused |
 | closed | Open if no other machine owns tabs, else refused | stop that machine |
 
+A project nobody has recorded follows the closed row (Decision 2), with one
+exception kept for older clients: a Start (`StartMachineProjectCli` with
+`all_instances: false`) naming one machine of a not-recorded project, from a
+web viewer that did not negotiate `project_open_state_v1`, starts that
+machine as it did before the change, also when other machines own tabs, and
+records nothing itself. When that machine's instance attaches, its
+`SessionStart` records the project open (Decision 2), and the other tab
+owners start at their next registration. Nothing else is excepted: a tab
+request from such a viewer and every native task launch follow the closed
+row for a not-recorded project. They open it when no other machine owns
+tabs of it, and are otherwise refused with "This project is closed and has
+tabs on other machines. Open it from the project." (The first release had a
+"not recorded" row: as before, nothing recorded, for starts and stops
+alike.)
+
 The older project view and the phone's "Open project" send
-`all_instances: true` without `project_open_state_v1`. On a not-recorded
-project those too act as before the change (today's
-`project_start_machines` and `project_stop_machines`) and record nothing;
-on a recorded project they are an Open or a Close, which is what their
-confirmations already describe.
+`all_instances: true` without `project_open_state_v1`. They are an Open or a
+Close, which is what their confirmations already describe; on a project
+nobody has recorded, the Open records it open and the Close records it
+closed.
 
 The closed row applies also when the named machine still has an instance
 attached (its stop is under way, or a close could not reach it): a tab
@@ -167,11 +218,10 @@ whether or not it owns a tab, because its stop may still be taking effect. A
 task chosen for a machine whose daemon is not connected fails as offline and
 records nothing.
 
-So on a not-recorded project every button of an older client does exactly
-what it did, an older "Start on \<host\>" can retry a machine of an open
-project, and the common single-machine case works as before. Only a client
-that negotiated `project_open_state_v1` records the state of a project
-nobody has recorded. The new web never sends `all_instances: false`.
+So an older "Start on \<host\>" still starts its machine of a project nobody
+has recorded, can retry a machine of an open project, and the common
+single-machine case works as before. The new web never sends
+`all_instances: false`.
 
 *Alternative considered:* new `OpenProject` / `CloseProject` variants.
 Cleaner names, but every client path, fixture and authorization check
@@ -313,7 +363,12 @@ never answers, as an older one does not.
 From the roster, inventory, attached instances, pending starts and that
 outcome it derives each machine's part: `running`, `starting`,
 `waiting_offline`, `not_started` with a reason, or `still_running` for a
-closed project. Parts are reported for not-recorded projects too.
+closed project. A project nobody has recorded (Decision 2) is given these
+parts: a machine that runs it reads `running`, a machine with a pending
+start an older client asked for reads `starting`, and every other tab owner
+reads `not_started` with no reason, connected or not, so never
+`waiting_offline`. A machine that runs it never reads `still_running`: its
+instance's attach records the project open.
 
 - `ServerToWeb::ProjectOpenState { project_id, state, set_by, set_at,
   machines: [...] }` goes to viewers that negotiated
@@ -369,7 +424,10 @@ there.
   `SessionStart`, so the state is recorded there: a `SessionStart` that
   creates the project's row records it open by that account, naming that
   machine. A `SessionStart` for a project that already has a row, as after
-  "Clone here" or `apas register` joining by remote, records nothing.
+  "Clone here" or `apas register` joining by remote, records nothing when
+  the project is recorded open or closed, and records it open when nobody has
+  recorded it, once that instance has attached (Decision 2, audited with the
+  source `first_seen`); a refused `SessionStart` records nothing.
 - Open and close are audited, with the actor and the machines asked. A start
   or stop the follow step sends at a registration is audited too, with the
   recorded actor, that machine and the source "registration"; a registration
@@ -417,13 +475,17 @@ For other viewers and for native launches, the table in Decision 3 applies.
   a closed project keep their real status, and Close is offered again.
 - In the Run on step, a machine that is not running a project recorded open
   is listed under "Starts the project first" ("the project starts there,
-  then the tab opens"); "Opens the project" is for a closed project and one
-  nobody has recorded.
-- The Open of a not-recorded project that already runs reads "Keep open",
-  also when it starts a machine that is not running it (its confirmation
-  then says which),
-  with "Its tabs start again on \<hosts\> after those machines have been
-  away."
+  then the tab opens"); "Opens the project" is for a closed project,
+  including one nobody has recorded that nothing runs.
+- A project has one button: Open while it reads closed, Close while it
+  reads open, plus "Open again" and "Close again" where the cases above
+  give them. A project nobody has recorded reads open while any machine
+  runs it and closed otherwise, and nothing a person sees says it is not
+  recorded. While it runs it gets a recorded-open project's controls and
+  sentences: Close, and "Open again" where a connected tab owner is not
+  running it, so no sentence names a button that is not there. (The first release offered "Keep open" on such a project while
+  it ran, with "Its tabs start again on \<hosts\> after those machines have
+  been away."; the owner removed it on 2026-11-16, Decision 2.)
 
 ### 12. Closing deletes nothing; deleting is a control of its own
 
@@ -488,7 +550,16 @@ deletion leaves local APAS configuration alone. Not done here.
 - [An external `apas --headless` debugging run of a closed project is
   stopped at the daemon's next registration] The daemon reports such a run
   as running and its stop kills it. → Documented in `AGENTS.md`: open the
-  project, or debug a project that is not recorded closed.
+  project first. A headless run of a project nobody has recorded records it
+  open when its instance attaches (Decision 2), and the project's other tab
+  owners then start at their next registration.
+- [Half-running projects start their other machine] A project nobody has
+  recorded that runs on one of its two tab-owner machines is recorded open
+  when it is seen running, and the other machine starts it at its next
+  registration (Decision 2). The owner accepted this on 2026-11-16 in
+  exchange for one Open/Close button with no third state. → Documented in
+  `AGENTS.md`; to keep the other machine out, close or forget its tabs
+  there (Decision 8).
 - [A stop reported done while the project still ends] The daemon gives up
   waiting after 30 s and reports success. → The machine's part comes from
   its next inventory, so it reads "Still running" and Close can be sent
@@ -505,12 +576,14 @@ deletion leaves local APAS configuration alone. Not done here.
 - [Many pinned tests change] The web tests that assert the Machines page
   never sends `all_instances`, and the "Start on \<host\>" tests, are
   rewritten, not deleted without replacement.
-- [An older server after rollback] It ignores the columns and behaves as
-  before, so people start and stop projects by hand again while the recorded
-  states go stale. The next start of a server with this change would then
-  follow those stale states at every registration: start projects someone
-  stopped by hand, and stop projects someone started. The rollback therefore
-  clears the recorded states (Migration Plan).
+- [An older server after rollback] A server older than release
+  `20261116T224049Z` ignores the columns and behaves as before, so people
+  start and stop projects by hand again while the recorded states go stale.
+  The next start of a server with this change would then follow those stale
+  states at every registration: start projects someone stopped by hand, and
+  stop projects someone started. A rollback to such a server therefore
+  clears the recorded states (Migration Plan). Release `20261116T224049Z`
+  itself reads and follows them, so a rollback to it keeps them.
 - [Scenario titles] OpenSpec keeps a modified requirement's scenario titles.
   "Start one machine from the Machines page", "A project that is not
   running" and "A project that is running" keep their titles with new
@@ -519,24 +592,39 @@ deletion leaves local APAS configuration alone. Not done here.
 ## Migration Plan
 
 1. **Server**, with the shared types and regenerated schemas. The columns
-   are added on first start; every project is not recorded. Older web
-   clients keep working by Decision 3: on a not-recorded project every
-   button of theirs does what it did and records nothing.
-2. **Web.** From here the Machines page and the workspace show the state,
-   and the first Open or Close of each project records it.
+   are added on first start with every project not recorded. Older web
+   clients keep working by Decision 3.
+2. **Web.** From here the Machines page and the workspace show the state as
+   Open or Closed with one button.
 3. **Native** needs no release for the protocol. Check an existing build
    stays connected while a project is opened and closed. Its refusal
    sentence changes with its next build.
-4. No daemon or agent restart. Nothing is started or stopped by this
-   deployment, because no project is recorded yet. Later server deploys
-   bring machines in line as their daemons register again (Decision 5).
+4. No daemon or agent restart.
+
+*As first released* (`20261116T224049Z`), with `NULL` a third state, that
+deployment started and stopped nothing, and each project was recorded only
+by someone's first Open or Close from the new web ("Keep open" while it ran).
+
+*With Decision 2 as it now stands,* the deploy of the server that brings it
+records every running project that is not recorded open as its instances
+attach again, within seconds; projects nothing runs stay unrecorded and read
+closed. The columns already exist on a server running `20261116T224049Z`,
+so nothing is added at that deploy. That deploy
+starts nothing by itself unless a tab owner's daemon registers after a
+project it owns tabs of was recorded open on another machine (Decision 2,
+the order in that deploy). From then on every server deploy brings machines
+in line as their daemons register again (Decision 5). Any project already
+recorded by the first release keeps its state.
 
 Rollback: redeploy the previous web, then the previous server. The columns
-stay and the older server ignores them. No stop is needed first, because
-nothing durable depends on the new server except the follow step, which
-simply no longer happens. **Clear the recorded states as part of every
-server rollback**, with the server stopped, also when the rollback is the
-deploy procedure's "restore the backed-up binary":
+stay. **A rollback to release `20261116T224049Z`** keeps the recorded
+states: that server reads and follows them, and its web offers "Keep open"
+only on a project that is still not recorded. **A rollback to a server older
+than `20261116T224049Z`** leaves the columns to a server that ignores them.
+No stop is needed first, because nothing durable depends on the new server
+except the follow step, which simply no longer happens. **Clear the
+recorded states as part of such a rollback**, with the server stopped, also
+when the rollback is the deploy procedure's "restore the backed-up binary":
 
 ```sql
 UPDATE projects SET open_state = NULL, open_state_set_by = NULL,
@@ -546,14 +634,22 @@ UPDATE projects SET open_state = NULL, open_state_set_by = NULL,
 
 Every project is then not recorded again, as after the first deployment.
 Without this, the next deploy of a server with this change would start and
-stop machines from states recorded before the rollback.
+stop machines from states recorded before the rollback. With it, that
+deploy starts again from what actually runs: running projects are recorded
+open as their instances attach (Decision 2), and the rest read closed.
 
 Smoke on the two-host harness before production: open with one machine
 offline and bring it back; close with one daemon frozen and release it;
 close during a daemon replacement; an older daemon as one of two tab owners
 that registers first after a server restart; a server restart between an
 open and a machine's return; an older web bundle's per-machine buttons on a
-not-recorded, an open and a closed two-machine project.
+not-recorded, an open and a closed two-machine project. For Decision 2 as it
+now stands: a server restart with a project running on one of two machines
+and nothing recorded, in both registration orders; a not-recorded
+project nothing runs, which must read closed and start nothing; and an
+older web bundle's one-machine Start of a not-recorded two-machine project,
+which starts that machine, beside a native task launch on one, which is
+refused with the closed sentence.
 
 ## Open Questions
 

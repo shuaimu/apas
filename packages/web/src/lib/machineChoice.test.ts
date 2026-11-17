@@ -198,8 +198,8 @@ describe("buildMachineChoices", () => {
   // every connected tab owner that is not running it starts. The choice
   // carries those hosts so the step and the confirmation can name them.
   it("says which tab owners start when a tab on a cloned machine opens the project", () => {
-    // What `buildProjectOpenModel(...).machines` holds for a closed project,
-    // and equally for one nobody has recorded that runs nowhere: tab owners
+    // What `buildProjectOpenModel(...).machines` holds for a closed project
+    // (also one the server has not recorded that runs nowhere): tab owners
     // that are not running it. zoo-006 is another account's machine, which
     // this viewer does not list.
     const idle = [
@@ -286,7 +286,7 @@ describe("buildMachineChoices", () => {
       ["zoo-006", "registered", true],
       ["laptop", "clone", true],
     ]);
-    // Closed, not recorded, or a server that records nothing: not marked.
+    // Closed, or a server that records nothing: not marked.
     expect(model(input).choices.every((choice) => choice.projectOpen === undefined)).toBe(true);
     expect(model({ ...input, openStateSupported: false, projectOpen: true }).choices
       .every((choice) => choice.projectOpen === undefined)).toBe(true);

@@ -227,7 +227,7 @@ describe("a project's open state in the project list", () => {
     expect(screen.getByRole("img", { name: "Claude 1: Not running" })).toBeTruthy();
   });
 
-  it("shows a project nobody has recorded from what runs", () => {
+  it("shows a project the server has not recorded as Open while it runs and Closed otherwise", () => {
     seed([project({ panes: twoMachines })]);
     const { unmount } = render(<Sidebar />);
     expect(stateOf()).toBe("Open");

@@ -2,7 +2,7 @@
 
 ### Requirement: The machine list opens and closes projects as a whole
 
-For each project a machine lists, the machine list SHALL show the project's open state and that machine's part in it: running, starting, not started with the reason, still running after a close, or that the machine owns no tabs of the project. It SHALL show these from what the machine list itself is sent, without the user having opened the project. It SHALL offer opening a closed project and closing an open one, opening a project that is not recorded, and closing any project a machine still runs, and each SHALL act on the whole project, as it does from the project's workspace. It SHALL NOT offer starting or stopping the project on that machine alone. When opening or closing from a machine's entry reaches other machines, the confirmation SHALL name them before anything is sent, and the confirmation for closing SHALL say that nothing is deleted. Opening a project that has no tabs from a machine's entry SHALL start it on that machine. Opening a project from the entry of a machine that owns none of its tabs, while other machines own some, SHALL say before anything is sent that the project starts on those machines and not on this one. The count of projects running on a machine SHALL keep counting what that machine runs. While a request is pending the entry SHALL say so, SHALL claim nothing for a request that was not sent, and SHALL NOT send it again by itself.
+For each project a machine lists, the machine list SHALL show the project's open state and that machine's part in it: running, starting, not started with the reason, still running after a close, or that the machine owns no tabs of the project. It SHALL show these from what the machine list itself is sent, without the user having opened the project. It SHALL offer one control for the project: opening while the project is closed and closing while it is open, plus opening again while the project is open and a connected machine that owns its tabs is not running it, and closing again while a machine still runs a closed project, and each SHALL act on the whole project, as it does from the project's workspace. A project that is not recorded SHALL be shown as open, with closing offered and opening again where it can start a machine, while any machine runs it, and as closed, with opening offered, otherwise; the entry SHALL NOT say that the project is not recorded. It SHALL NOT offer starting or stopping the project on that machine alone. When opening or closing from a machine's entry reaches other machines, the confirmation SHALL name them before anything is sent, and the confirmation for closing SHALL say that nothing is deleted. Opening a project that has no tabs from a machine's entry SHALL start it on that machine. Opening a project from the entry of a machine that owns none of its tabs, while other machines own some, SHALL say before anything is sent that the project starts on those machines and not on this one. The count of projects running on a machine SHALL keep counting what that machine runs. While a request is pending the entry SHALL say so, SHALL claim nothing for a request that was not sent, and SHALL NOT send it again by itself.
 
 #### Scenario: Open a project from one machine's entry
 - **WHEN** a closed project has tabs on zoo-005 and zoo-006 and a user chooses Open in zoo-005's entry
@@ -24,8 +24,14 @@ For each project a machine lists, the machine list SHALL show the project's open
 - **AND** it offers no control that starts the project on zoo-006 alone
 
 #### Scenario: A project nobody has recorded that runs on this machine
-- **WHEN** zoo-005's entry lists a project that is not recorded and that zoo-005 runs
-- **THEN** the entry offers to keep the project open and to close it
+- **WHEN** zoo-005's entry lists a project that is not recorded, that zoo-005 runs, and whose every tab owner runs it
+- **THEN** the entry shows the project as open and offers to close it
+- **AND** it offers no other control for the project
+
+#### Scenario: A project nobody has recorded that runs nowhere
+- **WHEN** zoo-005's entry lists a project that is not recorded and that no machine runs
+- **THEN** the entry shows the project as closed and offers to open it
+- **AND** confirming records the project open and starts it as an open does
 
 #### Scenario: The page is not connected
 - **WHEN** a user chooses Open while the page has no connection to the server

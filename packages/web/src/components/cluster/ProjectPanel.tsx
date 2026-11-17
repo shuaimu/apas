@@ -194,7 +194,7 @@ function ProjectDetail({
         {/* Only while nothing is known about the open state: see
             `ConnectionChip`. */}
         {summary && !open && <ConnectionChip connected={summary.connected} />}
-        {open && <OpenStateChip label={open.stateLabel} derived={openState?.supported === true && !open.recorded} />}
+        {open && <OpenStateChip label={open.stateLabel} />}
         {suspended && <SuspendedChip />}
       </div>
     </div>

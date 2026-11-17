@@ -473,8 +473,10 @@ impl Database {
         .execute(&self.pool)
         .await;
         // A project's open state (see `db/open_state.rs`). All five stay
-        // NULL until someone opens or closes the project: an upgraded
-        // deployment starts with every project not recorded.
+        // NULL until someone opens or closes the project or an instance of
+        // it attaches: an upgraded deployment starts with every project not
+        // recorded, and each running one is recorded open as its instance
+        // attaches again.
         let project_columns = sqlx::query("PRAGMA table_info(projects)")
             .fetch_all(&self.pool)
             .await?;

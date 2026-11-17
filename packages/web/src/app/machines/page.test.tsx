@@ -533,17 +533,32 @@ describe("MachinesPage open state", () => {
     expect(validateClientMessage(frames[0]).valid).toBe(true);
   });
 
-  it("offers to keep open and to close a project nobody has recorded, and records it with one request", () => {
+  it("offers only Close for a running project the server has not recorded, and Close is one ordinary request", () => {
     const sent = seedOverSocket([listing(ZOO5, "zoo-005", { isRunning: true, part: "running" })]);
     render(<MachinesPage />);
 
-    expect(screen.getByRole("button", { name: "Close mako (listed on zoo-005)" })).toBeTruthy();
-    fireEvent.click(screen.getByRole("button", { name: "Keep mako open (listed on zoo-005)" }));
-    expect(dialogLines()).toEqual([
-      "This records the project as open. Nothing starts now.",
-      "Its tabs start again on zoo-005 after those machines have been away.",
-    ]);
-    confirmInDialog("Keep open");
+    expect(screen.getByTestId("project-open-state").textContent).toBe("Open");
+    expect(screen.queryByRole("button", { name: /^(Open|Keep) mako/ })).toBeNull();
+    expect(document.body.textContent).not.toMatch(/Keep .*open|Nobody has opened|after those machines have been away/i);
+    fireEvent.click(screen.getByRole("button", { name: "Close mako (listed on zoo-005)" }));
+    expect(dialogLines()).toEqual(["This stops its agents on zoo-005.", CLOSE_DELETES_NOTHING]);
+    confirmInDialog("Close");
+    expect(sent()).toEqual([{
+      type: "stop_machine_project_cli",
+      machine_id: ZOO5,
+      project_id: PROJECT,
+      all_instances: true,
+    }]);
+  });
+
+  it("offers only Open for a project the server has not recorded that nothing runs", () => {
+    const sent = seedOverSocket([listing(ZOO5, "zoo-005", { part: "not_started" })]);
+    render(<MachinesPage />);
+
+    expect(screen.getByTestId("project-open-state").textContent).toBe("Closed");
+    expect(screen.queryByRole("button", { name: /^(Close|Keep) mako/ })).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Open mako (listed on zoo-005)" }));
+    confirmInDialog("Open");
     expect(sent()).toEqual([{
       type: "start_machine_project_cli",
       machine_id: ZOO5,
@@ -570,7 +585,7 @@ describe("MachinesPage open state", () => {
     expect(sent()).toHaveLength(1);
   });
 
-  it("never offers Keep open on a server that records no open state, and still asks for the whole project", () => {
+  it("offers one button per project on a server that records no open state, and still asks for the whole project", () => {
     const sent = seedOverSocket([
       listing(ZOO5, "zoo-005", { isRunning: true }),
       { ...listing(ZOO6, "zoo-006", {}), projects: [{ projectId: "other", name: "idle", path: "/work/idle", isRunning: false }] },

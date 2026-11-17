@@ -179,10 +179,26 @@ function expectValid(frame: Record<string, unknown>) {
   expect(result.valid).toBe(true);
 }
 
-/** The project's Open and Close controls that are offered, in order. */
+/** The project's Open and Close controls that are offered, in order.
+ *  "Keep open" stays in the list so that every assertion on it also says
+ *  that button is gone (removed by the owner on 2026-11-16). */
 function projectButtons(): string[] {
   return ["Open", "Keep open", "Open again", "Close", "Close again"]
     .filter((name) => screen.queryByRole("button", { name }) !== null);
+}
+
+/** What the owner removed on 2026-11-16: a third button that kept a
+ *  running project open, and every text telling a person a project is not
+ *  recorded. Searched in the text, the titles and the accessible names. */
+function expectNoRemovedText() {
+  const texts = [
+    document.body.textContent ?? "",
+    ...Array.from(document.querySelectorAll("[title]")).map((element) => element.getAttribute("title") ?? ""),
+    ...Array.from(document.querySelectorAll("[aria-label]")).map((element) => element.getAttribute("aria-label") ?? ""),
+  ].join("\n");
+  for (const pattern of [/Keep .*open/i, /Nobody has opened/, /after those machines have been away/, /Nothing starts now/]) {
+    expect(texts).not.toMatch(pattern);
+  }
 }
 
 function notice(): HTMLElement | null {
@@ -491,67 +507,92 @@ describe("an open project", () => {
   });
 });
 
-describe("a project nobody has recorded", () => {
-  it("offers Keep open while it runs everywhere, and confirming records it and starts nothing by itself", async () => {
+describe("a project the server has not recorded", () => {
+  it("shows Open and offers only Close while it runs everywhere, and Close is an ordinary close", async () => {
     seed();
     report(undefined, [part(ZOO5, "zoo-005", "running"), part(ZOO6, "zoo-006", "running")]);
     await renderView();
 
-    expect(projectButtons()).toEqual(["Keep open", "Close"]);
-    // No state is recorded, so none is shown as the server's.
-    expect(screen.queryByTestId("project-open-state")).toBeNull();
+    expect(projectButtons()).toEqual(["Close"]);
+    expect(screen.getByTestId("project-open-state").textContent).toBe("Open");
     expect(notice()).toBeNull();
-    const sentence = "Its tabs start again on zoo-005 and zoo-006 after those machines have been away.";
-    expect(screen.getByRole("button", { name: "Keep open" }).getAttribute("title")).toBe(sentence);
+    expectNoRemovedText();
 
-    fireEvent.click(screen.getByRole("button", { name: "Keep open" }));
-    expect(screen.getByRole("dialog", { name: "Keep apas open?" })).toBeTruthy();
-    expect(dialogLines()).toEqual(["This records the project as open. Nothing starts now.", sentence]);
-    confirmDialog("Keep open");
-    // The same request as Open: the whole project, never one machine.
-    const [keep] = sent("start_machine_project_cli");
-    expect(keep).toEqual({
-      type: "start_machine_project_cli",
+    fireEvent.click(screen.getByRole("button", { name: "Close" }));
+    expect(screen.getByRole("dialog", { name: "Close apas?" })).toBeTruthy();
+    expect(dialogLines()).toEqual(["This stops its agents on zoo-005 and zoo-006.", NOTHING_DELETED]);
+    expectNoRemovedText();
+    confirmDialog("Close");
+    // The whole project, never one machine.
+    const [close] = sent("stop_machine_project_cli");
+    expect(close).toEqual({
+      type: "stop_machine_project_cli",
       machine_id: ZOO5,
       project_id: SID,
       all_instances: true,
     });
-    expectValid(keep);
+    expectValid(close);
     expect(ws.send).toHaveBeenCalledTimes(1);
-
-    report("open", [part(ZOO5, "zoo-005", "running"), part(ZOO6, "zoo-006", "running")]);
-    expect(projectButtons()).toEqual(["Close"]);
-    expect(screen.getByTestId("project-open-state").textContent).toBe("Open");
   });
 
-  it("names the machine that is not running it and offers Keep open, which says what starts, and Close", async () => {
-    seed({ instances: [instance(ZOO5, "zoo-005", true)] });
+  it("names the machine that is not running it and offers Open again, which its stopped tab names", async () => {
+    seed({ instances: [instance(ZOO5, "zoo-005", true)], activePaneId: 11 });
     report(undefined, [part(ZOO5, "zoo-005", "running"), part(ZOO6, "zoo-006", "not_started")]);
-    await renderView();
+    await renderView(11);
 
+    expect(screen.getByTestId("project-open-state").textContent).toBe("Open");
     expect(notice()?.textContent).toBe("zoo-006 is not running this project.");
-    // The offer reads "Keep open" on every not-recorded project that runs.
-    expect(projectButtons()).toEqual(["Keep open", "Close"]);
-    fireEvent.click(screen.getByRole("button", { name: "Keep open" }));
-    expect(screen.getByRole("dialog", { name: "Keep apas open?" })).toBeTruthy();
-    // Confirming starts zoo-006: nothing says "Nothing starts now".
-    expect(dialogLines()).toEqual([
-      "zoo-005 already runs it.",
-      "Its tabs start on zoo-006.",
-      "Its tabs start again on zoo-005 and zoo-006 after those machines have been away.",
-    ]);
-    confirmDialog("Keep open");
-    expect(sent("start_machine_project_cli")).toEqual([{
+    // As for a recorded open project: the stopped tab's sentence names a
+    // button that is there.
+    expect(projectButtons()).toEqual(["Open again", "Close"]);
+    const sentence = "zoo-006 is not running this project. Open the project again to start it there.";
+    expect(screen.getByTestId("terminal-pane-11").getAttribute("data-input-disabled")).toBe(sentence);
+    expectNoRemovedText();
+
+    fireEvent.click(screen.getByRole("button", { name: "Open again" }));
+    expect(screen.getByRole("dialog", { name: "Open apas again?" })).toBeTruthy();
+    expect(dialogLines()).toEqual(["zoo-005 already runs it.", "Its tabs start on zoo-006."]);
+    expectNoRemovedText();
+    confirmDialog("Open again");
+    // The whole project, an ordinary open the server records; never zoo-006
+    // alone.
+    const starts = sent("start_machine_project_cli");
+    expect(starts).toEqual([{
       type: "start_machine_project_cli",
       machine_id: ZOO5,
       project_id: SID,
       all_instances: true,
     }]);
+    expectValid(starts[0]);
+    expect(ws.send).toHaveBeenCalledTimes(1);
+  });
+
+  it("shows Closed and offers only Open while nothing runs it, and Open is an ordinary open", async () => {
+    seed({ instances: [] });
+    report(undefined, [part(ZOO5, "zoo-005", "not_started"), part(ZOO6, "zoo-006", "not_started")]);
+    await renderView();
+
+    expect(projectButtons()).toEqual(["Open"]);
+    expect(screen.getByTestId("project-open-state").textContent).toBe("Closed");
+    expectNoRemovedText();
+    fireEvent.click(screen.getByRole("button", { name: "Open" }));
+    expect(screen.getByRole("dialog", { name: "Open apas?" })).toBeTruthy();
+    expect(dialogLines()).toEqual(["Its tabs start on zoo-005 and zoo-006."]);
+    expectNoRemovedText();
+    confirmDialog("Open");
+    const [open] = sent("start_machine_project_cli");
+    expect(open).toEqual({
+      type: "start_machine_project_cli",
+      machine_id: ZOO5,
+      project_id: SID,
+      all_instances: true,
+    });
+    expectValid(open);
   });
 });
 
 describe("a server that records no open state", () => {
-  it("shows a running project from what runs, with Close and never Keep open", async () => {
+  it("shows a running project from what runs, with Close alone and no state", async () => {
     seed({ negotiated: false });
     await renderView();
     // A frame this viewer never asked for changes nothing.
@@ -655,7 +696,7 @@ describe("a viewer that has received no project_open_state frame", () => {
     expect(projectButtons()).toEqual(["Open again", "Close"]);
   });
 
-  it("offers Keep open for a running project the lists carry no state for", async () => {
+  it("shows Open and offers only Close for a running project the lists carry no state for", async () => {
     seed({
       machines: [
         listed(ZOO5, "zoo-005", { isRunning: true, part: "running" }),
@@ -663,9 +704,9 @@ describe("a viewer that has received no project_open_state frame", () => {
       ],
     });
     await renderView();
-    // Not recorded: no state label, and Open reads as keeping it open.
-    expect(screen.queryByTestId("project-open-state")).toBeNull();
-    expect(projectButtons()).toEqual(["Keep open", "Close"]);
+    expect(screen.getByTestId("project-open-state").textContent).toBe("Open");
+    expect(projectButtons()).toEqual(["Close"]);
+    expectNoRemovedText();
   });
 });
 
@@ -858,7 +899,7 @@ describe("deleting a project", () => {
 });
 
 describe("a new tab on a machine that is not running the project", () => {
-  it("says it opens the project and names the other machines whose tabs start", async () => {
+  it("says it opens a closed project and names the other machines whose tabs start", async () => {
     seed({
       instances: [instance(ZOO5, "zoo-005", true)],
       panes: [
@@ -866,6 +907,7 @@ describe("a new tab on a machine that is not running the project", () => {
         terminal(11, "Claude 2", ZOO6, "zoo-006"),
         terminal(12, "Claude 3", ZOO7, "zoo-007"),
       ],
+      session: { openState: "closed" },
       machines: [
         machine(ZOO5, "zoo-005", { running: true }),
         machine(ZOO6, "zoo-006"),
@@ -883,8 +925,9 @@ describe("a new tab on a machine that is not running the project", () => {
         },
       },
     }));
-    report(undefined, [
-      part(ZOO5, "zoo-005", "running"),
+    // zoo-005 still runs the closed project: the tab on zoo-006 opens it.
+    report("closed", [
+      part(ZOO5, "zoo-005", "still_running"),
       part(ZOO6, "zoo-006", "not_started"),
       part(ZOO7, "zoo-007", "not_started"),
     ]);
@@ -911,12 +954,16 @@ describe("a new tab on a machine that is not running the project", () => {
     expect(sent("start_machine_project_cli")).toEqual([]);
   });
 
-  it("says the project starts on that machine first when the project is open already", async () => {
+  it.each([
+    ["recorded open", "open" as const],
+    // Shown Open, as the server records it as soon as it sees it run.
+    ["running and not recorded", undefined],
+  ])("says the project starts on that machine first when the project is %s already", async (_name, state) => {
     // Open, with tabs on zoo-005 only; zoo-006 has it registered.
     seed({
       instances: [instance(ZOO5, "zoo-005", true)],
       panes: [terminal(10, "Claude 1", ZOO5, "zoo-005")],
-      session: { openState: "open" },
+      session: { openState: state },
     });
     act(() => useStore.setState({
       projectPolicies: {
@@ -929,7 +976,7 @@ describe("a new tab on a machine that is not running the project", () => {
         },
       },
     }));
-    report("open", [part(ZOO5, "zoo-005", "running")]);
+    report(state, [part(ZOO5, "zoo-005", "running")]);
     await renderView();
     expect(screen.getByTestId("project-open-state").textContent).toBe("Open");
 

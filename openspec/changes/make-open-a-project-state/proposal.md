@@ -13,9 +13,11 @@ does. The machine is not a place to make that choice.
 
 ## What Changes
 
-- A project has one **open state**, kept durably by the server: open, closed,
-  or not yet recorded. It is recorded when someone opens or closes the
-  project and survives server restarts.
+- A project has one **open state**, kept durably by the server: open or
+  closed. It is recorded when someone opens or closes the project, or, for a
+  project nobody has recorded, open when the server first sees it running
+  (stored as not recorded until then), and survives server restarts. A project nobody has recorded that nothing
+  runs reads closed. A person sees Open or Closed and one button.
 - **Opening** starts the project on every machine that owns tabs of it.
   **Closing** stops it on every machine. Both are remembered, so a machine
   that was offline, rebooted or still reconnecting follows when its daemon
@@ -59,10 +61,13 @@ does. The machine is not a place to make that choice.
   project's connected machines, or, when none is connected, when it owns or
   hosts the project. A machine is started or stopped later only where the
   account that opened or closed the project may still use it.
-- A project nobody has opened or closed since the upgrade stays as it is: the
-  server neither starts nor stops it by itself, so the rollout launches no
-  agent and ends none. Its workspace offers to keep it open, and from that
-  click on its machines follow it.
+- A project nobody has opened or closed since the upgrade is recorded open
+  the first time the server sees it running (its instance attaching), and
+  reads closed while nothing runs it. The first release left such projects
+  unrecorded and offered "Keep open"; the owner removed that on 2026-11-16
+  for one Open/Close button (design Decision 2). Consequence accepted: a
+  project running on one of its two tab-owner machines starts on the other
+  at that machine's next registration.
 - No daemon change is needed. The server sends the start and stop requests
   daemons already understand, now also when a daemon registers.
 - Not changed: a machine's daemon still restarts its own running projects
@@ -126,7 +131,9 @@ does. The machine is not a place to make that choice.
   sentence it composes itself is reworded for its next build.
 - **CLI/daemon**: none. Older daemons take part as far as today's refusals
   allow.
-- **Rollout**: server, then web. Rollback needs no data change: an older
-  server ignores the recorded state.
+- **Rollout**: server, then web. A rollback to a server older than release
+  `20261116T224049Z` clears the recorded states while the server is stopped
+  (design, Migration Plan): such a server ignores them, and they would go
+  stale. A rollback to `20261116T224049Z` keeps them.
 - **Docs**: `AGENTS.md` sections "A project's tabs can run on several
   machines", "The daemon is replaced only when asked" and the Machines view.

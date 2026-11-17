@@ -178,13 +178,10 @@ export interface MobileSessionActivityProps {
 }
 
 /** How the pane-actions sheet and its confirmation name the project's Open:
- *  "Open project", "Open project again" while a connected machine is not
- *  following an open project, and "Keep project open" for a running project
- *  nobody has recorded. All three send the same request. */
+ *  "Open project", or "Open project again" while a connected machine is not
+ *  following an open project. Both send the same request. */
 function openProjectActionLabel(action: ProjectOpenAction | undefined): string {
-  return action?.kind === "open_again"
-    ? "Open project again"
-    : action?.kind === "keep_open" ? "Keep project open" : "Open project";
+  return action?.kind === "open_again" ? "Open project again" : "Open project";
 }
 
 function displayProjectName(workingDir?: string, gitRemote?: string): string {
@@ -594,8 +591,8 @@ export function MobileSessionActivity({ connected, onBack, onReconnect }: Mobile
     fallbackMachineId: machineProjectTarget?.machineId,
     openStateSupported,
     projectMachines: projectOpenModel.machines,
-    projectOpen: projectOpenModel.recorded && projectOpenModel.state === "open",
-  }), [instances, instancesSupported, machineProjectTarget?.machineId, machines, openStateSupported, projectOpenModel.machines, projectOpenModel.recorded, projectOpenModel.state, selectedPane, session, sessionId]);
+    projectOpen: projectOpenModel.supported && projectOpenModel.state === "open",
+  }), [instances, instancesSupported, machineProjectTarget?.machineId, machines, openStateSupported, projectOpenModel.machines, projectOpenModel.supported, projectOpenModel.state, selectedPane, session, sessionId]);
   // The user's pick, else the default (the selected pane's machine), derived
   // so a default that arrives while the sheet is open still counts. A pick
   // that disappears while the sheet is open (an instance detaches) is no pick.
@@ -1016,8 +1013,8 @@ export function MobileSessionActivity({ connected, onBack, onReconnect }: Mobile
   // A saved Pi tab, or any other retired provider's: listed, never running.
   const selectedIsRetired = isRetiredProviderModel(selectedPane?.provider, selectedPane?.model);
   // Open is offered by the project's state, not by whether one machine runs
-  // it: for a closed project, for one nobody has recorded, and again while a
-  // connected machine that owns tabs is not running an open one. Never for a
+  // it: for a closed project, and again while a connected machine that owns
+  // tabs is not running an open one. Never for a
   // machine that is offline, which nothing here can start.
   const openAction = projectOpenModel.openAction;
   const openRequest = projectOpenModel.request;
@@ -1530,7 +1527,7 @@ export function MobileSessionActivity({ connected, onBack, onReconnect }: Mobile
                         ? projectOpenModel.machines.some((machine) => machine.part === "starting" || machine.part === "running")
                           ? "This project is already starting"
                           : "No connected machine of this project can be started now"
-                        : openAction.note ?? (openAction.kind === "open_again" ? "Open this project again" : "Open this project")}
+                        : openAction.kind === "open_again" ? "Open this project again" : "Open this project"}
                   onClick={() => {
                     if (!canOpenProject || !openAction || !openRequest) return;
                     setMoreOpen(false);

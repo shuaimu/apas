@@ -34,12 +34,11 @@ const CLOSE_BUTTON = `${overviewButton} hover:border-red-300 hover:text-red-700 
 
 const AMBER_TEXT = "text-amber-800 dark:text-amber-200";
 
-/** "Open mako", "Keep mako open", "Close mako again": the control's name. */
+/** "Open mako", "Open mako again", "Close mako again": the control's name. */
 function actionName(action: ProjectOpenAction | ProjectCloseAction, project: string): string {
   switch (action.kind) {
     case "open": return `Open ${project}`;
     case "open_again": return `Open ${project} again`;
-    case "keep_open": return `Keep ${project} open`;
     case "close": return `Close ${project}`;
     case "close_again": return `Close ${project} again`;
   }
@@ -105,7 +104,6 @@ export function MachineProjectRow({
   // when any of it changes.
   const signature = [
     model.state,
-    model.recorded,
     partLabel,
     openAction?.kind,
     closeAction?.kind,
@@ -189,15 +187,7 @@ export function MachineProjectRow({
         {notSent && <div role="alert" className="text-xs text-red-700 dark:text-red-300">{NOTHING_SENT_TEXT}</div>}
       </div>
       <div className="flex shrink-0 flex-wrap items-center justify-end gap-2 self-end sm:self-auto">
-        <span
-          data-testid="project-open-state"
-          className={overviewChip}
-          title={openStateSupported && !model.recorded
-            ? "Nobody has opened or closed this project yet. It is shown from what runs."
-            : undefined}
-        >
-          {model.stateLabel}
-        </span>
+        <span data-testid="project-open-state" className={overviewChip}>{model.stateLabel}</span>
         {showPart && (
           <span
             data-testid="machine-part"
@@ -212,7 +202,7 @@ export function MachineProjectRow({
           <button
             type="button"
             aria-label={`${actionName(openAction, controlName)} (listed on ${hostname})`}
-            title={connected ? openAction.note : NOT_CONNECTED}
+            title={connected ? undefined : NOT_CONNECTED}
             disabled={disabled}
             onClick={() => ask("open", openAction)}
             className={overviewButton}

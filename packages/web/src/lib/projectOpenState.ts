@@ -25,7 +25,7 @@ import { hostList, stoppedOnHostReason, type ConfirmationCopy } from "./tabHosts
  * `Authenticate.capabilities`; a server that records open states echoes it
  * in `negotiated_capabilities` and only then sends `project_open_state`.
  * Without the echo the server is older (or rolled back): a project is then
- * shown from what runs, and "Keep open" is never offered.
+ * shown from what runs.
  */
 export const PROJECT_OPEN_STATE_CAPABILITY = "project_open_state_v1";
 
@@ -201,12 +201,6 @@ export function olderApasReason(hostname: string): string {
   return `${hostname} runs an older APAS that cannot run this project beside other machines. Reboot ${hostname} to update it.`;
 }
 
-/** "Its tabs start again on zoo-005 and zoo-006 after those machines have
- *  been away.": what recording a running project as open changes. */
-export function keepOpenNote(hosts: string[]): string {
-  return `Its tabs start again on ${hostList(hosts)} after those machines have been away.`;
-}
-
 /** "Open" or "Closed": the project's state as every list shows it. */
 export function openStateLabel(state: OpenState): "Open" | "Closed" {
   return state === "open" ? "Open" : "Closed";
@@ -217,17 +211,18 @@ export function openStateLabel(state: OpenState): "Open" | "Closed" {
  *
  * `not_started` is worded by the project's state: in an open project, or
  * with a reason, the machine failed or refused ("Not started: <reason>"). A
- * tab owner that does not run a closed project, or one nobody has recorded,
- * has not failed at anything and reads "Not running". Where the server did
- * not state the part of an open project's machine (`partUnconfirmed`), it
- * may be starting or may have failed, and reads "Not running yet".
+ * tab owner that does not run a closed project, or any project of a server
+ * that records no state (`supported` false), has not failed at anything and
+ * reads "Not running". Where the server did not state the part of an open
+ * project's machine (`partUnconfirmed`), it may be starting or may have
+ * failed, and reads "Not running yet".
  *
  * `part` absent means the machine has no part: it owns no tabs of the
  * project and does not run it.
  */
 export function machinePartLabel(
   machine: { part?: MachinePart; hostname: string; reason?: string; partUnconfirmed?: boolean },
-  project: { state: OpenState; recorded: boolean },
+  project: { state: OpenState; supported: boolean },
 ): string {
   switch (machine.part) {
     case undefined:
@@ -242,7 +237,7 @@ export function machinePartLabel(
       return "Still running";
     case "not_started":
       if (machine.reason) return `Not started: ${machine.reason}`;
-      if (!(project.recorded && project.state === "open")) return "Not running";
+      if (!(project.supported && project.state === "open")) return "Not running";
       return machine.partUnconfirmed ? "Not running yet" : "Not started";
   }
 }
@@ -267,24 +262,18 @@ export interface ProjectOpenMachine extends ProjectMachinePartInfo {
   cannotStart?: string;
 }
 
-export type ProjectOpenActionKind = "open" | "keep_open" | "open_again";
+export type ProjectOpenActionKind = "open" | "open_again";
 export type ProjectCloseActionKind = "close" | "close_again";
 
 export interface ProjectOpenAction {
   /**
-   * `open`: the project is closed, or is not recorded and runs nowhere.
-   * `keep_open`: nobody has recorded it and it runs somewhere; confirming
-   * records it open, and starts the connected tab owners that are not
-   * running it, which the confirmation names, or nothing.
+   * `open`: the project is closed.
    * `open_again`: it is open and the request can start a connected machine.
-   * All three send the same request (`openProject`).
+   * Both send the same request (`openProject`).
    */
   kind: ProjectOpenActionKind;
-  /** "Open", "Keep open" or "Open again": the button and the confirm
-   *  button. */
+  /** "Open" or "Open again": the button and the confirm button. */
   label: string;
-  /** Beside "Keep open": what recording the project changes. */
-  note?: string;
   confirmation: ConfirmationCopy;
 }
 
@@ -341,11 +330,14 @@ export interface ProjectOpenThisMachine {
 }
 
 export interface ProjectOpenModel {
-  /** The state to show. Not recorded: open while a machine runs it. */
+  /** The project's state. Where the server has recorded none, and on a
+   *  server without the capability: open while a machine runs it, else
+   *  closed. */
   state: OpenState;
-  /** Whether the server recorded `state`. False for a project nobody has
-   *  opened or closed yet, and always on a server without the capability. */
-  recorded: boolean;
+  /** The server records open states (`ProjectOpenModelInput.supported`).
+   *  Only then is `state` the project's state rather than a reading of what
+   *  runs; nothing shown tells the two apart beyond that. */
+  supported: boolean;
   /** "Open" or "Closed". */
   stateLabel: "Open" | "Closed";
   /** Who set a recorded state, when the server said. */
@@ -630,7 +622,6 @@ function offlineStopLines(hosts: string[], supported: boolean): string[] {
 export function buildProjectOpenModel(input: ProjectOpenModelInput): ProjectOpenModel {
   const ids = input.projectIds.filter((id): id is string => Boolean(id));
   const sources = resolveSources(input, ids);
-  const recorded = sources.recordedState !== undefined;
   const name = input.projectName?.trim() || "this project";
 
   const anyActive = sources.machines.some((machine) => runs(machine) || machine.part === "starting")
@@ -638,7 +629,7 @@ export function buildProjectOpenModel(input: ProjectOpenModelInput): ProjectOpen
     // the project runs.
     || (!sources.serverParts && input.session?.isActive === true);
   const state: OpenState = sources.recordedState ?? (anyActive ? "open" : "closed");
-  const project = { state, recorded };
+  const project = { state, supported: input.supported };
 
   const keyed: ProjectOpenMachine[] = sources.machines
     .map((machine) => ({
@@ -671,7 +662,7 @@ export function buildProjectOpenModel(input: ProjectOpenModelInput): ProjectOpen
       cannotStart,
       label: machinePartLabel({
         ...machine,
-        reason: machine.reason ?? (recorded && state === "open" ? cannotStart : undefined),
+        reason: machine.reason ?? (input.supported && state === "open" ? cannotStart : undefined),
       }, project),
     };
   });
@@ -721,48 +712,27 @@ export function buildProjectOpenModel(input: ProjectOpenModelInput): ProjectOpen
   const fromHasNoTabs = Boolean(fromEntry) && !fromMachine?.ownsTabs && ownersKnown;
 
   // --- Open ---------------------------------------------------------------
+  // One button opens or closes the project: Open while it is closed, Close
+  // while it is open. "Open again" is offered beside Close only where the
+  // project is shown open and a connected machine is not following it.
   let openKind: ProjectOpenActionKind | undefined;
   if (target) {
-    if (recorded) {
-      if (state === "closed") openKind = "open";
-      else if (startable.length > 0 || targetStartable) openKind = "open_again";
-    } else if (!anyActive) {
+    if (state === "closed") {
       openKind = "open";
-    } else if (!input.supported) {
+    } else if (input.supported) {
+      // Also for a running project the server has not recorded yet: it is
+      // shown open, its stopped tabs say "Open the project again", and an
+      // Open of it is an ordinary open, which the server records.
+      if (startable.length > 0 || targetStartable) openKind = "open_again";
+    } else if (startable.length > 0) {
       // An older server records nothing: an Open is worth offering only
       // while it can start a machine.
-      if (startable.length > 0) openKind = "open_again";
-    } else {
-      // It runs somewhere, so recording it is keeping it open, also where
-      // that starts a machine: the confirmation says which.
-      openKind = "keep_open";
+      openKind = "open_again";
     }
   }
 
-  // The machines whose tabs come back by themselves once the project is
-  // recorded open.
-  const followHosts = hostsOf(owners.length > 0 ? owners : running);
-  const awayNote = input.supported && !recorded && anyActive && followHosts.length > 0
-    ? keepOpenNote(followHosts)
-    : undefined;
-
   let openAction: ProjectOpenAction | undefined;
-  if (openKind === "keep_open" && startable.length === 0) {
-    openAction = {
-      kind: openKind,
-      label: "Keep open",
-      note: awayNote,
-      confirmation: {
-        title: `Keep ${name} open?`,
-        body: [
-          "This records the project as open. Nothing starts now.",
-          ...(awayNote ? [awayNote] : []),
-          ...notStartedLines,
-          ...offlineStartLines(hostsOf(offlineOwners), true),
-        ],
-      },
-    };
-  } else if (openKind) {
+  if (openKind) {
     const body: string[] = [];
     if (running.length > 0) {
       body.push(`${hostList(hostsOf(running))} already ${verb(hostsOf(running), "runs", "run")} it.`);
@@ -795,17 +765,12 @@ export function buildProjectOpenModel(input: ProjectOpenModelInput): ProjectOpen
     }
     body.push(...notStartedLines);
     body.push(...offlineStartLines(hostsOf(offlineOwners), input.supported));
-    if (awayNote) body.push(awayNote);
     if (body.length === 0) body.push("This records the project as open.");
     openAction = {
       kind: openKind,
-      // "Keep open" here starts a machine; the body above names it.
-      label: openKind === "open_again" ? "Open again" : openKind === "keep_open" ? "Keep open" : "Open",
-      ...(openKind === "keep_open" ? { note: awayNote } : {}),
+      label: openKind === "open_again" ? "Open again" : "Open",
       confirmation: {
-        title: openKind === "open_again"
-          ? `Open ${name} again?`
-          : openKind === "keep_open" ? `Keep ${name} open?` : `Open ${name}?`,
+        title: openKind === "open_again" ? `Open ${name} again?` : `Open ${name}?`,
         body,
       },
     };
@@ -814,10 +779,10 @@ export function buildProjectOpenModel(input: ProjectOpenModelInput): ProjectOpen
   // --- Close --------------------------------------------------------------
   let closeKind: ProjectCloseActionKind | undefined;
   if (target) {
-    if (recorded && state === "closed") {
-      if (running.length > 0 || starting.length > 0) closeKind = "close_again";
-    } else if (recorded || anyActive) {
+    if (state === "open") {
       closeKind = "close";
+    } else if (running.length > 0 || starting.length > 0) {
+      closeKind = "close_again";
     }
   }
   let closeAction: ProjectCloseAction | undefined;
@@ -863,7 +828,7 @@ export function buildProjectOpenModel(input: ProjectOpenModelInput): ProjectOpen
       reason: machine.reason ?? machine.cannotStart,
     });
     if (state === "closed") {
-      if (recorded && machine.part === "still_running") {
+      if (machine.part === "still_running") {
         line("still_running", `${machine.hostname} still runs this project.`);
       }
       continue;
@@ -901,7 +866,7 @@ export function buildProjectOpenModel(input: ProjectOpenModelInput): ProjectOpen
         : serverSaidNoPart ? machinePartLabel({ hostname: fromEntry.machine.hostname }, project)
           : isRunning ? "Running" : "Not running",
       reason: fromMachine?.reason
-        ?? (recorded && state === "open" ? fromMachine?.cannotStart : undefined),
+        ?? (input.supported && state === "open" ? fromMachine?.cannotStart : undefined),
       ownsTabs: fromMachine?.ownsTabs === true,
       running: isRunning,
     };
@@ -909,7 +874,7 @@ export function buildProjectOpenModel(input: ProjectOpenModelInput): ProjectOpen
 
   return {
     state,
-    recorded,
+    supported: input.supported,
     stateLabel: openStateLabel(state),
     setBy: sources.setBy,
     setKind: sources.setKind,

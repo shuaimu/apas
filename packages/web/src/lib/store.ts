@@ -1069,9 +1069,8 @@ interface AppState {
   listMachines: () => void;
   /** Open the project: the server records it open and starts it on every
    *  machine that owns its tabs, or on `machineId` when none does. Also the
-   *  retry for a machine of an open project that is not running it, and
-   *  "Keep open" for a project nobody has recorded. Sent once and never
-   *  resent; the state the server reports afterwards is the answer. Returns
+   *  retry for a machine of an open project that is not running it. Sent
+   *  once and never resent; the state the server reports afterwards is the answer. Returns
    *  whether the request was sent: nothing is sent while the socket is not
    *  open. */
   openProject: (machineId: string, projectId: string) => boolean;

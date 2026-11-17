@@ -85,8 +85,8 @@ export interface MachineChoiceInput {
      *  (`ProjectOpenMachine.cannotStart`); it is not named either. */
     cannotStart?: string;
   }[];
-  /** The project is recorded open (`ProjectOpenModel.recorded` and its
-   *  state): a tab on a machine that is not running it starts the project
+  /** The project is open on a server that records open states
+   *  (`ProjectOpenModel.supported` and its state): a tab on a machine that is not running it starts the project
    *  there, and the step does not say it opens the project. */
   projectOpen?: boolean;
 }

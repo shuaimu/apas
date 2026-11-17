@@ -218,8 +218,8 @@ function compareSessionRecency(left: MobileSessionSummary, right: MobileSessionS
 
 /// A project card's badge. While something runs the project it says what its
 /// agents do, also for a closed project a machine still runs. While nothing
-/// runs it, it says the project's state: "Closed", which is also how a
-/// project nobody has recorded reads, or "Not running" for a project that is
+/// runs it, it says the project's state: "Closed", also for a project the
+/// server has recorded no state for, or "Not running" for a project that is
 /// recorded open and that no machine runs.
 function statusLabel(session: MobileSessionSummary, allPanesUsageLimited = false): string {
   if (!session.is_active) return parseOpenState(session.open_state) === "open" ? "Not running" : "Closed";

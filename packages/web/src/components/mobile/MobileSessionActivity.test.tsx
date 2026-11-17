@@ -1070,7 +1070,7 @@ describe("MobileSessionActivity", () => {
     expect(screen.queryByRole("dialog", { name: "Open alpha?" })).toBeNull();
   });
 
-  it("shows the project's state in the header, from what runs while nobody has recorded one", () => {
+  it("shows the project's state in the header, from what runs on a server that records none", () => {
     seedStore();
     const view = render(<MobileSessionActivity connected onBack={vi.fn()} onReconnect={vi.fn()} />);
     expect(screen.getByTestId("project-open-state").textContent).toBe("Open");
@@ -1098,8 +1098,7 @@ describe("MobileSessionActivity", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "More actions" }));
     expect(screen.queryByRole("button", { name: "Open project" })).toBeNull();
-    // This server did not negotiate the open state: never "Keep open".
-    expect(screen.queryByRole("button", { name: "Keep project open" })).toBeNull();
+    expect(screen.queryByRole("button", { name: /keep/i })).toBeNull();
     expect(screen.queryByRole("button", { name: "Open project again" })).toBeNull();
   });
 

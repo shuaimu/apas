@@ -36,13 +36,12 @@ import { DELETE_PROJECT_LABEL } from "@/components/project/DeleteProjectDialog";
  * handler is present. There is no control for one machine alone.
  */
 export interface ProjectControls {
-  /** The state the server recorded. Absent while nobody has opened or
-   *  closed the project, and from a server that records no state: nothing
-   *  is then shown beside the buttons. */
-  recordedState?: "Open" | "Closed";
+  /** The project's state, "Open" or "Closed". Absent from a server that
+   *  records no state: nothing is then shown beside the buttons. */
+  openState?: "Open" | "Closed";
   /** The account that set the recorded state, where the server said. */
   recordedBy?: string;
-  /** "Open", "Keep open" or "Open again". */
+  /** "Open" or "Open again". */
   openAction?: ProjectOpenAction;
   /** "Close" or "Close again". */
   closeAction?: ProjectCloseAction;
@@ -702,19 +701,19 @@ export function TabBar({
             owns its tabs. Each action is confirmed in the page, with the
             machines named. Closing stops every agent in the project and
             deletes nothing; deleting is its own control and its own dialog. */}
-        {projectControls?.recordedState && (
+        {projectControls?.openState && (
           <span
             title={projectControls.recordedBy
-              ? `${projectControls.recordedState === "Open" ? "Opened" : "Closed"} by ${projectControls.recordedBy}`
+              ? `${projectControls.openState === "Open" ? "Opened" : "Closed"} by ${projectControls.recordedBy}`
               : undefined}
             className="inline-flex items-center gap-1 px-1 text-xs text-gray-600 dark:text-gray-300"
           >
             <span
               aria-hidden="true"
-              className={`h-1.5 w-1.5 rounded-full ${projectControls.recordedState === "Open" ? "bg-green-500" : "bg-gray-400"}`}
+              className={`h-1.5 w-1.5 rounded-full ${projectControls.openState === "Open" ? "bg-green-500" : "bg-gray-400"}`}
             />
             <span className="sr-only">Project state: </span>
-            <span data-testid="project-open-state">{projectControls.recordedState}</span>
+            <span data-testid="project-open-state">{projectControls.openState}</span>
           </span>
         )}
         {projectControls?.openAction && (() => {
@@ -730,7 +729,7 @@ export function TabBar({
                 onConfirm: projectControls.onOpen,
               })}
               className="px-2.5 h-8 my-1 text-xs font-medium rounded transition-colors bg-blue-500 hover:bg-blue-600 text-white whitespace-nowrap"
-              title={action.note ?? (action.kind === "open_again" ? "Open this project again" : "Open this project")}
+              title={action.kind === "open_again" ? "Open this project again" : "Open this project"}
             >
               {action.label}
             </button>

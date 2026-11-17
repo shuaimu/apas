@@ -2,11 +2,13 @@
 //! a whole, who set that, how, when, and for an open the machine the request
 //! named.
 //!
-//! The state is five nullable columns on `projects`. All five `NULL` is the
-//! third condition, "not recorded": nobody has opened or closed the project
-//! since the server began recording, and the server neither starts nor stops
-//! it by itself. It is deliberately not part of `lifecycle_status`, whose
-//! parser reads an unknown value as `deleting` and whose triggers reject one.
+//! The state is five nullable columns on `projects`. All five `NULL` is "not
+//! recorded": nobody has opened or closed the project since the server began
+//! recording, and no instance of it has attached since. The first instance
+//! that attaches records it open; until then it counts as closed, and the
+//! server neither starts nor stops it by itself. It is deliberately not part
+//! of `lifecycle_status`, whose parser reads an unknown value as `deleting`
+//! and whose triggers reject one.
 //!
 //! Every write goes through [`Database::write_project_open_state`], so the
 //! five columns always change together and `open` is never recorded for a
@@ -232,6 +234,24 @@ impl Database {
             > 0;
         anyhow::ensure!(!exists, "only an active project can be recorded open");
         Ok(false)
+    }
+
+    /// Set the project's five columns back to `NULL`, as the rollback in the
+    /// design does: the project is not recorded again. For tests that need
+    /// a project nobody has recorded in a lifecycle that records the state
+    /// when it is entered.
+    #[cfg(test)]
+    pub async fn forget_project_open_state_for_test(&self, project_id: &str) -> Result<()> {
+        sqlx::query(
+            r#"UPDATE projects
+               SET open_state = NULL, open_state_set_by = NULL, open_state_set_kind = NULL,
+                   open_state_set_at = NULL, open_state_machine_id = NULL
+               WHERE id = ?"#,
+        )
+        .bind(project_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
     }
 }
 

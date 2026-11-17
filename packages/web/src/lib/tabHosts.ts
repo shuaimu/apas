@@ -160,12 +160,12 @@ export interface TabHostsInput {
   isOwner: boolean;
   /**
    * The project's open state (`buildProjectOpenModel`), where the caller has
-   * it. A tab whose machine is not running a project that is recorded closed
-   * is refused with `PROJECT_CLOSED_TAB_REASON`, and one whose machine has a
+   * it. A tab whose machine is not running a closed project, on a server
+   * that records open states, is refused with `PROJECT_CLOSED_TAB_REASON`, and one whose machine has a
    * known reason for not running it with that reason. Without it every such
    * tab reads as the server refuses it.
    */
-  project?: Pick<ProjectOpenModel, "state" | "recorded" | "machines">;
+  project?: Pick<ProjectOpenModel, "state" | "supported" | "machines">;
 }
 
 /** Whether the viewer owns the project, the way the sidebar decides it. */
@@ -176,7 +176,7 @@ export function sessionIsOwned(session: Pick<SessionInfo, "shareRole" | "isShare
 
 export function describeTabHosts(input: TabHostsInput): TabHosts {
   const { panes, instances, machines, instancesSupported, projectIds, isOwner, project } = input;
-  const projectClosed = project?.recorded === true && project.state === "closed";
+  const projectClosed = project?.supported === true && project.state === "closed";
   // Why a machine is not running the project, where that is known.
   const partOf = (machineId: string | undefined, hostname: string | undefined) =>
     project?.machines.find((candidate) => machineId && candidate.machineId
@@ -236,7 +236,13 @@ export function describeTabHosts(input: TabHostsInput): TabHosts {
           // the server reports as still running keeps the machine's sentence.
           : projectClosed && partOf(place.machineId, hostname)?.part !== "still_running"
             ? closedProjectTabReason(hostname, state === "offline", reasonFor(place.machineId, hostname))
-            : stoppedOnHostReason(hostname, state === "offline", reasonFor(place.machineId, hostname));
+            : state === "stopped" && partOf(place.machineId, hostname)?.part === "starting" && hostname
+              // Asked to start and not attached yet: the notice's own words,
+              // not advice to open the project again.
+              ? `${hostname} is starting this project.`
+              : state === "stopped" && partOf(place.machineId, hostname)?.partUnconfirmed && hostname
+                ? `${hostname} is not running this project yet.`
+                : stoppedOnHostReason(hostname, state === "offline", reasonFor(place.machineId, hostname));
 
     let stopped: StoppedMachineActions | undefined;
     if ((state === "stopped" || state === "offline" || state === "disconnected") && place.machineId && hostname) {

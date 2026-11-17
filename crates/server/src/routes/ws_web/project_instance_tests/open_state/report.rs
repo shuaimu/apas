@@ -97,17 +97,21 @@ fn no_open_state(entry: &shared::MachineProjectInfo) -> bool {
         && entry.other_hosts.is_empty()
 }
 
-/// Scenario "A project that is not recorded and runs on one of two
-/// machines", and the rest of a not-recorded project's parts: a tab owner
-/// that does not run it is not started, offline or not, since nothing starts
-/// it by itself; a start an older client asks for reads as starting, then
-/// running; and the reason a machine stopped is its daemon's.
+/// A project nobody has recorded and nothing runs counts as closed: the
+/// report carries no state, and each tab owner is not started with no
+/// reason, connected or not and whatever its daemon last reported; no
+/// machine is waiting for it. A follow step sends nothing. An older web
+/// bundle's "Start on zoo-006" starts that machine as before, recording
+/// nothing (its instance's `SessionStart` records the project open), and
+/// the machine reads as starting, then running. A per-machine Stop ends it.
+/// The same Start from a viewer that negotiated the open state is the
+/// closed row: an Open where no other machine owns tabs, else refused.
 #[tokio::test]
-async fn parts_are_reported_for_a_project_nobody_recorded() {
+async fn a_project_nobody_recorded_that_nothing_runs_reads_as_closed() {
     let p = project().await;
-    let _d5 = p.daemon(p.m5, HOST_A, CAPABLE_DAEMON);
-    let _running = p.instance(p.m5, HOST_A);
+    let mut d5 = p.daemon(p.m5, HOST_A, CAPABLE_DAEMON);
     let older = p.viewer(p.owner, OLDER_VIEWER);
+    let mut web = p.viewer(p.owner, KNOWS);
     two_machine_roster(&p);
     refresh_basis(&p.state, &p.project_id()).await;
 
@@ -120,12 +124,29 @@ async fn parts_are_reported_for_a_project_nobody_recorded() {
     assert_eq!(
         told(&p),
         vec![
-            row(HOST_A, MachinePart::Running, None, true, true),
+            row(HOST_A, MachinePart::NotStarted, None, true, true),
             row(HOST_B, MachinePart::NotStarted, None, true, false),
         ]
     );
+    assert_eq!(
+        last_report(web.drain()),
+        (
+            None,
+            vec![
+                row(HOST_A, MachinePart::NotStarted, None, true, true),
+                row(HOST_B, MachinePart::NotStarted, None, true, false),
+            ]
+        )
+    );
+    // What its daemon last said is not a reason: nothing was asked of it.
+    p.state
+        .sessions
+        .update_daemon_projects(&p.m5, vec![with_error(&p, HOST_A, "exited with status 1")]);
+    assert_eq!(part(&p, p.m5), Some((MachinePart::NotStarted, None)));
 
-    let mut d6 = p.daemon(p.m6, HOST_B, CAPABLE_DAEMON);
+    // zoo-006 registers: nothing is started or stopped.
+    let mut d6 = registers(&p, p.m6, HOST_B, false).await;
+    assert!(nothing_sent(&mut d6) && nothing_sent(&mut d5));
     assert_eq!(
         told(&p)[1],
         row(HOST_B, MachinePart::NotStarted, None, true, true)
@@ -134,32 +155,46 @@ async fn parts_are_reported_for_a_project_nobody_recorded() {
     // An older web bundle's "Start on zoo-006": as before, nothing recorded.
     start_one(&p, &older, p.owner, p.m6).await;
     assert_eq!(sent(&mut d6), (vec![None], 0));
+    assert!(nothing_sent(&mut d5));
     assert_eq!(recorded(&p).await, None);
     assert_eq!(part(&p, p.m6), Some((MachinePart::Starting, None)));
     reports_running(&p, p.m6, HOST_B);
-    assert_eq!(part(&p, p.m6), Some((MachinePart::Running, None)));
-    assert_eq!(outcome(&p, p.m6), Some(MachineOutcome::Started));
-
-    // It ends by itself; the daemon's word is the reason.
-    p.state
-        .sessions
-        .update_daemon_projects(&p.m6, vec![with_error(&p, HOST_B, "exited with status 1")]);
     assert_eq!(
         part(&p, p.m6),
-        Some((
-            MachinePart::NotStarted,
-            Some("exited with status 1".to_string())
-        ))
+        Some((MachinePart::Running, None)),
+        "running, not still running: its instance records the project open"
     );
+    assert_eq!(outcome(&p, p.m6), Some(MachineOutcome::Started));
 
     // A per-machine Stop ends a start still pending there.
+    p.state
+        .sessions
+        .update_daemon_projects(&p.m6, vec![listed(&p, HOST_B, false)]);
     start_one(&p, &older, p.owner, p.m6).await;
     assert_eq!(part(&p, p.m6), Some((MachinePart::Starting, None)));
     stop_one(&p, &older, p.owner, p.m6).await;
     assert_eq!(sent(&mut d6), (vec![None], 1));
     assert_eq!(outcome(&p, p.m6), None);
-    assert_eq!(part(&p, p.m6).unwrap().0, MachinePart::NotStarted);
+    assert_eq!(part(&p, p.m6), Some((MachinePart::NotStarted, None)));
     assert_eq!(recorded(&p).await, None);
+
+    // From a viewer that knows the open state, the closed row: refused while
+    // another machine owns tabs, with nothing started or recorded.
+    start_one(&p, &web, p.owner, p.m6).await;
+    assert_eq!(errors(&web.drain()), vec![CLOSED_WITH_TABS_ELSEWHERE.to_string()]);
+    assert!(nothing_sent(&mut d5) && nothing_sent(&mut d6));
+    assert_eq!(recorded(&p).await, None);
+    // And an Open, by the requester and naming that machine, where every
+    // tab is on it.
+    tabs(&p, vec![pane(4, Some(p.m6), Some(HOST_B))]);
+    start_one(&p, &web, p.owner, p.m6).await;
+    assert!(errors(&web.drain()).is_empty());
+    one_correlated_start(&mut d6);
+    assert!(nothing_sent(&mut d5));
+    let opened = record(&p).await;
+    assert_eq!(opened.state, Some(ProjectOpenState::Open));
+    assert_eq!(opened.set_by_account(), Some(p.owner));
+    assert_eq!(opened.stand_in_machine(), Some(p.m6));
 }
 
 /// The parts of an open project: starting until the machine is seen running
@@ -975,9 +1010,10 @@ fn a_project_start_is_sent_only_from_an_open_a_tab_a_task_a_creation_and_a_regis
             // A tab request on a machine that is not running the project.
             "routes/ws_web.rs: start_instance_for_pane",
             // A start naming one machine: of an open project that already
-            // runs there, and of a project nobody has recorded.
+            // runs there, and of a project nobody has recorded from a viewer
+            // that predates the open state.
+            "routes/ws_web.rs: start_one_machine_as_before",
             "routes/ws_web.rs: start_one_machine_of_recorded_project",
-            "routes/ws_web.rs: start_unrecorded_machine_project",
         ])
     );
     assert_eq!(

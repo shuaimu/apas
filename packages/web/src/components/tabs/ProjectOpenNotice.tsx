@@ -4,9 +4,8 @@ import type { ProjectOpenNoticeLine } from "@/lib/projectOpenState";
 
 /**
  * The machines that are not in line with the project's open state, one line
- * each: a machine that owns tabs of an open project (or of one nobody has
- * recorded that runs elsewhere) and is not running it, with the server's
- * reason, or a machine that still runs a closed project. Nothing is shown
+ * each: a machine that owns tabs of an open project and is not running it,
+ * with the server's reason, or a machine that still runs a closed project. Nothing is shown
  * when every machine follows.
  *
  * It has no button on purpose. One machine alone is never started or stopped

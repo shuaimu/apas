@@ -48,14 +48,15 @@ describe("ProjectList open state", () => {
 
     expect(chip("Manage mako")?.textContent).toBe("Open");
     expect(chip("Manage mako")?.getAttribute("title")).toBeNull();
-    // Nobody has recorded it: shown from what runs, and the chip says so.
+    // The server has recorded no state and nothing runs it: Closed, and
+    // nothing says it is not recorded.
     expect(chip("Manage apas")?.textContent).toBe("Closed");
-    expect(chip("Manage apas")?.getAttribute("title"))
-      .toBe("Nobody has opened or closed this project yet. It is shown from what runs.");
+    expect(chip("Manage apas")?.getAttribute("title")).toBeNull();
+    expect(document.body.textContent).not.toMatch(/Nobody has opened|Keep .*open/i);
     expect(chip("Manage idle")).toBeNull();
   });
 
-  it("shows the state from what runs on a server that records none, without the note", () => {
+  it("shows the state from what runs on a server that records none", () => {
     render(<ProjectList projects={projects} userId="me" openState={{ supported: false, machines, sessions: [] }} selectedId={null} onSelect={vi.fn()} />);
 
     expect(chip("Manage mako")?.textContent).toBe("Open");

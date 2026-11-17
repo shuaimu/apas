@@ -1096,20 +1096,24 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                 let project_id = project_id.unwrap_or(session_id);
                                 // A `SessionStart` that creates the project's row is a
                                 // creation that starts it, and records it open. One for an
-                                // active project the server already holds records nothing,
-                                // so it needs no open-state lock. A row that is not active
-                                // may be one a deletion is about to erase while this waits
-                                // for its permit: the project is then created again below,
-                                // so the lock is taken for it too. Taken before the shared
-                                // permit, as everywhere.
-                                let creating_open_state = match state
+                                // active project whose state is recorded records nothing, so
+                                // it needs no open-state lock. A row that is not active may
+                                // be one a deletion is about to erase while this waits for
+                                // its permit, and one not recorded may be erased the same
+                                // way: the project is then created again below, so the lock
+                                // is taken for both. Taken before the shared permit, as
+                                // everywhere. An active project nobody has recorded is
+                                // recorded open too, but only once this instance has
+                                // attached: see the end of this arm.
+                                let open_state_lock = match state
                                     .db
-                                    .get_project(&project_id.to_string())
+                                    .get_project_open_state(&project_id.to_string())
                                     .await
                                 {
-                                    Ok(Some(project))
-                                        if project.lifecycle()
-                                            == crate::db::ProjectLifecycle::Active =>
+                                    Ok(Some(record))
+                                        if record.lifecycle
+                                            == crate::db::ProjectLifecycle::Active
+                                            && record.state.is_some() =>
                                     {
                                         None
                                     }
@@ -1130,8 +1134,13 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                         &user_id.to_string(),
                                     )
                                     .await;
-                                if matches!(registration, Ok((_, true)))
-                                    && creating_open_state.is_some()
+                                // Recorded open at the end of this arm if this instance
+                                // attaches: the project was not created here and may not
+                                // be recorded yet.
+                                let may_be_first_seen = open_state_lock.is_some()
+                                    && matches!(registration, Ok((_, false)));
+                                if open_state_lock.is_some()
+                                    && matches!(registration, Ok((_, true)))
                                 {
                                     crate::open_state::record_created_open(
                                         &state,
@@ -1142,7 +1151,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                     )
                                     .await;
                                 }
-                                drop(creating_open_state);
+                                drop(open_state_lock);
                                 if let Err(err) = registration {
                                     let reason = err.to_string();
                                     tracing::warn!(
@@ -1471,6 +1480,31 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                     primary,
                                     replaced
                                 );
+
+                                // An active project nobody has recorded runs: this instance
+                                // attached, so it is recorded open, naming this machine. Not
+                                // sooner: a `SessionStart` refused above records nothing.
+                                // The open-state lock is taken again, after the shared
+                                // permit is released, so the two are taken in their one
+                                // order and the lock is not held across the checks and the
+                                // sends above. Suspension and deletion record the project
+                                // closed under that lock before they change its row, and
+                                // `record_first_seen_open` writes only a project still
+                                // active and not recorded.
+                                drop(_project_guard);
+                                if may_be_first_seen {
+                                    let _open_state = state
+                                        .sessions
+                                        .project_open_state_guard(&project_id.to_string())
+                                        .await;
+                                    crate::open_state::record_first_seen_open(
+                                        &state,
+                                        &user_id,
+                                        &project_id.to_string(),
+                                        machine_id,
+                                    )
+                                    .await;
+                                }
                             }
                             Ok(CliToServer::Output {
                                 session_id,
@@ -3369,11 +3403,15 @@ mod instance_tests {
         }
     }
 
-    /// Start an instance and wait for the server to finish its start, which
-    /// ends by sending the project's policy.
+    /// Start an instance and wait for the server to finish its start. The
+    /// start sends the project's policy, and records a project nobody has
+    /// recorded open after that; a connection's frames are handled one at a
+    /// time, so the answer to a heartbeat sent next comes after all of it.
     async fn start(socket: &mut CliSocket, message: CliToServer) {
         send(socket, message).await;
         receive(socket, |message| matches!(message, ServerToCli::ProjectPolicy { .. })).await;
+        send(socket, CliToServer::Heartbeat).await;
+        receive(socket, |message| matches!(message, ServerToCli::Heartbeat)).await;
     }
 
     async fn eventually(what: &str, mut condition: impl FnMut() -> bool) {
@@ -3526,22 +3564,41 @@ mod instance_tests {
         assert_eq!(open_state(&harness, session).await, created);
     }
 
-    /// Scenario "A daemon restoring its projects does not open them", and
-    /// joining an existing project from another checkout: a `SessionStart`
-    /// for a project the server already holds records nothing. A project
-    /// nobody recorded stays not recorded, and one recorded closed stays
-    /// closed by whoever closed it.
-    #[tokio::test]
-    async fn a_session_start_for_a_project_the_server_holds_records_nothing() {
-        let harness = harness().await;
-        let session = Uuid::new_v4();
-        let (m5, m6) = (Uuid::new_v4(), Uuid::new_v4());
+    /// Every "project.opened" audit event of the harness's account.
+    async fn opened_events(harness: &Harness) -> Vec<crate::db::AdminAuditEvent> {
+        harness
+            .state
+            .db
+            .list_cluster_audit_events(&harness.user_id.to_string(), 50, 0)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|event| event.action == "project.opened")
+            .collect()
+    }
+
+    /// Register a project the server holds, as `apas register` or an
+    /// earlier server left it: active and not recorded.
+    async fn held_project(harness: &Harness, session: Uuid) {
         harness
             .state
             .db
             .authorize_project_registration(&session.to_string(), &harness.user_id.to_string())
             .await
             .unwrap();
+        assert_eq!(open_state(harness, session).await.state, None);
+    }
+
+    /// The first instance that attaches to a project nobody has recorded
+    /// records it open: by the account its CLI runs under, as a request,
+    /// naming that instance's machine, with one audit event whose source is
+    /// `first_seen`. A second machine's instance records nothing more.
+    #[tokio::test]
+    async fn the_first_session_start_of_a_project_nobody_recorded_records_it_open() {
+        let harness = harness().await;
+        let session = Uuid::new_v4();
+        let (m5, m6) = (Uuid::new_v4(), Uuid::new_v4());
+        held_project(&harness, session).await;
 
         let (mut a, _) = connect_cli(&harness, true).await;
         start(
@@ -3549,8 +3606,48 @@ mod instance_tests {
             session_start(session, m5, HOST_A, Some(vec![pane(3)])),
         )
         .await;
-        assert_eq!(open_state(&harness, session).await.state, None);
+        let opened = open_state(&harness, session).await;
+        assert_eq!(opened.state, Some(shared::ProjectOpenState::Open));
+        assert_eq!(opened.set_by_account(), Some(harness.user_id));
+        assert_eq!(opened.set_kind, Some(shared::OpenStateSetKind::Request));
+        assert_eq!(opened.stand_in_machine(), Some(m5));
+        assert!(opened.set_at.is_some());
+        let events = opened_events(&harness).await;
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].actor_user_id, harness.user_id.to_string());
+        assert!(events[0].details.as_deref().is_some_and(|details| details
+            .contains("first_seen")
+            && details.contains(&m5.to_string())));
+        assert_eq!(
+            harness
+                .state
+                .sessions
+                .project_open_view(&session.to_string())
+                .and_then(|view| view.state),
+            Some(shared::ProjectOpenState::Open),
+            "viewers are told"
+        );
 
+        let (mut b, _) = connect_cli(&harness, true).await;
+        start(
+            &mut b,
+            session_start(session, m6, HOST_B, Some(vec![pane(4)])),
+        )
+        .await;
+        assert_eq!(open_state(&harness, session).await, opened);
+        assert_eq!(opened_events(&harness).await.len(), 1);
+    }
+
+    /// Scenario "A daemon restoring its projects does not open them", and
+    /// joining an existing project from another checkout: a `SessionStart`
+    /// for a project recorded closed records nothing. It stays closed by
+    /// whoever closed it, and no opening is audited.
+    #[tokio::test]
+    async fn a_session_start_for_a_closed_project_records_nothing() {
+        let harness = harness().await;
+        let session = Uuid::new_v4();
+        let (m5, m6) = (Uuid::new_v4(), Uuid::new_v4());
+        held_project(&harness, session).await;
         assert!(harness
             .state
             .db
@@ -3564,6 +3661,13 @@ mod instance_tests {
             .await
             .unwrap());
         let closed = open_state(&harness, session).await;
+
+        let (mut a, _) = connect_cli(&harness, true).await;
+        start(
+            &mut a,
+            session_start(session, m5, HOST_A, Some(vec![pane(3)])),
+        )
+        .await;
         let (mut b, _) = connect_cli(&harness, true).await;
         start(
             &mut b,
@@ -3571,14 +3675,470 @@ mod instance_tests {
         )
         .await;
         assert_eq!(open_state(&harness, session).await, closed);
+        assert!(opened_events(&harness).await.is_empty());
+    }
+
+    /// A suspended project nobody has recorded, as one suspended before the
+    /// server recorded open states, is never recorded open: its
+    /// `SessionStart` is refused and records nothing, and recording it as a
+    /// running project directly does nothing either.
+    #[tokio::test]
+    async fn a_suspended_project_is_not_recorded_open_when_an_instance_starts() {
+        let harness = harness().await;
+        let session = Uuid::new_v4();
+        let project_id = session.to_string();
+        let m5 = Uuid::new_v4();
+        held_project(&harness, session).await;
         assert!(harness
             .state
             .db
-            .list_cluster_audit_events(&harness.user_id.to_string(), 50, 0)
+            .set_project_lifecycle(
+                &harness.user_id.to_string(),
+                &project_id,
+                crate::db::ProjectLifecycle::Suspended,
+            )
             .await
-            .unwrap()
+            .unwrap());
+        harness
+            .state
+            .db
+            .forget_project_open_state_for_test(&project_id)
+            .await
+            .unwrap();
+        assert_eq!(open_state(&harness, session).await.state, None);
+
+        let (mut a, _) = connect_cli(&harness, true).await;
+        send(
+            &mut a,
+            session_start(session, m5, HOST_A, Some(vec![pane(3)])),
+        )
+        .await;
+        receive(&mut a, |message| matches!(message, ServerToCli::SessionRejected { .. })).await;
+        assert_eq!(open_state(&harness, session).await.state, None);
+
+        let _lock = harness
+            .state
+            .sessions
+            .project_open_state_guard(&project_id)
+            .await;
+        assert!(
+            !crate::open_state::record_first_seen_open(
+                &harness.state,
+                &harness.user_id,
+                &project_id,
+                Some(m5),
+            )
+            .await
+        );
+        let record = open_state(&harness, session).await;
+        assert_eq!(record.state, None);
+        assert_eq!(record.lifecycle, crate::db::ProjectLifecycle::Suspended);
+        assert!(opened_events(&harness).await.is_empty());
+    }
+
+    /// An account other than the harness's, signed in on a CLI connection.
+    async fn stranger(harness: &Harness) -> Uuid {
+        let stranger = Uuid::new_v4();
+        harness
+            .state
+            .db
+            .create_user(&crate::db::User {
+                id: stranger.to_string(),
+                email: format!("{stranger}@example.test"),
+                password_hash: "unused".to_string(),
+                created_at: None,
+                cluster_role: "user".to_string(),
+                account_status: "active".to_string(),
+            })
+            .await
+            .unwrap();
+        stranger
+    }
+
+    /// A project nobody has recorded is recorded open only once an
+    /// instance has attached. A `SessionStart` refused after its
+    /// registration passed records nothing and audits nothing: one whose
+    /// session row belongs to another account, and an older CLI's beside an
+    /// attached capable instance. An accepted one records it open once.
+    #[tokio::test]
+    async fn a_refused_session_start_does_not_record_a_project_open() {
+        let harness = harness().await;
+        let session = Uuid::new_v4();
+        let project_id = session.to_string();
+        let (m5, m6) = (Uuid::new_v4(), Uuid::new_v4());
+        held_project(&harness, session).await;
+
+        // The session's row is another account's, as a copied `.apas` leaves it.
+        let other = stranger(&harness).await;
+        harness
+            .state
+            .db
+            .create_session(&crate::db::Session {
+                id: project_id.clone(),
+                user_id: other.to_string(),
+                cli_client_id: None,
+                working_dir: Some(format!("/work/{HOST_A}")),
+                hostname: Some(HOST_A.to_string()),
+                status: "inactive".to_string(),
+                created_at: None,
+                updated_at: None,
+                is_paused: false,
+                project_id: Some(project_id.clone()),
+                git_remote: None,
+                git_remote_url: None,
+            })
+            .await
+            .unwrap();
+        let (mut a, _) = connect_cli(&harness, true).await;
+        send(
+            &mut a,
+            session_start(session, m5, HOST_A, Some(vec![pane(3)])),
+        )
+        .await;
+        match receive(&mut a, |message| matches!(message, ServerToCli::SessionRejected { .. }))
+            .await
+        {
+            ServerToCli::SessionRejected { reason, .. } => {
+                assert!(reason.contains("already owned by another user"), "{reason}")
+            }
+            other => panic!("expected a rejection, got {other:?}"),
+        }
+        assert_eq!(open_state(&harness, session).await.state, None);
+        assert!(opened_events(&harness).await.is_empty());
+
+        // Another project nobody has recorded: a capable instance attaches
+        // and records it open, once.
+        let session = Uuid::new_v4();
+        let project_id = session.to_string();
+        held_project(&harness, session).await;
+        start(
+            &mut a,
+            session_start(session, m5, HOST_A, Some(vec![pane(3)])),
+        )
+        .await;
+        let opened = open_state(&harness, session).await;
+        assert_eq!(opened.state, Some(shared::ProjectOpenState::Open));
+        assert_eq!(opened.stand_in_machine(), Some(m5));
+        assert_eq!(opened_events(&harness).await.len(), 1);
+
+        // Not recorded again, as an earlier server left it while zoo-005
+        // runs it: an older CLI on zoo-006 is refused at its attach.
+        harness
+            .state
+            .db
+            .forget_project_open_state_for_test(&project_id)
+            .await
+            .unwrap();
+        let (mut older, _) = connect_cli(&harness, false).await;
+        send(
+            &mut older,
+            session_start(session, m6, HOST_B, Some(vec![pane(4)])),
+        )
+        .await;
+        match receive(&mut older, |message| matches!(message, ServerToCli::SessionRejected { .. }))
+            .await
+        {
+            ServerToCli::SessionRejected { reason, .. } => {
+                assert!(reason.contains(HOST_A), "{reason}")
+            }
+            other => panic!("expected a rejection, got {other:?}"),
+        }
+        assert_eq!(open_state(&harness, session).await.state, None);
+        assert_eq!(
+            opened_events(&harness).await.len(),
+            1,
+            "no first_seen opening is audited for an instance that never attached"
+        );
+    }
+
+    /// A daemon of the harness's account on `machine_id` that lists
+    /// `project_id` and does not run it, and can run it beside other
+    /// machines. The sender is what its connection would hold.
+    fn listing_daemon(
+        harness: &Harness,
+        machine_id: Uuid,
+        host: &str,
+        project_id: &str,
+    ) -> (
+        mpsc::Sender<shared::ServerToDaemon>,
+        mpsc::Receiver<shared::ServerToDaemon>,
+    ) {
+        let (tx, rx) = mpsc::channel(16);
+        harness.state.sessions.register_daemon(
+            machine_id,
+            harness.user_id,
+            tx.clone(),
+            shared::MachineInfo {
+                machine_id,
+                hostname: host.to_string(),
+                os: "linux".to_string(),
+                arch: "x86_64".to_string(),
+                daemon_version: None,
+                deepseek_backend: None,
+                last_seen: None,
+                providers: None,
+            },
+            vec![shared::MachineProjectInfo {
+                project_id: project_id.to_string(),
+                name: None,
+                path: format!("/work/{host}"),
+                preferred_machine_id: None,
+                is_running: false,
+                pid: None,
+                memory_kb: None,
+                last_error: None,
+                git_remote: None,
+                open_state: None,
+                part: None,
+                part_reason: None,
+                other_hosts: Vec::new(),
+            }],
+        );
+        harness.state.sessions.set_daemon_capabilities(
+            machine_id,
+            [PROJECT_INSTANCES_CAPABILITY, shared::PROJECT_POLICY_CAPABILITY]
+                .iter()
+                .map(|capability| capability.to_string())
+                .collect(),
+        );
+        (tx, rx)
+    }
+
+    /// Scenario "An older web bundle starts one machine of a project nobody
+    /// has recorded", as one chain: the older Start on zoo-006 starts it
+    /// there and records nothing; zoo-006's `SessionStart` records the
+    /// project open, naming zoo-006, with source `first_seen`; zoo-006 then
+    /// reads as running, its start no longer pending; and when zoo-005's
+    /// daemon registers it is sent one correlated start.
+    #[tokio::test]
+    async fn an_older_viewers_start_of_one_machine_is_followed_by_the_others_once_recorded() {
+        use crate::session::open_state::MachineOutcome;
+
+        let harness = harness().await;
+        let session = Uuid::new_v4();
+        let project_id = session.to_string();
+        let (m5, m6) = (Uuid::new_v4(), Uuid::new_v4());
+        held_project(&harness, session).await;
+        let mut on_zoo_005 = pane(3);
+        on_zoo_005.machine_id = Some(m5);
+        on_zoo_005.hostname = Some(HOST_A.to_string());
+        let mut on_zoo_006 = pane(4);
+        on_zoo_006.machine_id = Some(m6);
+        on_zoo_006.hostname = Some(HOST_B.to_string());
+        harness
+            .state
+            .storage
+            .save_pane_list(&session, &[on_zoo_005, on_zoo_006])
+            .await
+            .unwrap();
+        let (_, mut zoo_005) = listing_daemon(&harness, m5, HOST_A, &project_id);
+        let (_, mut zoo_006) = listing_daemon(&harness, m6, HOST_B, &project_id);
+
+        // A web bundle from before the open state.
+        let older = Uuid::new_v4();
+        let (tx, _older_rx) = mpsc::channel(256);
+        harness.state.sessions.register_web(older, tx);
+        harness.state.sessions.set_web_user(older, harness.user_id);
+        harness.state.sessions.set_web_capabilities(
+            older,
+            [shared::PROJECT_POLICY_CAPABILITY, PROJECT_INSTANCES_CAPABILITY]
+                .iter()
+                .map(|capability| capability.to_string())
+                .collect(),
+        );
+        crate::routes::ws_web::start_machine_project(
+            &harness.state,
+            &older,
+            &harness.user_id,
+            m6,
+            &project_id,
+            false,
+        )
+        .await;
+        match zoo_006.try_recv() {
+            Ok(shared::ServerToDaemon::StartProjectCli {
+                project_id: started,
+                request_id: None,
+                ..
+            }) => assert_eq!(started, project_id),
+            other => panic!("expected the start an older client asked for, got {other:?}"),
+        }
+        assert!(zoo_006.try_recv().is_err());
+        assert!(zoo_005.try_recv().is_err(), "zoo-005 is not started");
+        assert_eq!(open_state(&harness, session).await.state, None);
+        assert!(matches!(
+            harness.state.sessions.machine_outcome(&project_id, &m6),
+            Some(MachineOutcome::StartAsked { request_id: None, .. })
+        ));
+
+        // zoo-006's instance attaches: the project is recorded open.
+        let (mut b, _) = connect_cli(&harness, true).await;
+        start(
+            &mut b,
+            session_start(session, m6, HOST_B, Some(vec![pane(4)])),
+        )
+        .await;
+        let opened = open_state(&harness, session).await;
+        assert_eq!(opened.state, Some(shared::ProjectOpenState::Open));
+        assert_eq!(opened.set_by_account(), Some(harness.user_id));
+        assert_eq!(opened.set_kind, Some(shared::OpenStateSetKind::Request));
+        assert_eq!(opened.stand_in_machine(), Some(m6));
+        let events = opened_events(&harness).await;
+        assert_eq!(events.len(), 1);
+        assert!(events[0].details.as_deref().is_some_and(|details| details
+            .contains("first_seen")
+            && details.contains(&m6.to_string())));
+
+        // zoo-006 runs it, and nothing of the older start is left pending.
+        assert_eq!(
+            harness.state.sessions.machine_outcome(&project_id, &m6),
+            Some(MachineOutcome::Started)
+        );
+        let view = harness
+            .state
+            .sessions
+            .project_open_view(&project_id)
+            .expect("viewers are told the project");
+        assert_eq!(view.state, Some(shared::ProjectOpenState::Open));
+        let zoo_006_part = view
+            .machines
             .iter()
-            .all(|event| event.action != "project.opened"));
+            .find(|machine| machine.machine_id == Some(m6))
+            .expect("zoo-006 is listed");
+        assert_eq!(zoo_006_part.part, shared::MachinePart::Running);
+        assert_eq!(zoo_006_part.reason, None);
+        assert!(zoo_005.try_recv().is_err(), "zoo-005 waits for its registration");
+
+        // zoo-005's daemon registers: it follows the open, once.
+        let (tx, mut zoo_005) = listing_daemon(&harness, m5, HOST_A, &project_id);
+        crate::open_state::follow::follow_registered_daemon(
+            &harness.state,
+            m5,
+            &tx,
+            vec![project_id.clone()],
+        )
+        .await;
+        match zoo_005.try_recv() {
+            Ok(shared::ServerToDaemon::StartProjectCli {
+                project_id: started,
+                policy: Some(_),
+                request_id: Some(_),
+            }) => assert_eq!(started, project_id),
+            other => panic!("expected one correlated start, got {other:?}"),
+        }
+        assert!(zoo_005.try_recv().is_err());
+        assert!(zoo_006.try_recv().is_err(), "zoo-006 is sent nothing more");
+        assert_eq!(open_state(&harness, session).await, opened);
+        assert_eq!(opened_events(&harness).await.len(), 2);
+    }
+
+    /// A project nobody recorded that runs on zoo-005 and has tabs on
+    /// zoo-006 too: zoo-005's `SessionStart` records it open and starts
+    /// nothing, also on zoo-006, whose daemon is connected. When zoo-006's
+    /// daemon next registers, the follow step starts it there, on the
+    /// account that zoo-005's instance runs under.
+    #[tokio::test]
+    async fn a_half_running_project_is_recorded_open_and_its_other_machine_follows_at_registration(
+    ) {
+        let harness = harness().await;
+        let session = Uuid::new_v4();
+        let project_id = session.to_string();
+        let (m5, m6) = (Uuid::new_v4(), Uuid::new_v4());
+        held_project(&harness, session).await;
+        let mut on_zoo_006 = pane(4);
+        on_zoo_006.machine_id = Some(m6);
+        on_zoo_006.hostname = Some(HOST_B.to_string());
+        harness
+            .state
+            .storage
+            .save_pane_list(&session, &[on_zoo_006])
+            .await
+            .unwrap();
+        // zoo-006's daemon lists the project and does not run it.
+        let zoo_006 = |tx: mpsc::Sender<shared::ServerToDaemon>| {
+            harness.state.sessions.register_daemon(
+                m6,
+                harness.user_id,
+                tx,
+                shared::MachineInfo {
+                    machine_id: m6,
+                    hostname: HOST_B.to_string(),
+                    os: "linux".to_string(),
+                    arch: "x86_64".to_string(),
+                    daemon_version: None,
+                    deepseek_backend: None,
+                    last_seen: None,
+                    providers: None,
+                },
+                vec![shared::MachineProjectInfo {
+                    project_id: project_id.clone(),
+                    name: None,
+                    path: format!("/work/{HOST_B}"),
+                    preferred_machine_id: None,
+                    is_running: false,
+                    pid: None,
+                    memory_kb: None,
+                    last_error: None,
+                    git_remote: None,
+                    open_state: None,
+                    part: None,
+                    part_reason: None,
+                    other_hosts: Vec::new(),
+                }],
+            );
+            harness.state.sessions.set_daemon_capabilities(
+                m6,
+                [PROJECT_INSTANCES_CAPABILITY, shared::PROJECT_POLICY_CAPABILITY]
+                    .iter()
+                    .map(|capability| capability.to_string())
+                    .collect(),
+            );
+        };
+        let (tx, mut before) = mpsc::channel(16);
+        zoo_006(tx);
+
+        let (mut a, _) = connect_cli(&harness, true).await;
+        start(
+            &mut a,
+            session_start(session, m5, HOST_A, Some(vec![pane(3)])),
+        )
+        .await;
+        let opened = open_state(&harness, session).await;
+        assert_eq!(opened.state, Some(shared::ProjectOpenState::Open));
+        assert_eq!(opened.set_by_account(), Some(harness.user_id));
+        assert_eq!(
+            opened.stand_in_machine(),
+            Some(m5),
+            "the machine the project was seen running on"
+        );
+        assert!(before.try_recv().is_err(), "zoo-006 is not started yet");
+
+        let (tx, mut after) = mpsc::channel(16);
+        zoo_006(tx.clone());
+        crate::open_state::follow::follow_registered_daemon(
+            &harness.state,
+            m6,
+            &tx,
+            vec![project_id.clone()],
+        )
+        .await;
+        match after.try_recv() {
+            Ok(shared::ServerToDaemon::StartProjectCli {
+                project_id: started,
+                policy: Some(_),
+                request_id: Some(_),
+            }) => assert_eq!(started, project_id),
+            other => panic!("expected one correlated start, got {other:?}"),
+        }
+        assert!(after.try_recv().is_err());
+        assert_eq!(open_state(&harness, session).await, opened);
+        let events = opened_events(&harness).await;
+        assert_eq!(events.len(), 2);
+        assert!(events.iter().any(|event| event
+            .details
+            .as_deref()
+            .is_some_and(|details| details.contains("registration")
+                && details.contains(&m6.to_string()))));
     }
 
     /// Two machines' instances share the project's session. The session row

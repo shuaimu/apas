@@ -253,7 +253,7 @@ describe("describeTabHosts", () => {
       const result = hosts({
         panes,
         machines: [machine(ZOO5, "zoo-005"), machine(ZOO6, "zoo-006", { daemonConnected: false })],
-        project: { state: "closed", recorded: true, machines: [owner(ZOO5, "zoo-005", "not_started"), owner(ZOO6, "zoo-006", "not_started", { connected: false })] },
+        project: { state: "closed", supported: true, machines: [owner(ZOO5, "zoo-005", "not_started"), owner(ZOO6, "zoo-006", "not_started", { connected: false })] },
       });
       expect(PROJECT_CLOSED_TAB_REASON).toBe("This project is closed. Open it to start its tabs.");
       // Connected or offline: the project being closed is why. Opening
@@ -266,7 +266,7 @@ describe("describeTabHosts", () => {
     });
 
     it("keeps the real status of a machine that still runs a closed project, and its reconnecting sentence", () => {
-      const project = { state: "closed" as const, recorded: true, machines: [owner(ZOO5, "zoo-005", "not_started"), owner(ZOO6, "zoo-006", "still_running")] };
+      const project = { state: "closed" as const, supported: true, machines: [owner(ZOO5, "zoo-005", "not_started"), owner(ZOO6, "zoo-006", "still_running")] };
       const attached = hosts({ panes, machines, instances: [instance(ZOO6, "zoo-006", { primary: true })], project });
       expect(attached.tabs.get(2)).toMatchObject({ state: "running" });
       expect(attached.tabs.get(2)?.refusal).toBeUndefined();
@@ -289,7 +289,7 @@ describe("describeTabHosts", () => {
       const result = hosts({
         panes,
         machines,
-        project: { state: "closed", recorded: true, machines: [owner(ZOO5, "zoo-005", "not_started"), owner(ZOO6, "zoo-006", "not_started", { cannotStart: reason })] },
+        project: { state: "closed", supported: true, machines: [owner(ZOO5, "zoo-005", "not_started"), owner(ZOO6, "zoo-006", "not_started", { cannotStart: reason })] },
       });
       expect(result.tabs.get(1)?.refusal).toBe(PROJECT_CLOSED_TAB_REASON);
       expect(result.tabs.get(2)?.refusal).toBe(`This project is closed. ${reason}`);
@@ -301,23 +301,49 @@ describe("describeTabHosts", () => {
       const result = hosts({
         panes,
         machines,
-        project: { state: "closed", recorded: true, machines: [owner(ZOO5, "zoo-005", "not_started"), owner(ZOO6, "zoo-006", "still_running")] },
+        project: { state: "closed", supported: true, machines: [owner(ZOO5, "zoo-005", "not_started"), owner(ZOO6, "zoo-006", "still_running")] },
       });
       expect(result.tabs.get(1)?.refusal).toBe(PROJECT_CLOSED_TAB_REASON);
       expect(result.tabs.get(2)?.refusal)
         .toBe("zoo-006 is not running this project. Open the project again to start it there.");
     });
 
-    it("keeps the server's sentence for an open project and for one nobody has recorded", () => {
+    it("says a machine that is starting is starting, not that the project should be opened again", () => {
+      const starting = { ...owner(ZOO6, "zoo-006", "running"), part: "starting" as const };
+      const result = hosts({
+        panes,
+        machines,
+        project: { state: "open", supported: true, machines: [owner(ZOO5, "zoo-005", "running"), starting] },
+      });
+      expect(result.tabs.get(2)?.refusal).toBe("zoo-006 is starting this project.");
+      const unconfirmed = hosts({
+        panes,
+        machines,
+        project: { state: "open", supported: true, machines: [owner(ZOO5, "zoo-005", "running"), { ...owner(ZOO6, "zoo-006", "not_started"), partUnconfirmed: true }] },
+      });
+      expect(unconfirmed.tabs.get(2)?.refusal).toBe("zoo-006 is not running this project yet.");
+    });
+
+    it("keeps the server's sentence for an open project and on a server that records no state", () => {
       for (const project of [
-        { state: "open" as const, recorded: true, machines: [owner(ZOO5, "zoo-005", "running"), owner(ZOO6, "zoo-006", "not_started")] },
-        // Shown as closed from what runs, but nobody closed it.
-        { state: "closed" as const, recorded: false, machines: [owner(ZOO5, "zoo-005", "not_started"), owner(ZOO6, "zoo-006", "not_started")] },
+        { state: "open" as const, supported: true, machines: [owner(ZOO5, "zoo-005", "running"), owner(ZOO6, "zoo-006", "not_started")] },
+        // An older server: shown as closed from what runs, but nobody closed it.
+        { state: "closed" as const, supported: false, machines: [owner(ZOO5, "zoo-005", "not_started"), owner(ZOO6, "zoo-006", "not_started")] },
       ]) {
         const result = hosts({ panes, machines, project });
         expect(result.tabs.get(2)?.refusal)
           .toBe("zoo-006 is not running this project. Open the project again to start it there.");
       }
+    });
+
+    it("says a project the server has not recorded, which nothing runs, is closed", () => {
+      // The model shows it Closed (state "closed"), as the server treats it.
+      const result = hosts({
+        panes,
+        machines,
+        project: { state: "closed", supported: true, machines: [owner(ZOO5, "zoo-005", "not_started"), owner(ZOO6, "zoo-006", "not_started")] },
+      });
+      expect(result.tabs.get(2)?.refusal).toBe(PROJECT_CLOSED_TAB_REASON);
     });
 
     it("gives a machine's known reason instead of telling the user to open the project again", () => {
@@ -328,7 +354,7 @@ describe("describeTabHosts", () => {
           panes,
           machines,
           instances: [instance(ZOO5, "zoo-005", { primary: true })],
-          project: { state: "open", recorded: true, machines: [owner(ZOO5, "zoo-005", "running"), owner(ZOO6, "zoo-006", "not_started", extra)] },
+          project: { state: "open", supported: true, machines: [owner(ZOO5, "zoo-005", "running"), owner(ZOO6, "zoo-006", "not_started", extra)] },
         });
         expect(result.tabs.get(2)?.refusal).toBe(`zoo-006 is not running this project. ${reason}`);
         expect(result.tabs.get(1)?.refusal).toBeUndefined();
@@ -593,7 +619,7 @@ describe("a tab on a machine that is not running a project that is open already"
     expect(groupMachineChoices(model.choices)[1].label).toBe("Starts the project first");
   });
 
-  it("keeps Opens the project for a closed project and for one nobody has recorded", () => {
+  it("keeps Opens the project for a closed project", () => {
     const model = buildMachineChoices({ ...base, projectOpen: false, instances: [] });
     expect(groupMachineChoices(model.choices)[0].label).toBe("Opens the project");
     expect(machineChoiceDetail(model.choices[0])).toBe("Registered · opens the project, then the tab opens");

@@ -606,7 +606,7 @@ describe("opening and closing a project on several machines", () => {
     const onClose = vi.fn();
     const view = renderBar({
       projectControls: {
-        recordedState: model.recorded ? model.stateLabel : undefined,
+        openState: model.supported ? model.stateLabel : undefined,
         openAction: model.openAction,
         closeAction: model.closeAction,
         onOpen,
@@ -621,9 +621,21 @@ describe("opening and closing a project on several machines", () => {
     return Array.from(screen.getByRole("dialog").querySelectorAll("p")).map((line) => line.textContent);
   }
 
+  /** "Keep open" stays in the list so that every assertion on it also
+   *  says that button is gone (removed by the owner on 2026-11-16). */
   function projectButtons(): string[] {
     return ["Open", "Keep open", "Open again", "Close", "Close again"]
       .filter((name) => screen.queryByRole("button", { name }) !== null);
+  }
+
+  function expectNoRemovedText() {
+    const texts = [
+      document.body.textContent ?? "",
+      ...Array.from(document.querySelectorAll("[title]")).map((element) => element.getAttribute("title") ?? ""),
+    ].join("\n");
+    for (const pattern of [/Keep .*open/i, /Nobody has opened/, /after those machines have been away/, /Nothing starts now/]) {
+      expect(texts).not.toMatch(pattern);
+    }
   }
 
   it("offers Open for a closed project and names the machines whose tabs start", () => {
@@ -723,39 +735,52 @@ describe("opening and closing a project on several machines", () => {
     expect(projectButtons()).toEqual(["Open again", "Close"]);
   });
 
-  it("offers Keep open, with what it changes, for a running project nobody has recorded", () => {
-    const { onOpen } = controlsFor({
+  it("shows Open and offers only Close for a running project the server has not recorded", () => {
+    const { onOpen, onClose } = controlsFor({
       machines: [part(ZOO5, "zoo-005", "running"), part(ZOO6, "zoo-006", "running")],
     });
-    expect(projectButtons()).toEqual(["Keep open", "Close"]);
-    // Nobody has recorded a state, so none is shown as recorded.
-    expect(screen.queryByTestId("project-open-state")).toBeNull();
-    const sentence = "Its tabs start again on zoo-005 and zoo-006 after those machines have been away.";
-    const keep = screen.getByRole("button", { name: "Keep open" });
-    expect(keep.getAttribute("title")).toBe(sentence);
+    expect(projectButtons()).toEqual(["Close"]);
+    // Shown as any open project is.
+    expect(screen.getByTestId("project-open-state").textContent).toBe("Open");
+    expectNoRemovedText();
 
-    fireEvent.click(keep);
-    expect(screen.getByRole("dialog", { name: "Keep apas open?" })).toBeTruthy();
-    expect(dialogLines()).toEqual(["This records the project as open. Nothing starts now.", sentence]);
-    fireEvent.click(within(screen.getByRole("dialog")).getByRole("button", { name: "Keep open" }));
-    expect(onOpen).toHaveBeenCalledTimes(1);
+    fireEvent.click(screen.getByRole("button", { name: "Close" }));
+    expect(screen.getByRole("dialog", { name: "Close apas?" })).toBeTruthy();
+    expect(dialogLines()).toEqual(["This stops its agents on zoo-005 and zoo-006.", NOTHING_DELETED]);
+    expectNoRemovedText();
+    fireEvent.click(within(screen.getByRole("dialog")).getByRole("button", { name: "Close" }));
+    expect(onClose).toHaveBeenCalledTimes(1);
+    expect(onOpen).not.toHaveBeenCalled();
   });
 
-  it("offers Keep open and Close for a project nobody has recorded that runs on one of two machines, saying what starts", () => {
-    const { onOpen } = controlsFor({
+  it("offers Open again and Close for a project the server has not recorded that runs on one of two machines", () => {
+    // As for a recorded open project: zoo-006 is connected and not running it.
+    const { onOpen, onClose } = controlsFor({
       machines: [part(ZOO5, "zoo-005", "running"), part(ZOO6, "zoo-006", "not_started")],
     });
-    // "Keep open", as on every not-recorded project that runs somewhere.
-    expect(projectButtons()).toEqual(["Keep open", "Close"]);
-    fireEvent.click(screen.getByRole("button", { name: "Keep open" }));
-    expect(screen.getByRole("dialog", { name: "Keep apas open?" })).toBeTruthy();
-    // It starts zoo-006, and says so; nothing claims that nothing starts.
-    expect(dialogLines()).toEqual([
-      "zoo-005 already runs it.",
-      "Its tabs start on zoo-006.",
-      "Its tabs start again on zoo-005 and zoo-006 after those machines have been away.",
-    ]);
-    fireEvent.click(within(screen.getByRole("dialog")).getByRole("button", { name: "Keep open" }));
+    expect(projectButtons()).toEqual(["Open again", "Close"]);
+    expect(screen.getByTestId("project-open-state").textContent).toBe("Open");
+    expectNoRemovedText();
+
+    fireEvent.click(screen.getByRole("button", { name: "Open again" }));
+    expect(screen.getByRole("dialog", { name: "Open apas again?" })).toBeTruthy();
+    expect(dialogLines()).toEqual(["zoo-005 already runs it.", "Its tabs start on zoo-006."]);
+    expectNoRemovedText();
+    fireEvent.click(within(screen.getByRole("dialog")).getByRole("button", { name: "Open again" }));
+    expect(onOpen).toHaveBeenCalledTimes(1);
+    expect(onClose).not.toHaveBeenCalled();
+  });
+
+  it("shows Closed and offers only Open for a project the server has not recorded that runs nowhere", () => {
+    const { onOpen } = controlsFor({
+      machines: [part(ZOO5, "zoo-005", "not_started"), part(ZOO6, "zoo-006", "not_started")],
+    });
+    expect(projectButtons()).toEqual(["Open"]);
+    expect(screen.getByTestId("project-open-state").textContent).toBe("Closed");
+    fireEvent.click(screen.getByRole("button", { name: "Open" }));
+    expect(dialogLines()).toEqual(["Its tabs start on zoo-005 and zoo-006."]);
+    expectNoRemovedText();
+    fireEvent.click(within(screen.getByRole("dialog")).getByRole("button", { name: "Open" }));
     expect(onOpen).toHaveBeenCalledTimes(1);
   });
 
@@ -790,7 +815,7 @@ describe("opening and closing a project on several machines", () => {
     expect(lines.at(-1)).toBe(NOTHING_DELETED);
   });
 
-  it("never offers Keep open against a server that records no open state", () => {
+  it("offers only Close, and shows no state, against a server that records no open state", () => {
     // No frame and no capability: the project is shown from what runs.
     controlsFor(undefined, {
       supported: false,

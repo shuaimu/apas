@@ -685,8 +685,11 @@ impl SessionManager {
     ///   gave, else its daemon's `last_error`, else that it never answered;
     /// - **closed**: still running, with the reason a close left it so when
     ///   one is known; else, for a tab owner, not started with no reason;
-    /// - **not recorded**: running; else starting; else, for a tab owner,
-    ///   not started, connected or not, since nothing starts it by itself.
+    /// - **not recorded**: as closed while nothing runs it: for a tab owner,
+    ///   not started with no reason, connected or not. A machine that runs
+    ///   it reads as running, not as still running: its instance's
+    ///   `SessionStart` records the project open. A start an older client
+    ///   asked for reads as starting.
     pub(crate) fn project_open_view(&self, project_id: &str) -> Option<ProjectOpenView> {
         let basis = self
             .open_state
@@ -864,7 +867,7 @@ impl SessionManager {
                     } else if is_starting {
                         (MachinePart::Starting, None)
                     } else if owns_tabs {
-                        (MachinePart::NotStarted, not_started_reason())
+                        (MachinePart::NotStarted, None)
                     } else {
                         continue;
                     }

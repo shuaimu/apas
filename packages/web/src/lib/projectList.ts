@@ -25,11 +25,9 @@ interface ProjectDetails {
    *  not the project's state; that is `openState`. */
   isActive: boolean;
   /** The project's state as the lists word it (`projectStateLabel`): the
-   *  state the server recorded, or, while nobody has recorded one and on an
+   *  state the server recorded, or, where it has recorded none and on an
    *  older server, open while something runs it. */
   openState: OpenState;
-  /** Whether the server recorded `openState`. */
-  openStateRecorded: boolean;
   createdAt?: string;
   isShared?: boolean;
   ownerEmail?: string;
@@ -121,7 +119,6 @@ export function buildProjectList(
         isActive: session.isActive || false,
         // Settled below, once everything that says whether it runs is in.
         openState: "closed",
-        openStateRecorded: false,
         createdAt: session.createdAt,
         isShared: session.isShared,
         ownerEmail: session.ownerEmail,
@@ -196,7 +193,6 @@ export function buildProjectList(
         gitRemote: mp.gitRemote ?? existing?.gitRemote,
         isActive: mp.isRunning,
         openState: "closed",
-        openStateRecorded: false,
         machinesHref: machineProjectHref({
           machineId: machine.machine.machineId,
           projectId: mp.projectId,
@@ -207,9 +203,7 @@ export function buildProjectList(
   }
 
   for (const project of projectMap.values()) {
-    const recorded = recordedStates.get(project.projectId);
-    project.openStateRecorded = recorded !== undefined;
-    project.openState = recorded ?? (project.isActive ? "open" : "closed");
+    project.openState = recordedStates.get(project.projectId) ?? (project.isActive ? "open" : "closed");
   }
 
   // Sort: active first, then by creation date (newest first)

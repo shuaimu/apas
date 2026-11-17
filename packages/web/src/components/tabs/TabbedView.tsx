@@ -591,7 +591,7 @@ export function TabbedView({
   // The project's open state as the server reports it: the state to show,
   // the Open and Close to offer with their confirmations, and the machines
   // that are not following. From a server that records no state it is
-  // derived from what runs, and "Keep open" is never offered.
+  // derived from what runs.
   const projectOpenReport = useStore((s) => selectProjectOpenReport(s, [currentSession?.projectId, sessionId]));
   const projectName = currentSession ? projectNameFor(currentSession) : undefined;
   const projectOpenModel = useMemo(() => buildProjectOpenModel({
@@ -653,7 +653,7 @@ export function TabbedView({
     fallbackMachineId: bootTarget?.machineId,
     openStateSupported,
     projectMachines: projectOpenModel.machines,
-    projectOpen: projectOpenModel.recorded && projectOpenModel.state === "open",
+    projectOpen: projectOpenModel.supported && projectOpenModel.state === "open",
   }), [
     bootTarget?.machineId,
     currentSession,
@@ -662,7 +662,7 @@ export function TabbedView({
     machines,
     openStateSupported,
     projectOpenModel.machines,
-    projectOpenModel.recorded,
+    projectOpenModel.supported,
     projectOpenModel.state,
     selectedTabConfig,
     sessionId,
@@ -1278,7 +1278,7 @@ export function TabbedView({
         onRenameTab={handleRenameTab}
         onReorderTabs={handleReorderTabs}
         projectControls={{
-          recordedState: projectOpenModel.recorded ? projectOpenModel.stateLabel : undefined,
+          openState: projectOpenModel.supported ? projectOpenModel.stateLabel : undefined,
           recordedBy: projectOpenModel.setBy,
           openAction: projectOpenModel.openAction,
           closeAction: projectOpenModel.closeAction,

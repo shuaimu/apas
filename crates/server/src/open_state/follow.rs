@@ -28,7 +28,8 @@ use uuid::Uuid;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Followed {
     /// The machine is in line with the project's state, the project is not
-    /// recorded, or the machine is not one of the project's.
+    /// recorded (its instances record it open when they attach), or the
+    /// machine is not one of the project's.
     Nothing,
     /// The project is open and the machine was asked to start it.
     Started,
@@ -68,8 +69,13 @@ async fn follow_project_locked(
     let project_id = record.project_id.as_str();
     let administrative = record.set_kind == Some(OpenStateSetKind::Administrative);
     match record.state {
-        // Nobody has recorded what this project should do, so the server
-        // neither starts nor stops it.
+        // Nobody has recorded what this project should do. While nothing
+        // runs it, it counts as closed, and a closed project's step starts
+        // nothing. A machine that runs it is not stopped either: at a
+        // deployment every daemon registers again before its instances
+        // attach, and each instance's `SessionStart` records the project
+        // open. Treating this as the closed arm would stop every running
+        // project in that window.
         None => Followed::Nothing,
         Some(ProjectOpenState::Open) => {
             // Only an active project is open; one that is suspended or being

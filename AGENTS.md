@@ -1461,8 +1461,9 @@ distinguishes them from an `apas --attach` in use. Those stay a manual step.
 debugging. Nothing spawns it, and a project with an external headless run is
 never given a second owner. The daemon reports such a run as running, so for
 a project recorded **closed** the server stops it at the daemon's next
-registration: open the project first, or debug one that is not recorded
-closed.
+registration: open the project first. A headless run of a project nobody
+has recorded records it open when it attaches, and the project's other tab
+owners then start at their next registration.
 
 ## One instance per user per host
 
@@ -2101,13 +2102,37 @@ wire. Nothing in `crates/client-cli` changed: daemons and CLIs need no update.
 **Where it is kept.** Five nullable columns on `projects`: `open_state`
 (`NULL`, `open`, `closed`), `open_state_set_by`, `open_state_set_kind`
 (`request` or `administrative`), `open_state_set_at` and
-`open_state_machine_id`. `NULL` is a third value, **not recorded**: the server
-leaves such a project alone, shows it from what runs, and neither starts nor
-stops it. Every project is not recorded on the day the server is first
-deployed, and stays so until someone opens or closes it from the new web. For
-a not-recorded project that already runs, the button reads **Keep open**
-("This records the project as open. Nothing starts now."). Only an active
-project can be open.
+`open_state_machine_id`. A person sees **Open** or **Closed** and one button
+that toggles it, plus "Open again" or "Close again" where a machine is not
+following. Only an active project can be open.
+
+**A project nobody has opened or closed** (`open_state` `NULL`) is recorded
+open the first time the server sees it running: once an instance of it has
+attached (its `SessionStart` in `routes/ws_cli.rs` has passed the
+session-owner and attach checks; a refused one records nothing), under the
+open-state lock, set by the account that instance's CLI runs under, naming
+its machine, and audited with the source `first_seen`. While nothing runs
+it, it reads closed and every rule for a closed project applies to it,
+except an older web bundle's Start naming one machine (see "Older clients
+and mixed fleets"). Its machines' parts: a machine that runs it reads
+Running, a start an older client asked for reads Starting…, and every other
+tab owner reads not started with no reason, also while offline. While a
+machine runs it, the web treats it like an open project: Close, and "Open
+again" where a connected tab owner is not running it. Nothing a person sees
+says that a project is not recorded. Every running instance attaches
+again at a server deploy, so the first deploy of this rule records every
+running project that is not recorded open within seconds; a project already
+recorded keeps its record. **The consequence, accepted by the
+owner:** a project running on one of its two tab-owner machines is recorded
+open, and the other machine starts it at its next registration (a daemon
+reboot or a server deploy). In the deploy that brings the rule, that
+machine starts in the same deploy if the running instance attached before
+it registered, and at its following registration otherwise. To keep it out,
+close or forget its tabs there. The first release (`20261116T224049Z`) left
+such projects unrecorded and offered **Keep open**; the owner removed that
+on 2026-11-16 for one Open/Close button (Decision 2 of the design record).
+This rule is not yet deployed: until it is, production runs the first
+release's rule (section 7 of the change's `tasks.md`).
 
 **What Open and Close do** (`crates/server/src/open_state.rs`):
 
@@ -2239,18 +2264,28 @@ the project creates a new project under the same id; the dialog says so.
 
   | Project | Start / tab / task naming one machine | Stop naming one machine |
   | --- | --- | --- |
-  | not recorded | as before; nothing recorded | as before; nothing recorded |
   | open | start that machine | Close if no other machine owns tabs or runs it, else refused |
   | closed | Open if no other machine owns tabs, else refused | stop that machine |
+
+  A project nobody has recorded follows the closed row, with one exception:
+  a Start naming one machine (`StartMachineProjectCli` with
+  `all_instances: false`) from a web viewer that did not negotiate
+  `project_open_state_v1` starts that machine as before, also when other
+  machines own tabs; its instance's attach then records the project open,
+  and the other tab owners start at their next registration. An older
+  viewer's tab request and every native task launch get the closed row: on
+  a project nobody has recorded they open it when no other machine owns
+  tabs, and are otherwise refused with the closed sentence below. A project
+  nobody has recorded that an instance already runs is treated as open: that
+  instance's attach records it so.
 
   The refusals are "This project runs on other machines too. Close it from the
   project." and "This project is closed and has tabs on other machines. Open
   it from the project." The closed row applies also while the named machine
   still has an instance attached.
 - **An older web bundle or the phone's "Open project"** sending
-  `all_instances: true` acts as before on a not-recorded project and records
-  nothing; on a recorded project it is an Open or a Close. Only a viewer that
-  negotiated `project_open_state_v1` records a project nobody has recorded.
+  `all_instances: true` is an Open or a Close, also on a project nobody has
+  recorded.
 - **Older viewers and native** are sent no `ProjectOpenState` frame; the new
   fields are optional and ignored. Native composes its own refusal sentence
   and gains the new wording with its next build. The phone's browser screen
@@ -2259,13 +2294,20 @@ the project creates a new project under the same id; the dialog says so.
 ### Rollout and rollback
 
 Deploy **server, then web**. No daemon or agent restart, and no native
-release. The columns are added on first start with every project not
-recorded, so the deployment itself starts and stops nothing. After it, check
-that no project was started or stopped, that every project offers "Keep open",
-and that an un-reloaded older web bundle's buttons still work and record
-nothing.
+release. The columns already exist on a server running `20261116T224049Z`
+(that release added them, with every project not recorded); as the
+instances attach again, every running project that is not recorded is
+recorded open. After it, check that every running project that was not
+recorded reads Open with a `first_seen` audit row, that projects already
+recorded keep their record and audit history, that the rest read Closed,
+which machines the follow step started (the other machine of a project that
+ran on one of two), that the deploy started nothing on a machine that was
+in line, and that no screen offers "Keep open".
 
-**A server rollback must clear the recorded states**, with the server
+**A rollback to `20261116T224049Z` keeps the recorded states**: that server
+reads and follows them, and its web offers "Keep open" only on a project
+that is still not recorded. **A rollback to a server older than
+`20261116T224049Z` must clear the recorded states**, with the server
 stopped, also when the rollback is only "restore the backed-up binary":
 
 ```bash
@@ -2273,11 +2315,13 @@ ssh root@apas.mpaxos.com "systemctl stop apas-server && sqlite3 /opt/apas/data/a
   'UPDATE projects SET open_state = NULL, open_state_set_by = NULL, open_state_set_kind = NULL, open_state_set_at = NULL, open_state_machine_id = NULL;'"
 ```
 
-An older server ignores the columns, people start and stop projects by hand
-again, and the recorded states go stale. Without the statement, the next
+A server older than `20261116T224049Z` ignores the columns, people start
+and stop projects by hand again, and the recorded states go stale. Without the statement, the next
 deploy of a server with this change would follow those stale states at every
 registration: start projects someone stopped, and stop projects someone
-started. Roll the web back first, then the server.
+started. With it, the next deploy starts from what runs: running projects
+are recorded open as their instances attach. Roll the web back first, then
+the server.
 
 ### Known limits
 
@@ -2300,6 +2344,12 @@ started. Roll the web back first, then the server.
   release's server start one legacy-policy import logged "database is
   locked"; the CLI sends the flags again every 5 s, so it was imported on the
   next round.
+- **A native task launch or an older web bundle's tab request on a project
+  nobody has recorded, whose tabs are on two machines and that nothing runs,
+  is refused** with "This project is closed and has tabs on other machines.
+  Open it from the project." Native has no Open: open the project from the
+  new web first. Only an older web bundle's Start naming one machine still
+  starts that machine as before.
 - The phone's "All projects" cards show the server's UTC time as local time
   (older than this change).
 
@@ -2324,13 +2374,15 @@ change has no CLI part, and no daemon or agent was restarted.
   `200`, `/projects/by-remote` answered `401` and `/projects/workers` `403`
   with JSON from `apas-server`, and the served bundle carries the new texts.
 - Not checked on the live site: the new controls in a signed-in browser
-  ("Keep open" on every project, a first Open and Close), an un-reloaded
-  older web bundle's buttons, and a native build staying connected. The
-  first two were exercised on the harness only.
+  (a first Open and Close, and "Keep open", which that release offered on
+  every project and which the owner has since removed; see "A project nobody
+  has opened or closed" above), an un-reloaded older web bundle's buttons,
+  and a native build staying connected. The first two were exercised on the
+  harness only.
 
 **To roll this release back**, follow "Rollout and rollback" above: web
-first, then the server binary from the backup, and clear the five columns
-while the server is stopped.
+first, then the server binary from the backup, which is older than this
+release, and clear the five columns while the server is stopped.
 
 ### Verification
 

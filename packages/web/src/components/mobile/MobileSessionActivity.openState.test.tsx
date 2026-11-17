@@ -23,7 +23,6 @@ const SID = "20000000-0000-4000-8000-000000000001";
 const ZOO5 = "50000000-0000-4000-8000-000000000005";
 const ZOO6 = "50000000-0000-4000-8000-000000000006";
 const LAPTOP = "50000000-0000-4000-8000-000000000007";
-const KEEP_OPEN = "Its tabs start again on zoo-005 and zoo-006 after those machines have been away.";
 const initialStore = useStore.getInitialState();
 
 function terminal(pane_id: number, label: string, machine_id: string, hostname: string): PaneConfig {
@@ -183,6 +182,27 @@ function expectOpenOnly(sheet: HTMLElement) {
   const names = within(sheet).getAllByRole("button").map((button) =>
     button.getAttribute("aria-label") ?? button.textContent ?? "");
   expect(names.filter((name) => /close project|^close( again)?$|delete|^start on|^stop /i.test(name.trim()))).toEqual([]);
+}
+
+/** What the owner removed on 2026-11-16: a third button that kept a
+ *  running project open, and every text telling a person a project is not
+ *  recorded. Searched in the text, the titles and the accessible names. */
+function expectNoRemovedText() {
+  const texts = [
+    document.body.textContent ?? "",
+    ...Array.from(document.querySelectorAll("[title]")).map((element) => element.getAttribute("title") ?? ""),
+    ...Array.from(document.querySelectorAll("[aria-label]")).map((element) => element.getAttribute("aria-label") ?? ""),
+  ].join("\n");
+  for (const pattern of [/Keep .*open/i, /Nobody has opened/, /after those machines have been away/, /Nothing starts now/]) {
+    expect(texts).not.toMatch(pattern);
+  }
+}
+
+/** The project-level Open the sheet offers, by name. The phone offers no
+ *  Close of a project at all (`expectOpenOnly`). */
+function openButtons(sheet: HTMLElement): string[] {
+  return within(sheet).queryAllByRole("button", { name: /open project|keep project open/i })
+    .map((button) => button.textContent?.trim() ?? "");
 }
 
 const OPEN_FRAME = { type: "start_machine_project_cli", machine_id: ZOO5, project_id: SID, all_instances: true };
@@ -421,45 +441,55 @@ describe("an open project on the phone", () => {
   });
 });
 
-describe("a project nobody has recorded, on the phone", () => {
-  it("offers to keep a running one open, saying what that changes, and starts nothing by it", () => {
+describe("a project the server has not recorded, on the phone", () => {
+  it("shows a running one as Open and offers no Open of any kind", () => {
     seed();
     report(undefined, [part(ZOO5, "zoo-005", "running"), part(ZOO6, "zoo-006", "running")]);
     renderScreen();
-    // Shown from what runs.
     expect(stateChip()).toBe("Open");
 
     const sheet = openActions();
     expectOpenOnly(sheet);
-    const keep = within(sheet).getByRole("button", { name: "Keep project open" });
-    expect(keep.getAttribute("title")).toBe(KEEP_OPEN);
-    fireEvent.click(keep);
-    const confirm = screen.getByRole("dialog", { name: "Keep mako open?" });
-    expect(lines(confirm)).toEqual(["This records the project as open. Nothing starts now.", KEEP_OPEN]);
-    fireEvent.click(within(confirm).getByRole("button", { name: "Keep project open" }));
-    expect(sent("start_machine_project_cli")).toEqual([OPEN_FRAME]);
-
-    // Recorded: nothing is left to offer.
-    report("open", [part(ZOO5, "zoo-005", "running"), part(ZOO6, "zoo-006", "running")]);
-    fireEvent.click(screen.getByRole("button", { name: "More actions" }));
-    expect(screen.queryByRole("button", { name: /open project|keep project open/i })).toBeNull();
+    // The phone closes no project, so a running one has nothing to offer.
+    expect(openButtons(sheet)).toEqual([]);
+    expectNoRemovedText();
+    expect(ws.send).not.toHaveBeenCalled();
   });
 
-  it("offers Keep project open for one that runs on one of its two machines, and says what starts", () => {
+  it("offers Open project again for one that runs on one of its two machines, as for a recorded open project", () => {
     seed({ instances: [instance(ZOO5, "zoo-005", true)] });
     report(undefined, [part(ZOO5, "zoo-005", "running"), part(ZOO6, "zoo-006", "not_started")]);
     renderScreen();
+    expect(stateChip()).toBe("Open");
     const sheet = openActions();
     expect(within(sheet).getByRole("status", { name: "Machines not following this project" }).textContent)
       .toBe("zoo-006 is not running this project.");
-    // "Keep open", as on every not-recorded project that runs somewhere.
-    expect(within(sheet).queryByRole("button", { name: "Open project" })).toBeNull();
-    fireEvent.click(within(sheet).getByRole("button", { name: "Keep project open" }));
-    const confirm = screen.getByRole("dialog", { name: "Keep mako open?" });
-    // Confirming starts zoo-006, and the sheet says so.
-    expect(lines(confirm))
-      .toEqual(["zoo-005 already runs it.", "Its tabs start on zoo-006.", KEEP_OPEN]);
-    fireEvent.click(within(confirm).getByRole("button", { name: "Keep project open" }));
+    expect(openButtons(sheet)).toEqual(["Open project again"]);
+    expectNoRemovedText();
+    fireEvent.click(within(sheet).getByRole("button", { name: "Open project again" }));
+    const confirm = screen.getByRole("dialog", { name: "Open mako again?" });
+    expect(lines(confirm)).toEqual(["zoo-005 already runs it.", "Its tabs start on zoo-006."]);
+    fireEvent.click(within(confirm).getByRole("button", { name: "Open project again" }));
+    // The whole project, an ordinary open the server records.
+    const starts = sent("start_machine_project_cli");
+    expect(starts).toEqual([OPEN_FRAME]);
+    expectValid(starts[0]);
+  });
+
+  it("shows one that nothing runs as Closed and offers only Open project, an ordinary open", () => {
+    seed({ instances: [] });
+    report(undefined, [part(ZOO5, "zoo-005", "not_started"), part(ZOO6, "zoo-006", "not_started")]);
+    renderScreen();
+    expect(stateChip()).toBe("Closed");
+    const sheet = openActions();
+    expectOpenOnly(sheet);
+    expect(openButtons(sheet)).toEqual(["Open project"]);
+    expectNoRemovedText();
+    fireEvent.click(within(sheet).getByRole("button", { name: "Open project" }));
+    const confirm = screen.getByRole("dialog", { name: "Open mako?" });
+    expect(lines(confirm)).toEqual(["Its tabs start on zoo-005 and zoo-006."]);
+    expectNoRemovedText();
+    fireEvent.click(within(confirm).getByRole("button", { name: "Open project" }));
     expect(sent("start_machine_project_cli")).toEqual([OPEN_FRAME]);
   });
 });

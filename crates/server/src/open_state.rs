@@ -1085,9 +1085,10 @@ pub(crate) async fn other_machines_own_tabs(
 /// From a viewer that negotiated the open state (`knows_open_state`), the
 /// project is opened as `actor`: recorded open, and the other machines that
 /// own tabs started as an open starts them. From any other client the
-/// request reaches no machine but the one it names (design Decision 3): a
-/// project that is not recorded or is open is left as it is, and a closed
-/// one is opened only when no other machine owns tabs of it, else refused.
+/// request reaches no machine but the one it names (design Decision 3): an
+/// open project is left as it is, and a closed one, or one nobody has
+/// recorded, which counts as closed, is opened only when no other machine
+/// owns tabs of it, else refused.
 /// `Err` is the refusal; nothing was recorded and no machine was started.
 pub(crate) async fn admit_start_for_new_work(
     state: &AppState,
@@ -1104,8 +1105,8 @@ pub(crate) async fn admit_start_for_new_work(
     };
     if !knows_open_state {
         match record.state {
-            None | Some(ProjectOpenState::Open) => return Ok(()),
-            Some(ProjectOpenState::Closed) => {
+            Some(ProjectOpenState::Open) => return Ok(()),
+            None | Some(ProjectOpenState::Closed) => {
                 if other_machines_own_tabs(state, project_id, &machine_id).await {
                     return Err(CLOSED_WITH_TABS_ELSEWHERE.to_string());
                 }
@@ -1170,6 +1171,71 @@ pub(crate) async fn admit_new_work_on_unnamed_machine(
     open_project_locked(state, actor, project_id, None, source, None)
         .await
         .map(|_| ())
+}
+
+/// An instance of a project nobody has recorded attached: the project is
+/// recorded open, by the account its CLI runs under and naming that
+/// instance's machine, and the opening is audited with source `first_seen`.
+/// Every running instance attaches again when the server restarts, so a
+/// project that runs is recorded open within seconds of a deployment.
+/// Called only once the instance has attached, so a `SessionStart` that a
+/// later check refuses records nothing. The caller holds the project's
+/// open-state lock, and not the project's shared permit.
+///
+/// Only a project that is active and still not recorded is written: one
+/// recorded open or closed keeps its record, and one that is suspended or
+/// being deleted is never recorded open. Nothing is started or stopped
+/// here; another machine that owns tabs follows the open when its daemon
+/// next registers. What is held for each machine is kept: a start still
+/// pending on another machine stays pending, so a close still stops it.
+pub(crate) async fn record_first_seen_open(
+    state: &AppState,
+    actor: &Uuid,
+    project_id: &str,
+    machine_id: Option<Uuid>,
+) -> bool {
+    match state.db.get_project_open_state(project_id).await {
+        Ok(Some(record))
+            if record.state.is_none() && record.lifecycle == ProjectLifecycle::Active => {}
+        Ok(_) => return false,
+        Err(error) => {
+            tracing::warn!(%project_id, %error, "open state lookup failed for a running project");
+            return false;
+        }
+    }
+    match state
+        .db
+        .set_project_open_state(
+            project_id,
+            ProjectOpenState::Open,
+            &actor.to_string(),
+            OpenStateSetKind::Request,
+            machine_id.as_ref(),
+        )
+        .await
+    {
+        Ok(true) => {
+            let machines: Vec<Uuid> = machine_id.into_iter().collect();
+            audit_open_state(
+                state,
+                &actor.to_string(),
+                project_id,
+                ProjectOpenState::Open,
+                OpenStateSetKind::Request,
+                "first_seen",
+                &machines,
+            )
+            .await;
+            tracing::info!(%project_id, %actor, ?machine_id, "running project recorded open");
+            refresh_basis(state, project_id).await;
+            true
+        }
+        Ok(false) => false,
+        Err(error) => {
+            tracing::warn!(%project_id, %error, "failed to record a running project open");
+            false
+        }
+    }
 }
 
 /// Whether the project is recorded closed. False when it is open, not

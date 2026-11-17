@@ -587,7 +587,9 @@ async fn a_follow_stop_is_never_sent_after_a_later_open() {
 /// registers again.
 #[tokio::test]
 async fn nothing_follows_a_not_recorded_project_and_no_heartbeat_starts_anything() {
-    // Scenario "A project nobody has touched since the upgrade".
+    // A project nobody has recorded that runs on zoo-005, as at a deployment
+    // before that instance's `SessionStart` records it open: zoo-006's
+    // registration starts nothing, and stops nothing on its return.
     let p = project().await;
     let mut d5 = p.daemon(p.m5, HOST_A, CAPABLE_DAEMON);
     let _running = p.instance(p.m5, HOST_A);

@@ -96,15 +96,10 @@ export function ConnectionChip({ connected }: { connected: boolean }) {
   );
 }
 
-/** "Open" or "Closed": the project's state as every list shows it. With
- *  `derived`, nobody has recorded it and it is shown from what runs. */
-export function OpenStateChip({ label, derived = false }: { label: "Open" | "Closed"; derived?: boolean }) {
+/** "Open" or "Closed": the project's state as every list shows it. */
+export function OpenStateChip({ label }: { label: "Open" | "Closed" }) {
   return (
-    <span
-      data-testid="project-open-state"
-      className={overviewChip}
-      title={derived ? "Nobody has opened or closed this project yet. It is shown from what runs." : undefined}
-    >
+    <span data-testid="project-open-state" className={overviewChip}>
       {label}
     </span>
   );
@@ -182,7 +177,7 @@ export function ProjectList({
                   {project.project_name || "Unnamed project"}
                 </span>
                 {!open && <ConnectionChip connected={project.connected} />}
-                {open && <OpenStateChip label={open.stateLabel} derived={openState?.supported === true && !open.recorded} />}
+                {open && <OpenStateChip label={open.stateLabel} />}
                 {project.lifecycle_status === "suspended" && <SuspendedChip />}
               </span>
               {facts && <span className={`block truncate ${overviewMuted}`}>{facts}</span>}

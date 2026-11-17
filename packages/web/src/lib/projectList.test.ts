@@ -243,23 +243,23 @@ describe("a project's open state", () => {
       // Closed, and a machine that could not be stopped still runs it.
       session("closed-running", { openState: "closed", isActive: true }),
     ], [], []));
-    expect(projects["open-idle"]).toMatchObject({ openState: "open", openStateRecorded: true, isActive: false });
+    expect(projects["open-idle"]).toMatchObject({ openState: "open", isActive: false });
     expect(projectStateLabel(projects["open-idle"])).toBe("Open");
     // `isActive` stays what runs, so its tabs keep their real status.
-    expect(projects["closed-running"]).toMatchObject({ openState: "closed", openStateRecorded: true, isActive: true });
+    expect(projects["closed-running"]).toMatchObject({ openState: "closed", isActive: true });
     expect(projectStateLabel(projects["closed-running"])).toBe("Closed");
   });
 
-  it("shows a project nobody has recorded from what runs, as before", () => {
+  it("shows a project the server has not recorded as Open while it runs and Closed otherwise", () => {
     const projects = byId(buildProjectList(
       [session("running", { isActive: true }), session("stopped", { isActive: false }), session("elsewhere")],
       [],
       [host("m1", "zoo-005", [{ projectId: "elsewhere", path: "/work/elsewhere", isRunning: true }])],
     ));
-    expect(projects.running).toMatchObject({ openState: "open", openStateRecorded: false });
-    expect(projects.stopped).toMatchObject({ openState: "closed", openStateRecorded: false });
+    expect(projects.running).toMatchObject({ openState: "open" });
+    expect(projects.stopped).toMatchObject({ openState: "closed" });
     // Any machine running it makes it open.
-    expect(projects.elsewhere).toMatchObject({ openState: "open", openStateRecorded: false, isActive: true });
+    expect(projects.elsewhere).toMatchObject({ openState: "open", isActive: true });
     expect(projectStateLabel(projects.stopped)).toBe("Closed");
   });
 
@@ -273,9 +273,9 @@ describe("a project's open state", () => {
       // Another machine's entry for the same project carries the same state.
       host("m2", "zoo-006", [{ projectId: "kept-open", path: "/work/kept-open", isRunning: false, openState: "open" }]),
     ]));
-    expect(projects["kept-open"]).toMatchObject({ sessionId: null, openState: "open", openStateRecorded: true, isActive: false });
-    expect(projects["never-ran"]).toMatchObject({ openState: "closed", openStateRecorded: false });
-    expect(projects.runs).toMatchObject({ openState: "open", openStateRecorded: false });
+    expect(projects["kept-open"]).toMatchObject({ sessionId: null, openState: "open", isActive: false });
+    expect(projects["never-ran"]).toMatchObject({ openState: "closed" });
+    expect(projects.runs).toMatchObject({ openState: "open" });
   });
 
   it("lets a machine entry record the state of a session whose own entry lacks it", () => {
@@ -284,7 +284,7 @@ describe("a project's open state", () => {
       [],
       [host("m1", "zoo-005", [{ projectId: "p", path: "/work/p", isRunning: true, openState: "closed", part: "still_running" }])],
     );
-    expect(project).toMatchObject({ openState: "closed", openStateRecorded: true, isActive: true });
+    expect(project).toMatchObject({ openState: "closed", isActive: true });
   });
 
   it("never turns a shared machine's entry into a project row, with or without a state", () => {

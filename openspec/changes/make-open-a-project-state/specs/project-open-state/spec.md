@@ -8,21 +8,37 @@ project, and a machine that was away follows the state when it returns.
 
 ### Requirement: A project has one recorded open state
 
-The server SHALL keep, for each project, one open state: open, closed, or not recorded. It SHALL record the state, the account or administrator that set it, whether it was set by an administrative stop, the time, and for an open the machine the request named, SHALL keep them across server restarts, and SHALL NOT keep them in the project's own metadata on any machine. A project nobody has opened or closed since the server gained this capability SHALL be not recorded. For a project that is not recorded, the server SHALL NOT start or stop anything by itself, and SHALL report it as open while at least one machine runs it and as closed otherwise. A machine starting or ending its run of a project by itself, as when a daemon restores its projects after replacing itself, SHALL NOT change the recorded state. Only a project whose administrative state is active SHALL be recorded open: a request that would open a suspended project or one being deleted SHALL be refused and SHALL record nothing. An open, a close and a follow step for one project SHALL be applied one at a time, each on the state as it is at that moment, so a stop decided for a closed project is never sent after a later open.
+The server SHALL keep, for each project, one open state: open, closed, or not recorded. It SHALL record the state, the account or administrator that set it, whether it was set by an administrative stop, the time, and for an open the machine the request named, SHALL keep them across server restarts, and SHALL NOT keep them in the project's own metadata on any machine. A project nobody has opened or closed since the server gained this capability SHALL be not recorded until the server first sees it running. The first time an instance of a not-recorded, active project attaches, the server SHALL record the project open, set by the account that instance's CLI runs under and naming that instance's machine, applied under the same one-at-a-time rule as an open and only if the project is still not recorded at that moment, and SHALL write it to the audit history. It SHALL do so only once the instance has attached: a session start the server refuses SHALL record nothing and SHALL write nothing to the audit history. A project that is not recorded and that no machine runs SHALL be treated as closed: it SHALL be shown as closed, and every rule for a closed project SHALL apply to it except where a requirement names it. No viewer SHALL be shown that a project is not recorded: a project SHALL be shown as open or closed. A machine starting or ending its run of a project by itself, as when a daemon restores its projects after replacing itself, SHALL NOT change a recorded open or closed state. Only a project whose administrative state is active SHALL be recorded open: a request that would open a suspended project or one being deleted SHALL be refused and SHALL record nothing. An open, a close and a follow step for one project SHALL be applied one at a time, each on the state as it is at that moment, so a stop decided for a closed project is never sent after a later open.
 
 #### Scenario: The state survives a server restart
 - **WHEN** a user opens a project and the server then restarts
 - **THEN** the project is still recorded open
 - **AND** machines are started or stopped only as their daemons register again and are found out of line with it
 
-#### Scenario: A project nobody has touched since the upgrade
-- **WHEN** the server is upgraded while a project runs on zoo-005 and its tabs on zoo-006 are stopped
-- **THEN** the project is not recorded, and is reported as open because zoo-005 runs it
-- **AND** zoo-006 is not started when its daemon registers
+#### Scenario: A running project nobody recorded is recorded open
+- **WHEN** the server is upgraded while a project nobody has recorded runs on zoo-005, the only machine that owns its tabs, and zoo-005's instance attaches again
+- **THEN** the project is recorded open, set by the account zoo-005's CLI runs under and naming zoo-005
+- **AND** the audit history shows it
+- **AND** nothing is started or stopped
 
-#### Scenario: A daemon restoring its projects does not open them
-- **WHEN** a daemon replaces itself and starts the projects it was running again, one of which is not recorded
-- **THEN** that project stays not recorded
+#### Scenario: A half-running project nobody recorded
+- **WHEN** a project nobody has recorded runs on zoo-005 while its tabs on zoo-006 are stopped, and zoo-005's instance attaches
+- **THEN** the project is recorded open
+- **AND** zoo-006 is asked to start the project at its daemon's next registration
+
+#### Scenario: A project nobody recorded that nothing runs
+- **WHEN** a project nobody has recorded has tabs on zoo-005 and zoo-006 and runs on neither
+- **THEN** it is shown as closed
+- **AND** neither machine is started when its daemon registers
+
+#### Scenario: A refused session start records nothing
+- **WHEN** nothing runs a project nobody has recorded, and a CLI on zoo-006 starts a session of it that the server refuses, as for a session that belongs to another account
+- **THEN** the project stays not recorded and is shown as closed
+- **AND** the audit history gains no entry for it
+
+#### Scenario: A daemon restoring its projects does not reopen a closed one
+- **WHEN** a daemon replaces itself and starts the projects it was running again, one of which was closed while it was being replaced
+- **THEN** that project stays recorded closed
 
 #### Scenario: Opening a suspended project
 - **WHEN** a user asks to open a suspended project
@@ -155,7 +171,7 @@ When a machine's daemon has registered with the server, the server SHALL bring t
 
 ### Requirement: Each machine's part in a project is reported
 
-The server SHALL report to every viewer that may read a project, for each machine that owns tabs of it or runs it, one of: running; starting; waiting for the machine, which is offline; not started, with the reason; or, for a closed project, still running, with the reason when one is known. The reason SHALL be the one the refusing check or the daemon gave, and a start the daemon never answered SHALL be reported as not started after a time limit. The report SHALL cover a project that is not recorded as well, where a tab owner that is offline SHALL be reported as not started, since nothing will start it when it returns, SHALL be sent when a viewer attaches to the project and whenever a part changes, and SHALL say who set the state and when. Machine-list entries SHALL carry, for each project, its open state, that machine's part with its reason, and the hosts of the other machines that own tabs of the project or run it, so that a machine list can show and confirm without attaching to the project. A project's open state SHALL also be carried on the entries of session lists and the mobile bootstrap. All of these SHALL be values an older client ignores, and a viewer that did not negotiate support for the report SHALL be sent no frame of a kind it does not know.
+The server SHALL report to every viewer that may read a project, for each machine that owns tabs of it or runs it, one of: running; starting; waiting for the machine, which is offline; not started, with the reason; or, for a closed project, still running, with the reason when one is known. The reason SHALL be the one the refusing check or the daemon gave, and a start the daemon never answered SHALL be reported as not started after a time limit. The report SHALL cover a project that is not recorded as well: a machine that runs it SHALL be reported as running, a machine on which a start an older client asked for is pending SHALL be reported as starting, and every other machine that owns tabs of it SHALL be reported as not started with no reason, also while that machine is offline. The report SHALL be sent when a viewer attaches to the project and whenever a part changes, and SHALL say who set the state and when. Machine-list entries SHALL carry, for each project, its open state, that machine's part with its reason, and the hosts of the other machines that own tabs of the project or run it, so that a machine list can show and confirm without attaching to the project. A project's open state SHALL also be carried on the entries of session lists and the mobile bootstrap. All of these SHALL be values an older client ignores, and a viewer that did not negotiate support for the report SHALL be sent no frame of a kind it does not know.
 
 #### Scenario: One machine is offline
 - **WHEN** a viewer opens an open project that zoo-005 runs and whose other tabs belong to zoo-006, which is offline
@@ -165,9 +181,14 @@ The server SHALL report to every viewer that may read a project, for each machin
 - **WHEN** zoo-006's daemon refuses to start an open project
 - **THEN** every attached viewer that negotiated support is told zoo-006 is not started, with the daemon's reason
 
-#### Scenario: A project that is not recorded and runs on one of two machines
-- **WHEN** a viewer opens a project that is not recorded, which zoo-005 runs and of which zoo-006 owns tabs it is not running
-- **THEN** the viewer is told the project is not recorded, zoo-005 is running and zoo-006 is not started
+#### Scenario: A project that is not recorded and runs nowhere
+- **WHEN** a viewer opens a project that is not recorded, of which zoo-005 and zoo-006 own tabs and which neither runs
+- **THEN** each machine's part is reported as not started with no reason, as for a closed project
+
+#### Scenario: A project that is not recorded and runs on one machine
+- **WHEN** a viewer opens a project that is not recorded, which zoo-005's daemon reports running before zoo-005's instance has attached, and of which zoo-006, which is offline, also owns tabs
+- **THEN** zoo-005 is reported as running
+- **AND** zoo-006 is reported as not started with no reason, not as waiting for an offline machine
 
 #### Scenario: The machine list without an attached project
 - **WHEN** a user's machine list shows an open project on zoo-006 that zoo-006 failed to start, and the user has not opened that project's workspace
@@ -199,7 +220,7 @@ When a viewer that negotiated support for the open state asks to create a tab on
 
 ### Requirement: A client that does not know the open state never reaches beyond the machine it names
 
-A request that names one machine and comes from a client that cannot have said what opening or closing does (a start or stop of the project on one machine, a tab request from a viewer that did not negotiate support for the open state, and a native task launch) SHALL never start or stop a machine other than the one it names. For a project that is not recorded it SHALL act on that machine as it did before the open state and SHALL record nothing; and a request to start or stop a not-recorded project on every machine, from a viewer that did not negotiate support for the open state, SHALL likewise act as it did before and SHALL record nothing. For a project recorded open: a start, a tab request or a task launch SHALL start the machine it names; a stop SHALL close the project when no other machine owns tabs of it or runs it, and SHALL otherwise be refused, with nothing stopped, with "This project runs on other machines too. Close it from the project." For a project recorded closed: a start, a tab request or a task launch SHALL open the project when no other machine owns tabs of it, and SHALL otherwise be refused, with nothing started, with "This project is closed and has tabs on other machines. Open it from the project.", also when the named machine still has an instance of the project attached; a stop SHALL stop the machine it names. A tab request that names no machine SHALL be judged as naming the machine of the instance it would be sent to. A request that opens a project this way SHALL be accepted only from an account that may open the project, and SHALL otherwise be refused with nothing recorded. A task launch chosen for a machine whose daemon is not connected SHALL fail and SHALL record nothing.
+A request that names one machine and comes from a client that cannot have said what opening or closing does (a start or stop of the project on one machine, a tab request from a viewer that did not negotiate support for the open state, and a native task launch) SHALL never itself start or stop a machine other than the one it names. A project that is not recorded SHALL be treated as recorded closed, with one exception: a start of the project on one machine from a web viewer that did not negotiate support for the open state SHALL start that machine as it did before the open state, also when other machines own tabs of it, and SHALL record nothing itself; the project is then recorded open when that machine's instance attaches, and the other machines that own its tabs follow at their next registration. No other request SHALL be excepted: a tab request from such a viewer and a native task launch on a project that is not recorded SHALL be handled as for a project recorded closed. A request to start or stop a not-recorded project on every machine, from a viewer that did not negotiate support for the open state, SHALL open or close it as such a request does for a recorded project. For a project recorded open: a start, a tab request or a task launch SHALL start the machine it names; a stop SHALL close the project when no other machine owns tabs of it or runs it, and SHALL otherwise be refused, with nothing stopped, with "This project runs on other machines too. Close it from the project." For a project recorded closed: a start, a tab request or a task launch SHALL open the project when no other machine owns tabs of it, and SHALL otherwise be refused, with nothing started, with "This project is closed and has tabs on other machines. Open it from the project.", also when the named machine still has an instance of the project attached; a stop SHALL stop the machine it names. A tab request that names no machine SHALL be judged as naming the machine of the instance it would be sent to. A request that opens a project this way SHALL be accepted only from an account that may open the project, and SHALL otherwise be refused with nothing recorded. A task launch chosen for a machine whose daemon is not connected SHALL fail and SHALL record nothing.
 
 #### Scenario: A task for a machine that is away
 - **WHEN** a closed project has its tabs on zoo-006 only, zoo-006's daemon is not connected, and a native task launch names zoo-006
@@ -207,14 +228,28 @@ A request that names one machine and comes from a client that cannot have said w
 - **AND** the project stays recorded closed
 
 #### Scenario: An older web bundle starts one machine of a project nobody has recorded
-- **WHEN** a web bundle from before the open state asks to start a not-recorded project on zoo-006 while zoo-005 runs it
+- **WHEN** a web bundle from before the open state asks to start a not-recorded project on zoo-006, which nothing runs and of which zoo-005 also owns tabs
 - **THEN** zoo-006 starts, as before
-- **AND** the project stays not recorded
+- **AND** the project is recorded open when zoo-006's instance attaches
+- **AND** zoo-005 is asked to start it at its daemon's next registration
+
+#### Scenario: A native task in a project nobody has recorded with tabs on two machines
+- **WHEN** a project nobody has recorded has tabs on zoo-005 and zoo-006, nothing runs it, and a user launches a native task choosing zoo-005
+- **THEN** the launch fails with "This project is closed and has tabs on other machines. Open it from the project."
+- **AND** nothing starts and the project stays not recorded
+
+#### Scenario: An older web bundle's tab request in a project nobody has recorded
+- **WHEN** a project nobody has recorded has tabs on zoo-005 and zoo-006, nothing runs it, and a web bundle from before the open state asks for a new tab on zoo-005
+- **THEN** the request is refused with "This project is closed and has tabs on other machines. Open it from the project."
+- **AND** nothing starts and the project stays not recorded
+
+#### Scenario: A native task in a single-machine project nobody has recorded
+- **WHEN** a project nobody has recorded has its tabs on zoo-005 only, nothing runs it, and a user launches a native task choosing zoo-005
+- **THEN** the project is recorded open by that user and the task runs on zoo-005
 
 #### Scenario: An older web bundle's project-view button on a project nobody has recorded
-- **WHEN** a web bundle from before the open state starts a not-recorded project from its project view
-- **THEN** the machines it reached before the open state start, as before
-- **AND** the project stays not recorded, so no machine is started or stopped for it later
+- **WHEN** a web bundle from before the open state starts a not-recorded project that nothing runs from its project view
+- **THEN** the project is recorded open and every connected machine that owns its tabs is asked to start, as an open does
 
 #### Scenario: An older web bundle retries a machine of an open project
 - **WHEN** a project is open, zoo-006 owns tabs and is not running it, and a web bundle from before the open state asks to start it on zoo-006
@@ -240,7 +275,7 @@ A request that names one machine and comes from a client that cannot have said w
 
 ### Requirement: Other paths that start or end a project record its state
 
-Creating a project in a way that starts it SHALL record it open, by the creating account, when the new project first runs. Joining an existing project from another checkout SHALL NOT change that project's recorded state. Suspending a project, an operator or system administrator stopping its runtime, and beginning its deletion SHALL record the project as closed by that actor, in addition to what they do today. Reactivating a suspended project SHALL start nothing and SHALL leave it closed. Opening and closing a project, by any path, SHALL be recorded in the audit history of the clusters hosting it, with the actor and the machines asked to start or stop. A start or stop the server sends when a machine's daemon registers SHALL be recorded there too, with the recorded actor and that machine. Closing a project SHALL NOT by itself cancel or pause autonomous workers or their jobs; an administrative stop keeps cancelling them as it does today.
+Creating a project in a way that starts it SHALL record it open, by the creating account, when the new project first runs. Joining an existing project from another checkout SHALL NOT change that project's recorded open or closed state; a joined project that is not recorded is recorded open when its instance first attaches, as any project that is not recorded is. Suspending a project, an operator or system administrator stopping its runtime, and beginning its deletion SHALL record the project as closed by that actor, in addition to what they do today. Reactivating a suspended project SHALL start nothing and SHALL leave it closed. Opening and closing a project, by any path, SHALL be recorded in the audit history of the clusters hosting it, with the actor and the machines asked to start or stop. A start or stop the server sends when a machine's daemon registers SHALL be recorded there too, with the recorded actor and that machine. Closing a project SHALL NOT by itself cancel or pause autonomous workers or their jobs; an administrative stop keeps cancelling them as it does today.
 
 #### Scenario: A project created and started
 - **WHEN** an owner creates a project from a clone with "Create & start" on zoo-005

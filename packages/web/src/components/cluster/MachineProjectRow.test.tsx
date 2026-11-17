@@ -91,6 +91,19 @@ const confirm = (name: string) => fireEvent.click(within(screen.getByRole("dialo
 const other = (hostname: string, running: boolean, connected = true) =>
   ({ hostname, connected, running, ownsTabs: true });
 
+/** What the owner removed on 2026-11-16: a third button that kept a
+ *  running project open, and every text telling a person a project is not
+ *  recorded. Searched in the text, the titles and the accessible names. */
+const REMOVED_TEXT = [/Keep .*open/i, /Nobody has opened/, /after those machines have been away/, /Nothing starts now/];
+function expectNoRemovedText() {
+  const texts = [
+    document.body.textContent ?? "",
+    ...Array.from(document.querySelectorAll("[title]")).map((element) => element.getAttribute("title") ?? ""),
+    ...Array.from(document.querySelectorAll("[aria-label]")).map((element) => element.getAttribute("aria-label") ?? ""),
+  ].join("\n");
+  for (const pattern of REMOVED_TEXT) expect(texts).not.toMatch(pattern);
+}
+
 describe("MachineProjectRow", () => {
   it("opens a closed project from one machine's entry, naming the other machine first", () => {
     const closed = [
@@ -185,11 +198,14 @@ describe("MachineProjectRow", () => {
     const { onOpen } = renderRow({ machines: [machine(ZOO5, "zoo-005")], from: ZOO5 });
 
     expect(state()).toBe("Closed");
-    expect(screen.getByTestId("project-open-state").getAttribute("title"))
-      .toBe("Nobody has opened or closed this project yet. It is shown from what runs.");
+    expect(screen.getByTestId("project-open-state").getAttribute("title")).toBeNull();
     expect(part()).toBe("No tabs here");
+    // One button: Open, and no Close.
+    expect(screen.getAllByRole("button").map((control) => control.textContent?.trim())).toEqual(["Open"]);
+    expectNoRemovedText();
     fireEvent.click(button("Open mako (listed on zoo-005)"));
     expect(dialogLines("Open mako?")).toEqual(["It starts on zoo-005."]);
+    expectNoRemovedText();
     confirm("Open");
     expect(onOpen).toHaveBeenCalledTimes(1);
   });
@@ -212,26 +228,25 @@ describe("MachineProjectRow", () => {
     expect(dialogLines("Close mako?")).toEqual(["This stops its agents on zoo-005.", CLOSE_DELETES_NOTHING]);
   });
 
-  it("offers to keep open and to close a project nobody has recorded that this machine runs", () => {
-    const { onOpen } = renderRow({
+  it("offers only Close for a project the server has not recorded that this machine runs", () => {
+    const { onOpen, onClose } = renderRow({
       machines: [machine(ZOO5, "zoo-005", { isRunning: true, part: "running" })],
       from: ZOO5,
     });
 
     expect(state()).toBe("Open");
+    expect(screen.getByTestId("project-open-state").getAttribute("title")).toBeNull();
     expect(part()).toBe("Running");
-    const keep = button("Keep mako open (listed on zoo-005)");
-    expect(keep.textContent).toContain("Keep open");
-    expect(keep.title).toBe("Its tabs start again on zoo-005 after those machines have been away.");
-    expect(button("Close mako (listed on zoo-005)")).toBeTruthy();
+    expect(screen.getAllByRole("button").map((control) => control.textContent?.trim())).toEqual(["Close"]);
+    expectNoRemovedText();
 
-    fireEvent.click(keep);
-    expect(dialogLines("Keep mako open?")).toEqual([
-      "This records the project as open. Nothing starts now.",
-      "Its tabs start again on zoo-005 after those machines have been away.",
-    ]);
-    confirm("Keep open");
-    expect(onOpen).toHaveBeenCalledTimes(1);
+    // An ordinary Close: it records the project closed.
+    fireEvent.click(button("Close mako (listed on zoo-005)"));
+    expect(dialogLines("Close mako?")).toEqual(["This stops its agents on zoo-005.", CLOSE_DELETES_NOTHING]);
+    expectNoRemovedText();
+    confirm("Close");
+    expect(onClose).toHaveBeenCalledTimes(1);
+    expect(onOpen).not.toHaveBeenCalled();
   });
 
   it("says nothing was sent when the page has no connection, and sends nothing later", () => {
@@ -255,14 +270,21 @@ describe("MachineProjectRow", () => {
 
   it("disables Open and Close while the page is not connected to the server", () => {
     renderRow({
+      machines: [machine(ZOO5, "zoo-005", { openState: "closed", part: "not_started" })],
+      from: ZOO5,
+      connected: false,
+    });
+    const open = button("Open mako (listed on zoo-005)");
+    expect(open.disabled).toBe(true);
+    expect(open.title).toBe("Not connected to the server");
+    cleanup();
+
+    renderRow({
       machines: [machine(ZOO5, "zoo-005", { isRunning: true, part: "running" })],
       from: ZOO5,
       connected: false,
     });
 
-    const keep = button("Keep mako open (listed on zoo-005)");
-    expect(keep.disabled).toBe(true);
-    expect(keep.title).toBe("Not connected to the server");
     const close = button("Close mako (listed on zoo-005)");
     expect(close.disabled).toBe(true);
     expect(close.title).toBe("Not connected to the server");
@@ -347,27 +369,31 @@ describe("MachineProjectRow", () => {
     expect(screen.getByTestId("project-open-state").className).toContain("text-gray-600");
   });
 
-  it("offers Keep open, not Open beside an Open chip, for a not-recorded project that runs on one of its two machines", () => {
+  it("offers Open again and Close, beside an Open chip, for a not-recorded project that runs on one of its two machines", () => {
+    // As a recorded open project is: zoo-006 is connected, owns tabs and is
+    // not running it, and an Open of the project starts it there.
     const half = [
       machine(ZOO5, "zoo-005", { isRunning: true, part: "running", otherHosts: [other("zoo-006", false)] }),
       machine(ZOO6, "zoo-006", { part: "not_started", otherHosts: [other("zoo-005", true)] }),
     ];
     for (const [from, host] of [[ZOO5, "zoo-005"], [ZOO6, "zoo-006"]] as const) {
-      const { onOpen } = renderRow({ machines: half, from });
+      const opened = renderRow({ machines: half, from });
       expect(state()).toBe("Open");
-      expect(screen.queryByRole("button", { name: `Open mako (listed on ${host})` })).toBeNull();
-      const keep = button(`Keep mako open (listed on ${host})`);
-      expect(keep.textContent).toContain("Keep open");
-      fireEvent.click(keep);
-      // Confirming starts zoo-006, and the confirmation says so.
-      expect(dialogLines("Keep mako open?")).toEqual([
-        "zoo-005 already runs it.",
-        "Its tabs start on zoo-006.",
-        "Its tabs start again on zoo-005 and zoo-006 after those machines have been away.",
-      ]);
-      confirm("Keep open");
-      expect(onOpen).toHaveBeenCalledTimes(1);
-      expect(button(`Close mako (listed on ${host})`)).toBeTruthy();
+      expect(screen.getAllByRole("button").map((control) => control.textContent?.trim())).toEqual(["Open again", "Close"]);
+      expectNoRemovedText();
+      fireEvent.click(button(`Open mako again (listed on ${host})`));
+      expect(dialogLines("Open mako again?")).toEqual(["zoo-005 already runs it.", "Its tabs start on zoo-006."]);
+      confirm("Open again");
+      expect(opened.onOpen).toHaveBeenCalledTimes(1);
+      expect(opened.onClose).not.toHaveBeenCalled();
+      cleanup();
+
+      const { onOpen, onClose } = renderRow({ machines: half, from });
+      fireEvent.click(button(`Close mako (listed on ${host})`));
+      expect(dialogLines("Close mako?")).toEqual(["This stops its agents on zoo-005.", CLOSE_DELETES_NOTHING]);
+      confirm("Close");
+      expect(onClose).toHaveBeenCalledTimes(1);
+      expect(onOpen).not.toHaveBeenCalled();
       cleanup();
     }
   });
@@ -489,7 +515,7 @@ describe("MachineProjectRow", () => {
   });
 
   describe("on a server that records no open state", () => {
-    it("shows the project from what runs and never offers Keep open", () => {
+    it("shows the project from what runs and offers only Close while it runs", () => {
       const { onClose } = renderRow({
         machines: [machine(ZOO5, "zoo-005", { isRunning: true, memoryKb: 2048 })],
         from: ZOO5,

@@ -980,7 +980,7 @@ export function Sidebar({ onClose, onCollapse, width }: SidebarProps) {
                     )}
                     <div className="flex items-center gap-2 text-xs text-gray-500">
                       {/* The project's state, Open or Closed: what the server
-                          recorded, or, while nobody has recorded one, open
+                          recorded, or, where it has recorded none, open
                           while something runs it. */}
                       <span className="shrink-0" data-testid="project-open-state">
                         {projectStateLabel(project)}

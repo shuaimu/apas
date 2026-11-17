@@ -35,29 +35,29 @@ describe("clusterProjectOpenModel", () => {
     const closed = clusterProjectOpenModel(project, source({
       machines: [machine("zoo-005", { openState: "closed", part: "not_started" })],
     }));
-    expect(closed).toMatchObject({ state: "closed", recorded: true, stateLabel: "Closed" });
+    expect(closed).toMatchObject({ state: "closed", stateLabel: "Closed" });
     // It names no machine for a request, so it offers neither action.
     expect(closed?.openAction).toBeUndefined();
     expect(closed?.closeAction).toBeUndefined();
   });
 
-  it("shows a project nobody has recorded from what runs", () => {
+  it("shows a project the server has not recorded as Open while it runs and Closed otherwise", () => {
     expect(clusterProjectOpenModel(project, source({
       machines: [machine("zoo-005", { isRunning: true, part: "running" })],
-    }))).toMatchObject({ state: "open", recorded: false, stateLabel: "Open" });
+    }))).toMatchObject({ state: "open", stateLabel: "Open" });
     expect(clusterProjectOpenModel(project, source({
       machines: [machine("zoo-005", {})],
-    }))).toMatchObject({ state: "closed", recorded: false, stateLabel: "Closed" });
+    }))).toMatchObject({ state: "closed", stateLabel: "Closed" });
   });
 
   it("reads the state from the session list when no machine lists the project", () => {
     expect(clusterProjectOpenModel(project, source({
       sessions: [{ id: "session-1", projectId: PROJECT, isActive: false, openState: "open" }],
-    }))).toMatchObject({ state: "open", recorded: true });
+    }))).toMatchObject({ state: "open" });
     // A legacy session row is the project.
     expect(clusterProjectOpenModel(project, source({
       sessions: [{ id: PROJECT, isActive: true }],
-    }))).toMatchObject({ state: "open", recorded: false });
+    }))).toMatchObject({ state: "open" });
     expect(clusterProjectOpenModel(project, source({
       sessions: [{ id: "other", projectId: "another-project", isActive: true }],
     }))).toBeNull();
@@ -85,6 +85,6 @@ describe("clusterProjectOpenModel", () => {
     expect(clusterProjectOpenModel(project, source({
       supported: false,
       machines: [machine("zoo-005", { isRunning: true })],
-    }))).toMatchObject({ state: "open", recorded: false });
+    }))).toMatchObject({ state: "open" });
   });
 });
