@@ -72,10 +72,10 @@ async fn follow_project_locked(
         // Nobody has recorded what this project should do. While nothing
         // runs it, it counts as closed, and a closed project's step starts
         // nothing. A machine that runs it is not stopped either: at a
-        // deployment every daemon registers again before its instances
-        // attach, and each instance's `SessionStart` records the project
-        // open. Treating this as the closed arm would stop every running
-        // project in that window.
+        // deployment a daemon can register again before its instances have
+        // attached (the smoke runs saw both orders), and each instance's
+        // `SessionStart` then records the project open. Treating this as
+        // the closed arm would stop running projects in that window.
         None => Followed::Nothing,
         Some(ProjectOpenState::Open) => {
             // Only an active project is open; one that is suspended or being

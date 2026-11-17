@@ -1172,20 +1172,20 @@ export type WebToServer =
        * False, and absent from every older client, names `machine_id`
        * alone and never starts another machine. What it does depends on
        * the recorded state:
-       * - not recorded: starts `machine_id`, as before the state
-       *   existed, and records nothing;
+       * - not recorded, from a viewer without the capability: starts
+       *   `machine_id`, as before the state existed; its instance's
+       *   `SessionStart`, once accepted, records the project open;
+       * - not recorded, from a viewer with it: as closed;
        * - open: starts `machine_id`;
        * - closed: opens the project when no other machine owns tabs of
        *   it, and is otherwise refused.
        *
        * A viewer that negotiated the capability never sends false. One
-       * that did not, and sends true (an older project view), opens a
-       * recorded project as above; on a project that is not recorded its
-       * request starts every online machine that owns tabs and
-       * advertises [`PROJECT_INSTANCES_CAPABILITY`], or `machine_id`
-       * when none does, as it did before, and records nothing. Only a
-       * viewer with the capability records the state of a project nobody
-       * has recorded. An older server ignores the flag's new meaning and
+       * that did not, and sends true (an older project view), opens the
+       * project as above, whether or not it was recorded. A project
+       * nobody has recorded is recorded open by the server once an
+       * instance of it has attached, and counts as closed while nothing
+       * runs it. An older server ignores the flag's new meaning and
        * records nothing.
        */
       all_instances?: boolean;
@@ -1217,19 +1217,17 @@ export type WebToServer =
        * alone and never stops another machine. What it does depends on
        * the recorded state:
        * - not recorded: stops `machine_id`, as before the state existed,
-       *   and records nothing;
+       *   and records nothing (a running project nobody has recorded is
+       *   recorded open as soon as its instance has attached);
        * - open: closes the project when no other machine owns tabs of it
        *   or runs it, and is otherwise refused;
        * - closed: stops `machine_id`.
        *
        * A viewer that negotiated [`crate::PROJECT_OPEN_STATE_CAPABILITY`]
        * never sends false. One that did not, and sends true (an older
-       * project view), closes a recorded project as above; on a project
-       * that is not recorded its request stops what it stopped before
-       * (`machine_id`, every attached instance, and every connected
-       * daemon of the project's own accounts that reports running it)
-       * and records nothing. An older server ignores the flag's new
-       * meaning and records nothing.
+       * project view), closes the project as above, whether or not it was
+       * recorded. An older server ignores the flag's new meaning and
+       * records nothing.
        */
       all_instances?: boolean;
       /**

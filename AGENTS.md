@@ -2352,6 +2352,13 @@ the server.
   starts that machine as before.
 - The phone's "All projects" cards show the server's UTC time as local time
   (older than this change).
+- A `first_seen` audit row written before that machine's daemon has
+  registered again (the usual order at a deploy) names the machine by id with
+  no hostname. Nothing shows machine names in Activity today.
+- While a Close is under way, a tab whose machine has just stopped can show
+  the server's "<host> is not running this project. Open the project again to
+  start it there." for a few seconds, the answer to a terminal resize the page
+  sent, until the page refreshes the tab's state.
 
 ### Rollout record
 
