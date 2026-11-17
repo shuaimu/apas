@@ -2131,8 +2131,7 @@ it registered, and at its following registration otherwise. To keep it out,
 close or forget its tabs there. The first release (`20261116T224049Z`) left
 such projects unrecorded and offered **Keep open**; the owner removed that
 on 2026-11-16 for one Open/Close button (Decision 2 of the design record).
-This rule is not yet deployed: until it is, production runs the first
-release's rule (section 7 of the change's `tasks.md`).
+This rule has been live since release `20261117T042413Z`.
 
 **What Open and Close do** (`crates/server/src/open_state.rs`):
 
@@ -2386,6 +2385,31 @@ change has no CLI part, and no daemon or agent was restarted.
   has opened or closed" above), an un-reloaded older web bundle's buttons,
   and a native build staying connected. The first two were exercised on the
   harness only.
+
+**One Open/Close button, on 2026-11-17.** Server and web release
+`20261117T042413Z` (version 26.11.74, built at f6b817c) replaced "Keep
+open" with the rule above: the server at 04:25:17 UTC, the web at 04:25:38
+UTC. Backups are under `/opt/apas/backups/deploy-20261117T042413Z`. Checked
+read-only first: none of the ten running projects ran on only some of its tab
+owners, so the rule could start nothing.
+
+- At the server's start both daemons registered again and eleven instances
+  attached. The ten running projects were recorded open with one `first_seen`
+  audit row each (one project runs on two machines); the other 91 read
+  Closed. No follow step started or stopped anything, zoo-005 kept its 26
+  pane hosts and zoo-006 its 4, and the server logged no error and no
+  "database is locked".
+- Twelve addresses answered `200` with no redirect, 19 referenced static
+  assets `200`, the JSON routes answered from `apas-server`, and the served
+  pages carry no "Keep open" (an older chunk kept for un-reloaded browsers
+  still does).
+- Checked before on the harness (build `os3`, 76aed62): a server restart with
+  three running and three stopped projects nobody had recorded recorded the
+  running ones open and started and stopped nothing; a half-running project
+  started its other machine in the same restart; an older bundle's
+  one-machine Start and the closed-row refusals; Close then Open; and in
+  Chromium one button per state on the workspace, the Machines rows and the
+  phone, with none of the removed words on any page.
 
 **To roll this release back**, follow "Rollout and rollback" above: web
 first, then the server binary from the backup, which is older than this
