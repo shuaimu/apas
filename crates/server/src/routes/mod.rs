@@ -20,6 +20,7 @@ pub(crate) mod mobile_auth;
 mod mobile_notifications;
 mod project_join;
 pub(crate) mod projects;
+mod server_load;
 pub(crate) mod share;
 pub mod system_admin;
 pub(crate) mod workers;
@@ -79,6 +80,7 @@ pub fn create_router(state: AppState) -> Router {
         .route("/admin/auth/me", get(system_admin::me))
         .route("/admin/auth/password", post(system_admin::change_password))
         .route("/admin/clusters", get(admin::list_clusters))
+        .route("/admin/load", get(server_load::get))
         .route("/admin/stats", get(admin::get_stats))
         .route("/admin/mobile/metrics", get(admin::get_mobile_metrics))
         .route("/admin/users", get(admin::list_users))
@@ -324,6 +326,22 @@ mod cluster_authorization_tests {
             HeaderValue::from_str(&format!("Bearer {token}")).unwrap(),
         );
         headers
+    }
+
+    #[tokio::test]
+    async fn server_load_requires_a_system_admin_token() {
+        let state = state().await;
+        for credential in [HeaderMap::new(), headers(&state, "ordinary-user")] {
+            assert!(server_load::get(State(state.clone()), credential)
+                .await
+                .is_err());
+        }
+        let result = server_load::get(State(state.clone()), system_admin_headers(&state).await)
+            .await
+            .unwrap();
+        let json = serde_json::to_value(&result.0).unwrap();
+        assert_eq!(json["activity"]["online_users"], 0);
+        assert!(json["sampled_at"].is_string());
     }
 
     #[tokio::test]

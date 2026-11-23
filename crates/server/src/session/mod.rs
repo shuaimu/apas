@@ -13,6 +13,7 @@ use uuid::Uuid;
 pub mod autopilot;
 pub mod autopilot_prompts;
 pub mod instances;
+pub(crate) mod load;
 mod local_projects;
 pub mod open_state;
 pub mod pane_launches;

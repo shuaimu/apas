@@ -90,13 +90,83 @@ interface AuditEvent {
   created_at?: string;
 }
 
-function StatCard({ label, value, detail }: { label: string; value: number; detail?: string }) {
+function StatCard({ label, value, detail }: { label: string; value: number | string; detail?: string }) {
   return (
     <div className="rounded-xl border border-gray-200 bg-white p-4 dark:border-gray-700 dark:bg-gray-800">
       <div className="text-2xl font-semibold">{value}</div>
       <div className="text-sm text-gray-500">{label}</div>
       {detail && <div className="mt-1 text-xs text-gray-400">{detail}</div>}
     </div>
+  );
+}
+
+interface LoadSnapshot {
+  sampled_at: string;
+  activity: {
+    online_users: number;
+    viewer_connections: number;
+    working_sessions: number;
+    connected_sessions: number;
+    connected_daemons: number;
+  };
+  host_cpu_percent: number | null;
+  host_memory: { used_bytes: number; total_bytes: number } | null;
+}
+
+function ServerLoad({ api, refresh }: {
+  api: <T,>(path: string, init?: RequestInit) => Promise<T>;
+  refresh: number;
+}) {
+  const [snapshot, setSnapshot] = useState<LoadSnapshot | null>(null);
+  const [failed, setFailed] = useState(false);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    let timer: ReturnType<typeof setTimeout>;
+    async function sample() {
+      try {
+        const data = await api<LoadSnapshot>("/admin/load", { signal: controller.signal, cache: "no-store" });
+        if (!controller.signal.aborted) {
+          setSnapshot(data);
+          setFailed(false);
+        }
+      } catch {
+        if (!controller.signal.aborted) setFailed(true);
+      } finally {
+        if (!controller.signal.aborted) timer = setTimeout(sample, 15_000);
+      }
+    }
+    void sample();
+    return () => {
+      controller.abort();
+      clearTimeout(timer);
+    };
+  }, [api, refresh]);
+
+  const activity = snapshot?.activity;
+  const memory = snapshot?.host_memory;
+  const cpu = snapshot?.host_cpu_percent;
+  const percent = (value: number) => `${value.toFixed(1)}%`;
+  const gib = (bytes: number) => (bytes / 2 ** 30).toFixed(1);
+
+  return (
+    <section aria-labelledby="server-load" className="mt-4 space-y-3">
+      <div className="flex flex-wrap items-baseline justify-between gap-x-4 gap-y-1">
+        <h2 id="server-load" className="text-lg font-semibold">Server load</h2>
+        {snapshot && <p className="text-xs text-gray-500">Sampled {new Date(snapshot.sampled_at).toLocaleTimeString()} · Updates every 15 seconds</p>}
+      </div>
+      {failed && <p role="status" className="text-sm text-amber-700 dark:text-amber-300">
+        {snapshot ? "Refresh failed. Showing the last sample." : "Server load is unavailable."} Retrying in 15 seconds.
+      </p>}
+      {!snapshot && !failed && <p role="status" className="text-sm text-gray-500">Reading server load…</p>}
+      {activity && <div className="grid grid-cols-2 gap-4 lg:grid-cols-4">
+        <StatCard label="Online users" value={activity.online_users} detail={`${activity.viewer_connections} signed-in viewer connections`} />
+        <StatCard label="Working sessions" value={activity.working_sessions} detail={`${activity.connected_sessions} connected sessions · ${activity.connected_daemons} machine daemons online`} />
+        <StatCard label="Host CPU" value={cpu != null ? percent(cpu) : "Unavailable"} detail="Across all CPU cores" />
+        <StatCard label="Host memory" value={memory && memory.total_bytes > 0 ? percent(100 * memory.used_bytes / memory.total_bytes) : "Unavailable"}
+          detail={memory ? `${gib(memory.used_bytes)} of ${gib(memory.total_bytes)} GiB used` : undefined} />
+      </div>}
+    </section>
   );
 }
 
@@ -180,6 +250,7 @@ export default function SystemAdminPage() {
   const [tab, setTab] = useState<Tab>("overview");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [loadRefresh, setLoadRefresh] = useState(0);
   const [stats, setStats] = useState<SystemStats | null>(null);
   const [accounts, setAccounts] = useState<Account[]>([]);
   const [clusters, setClusters] = useState<ClusterSummary[]>([]);
@@ -233,7 +304,7 @@ export default function SystemAdminPage() {
         ...init?.headers,
       },
     });
-    if (response.status === 401) {
+    if (response.status === 401 && !init?.signal?.aborted) {
       sessionStorage.removeItem(TOKEN_KEY);
       setToken(null);
     }
@@ -323,7 +394,7 @@ export default function SystemAdminPage() {
             </div>
           </div>
           <div className="flex items-center gap-2">
-            <button aria-label="Refresh" onClick={() => void load()} className="rounded-lg border border-gray-300 p-2 dark:border-gray-700">
+            <button aria-label="Refresh" onClick={() => { setLoadRefresh(value => value + 1); void load(); }} className="rounded-lg border border-gray-300 p-2 dark:border-gray-700">
               <RefreshCw className={`h-4 w-4 ${loading ? "animate-spin" : ""}`} />
             </button>
             <button
@@ -377,6 +448,8 @@ export default function SystemAdminPage() {
         </nav>
 
         <ErrorBanner message={error} />
+
+        {tab === "overview" && <ServerLoad key={token} api={api} refresh={loadRefresh} />}
 
         {tab === "overview" && stats && (
           <section className="mt-4 space-y-6">

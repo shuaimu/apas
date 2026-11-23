@@ -19,7 +19,7 @@ function response(body: unknown, ok = true, status = ok ? 200 : 500) {
   return { ok, status, json: vi.fn().mockResolvedValue(body) };
 }
 
-function installApiFixtures({ bootstrapPending = false } = {}) {
+function installApiFixtures({ bootstrapPending = false, loadFails = false } = {}) {
   fetchMock.mockImplementation(async (input: string | URL, init?: RequestInit) => {
     const url = String(input);
     if (url.endsWith("/admin/auth/login")) {
@@ -30,6 +30,15 @@ function installApiFixtures({ bootstrapPending = false } = {}) {
     }
     if (url.endsWith("/admin/auth/password")) {
       return response({ token: "rotated-token", username: "admin", bootstrap_pending: false });
+    }
+    if (url.endsWith("/admin/load")) {
+      if (loadFails) return response({}, false);
+      return response({
+        sampled_at: "2026-11-22T12:00:00Z",
+        activity: { online_users: 2, viewer_connections: 5, connected_sessions: 6, working_sessions: 3, connected_daemons: 4 },
+        host_cpu_percent: null,
+        host_memory: { used_bytes: 2 ** 30, total_bytes: 4 * 2 ** 30 },
+      });
     }
     if (url.endsWith("/admin/stats")) {
       return response({
@@ -193,6 +202,12 @@ describe("SystemAdminPage", () => {
     await signIn();
 
     expect(await screen.findByText("Accounts")).toBeTruthy();
+    const load = within(screen.getByRole("region", { name: "Server load" }));
+    expect(await load.findByText("5 signed-in viewer connections")).toBeTruthy();
+    expect(load.getByText("6 connected sessions · 4 machine daemons online")).toBeTruthy();
+    expect(load.getByText("Unavailable")).toBeTruthy();
+    expect(load.getByText("25.0%")).toBeTruthy();
+    expect(load.getByText("1.0 of 4.0 GiB used")).toBeTruthy();
     expect(screen.getByText("Deployment default policy")).toBeTruthy();
     expect(screen.getByText("Codex Terminal")).toBeTruthy();
     expect(screen.queryByText("Legacy GLM")).toBeNull();
@@ -200,6 +215,26 @@ describe("SystemAdminPage", () => {
       "https://apas.mpaxos.com/admin/stats",
       expect.objectContaining({ headers: expect.objectContaining({ Authorization: "Bearer system-token" }) }),
     );
+  });
+
+  it("keeps the last sample on failure and clears the warning after a refresh", async () => {
+    installApiFixtures();
+    sessionStorage.setItem(TOKEN_KEY, "system-token");
+    render(<SystemAdminPage />);
+    await screen.findByText("5 signed-in viewer connections");
+
+    installApiFixtures({ loadFails: true });
+    fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
+    expect(await screen.findByText(/Refresh failed/)).toBeTruthy();
+    expect(screen.getByText("5 signed-in viewer connections")).toBeTruthy();
+
+    installApiFixtures();
+    fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
+    await waitFor(() => expect(screen.queryByText(/Refresh failed/)).toBeNull());
+    const requests = fetchMock.mock.calls.filter(([path]) => String(path).endsWith("/admin/load"));
+    expect(requests).toHaveLength(3);
+    fireEvent.click(screen.getByRole("button", { name: "users" }));
+    expect(requests[2][1].signal.aborted).toBe(true);
   });
 
   it("lists every virtual cluster in the deployment", async () => {

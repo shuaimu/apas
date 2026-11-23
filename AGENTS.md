@@ -1314,6 +1314,13 @@ rotating the password bumps that version and invalidates every outstanding
 token. An account token is rejected by `/admin/*` and this token is rejected
 everywhere else. No UI can grant it, and `bootstrap_admin_email` is gone.
 
+The system admin Overview samples `GET /admin/load` every 15 seconds while
+open. Online users counts distinct accounts with a signed-in viewer connection.
+Working sessions counts connected sessions with at least one working pane.
+CPU and memory cover the Linux host running `apas-server`. CPU is sampled
+over 250 ms and memory used is total minus available. The panel shows when
+it last sampled successfully and marks unavailable host readings individually.
+
 **An empty `bootstrap_password` is silent and total.** Seeding is skipped when
 the value is blank, and the only report is one `WARN` at startup. With no
 credential nobody can enter `/admin`; `/admin/users/invitations` is the sole
