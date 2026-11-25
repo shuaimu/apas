@@ -5,17 +5,17 @@
 Defines which model providers and API backends APAS actively supports, how retired providers are blocked, and how existing projects remain recoverable when provider support is removed.
 ## Requirements
 ### Requirement: The supported launch catalog is terminal-only
-APAS SHALL advertise exactly the supported Claude, Codex, OpenCode, and OMP terminal profiles plus the supported DeepSeek 4.1 Flash terminal profile. Structured `agent:*` profiles, Cursor Agent, Fable, MiniMax, GLM, Pi, DeepSeek Pro, and unknown profiles SHALL NOT be offered for new work.
+APAS SHALL advertise exactly the supported Claude, Codex, OpenCode, Antigravity, and OMP terminal profiles plus the supported DeepSeek 4.1 Flash terminal profile. Structured `agent:*` profiles, Cursor Agent, Fable, MiniMax, GLM, Pi, DeepSeek Pro, and unknown profiles SHALL NOT be offered for new work.
 
 #### Scenario: User opens a launch surface
 - **WHEN** a user opens a new-pane, shared-member default, or policy launch surface
-- **THEN** only Claude Terminal, Codex Terminal, OpenCode Terminal, OMP Terminal, and DeepSeek 4.1 Flash Terminal are presented when allowed by effective project policy
+- **THEN** only Claude Terminal, Codex Terminal, OpenCode Terminal, Antigravity Terminal, OMP Terminal, and DeepSeek 4.1 Flash Terminal are presented when allowed by effective project policy
 - **AND** no structured agent profile is presented
 
 #### Scenario: Operator reviews supported launch profiles
 - **WHEN** the system administrator or a cluster owner reads the supported-profile catalog or edits launch policy
 - **THEN** every catalog key begins with `terminal:`
-- **AND** the catalog contains exactly the five supported terminal profiles
+- **AND** the catalog contains exactly the six supported terminal profiles
 
 #### Scenario: Persisted structured-agent policy is upgraded
 - **WHEN** stored deployment, cluster, project, member-default, or provisioning policy contains a structured-agent launch profile
@@ -107,6 +107,22 @@ The release SHALL include compatibility and regression coverage proving that ret
 - **WHEN** the complete Rust and web verification suites run against the upgraded code
 - **THEN** tests cover retired-value rejection, policy normalization, legacy-state loading, credential inertness, and absence from user-facing catalogs
 - **AND** the supported Claude, Codex, DeepSeek, and OpenCode terminal launch tests continue to pass
+
+### Requirement: Antigravity runs in an interactive terminal
+
+APAS SHALL offer Google Antigravity CLI under `terminal:antigravity:official:default` when permitted by the effective launch policy. The receiving CLI SHALL advertise `terminal_antigravity_v1` before the server routes a launch or provider switch to it.
+
+#### Scenario: Open a tab on a machine missing Antigravity
+
+- **WHEN** the default `agy` executable is absent from PATH and its user install directory on a supported machine
+- **THEN** the tab downloads the pinned release for that operating system and architecture, verifies the archive checksum, and starts the installed executable in its terminal
+- **AND** a failed verification leaves the destination untouched
+
+#### Scenario: Use an existing installation
+
+- **WHEN** the configured executable is installed and the user opens an Antigravity tab
+- **THEN** the host starts that executable in the pane's working directory and passes any initial task as an interactive prompt
+- **AND** an unavailable custom executable produces a launch error
 
 ### Requirement: OpenCode is available as a policy-controlled terminal provider
 APAS SHALL offer OpenCode as a user-created terminal provider on supported launch surfaces when `terminal:opencode:official:default` is permitted by the effective project policy. The project host SHALL run the configured OpenCode interactive CLI with a non-blocking permission mode, SHALL deliver a fresh launch instruction using OpenCode's supported initial-prompt interface, and SHALL use OpenCode's continuation interface when restoring the pane.

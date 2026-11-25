@@ -3141,7 +3141,7 @@
       "type": "object",
       "properties": {
         "can_install": {
-          "description": "The daemon can install this provider by itself (today only OMP). This\nsays what the machine can do, not what the viewer may ask for: the\ncommand that performs an install authorizes its requester.",
+          "description": "The daemon can install this provider by itself (OMP and Antigravity). This\nsays what the machine can do, not what the viewer may ask for: the\ncommand that performs an install authorizes its requester.",
           "type": "boolean"
         },
         "installed": {
@@ -5080,6 +5080,7 @@
             "codex",
             "deepseek",
             "opencode",
+            "antigravity",
             "cursor-agent"
           ]
         },

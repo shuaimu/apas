@@ -183,26 +183,18 @@ fn mobile_launch_profiles(policy: &shared::EffectiveProjectPolicy) -> Vec<Mobile
 fn mobile_launch_capability_error(
     provider: shared::Provider,
     supports_mobile_launch: bool,
-    supports_opencode_terminal: bool,
-    supports_omp_terminal: bool,
+    supports: impl Fn(&str) -> bool,
 ) -> Option<&'static str> {
     if !supports_mobile_launch {
         return Some("The project CLI must be updated and reconnected before mobile task launch");
     }
-    if provider == shared::Provider::Opencode && !supports_opencode_terminal {
-        return Some(
-            "The project CLI must be updated and reconnected before launching an OpenCode task",
-        );
-    }
     if shared::is_retired_provider(provider) {
-        // Unreachable through the catalog, which no longer lists a retired
-        // provider; kept so this function alone cannot let one through.
         return Some(shared::retired_launch_message(provider));
     }
-    if provider == shared::Provider::Omp && !supports_omp_terminal {
-        return Some(
-            "The project CLI must be updated and reconnected before launching an OMP task",
-        );
+    if let Some((capability, reason)) = super::ws_web::required_terminal_capability(provider) {
+        if !supports(capability) {
+            return Some(reason);
+        }
     }
     None
 }
@@ -791,8 +783,7 @@ pub async fn launch_task(
     if let Some(message) = mobile_launch_capability_error(
         profile.provider,
         supports(shared::MOBILE_TASK_LAUNCH_CAPABILITY),
-        supports(shared::OPENCODE_TERMINAL_CAPABILITY),
-        supports(shared::OMP_TERMINAL_CAPABILITY),
+        supports,
     ) {
         return Err(fail_task_launch(&state, &request, &user.id, message).await);
     }
@@ -1030,6 +1021,7 @@ mod tests {
                 "terminal:claude:official:default",
                 "terminal:codex:official:default",
                 "terminal:opencode:official:default",
+                "terminal:antigravity:official:default",
                 "terminal:omp:official:default",
                 "terminal:claude:deepseek:deepseek-flash",
             ]
@@ -1040,20 +1032,37 @@ mod tests {
     }
 
     #[test]
+    fn antigravity_requires_its_own_capability() {
+        let provider = shared::Provider::Antigravity;
+        assert!(mobile_launch_capability_error(provider, true, |cap| cap
+            == shared::ANTIGRAVITY_TERMINAL_CAPABILITY)
+        .is_none());
+        assert!(mobile_launch_capability_error(provider, true, |cap| cap
+            != shared::ANTIGRAVITY_TERMINAL_CAPABILITY)
+        .is_some());
+    }
+
+    #[test]
     fn mobile_opencode_launch_requires_its_provider_capability() {
-        let error = mobile_launch_capability_error(shared::Provider::Opencode, true, false, true)
-            .expect("older CLI must be rejected");
+        let error = mobile_launch_capability_error(shared::Provider::Opencode, true, |cap| {
+            cap != shared::OPENCODE_TERMINAL_CAPABILITY
+        })
+        .expect("older CLI must be rejected");
         assert!(error.contains("OpenCode"));
         assert!(error.contains("updated and reconnected"));
 
         assert!(
-            mobile_launch_capability_error(shared::Provider::Opencode, true, true, true).is_none()
+            mobile_launch_capability_error(shared::Provider::Opencode, true, |_| true).is_none()
         );
         assert!(
-            mobile_launch_capability_error(shared::Provider::Claude, true, false, true).is_none()
+            mobile_launch_capability_error(shared::Provider::Claude, true, |cap| cap
+                != shared::OPENCODE_TERMINAL_CAPABILITY)
+            .is_none()
         );
         assert!(
-            mobile_launch_capability_error(shared::Provider::Codex, true, false, true).is_none()
+            mobile_launch_capability_error(shared::Provider::Codex, true, |cap| cap
+                != shared::OPENCODE_TERMINAL_CAPABILITY)
+            .is_none()
         );
     }
 
@@ -1072,7 +1081,7 @@ mod tests {
             .all(|profile| profile.provider != shared::Provider::Pi));
 
         assert_eq!(
-            mobile_launch_capability_error(shared::Provider::Pi, true, true, true),
+            mobile_launch_capability_error(shared::Provider::Pi, true, |_| true),
             Some("Pi is no longer supported. Use OMP instead.")
         );
         assert_eq!(
@@ -1080,11 +1089,16 @@ mod tests {
             Some(shared::PI_RETIRED_MESSAGE)
         );
         // OMP is untouched: it needs only its own capability.
-        assert!(mobile_launch_capability_error(shared::Provider::Omp, true, false, true).is_none());
         assert!(
-            mobile_launch_capability_error(shared::Provider::Omp, true, true, false)
-                .expect("an older CLI cannot host OMP")
-                .contains("OMP")
+            mobile_launch_capability_error(shared::Provider::Omp, true, |cap| cap
+                != shared::OPENCODE_TERMINAL_CAPABILITY)
+            .is_none()
+        );
+        assert!(
+            mobile_launch_capability_error(shared::Provider::Omp, true, |cap| cap
+                != shared::OMP_TERMINAL_CAPABILITY)
+            .expect("an older CLI cannot host OMP")
+            .contains("OMP")
         );
     }
 

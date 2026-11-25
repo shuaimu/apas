@@ -234,6 +234,9 @@ function ProviderIcon({
       </svg>
     );
   }
+  if (provider === "antigravity") {
+    return <span className={`${className} text-center font-bold`} aria-label="Antigravity">A</span>;
+  }
   if (provider === "opencode") {
     // OpenCode logo — code brackets < />
     return (
@@ -527,6 +530,7 @@ export function TabBar({
                       ? "Cursor"
                       : tab.provider === "opencode"
                         ? "OpenCode"
+                        : tab.provider === "antigravity" ? "Antigravity"
                         : tab.provider === "omp"
                           ? "OMP"
                           : isRetiredPiProvider(tab.provider)
@@ -979,6 +983,7 @@ function AddTabButton({
     { provider: "claude", label: "Claude / DeepSeek 4.1 Flash", model: DEEPSEEK_FLASH_MODEL },
     { provider: "codex", label: "Codex" },
     { provider: "opencode", label: "OpenCode" },
+    { provider: "antigravity", label: "Antigravity" },
     { provider: "omp", label: "OMP" },
   ].filter((entry) => isAllowed("terminal", entry.provider, entry.model));
 

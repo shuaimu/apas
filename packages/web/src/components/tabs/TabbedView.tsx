@@ -343,6 +343,7 @@ const PROVIDER_OPTIONS = [
   { value: "codex", label: "Codex" },
   { value: "cursor-agent", label: "Cursor" },
   { value: "opencode", label: "OpenCode" },
+  { value: "antigravity", label: "Antigravity" },
   { value: "omp", label: "OMP" },
   { value: "deepseek", label: "DeepSeek" },
 ] as const;
@@ -903,6 +904,7 @@ export function TabbedView({
         ? "Cursor"
         : provider === "opencode"
           ? "OpenCode"
+          : provider === "antigravity" ? "Antigravity"
           : provider === "omp"
             ? "OMP"
             : isDeepseek || deepseekModel === DEEPSEEK_FLASH_MODEL
@@ -1504,7 +1506,7 @@ export function TabbedView({
           />
         )}
 
-        {activeIsTerminal && !activeIsUnsupported && (
+        {activeIsTerminal && activeProvider !== "antigravity" && !activeIsUnsupported && (
           <TerminalViewToggle
             mode={activeTerminalViewMode}
             onChange={setActiveTerminalViewMode}
@@ -1666,7 +1668,7 @@ export function TabbedView({
                   sessionId={sessionId}
                   paneId={tab.pane_id}
                   messages={msgs}
-                  mode={terminalViewModeForPane(tab.pane_id)}
+                  mode={tab.provider === "antigravity" ? "terminal" : terminalViewModeForPane(tab.pane_id)}
                   isActive={isActive}
                   onLoadMore={() => loadMoreMessages(tab.pane_id)}
                   isLoading={loadingMorePane === tab.pane_id}

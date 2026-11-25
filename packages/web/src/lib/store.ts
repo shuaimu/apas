@@ -247,7 +247,7 @@ export interface UsageLimitedStatus {
   allModelsUtilization?: number;
 }
 
-export type Provider = "claude" | "codex" | "minimax" | "glm" | "deepseek" | "opencode" | "pi" | "omp" | "cursor-agent";
+export type Provider = "claude" | "codex" | "minimax" | "glm" | "deepseek" | "opencode" | "antigravity" | "pi" | "omp" | "cursor-agent";
 
 /** Providers that can run a tab. The retired ones stay in `Provider` so a
  *  saved tab and an older frame still parse. */
@@ -693,6 +693,7 @@ function normalizeProvider(raw: unknown): Provider | null {
     if (normalized === "codex" || normalized === "openai" || normalized === "chatgpt") return "codex";
     if (normalized === "glm" || normalized === "zai" || normalized === "z.ai" || normalized === "zhipu") return "glm";
     if (normalized === "deepseek" || normalized === "deep_seek" || normalized === "deep-seek") return "deepseek";
+    if (normalized === "antigravity") return "antigravity";
     if (normalized === "opencode") return "opencode";
     // Retired, and still parsed: an old roster or stored session names it.
     if (normalized === "pi") return "pi";

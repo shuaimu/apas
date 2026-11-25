@@ -323,7 +323,7 @@ function parseLaunchProfile(key: string): LaunchOption | null {
   ) as Provider;
   // Pi was retired: a policy stored while it was offered may still list its
   // profile, and it must not come back as a launch option.
-  if (!["claude", "codex", "deepseek", "opencode", "omp", "cursor-agent"].includes(provider)) return null;
+  if (!["claude", "codex", "deepseek", "opencode", "antigravity", "omp", "cursor-agent"].includes(provider)) return null;
   const rawModel = modelParts.join(":");
   const model = rawModel && rawModel !== "default" ? rawModel : undefined;
   const deepseekModel = canonicalDeepseekModel(model);
@@ -1009,6 +1009,7 @@ export function MobileSessionActivity({ connected, onBack, onReconnect }: Mobile
 
   const projectName = displayProjectName(session.workingDir, session.gitRemote);
   const selectedIsTerminal = selectedPane?.kind === "terminal";
+  const selectedIsAntigravity = selectedIsTerminal && selectedPane?.provider === "antigravity";
   const selectedIsBot = selectedPane?.mode === "deadloop";
   // A saved Pi tab, or any other retired provider's: listed, never running.
   const selectedIsRetired = isRetiredProviderModel(selectedPane?.provider, selectedPane?.model);
@@ -1020,7 +1021,7 @@ export function MobileSessionActivity({ connected, onBack, onReconnect }: Mobile
   const openRequest = projectOpenModel.request;
   const canOpenProject = connected && openAction !== undefined && openRequest !== null;
   const openProjectLabel = openProjectActionLabel(openAction);
-  const canCompose = selectedPaneId !== null && !selectedIsBot && !selectedIsRetired;
+  const canCompose = selectedPaneId !== null && !selectedIsBot && !selectedIsRetired && !selectedIsAntigravity;
   const canSend = canCompose && connected && sessionIsRunning && !selectedRefusal;
   const hostLabel = projectHostLabel(instances, session.hostname);
   const stoppedActions = selectedHost?.stopped;
@@ -1335,7 +1336,9 @@ export function MobileSessionActivity({ connected, onBack, onReconnect }: Mobile
         ) : (
           <div className="flex min-h-60 flex-col items-center justify-center px-5 text-center">
             <div className="rounded-2xl bg-[#efeff5] p-3 dark:bg-[#25252d]">{connected ? <Wifi className="h-6 w-6 text-[#686873]" /> : <WifiOff className="h-6 w-6 text-[#686873]" />}</div>
-            {connected && selectedIsTerminal && !selectedIsRetired ? (
+            {connected && selectedIsAntigravity ? (
+              <h2 className="mt-3 text-lg font-extrabold">Sign in and follow the conversation in Antigravity’s terminal.</h2>
+            ) : connected && selectedIsTerminal && !selectedIsRetired ? (
               <>
                 {/* A terminal pane records every turn, so none at all means no
                     conversation has started — it is very likely still at a
@@ -1432,10 +1435,14 @@ export function MobileSessionActivity({ connected, onBack, onReconnect }: Mobile
           <p>Original provider: {selectedPane?.provider}. This retained history is read-only. New autonomous workers are created and approved independently.</p>
           <p className="whitespace-pre-wrap break-words">{selectedPane?.prompt || "No saved bot prompt is available."}</p>
         </details>}
-        <div className="flex items-end gap-2">
+        {selectedIsAntigravity ? (
+          <button type="button" disabled={!connected} onClick={openRawTerminal} className="min-h-11 w-full rounded-xl bg-[#6d5efc] px-4 text-sm font-bold text-white disabled:opacity-40">
+            Open Antigravity terminal
+          </button>
+        ) : <div className="flex items-end gap-2">
           <textarea value={followUp} onChange={(event) => setFollowUp(event.target.value)} rows={2} placeholder={selectedIsBot ? "Legacy bot history is read-only" : selectedIsRetired ? "This tab is read-only" : selectedIsTerminal ? "Message this terminal conversation" : "Steer this session and pane"} disabled={!canCompose} className="min-h-[2.75rem] flex-1 resize-none rounded-xl border border-[#dedee7] bg-white px-3 py-2 text-sm outline-none focus:border-[#6d5efc] disabled:opacity-50 dark:border-[#383842] dark:bg-[#1b1b21]" />
           <button type="button" aria-label={selectedIsTerminal ? "Send conversation message" : "Send follow-up"} disabled={!canSend || !followUp.trim()} onClick={sendFollowUp} className="flex h-11 w-11 shrink-0 items-center justify-center rounded-xl bg-[#6d5efc] text-white disabled:opacity-40"><Send className="h-5 w-5" /></button>
-        </div>
+        </div>}
       </div>
       </div>
 

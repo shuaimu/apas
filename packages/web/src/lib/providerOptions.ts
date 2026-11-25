@@ -66,6 +66,13 @@ export const PROVIDER_MODEL_GROUPS: ProviderModelGroup[] = [
     ],
   },
   {
+    id: "antigravity",
+    label: "Antigravity",
+    iconProvider: "antigravity",
+    toneClass: "text-blue-500",
+    options: [{ value: "antigravity/official", label: "Antigravity", provider: "antigravity" }],
+  },
+  {
     id: "omp",
     label: "OMP",
     iconProvider: "omp",
@@ -189,6 +196,7 @@ export function providerModelValue(
   }
   if (provider === "codex") return "codex/official";
   if (provider === "opencode") return "opencode/official";
+  if (provider === "antigravity") return "antigravity/official";
   if (provider === "omp") return "omp/official";
   if (provider === "cursor-agent") return "cursor-agent/official";
   if (provider === "deepseek") {

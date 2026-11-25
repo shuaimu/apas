@@ -1249,6 +1249,7 @@ fn resolve_pane_binary_path(
     claude_path: &str,
     codex_path: &str,
     opencode_path: &str,
+    antigravity_path: &str,
     omp_path: &str,
     cursor_agent_path: &str,
 ) -> String {
@@ -1259,6 +1260,7 @@ fn resolve_pane_binary_path(
         Provider::Claude | Provider::Deepseek => claude_path.to_string(),
         Provider::Codex => codex_path.to_string(),
         Provider::Opencode => opencode_path.to_string(),
+        Provider::Antigravity => antigravity_path.to_string(),
         Provider::Omp => omp_path.to_string(),
         Provider::CursorAgent => cursor_agent_path.to_string(),
         #[allow(deprecated)]
@@ -1286,6 +1288,7 @@ fn provider_display_name(provider: &Provider, model: Option<&str>) -> &'static s
         Provider::Pi => "Pi",
         Provider::Deepseek => "DeepSeek",
         Provider::Opencode => "OpenCode",
+        Provider::Antigravity => "Antigravity",
         Provider::Omp => "OMP",
         Provider::CursorAgent => "Cursor",
     }
@@ -1300,6 +1303,7 @@ fn provider_config_key(provider: &Provider, model: Option<&str>) -> &'static str
         Provider::Codex => "codex_path",
         Provider::Deepseek => "claude_path",
         Provider::Opencode => "opencode_path",
+        Provider::Antigravity => "antigravity_path",
         Provider::Omp => "omp_path",
         Provider::CursorAgent => "cursor_agent_path",
         #[allow(deprecated)]
@@ -1962,7 +1966,12 @@ fn spawn_terminal_pane(
     // OMP can keep running from the last verified local install when its
     // configured NFS executable is temporarily unavailable. For other
     // providers, preflight the source before copying it.
-    let source = if matches!(provider, Provider::Omp) {
+    let source = if *provider == Provider::Antigravity && binary_path == "agy" {
+        crate::terminal_pane::installed_antigravity().map_or_else(
+            || resolve_binary_path("agy"),
+            |path| path.display().to_string(),
+        )
+    } else if matches!(provider, Provider::Omp) {
         resolve_binary_path(binary_path)
     } else {
         resolve_terminal_binary(provider, binary_path)?
@@ -3311,6 +3320,7 @@ async fn run_inner(
     let claude_path = resolve_binary_path(&config.local.claude_path);
     let codex_path = resolve_binary_path(&config.local.codex_path);
     let opencode_path = resolve_binary_path(&config.local.opencode_path);
+    let antigravity_path = resolve_binary_path(&config.local.antigravity_path);
     let omp_path = resolve_binary_path(&config.local.omp_path);
     let cursor_agent_path = resolve_binary_path(&config.local.cursor_agent_path);
 
@@ -3536,6 +3546,7 @@ async fn run_inner(
             &claude_path,
             &codex_path,
             &opencode_path,
+            &antigravity_path,
             &omp_path,
             &cursor_agent_path,
         );
@@ -3724,6 +3735,7 @@ async fn run_inner(
             &claude_path,
             &codex_path,
             &opencode_path,
+            &antigravity_path,
             &omp_path,
             &cursor_agent_path,
         );
@@ -3807,6 +3819,7 @@ async fn run_inner(
         let claude_path_event = claude_path.clone();
         let codex_path_event = codex_path.clone();
         let opencode_path_event = opencode_path.clone();
+        let antigravity_path_event = antigravity_path.clone();
         let omp_path_event = omp_path.clone();
         let cursor_agent_path_event = cursor_agent_path.clone();
         let pane_sessions_event = pane_sessions.clone();
@@ -3829,6 +3842,7 @@ async fn run_inner(
                 &claude_path_event,
                 &codex_path_event,
                 &opencode_path_event,
+                &antigravity_path_event,
                 &omp_path_event,
                 &cursor_agent_path_event,
                 &working_dir_event,
@@ -5027,6 +5041,7 @@ fn handle_tui_events(
     claude_path: &str,
     codex_path: &str,
     opencode_path: &str,
+    antigravity_path: &str,
     omp_path: &str,
     cursor_agent_path: &str,
     working_dir: &str,
@@ -5342,6 +5357,7 @@ fn handle_tui_events(
                     claude_path,
                     codex_path,
                     opencode_path,
+                    antigravity_path,
                     omp_path,
                     cursor_agent_path,
                 );
@@ -5771,7 +5787,7 @@ fn active_usage_providers(pane_metas: &PaneMetas) -> (bool, bool, bool) {
             Provider::Codex => has_codex = true,
             Provider::Minimax | Provider::Glm => {}
             Provider::Deepseek => has_deepseek = true,
-            Provider::Opencode => {}
+            Provider::Opencode | Provider::Antigravity => {}
             Provider::Pi => {}
             Provider::Omp => {}
             Provider::CursorAgent => {}
@@ -5943,7 +5959,7 @@ fn build_agent_args(
         }
         #[allow(deprecated)]
         Provider::Minimax | Provider::Glm | Provider::Pi => (Vec::new(), false),
-        Provider::Omp => (Vec::new(), false),
+        Provider::Omp | Provider::Antigravity => (Vec::new(), false),
         Provider::Opencode => {
             // OpenCode generates its own `ses_*` identifiers, so the APAS
             // UUID cannot be passed to --session. Resume the newest session
@@ -6327,7 +6343,7 @@ fn parse_agent_output(
             Err(_) => None,
         },
         Provider::Opencode => convert_opencode_to_claude(line, session_id_str),
-        Provider::Omp => None,
+        Provider::Omp | Provider::Antigravity => None,
         Provider::CursorAgent => {
             // cursor-agent --output-format stream-json emits Claude-compatible events
             serde_json::from_str::<ClaudeStreamMessage>(line).ok()
@@ -9131,6 +9147,7 @@ mod tests {
             "claude",
             "codex",
             "opencode",
+            "agy",
             "omp",
             "cursor-agent",
         );
@@ -9146,6 +9163,7 @@ mod tests {
                 "claude",
                 "codex",
                 "opencode",
+                "agy",
                 "/opt/omp/bin/omp",
                 "cursor-agent",
             )
@@ -14027,6 +14045,7 @@ fn cli_capabilities(
         shared::PROJECT_POLICY_CAPABILITY.to_string(),
         shared::MOBILE_TASK_LAUNCH_CAPABILITY.to_string(),
         shared::OPENCODE_TERMINAL_CAPABILITY.to_string(),
+        shared::ANTIGRAVITY_TERMINAL_CAPABILITY.to_string(),
         shared::OMP_TERMINAL_CAPABILITY.to_string(),
         shared::OMP_QUESTION_CAPABILITY.to_string(),
         // The build speaks the autopilot protocol. Whether one tab can run

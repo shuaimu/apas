@@ -64,7 +64,7 @@ export type PaneMode = "deadloop" | "interactive";
  * Provider for a pane
  */
 export type Provider =
-  ("codex" | "deepseek" | "opencode" | "cursor-agent") | "claude" | "minimax" | "glm" | "pi" | "omp";
+  ("codex" | "deepseek" | "opencode" | "antigravity" | "cursor-agent") | "claude" | "minimax" | "glm" | "pi" | "omp";
 /**
  * The recorded open state of a project.
  *
@@ -445,7 +445,13 @@ export type ServerToWeb =
       /**
        * Provider for a pane
        */
-      provider?: ("codex" | "deepseek" | "opencode" | "cursor-agent") | "claude" | "minimax" | "glm" | "pi" | "omp";
+      provider?:
+        | ("codex" | "deepseek" | "opencode" | "antigravity" | "cursor-agent")
+        | "claude"
+        | "minimax"
+        | "glm"
+        | "pi"
+        | "omp";
       type: "usage_limits";
       [k: string]: unknown;
     }
@@ -1817,7 +1823,7 @@ export interface DeepseekBackendInfo {
  */
 export interface MachineProviderStatus {
   /**
-   * The daemon can install this provider by itself (today only OMP). This
+   * The daemon can install this provider by itself (OMP and Antigravity). This
    * says what the machine can do, not what the viewer may ask for: the
    * command that performs an install authorizes its requester.
    */

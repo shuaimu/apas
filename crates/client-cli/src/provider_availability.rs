@@ -23,10 +23,11 @@ const REFRESH_INTERVAL: Duration = Duration::from_secs(5 * 60);
 const VERSION_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The providers reported, in this order.
-const PROVIDERS: [Provider; 4] = [
+const PROVIDERS: [Provider; 5] = [
     Provider::Claude,
     Provider::Codex,
     Provider::Opencode,
+    Provider::Antigravity,
     Provider::Omp,
 ];
 
@@ -87,6 +88,7 @@ fn configured_path(config: &crate::config::Config, provider: Provider) -> &str {
         Provider::Claude => &config.local.claude_path,
         Provider::Codex => &config.local.codex_path,
         Provider::Opencode => &config.local.opencode_path,
+        Provider::Antigravity => &config.local.antigravity_path,
         Provider::Omp => &config.local.omp_path,
         _ => "",
     }
@@ -137,6 +139,14 @@ fn detect_with(
             let mut found = resolve(configured);
             let mut version = None;
             let mut can_install = false;
+            if provider == Provider::Antigravity && configured == "agy" && found.is_none() {
+                found = crate::terminal_pane::installed_antigravity();
+                can_install = found.is_none()
+                    && cfg!(all(
+                        any(target_os = "linux", target_os = "macos"),
+                        any(target_arch = "aarch64", target_arch = "x86_64")
+                    ));
+            }
             if provider == Provider::Omp && found.is_none() {
                 // What a launch would use instead: the verified host-local
                 // copy (its version is already known), or the official
@@ -348,7 +358,7 @@ mod tests {
     }
 
     #[test]
-    fn every_provider_is_reported_and_only_omp_can_be_installed() {
+    fn every_provider_is_reported_and_custom_paths_are_respected() {
         let dir = tempfile::tempdir().unwrap();
         let claude = dir.path().join("claude");
         std::fs::write(&claude, "#!/bin/sh\necho '2.1.233 (Claude Code)'\n").unwrap();
@@ -360,6 +370,7 @@ mod tests {
             .join("missing-codex")
             .to_string_lossy()
             .into_owned();
+        config.local.antigravity_path = dir.path().join("missing-agy").display().to_string();
         config.local.opencode_path = dir
             .path()
             .join("missing-opencode")
@@ -385,10 +396,10 @@ mod tests {
         assert!(found[0].installed);
         assert_eq!(found[0].version.as_deref(), Some("2.1.233"));
         assert!(!found[1].installed && found[1].version.is_none());
-        assert!(found.iter().take(3).all(|status| !status.can_install));
+        assert!(found.iter().take(4).all(|status| !status.can_install));
         // A launch never installs over an explicit path elsewhere, so
         // nothing offers to.
-        assert!(!found[3].installed && !found[3].can_install);
+        assert!(!found[4].installed && !found[4].can_install);
         assert_eq!(asked, vec![claude], "versions only for what was found");
 
         let quick = detect(&config, &mut |_| None, &|| None);
@@ -408,8 +419,8 @@ mod tests {
             &|| Some((copy.clone(), "18.20.2".to_string())),
         );
         assert!(!asked_omp);
-        assert!(found[3].installed);
-        assert_eq!(found[3].version.as_deref(), Some("18.20.2"));
+        assert!(found[4].installed);
+        assert_eq!(found[4].version.as_deref(), Some("18.20.2"));
     }
 
     #[test]

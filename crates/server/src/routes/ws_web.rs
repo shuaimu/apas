@@ -3078,10 +3078,14 @@ async fn authorize_profile_launch(
 /// it can host that provider's interactive TUI, with the error to show when it
 /// does not. Kept in one place so pane creation and provider switching cannot
 /// drift apart.
-fn required_terminal_capability(
+pub(super) fn required_terminal_capability(
     provider: shared::Provider,
 ) -> Option<(&'static str, &'static str)> {
     match provider {
+        shared::Provider::Antigravity => Some((
+            shared::ANTIGRAVITY_TERMINAL_CAPABILITY,
+            "The project CLI must be updated and reconnected before creating an Antigravity terminal pane.",
+        )),
         shared::Provider::Opencode => Some((
             shared::OPENCODE_TERMINAL_CAPABILITY,
             "The project CLI must be updated and reconnected before creating an OpenCode terminal pane.",

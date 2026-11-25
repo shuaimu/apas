@@ -1312,7 +1312,7 @@ fn is_apas_daemon_process(pid: u32) -> bool {
     process_info::is_apas_daemon(pid)
 }
 
-const CONFIG_KEYS: &str = "server, token, claude_path, codex_path, opencode_path, omp_path, cursor_agent_path, deepseek_api_base_url, deepseek_api_key, pane_host_adoption_grace_seconds, pane_host_reboot_grace_seconds, daemon_machine_id, daemon_roots, summary_enabled, summary_adapter, summary_model, summary_timeout_seconds, summary_max_input_bytes, summary_allow_cross_provider";
+const CONFIG_KEYS: &str = "server, token, claude_path, codex_path, opencode_path, antigravity_path, omp_path, cursor_agent_path, deepseek_api_base_url, deepseek_api_key, pane_host_adoption_grace_seconds, pane_host_reboot_grace_seconds, daemon_machine_id, daemon_roots, summary_enabled, summary_adapter, summary_model, summary_timeout_seconds, summary_max_input_bytes, summary_allow_cross_provider";
 
 /// What `apas config set/get pi_path` answers. A config file that still holds
 /// the key loads without complaint; only asking for it by name says this.
@@ -1326,6 +1326,7 @@ fn set_config_value(config: &mut config::Config, key: &str, value: String) -> Re
         "claude_path" => config.local.claude_path = value,
         "codex_path" => config.local.codex_path = value,
         "opencode_path" => config.local.opencode_path = value,
+        "antigravity_path" => config.local.antigravity_path = value,
         "pi_path" => anyhow::bail!(PI_PATH_RETIRED),
         "omp_path" => config.local.omp_path = value,
         "cursor_agent_path" => config.local.cursor_agent_path = value,
@@ -2492,6 +2493,7 @@ fn get_config_value(config: &config::Config, key: &str) -> Result<String> {
         "claude_path" => config.local.claude_path.clone(),
         "codex_path" => config.local.codex_path.clone(),
         "opencode_path" => config.local.opencode_path.clone(),
+        "antigravity_path" => config.local.antigravity_path.clone(),
         "pi_path" => anyhow::bail!(PI_PATH_RETIRED),
         "omp_path" => config.local.omp_path.clone(),
         "cursor_agent_path" => config.local.cursor_agent_path.clone(),
@@ -2551,6 +2553,7 @@ async fn handle_config_command(action: ConfigAction) -> Result<()> {
             println!("claude_path: {}", config.local.claude_path);
             println!("codex_path: {}", config.local.codex_path);
             println!("opencode_path: {}", config.local.opencode_path);
+            println!("antigravity_path: {}", config.local.antigravity_path);
             println!("omp_path: {}", config.local.omp_path);
             println!("cursor_agent_path: {}", config.local.cursor_agent_path);
             println!(

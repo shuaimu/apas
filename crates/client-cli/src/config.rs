@@ -86,6 +86,8 @@ pub struct LocalConfig {
     pub codex_path: String,
     #[serde(default = "default_opencode_path")]
     pub opencode_path: String,
+    #[serde(default = "default_antigravity_path")]
+    pub antigravity_path: String,
     #[serde(default = "default_omp_path")]
     pub omp_path: String,
     #[serde(default = "default_cursor_agent_path")]
@@ -145,6 +147,10 @@ fn default_opencode_path() -> String {
     "opencode".to_string()
 }
 
+fn default_antigravity_path() -> String {
+    "agy".to_owned()
+}
+
 fn default_omp_path() -> String {
     "omp".to_string()
 }
@@ -167,6 +173,7 @@ impl Default for LocalConfig {
             claude_path: "claude".to_string(),
             codex_path: default_codex_path(),
             opencode_path: default_opencode_path(),
+            antigravity_path: default_antigravity_path(),
             omp_path: default_omp_path(),
             cursor_agent_path: default_cursor_agent_path(),
             deepseek_api_base_url: None,

@@ -751,6 +751,7 @@ pub fn terminal_binary_for(provider: &Provider) -> Option<&'static str> {
         Provider::Claude => Some("claude"),
         Provider::Codex => Some("codex"),
         Provider::Opencode => Some("opencode"),
+        Provider::Antigravity => Some("agy"),
         Provider::Omp => Some("omp"),
         Provider::Minimax
         | Provider::Glm
@@ -758,6 +759,27 @@ pub fn terminal_binary_for(provider: &Provider) -> Option<&'static str> {
         | Provider::CursorAgent
         | Provider::Pi => None,
     }
+}
+
+/// The default user install may be outside the daemon's PATH.
+pub(crate) fn installed_antigravity() -> Option<std::path::PathBuf> {
+    dirs::home_dir()
+        .map(|home| home.join(".local/bin/agy"))
+        .filter(|path| crate::omp_install::is_executable_file(path))
+}
+
+/// A bare agy here means the default executable was missing. Run the
+/// installer in the PTY and replace it with agy upon successful installation.
+pub(crate) fn terminal_command(provider: &Provider, binary_path: &str) -> CommandBuilder {
+    if *provider == Provider::Antigravity && binary_path == "agy" {
+        let mut cmd = CommandBuilder::new("/bin/bash");
+        cmd.arg("-c");
+        cmd.arg(include_str!("../../../scripts/install-antigravity.sh"));
+        cmd.arg("apas-antigravity");
+        cmd.arg("--exec");
+        return cmd;
+    }
+    CommandBuilder::new(binary_path)
 }
 
 /// OMP's private per-pane session directory arguments.
@@ -823,7 +845,7 @@ fn resume_args_for(
 /// not degrade; it fails the spawn outright.
 fn permission_bypass_flag_for(provider: &Provider) -> Option<&'static str> {
     match provider {
-        Provider::Claude => Some("--dangerously-skip-permissions"),
+        Provider::Claude | Provider::Antigravity => Some("--dangerously-skip-permissions"),
         Provider::Codex => Some("--dangerously-bypass-approvals-and-sandbox"),
         // Official OpenCode auto mode approves requests that are not
         // explicitly denied by the user's own permission configuration.
@@ -893,6 +915,8 @@ pub(crate) fn terminal_args_for(
             // instruction positionally.
             if matches!(provider, Provider::Opencode) {
                 args.push("--prompt".to_string());
+            } else if matches!(provider, Provider::Antigravity) {
+                args.push("--prompt-interactive".to_string());
             }
             args.push(prompt.to_string());
         }
@@ -970,7 +994,7 @@ impl TerminalHandle {
         );
         let env: &[(String, String)] = &hook_env;
 
-        let mut cmd = CommandBuilder::new(binary_path);
+        let mut cmd = terminal_command(provider, binary_path);
         if let Some(extension) = extension {
             cmd.arg("--extension");
             cmd.arg(extension);
@@ -1276,7 +1300,42 @@ mod tests {
         }
     }
 
-    /// End-to-end over a real pty: spawn, capture output, observe exit.
+    #[test]
+    fn antigravity_stays_interactive_and_does_not_resume_another_tabs_conversation() {
+        let provider = Provider::Antigravity;
+        assert_eq!(terminal_binary_for(&provider), Some("agy"));
+        let args = terminal_args_for(
+            &provider,
+            Uuid::nil(),
+            false,
+            Some("inspect this change"),
+            None,
+        );
+        assert_eq!(
+            args,
+            [
+                "--dangerously-skip-permissions",
+                "--prompt-interactive",
+                "inspect this change"
+            ]
+        );
+        assert_eq!(
+            terminal_args_for(&provider, Uuid::nil(), true, None, None),
+            ["--dangerously-skip-permissions"]
+        );
+        assert_eq!(
+            terminal_command(&provider, "/opt/agy").get_argv(),
+            &[std::ffi::OsString::from("/opt/agy")]
+        );
+        assert_eq!(
+            terminal_command(&provider, "agy")
+                .get_argv()
+                .last()
+                .unwrap(),
+            "--exec"
+        );
+    }
+
     #[test]
     fn every_terminal_host_launches_without_permission_prompts() {
         // A terminal pane is driven from a browser; an approval prompt there
@@ -1286,6 +1345,7 @@ mod tests {
             Provider::Claude,
             Provider::Codex,
             Provider::Opencode,
+            Provider::Antigravity,
             Provider::Omp,
         ] {
             assert!(

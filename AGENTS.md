@@ -1132,7 +1132,8 @@ added later is permitted until an owner says otherwise, rather than vanishing
 from their menu.
 
 The catalog is deliberately **not** every `Provider`. It lists exactly
-`terminal:claude`, `terminal:codex`, `terminal:opencode` and `terminal:omp`.
+`terminal:claude`, `terminal:codex`, `terminal:opencode`,
+`terminal:antigravity` and `terminal:omp`.
 DeepSeek is the Claude binary against a different backend, so the add-tab menu
 offers it as a Claude model. The retired values (MiniMax, GLM, and Pi since
 2026-11-13) still decode and are never offered. `shared::all_tab_types` and
@@ -1579,11 +1580,11 @@ question is answered from the web; autopilot starts and stops. If the
 extension stays silent, the daemon's log says so once per agent after 60
 seconds.
 
-## Machines report their providers; OMP is installed when missing
+## Machines report their providers and install missing OMP or Antigravity
 
 Each daemon reports, in `MachineInfo.providers`, whether it finds Claude,
-Codex, OpenCode and OMP the way a launch would, their versions, and whether
-APAS can install them (only OMP, and only where a launch would). It sends a
+Codex, OpenCode, Antigravity and OMP the way a launch would, their versions, and whether
+APAS can install them (OMP or Antigravity where a launch would). It sends a
 quick list at registration and refreshes it every five minutes, after an
 install and at daemon start (`provider_availability.rs`). A missing list means
 an older daemon and changes nothing in the UI.
@@ -1594,6 +1595,23 @@ with "<Provider> is not installed on <host>." where the provider is missing
 and cannot be installed (`providerOfferOn` in `lib/machineChoice.ts`). The
 machine itself is never disabled for this. The Machines page and the phone's
 Machines card show "Providers: Claude, Codex, OMP", versions in the tooltip.
+
+**Antigravity CLI** uses `agy` from the daemon's PATH or `~/.local/bin/agy`.
+Select Antigravity in the desktop or phone provider menu and sign in inside
+its terminal. An explicit allowlist needs `terminal:antigravity:official:default`.
+Deploy the server and web first, then update project hosts before selecting it.
+The receiving CLI must advertise `terminal_antigravity_v1`.
+
+On first launch with the default setting, APAS runs the embedded
+`scripts/install-antigravity.sh` in the pane if the binary is missing. The
+script also works standalone. It verifies the pinned Google 1.5.16 archive
+against its platform's SHA-512 digest and publishes it at `~/.local/bin/agy`.
+Linux (glibc or musl) and macOS support x86-64 and arm64. Set a custom binary
+with `apas config set antigravity_path /path/to/agy`. Existing installs take
+precedence. APAS passes an initial task with `--prompt-interactive` and uses
+Antigravity's automatic tool approval flag, as it does for other terminal
+providers. Output and sign-in stay in the terminal. APAS can reattach a live
+PTY, but has no Antigravity transcript or conversation ID for a cold restart.
 
 **The OMP install** (`omp_install.rs`) pins one checked version, **18.20.2**,
 with the SHA-256 and size of the darwin-arm64, darwin-x64, linux-x64 and
@@ -2951,8 +2969,7 @@ provider's model provider or authenticate it. **It installs OMP by itself**
 (since 2026-11-15) when an OMP tab is opened, restored or rebooted on a
 machine with no `omp` on the daemon's PATH, no verified host-local copy and
 nothing at `~/.local/bin/omp`, and only when `omp_path` is the bare name or
-`~/.local/bin/omp`; see "Machines report their providers; OMP is installed
-when missing". The person still signs OMP in to a model provider in the tab's
+`~/.local/bin/omp`; see "Machines report their providers and install missing OMP or Antigravity". The person still signs OMP in to a model provider in the tab's
 Terminal view. The default executables are `opencode` and
 `omp`; override nonstandard installations with `apas config set
 opencode_path ...` and `apas config set omp_path ...`. Existing explicit

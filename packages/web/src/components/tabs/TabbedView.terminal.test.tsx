@@ -83,6 +83,15 @@ afterEach(() => {
 });
 
 describe("TabbedView terminal panes", () => {
+  it("opens Antigravity in its terminal even when the previous provider used conversation view", async () => {
+    localStorage.setItem("apas_terminal_view_mode", JSON.stringify({ [`${SESSION_ID}:7`]: "conversation" }));
+    seed([pane({ pane_id: 7, label: "Antigravity", kind: "terminal", provider: "antigravity" })], 7);
+    render(<TabbedView />);
+    const terminal = await screen.findByTestId("terminal-pane-7");
+    expect(terminal.closest(".hidden")).toBeNull();
+    expect(screen.queryByRole("button", { name: "Conversation" })).toBeNull();
+  });
+
   it("opens project Overview without pane commands or remounting the terminal", async () => {
     seed([pane({ pane_id: 7, label: "Codex TTY", kind: "terminal" })], 7);
     const removePane = vi.fn();

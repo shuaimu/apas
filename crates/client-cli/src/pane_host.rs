@@ -5,7 +5,7 @@
 //! mode-0600 host-local file and raw terminal bytes remain in memory.
 
 use anyhow::{bail, Context, Result};
-use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
+use portable_pty::{native_pty_system, MasterPty, PtySize};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use shared::{Provider, TerminalLifecycle};
 use std::collections::VecDeque;
@@ -909,7 +909,7 @@ impl HostedProcess {
         // size at startup (opencode's opentui) stay stuck at the initial
         // 80-column width. Cleanup still terminates the whole tree because
         // the direct child is a session/process-group leader.
-        let mut command = CommandBuilder::new(binary_path);
+        let mut command = crate::terminal_pane::terminal_command(&provider, binary_path);
         // Install Claude's SessionStart hook, which is how this pane's
         // transcript is identified rather than guessed. Returns None for other
         // providers and on any failure, which leaves the pane starting normally.

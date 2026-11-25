@@ -16,6 +16,8 @@ pub const MOBILE_TASK_LAUNCH_CAPABILITY: &str = "mobile_task_launch_v2";
 /// server/web deployment cannot route an OpenCode pane to an older CLI that
 /// would persist the pane but fail to launch it.
 pub const OPENCODE_TERMINAL_CAPABILITY: &str = "terminal_opencode_v1";
+/// The CLI can launch Google Antigravity in an interactive terminal.
+pub const ANTIGRAVITY_TERMINAL_CAPABILITY: &str = "terminal_antigravity_v1";
 /// The connected CLI can host OMP's interactive TUI, give each pane its own
 /// session directory, and mirror the session transcript written there.
 ///
@@ -3274,7 +3276,7 @@ pub struct MachineProviderStatus {
     /// The version the executable reported, when the daemon asked it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
-    /// The daemon can install this provider by itself (today only OMP). This
+    /// The daemon can install this provider by itself (OMP and Antigravity). This
     /// says what the machine can do, not what the viewer may ask for: the
     /// command that performs an install authorizes its requester.
     pub can_install: bool,
@@ -3504,6 +3506,7 @@ pub enum Provider {
     Glm,
     Deepseek,
     Opencode,
+    Antigravity,
     /// Decode-only compatibility tombstone. The Pi coding agent (`pi`) is not
     /// launchable; OMP replaced it. The value stays so an older `.apas`, a
     /// stored session or policy, and a frame from an older client still parse.
@@ -3596,6 +3599,7 @@ pub fn all_tab_types() -> Vec<String> {
         tab_type_key(PaneKind::Terminal, Provider::Claude),
         tab_type_key(PaneKind::Terminal, Provider::Codex),
         tab_type_key(PaneKind::Terminal, Provider::Opencode),
+        tab_type_key(PaneKind::Terminal, Provider::Antigravity),
         tab_type_key(PaneKind::Terminal, Provider::Omp),
     ]
 }
@@ -3724,6 +3728,14 @@ pub fn supported_launch_profiles() -> Vec<LaunchProfile> {
             "OpenCode Terminal",
             PaneKind::Terminal,
             Provider::Opencode,
+            "official",
+            None,
+        ),
+        launch_profile(
+            "terminal:antigravity:official:default",
+            "Antigravity Terminal",
+            PaneKind::Terminal,
+            Provider::Antigravity,
             "official",
             None,
         ),
@@ -3871,6 +3883,7 @@ pub fn launch_profile_key(kind: PaneKind, provider: Provider, model: Option<&str
         Provider::Claude | Provider::Deepseek => "claude",
         Provider::Codex => "codex",
         Provider::Opencode => "opencode",
+        Provider::Antigravity => "antigravity",
         Provider::Omp => "omp",
         Provider::CursorAgent => "cursor-agent",
         Provider::Minimax | Provider::Glm | Provider::Pi => "unsupported",
@@ -5877,6 +5890,7 @@ mod tests {
                 "terminal:claude".to_string(),
                 "terminal:codex".to_string(),
                 "terminal:opencode".to_string(),
+                "terminal:antigravity".to_string(),
                 "terminal:omp".to_string(),
             ]
         );
@@ -6046,7 +6060,7 @@ mod tests {
     #[test]
     fn supported_profiles_and_default_policy_offer_only_terminal_backends() {
         let profiles = supported_launch_profiles();
-        assert_eq!(profiles.len(), 5);
+        assert_eq!(profiles.len(), 6);
         assert!(profiles
             .iter()
             .all(|profile| profile.kind == PaneKind::Terminal));
@@ -6059,6 +6073,10 @@ mod tests {
                 ("terminal:claude:official:default", "Claude Terminal"),
                 ("terminal:codex:official:default", "Codex Terminal"),
                 ("terminal:opencode:official:default", "OpenCode Terminal"),
+                (
+                    "terminal:antigravity:official:default",
+                    "Antigravity Terminal"
+                ),
                 ("terminal:omp:official:default", "OMP Terminal"),
                 (
                     "terminal:claude:deepseek:deepseek-flash",

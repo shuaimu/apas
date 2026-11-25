@@ -30,6 +30,7 @@ describe("tab type keys", () => {
       "terminal:claude",
       "terminal:codex",
       "terminal:opencode",
+      "terminal:antigravity",
       "terminal:omp",
     ]);
     // Pi was retired. A stored deny list may still name it; nothing offers it.

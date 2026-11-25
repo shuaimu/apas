@@ -23,7 +23,7 @@ terminal views, the project overview, and the diff and pull-request handoffs.
 
 - **Terminal panes**: each pane runs a provider's real interactive TUI on a pty
   and streams it to the browser, so you get the CLI exactly as it ships
-- **Claude, Codex, OpenCode, and OMP**, plus Claude against a DeepSeek backend
+- **Claude, Codex, OpenCode, Antigravity, and OMP**, plus Claude against a DeepSeek backend
 - **Read it as a conversation**: a per-pane toggle swaps the live terminal for a
   structured transcript, recovered from the provider's own session files
 - **Drive it from a phone**: type into the conversation view and answer an
@@ -120,10 +120,14 @@ output format.
 headlessly and parses its stream-JSON. It is kept only for panes that already
 exist. Nothing creates one any more.
 
-Claude, Codex, OpenCode, and OMP can host terminal panes. DeepSeek runs
-the Claude binary against an Anthropic-compatible endpoint. APAS does not
-install or authenticate these tools; install and log into them on each host
-first. Pi was retired on 2026-11-13; see "Pi is retired; OMP remains" below.
+Claude, Codex, OpenCode, Antigravity, and OMP can host terminal panes. DeepSeek runs
+the Claude binary against an Anthropic-compatible endpoint. APAS can install Antigravity or OMP when you open a tab on a host
+that needs it. To install Antigravity separately, run
+`scripts/install-antigravity.sh`. Sign in inside its terminal on first use.
+For an existing custom installation, run
+`apas config set antigravity_path /path/to/agy`. Pi was retired on 2026-11-13; see "Pi is retired; OMP remains" below.
+
+Antigravity uses the raw terminal view. APAS does not import its conversation history.
 
 ### Terminal panes have history
 
@@ -306,7 +310,7 @@ working.
 
 `disallowed_tab_types` restricts which tab types users may create, where a tab
 type is a pane kind plus a provider (`terminal:claude`, `terminal:codex`,
-`terminal:opencode`, `terminal:omp`). It is stored as a deny
+`terminal:opencode`, `terminal:antigravity`, `terminal:omp`). It is stored as a deny
 list, so an empty value means everything is allowed and a provider added later
 is permitted until an owner says otherwise. The CLI enforces it by re-reading
 `.apas` on every request, because the web only hides menu entries.

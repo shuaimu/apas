@@ -129,7 +129,7 @@ When an APAS CLI process restores a persisted OpenCode terminal pane, it SHALL s
 - **AND** it does not submit the original prompt again
 
 ### Requirement: Supported terminal runtimes survive project CLI replacement
-The project host SHALL keep every live terminal runtime it can host persistently, for the Claude, Codex, OpenCode and OMP providers, outside the replaceable project CLI process. A successful full CLI reboot SHALL preserve the provider process, PTY state, terminal process-instance identifier, active turn, and descendant processes, then reconnect the replacement CLI to that same runtime. A terminal tab of a retired provider SHALL NOT be among the runtimes the project host keeps: when a project starts, a persistent runtime left for such a tab by an older CLI SHALL be ended.
+The project host SHALL keep every live terminal runtime it can host persistently, for the Claude, Codex, OpenCode, Antigravity and OMP providers, outside the replaceable project CLI process. A successful full CLI reboot SHALL preserve the provider process, PTY state, terminal process-instance identifier, active turn, and descendant processes, then reconnect the replacement CLI to that same runtime. A terminal tab of a retired provider SHALL NOT be among the runtimes the project host keeps: when a project starts, a persistent runtime left for such a tab by an older CLI SHALL be ended.
 
 #### Scenario: CLI reboots while a terminal agent is working
 - **WHEN** a supported terminal pane is running a turn during a full project CLI reboot
