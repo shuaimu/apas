@@ -34,6 +34,7 @@
     "expo-sqlite": "56.0.5",
     "expo-status-bar": "56.0.4",
     "expo-updates": "56.0.24",
+    "marked": "15.0.12",
     "react": "19.2.3",
     "react-dom": "19.2.3",
     "react-native": "0.85.3",

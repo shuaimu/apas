@@ -6728,8 +6728,10 @@ async fn handle_approval_decision(
 const TERMINAL_CONVERSATION_SUBMIT_DELAY: Duration =
     Duration::from_millis(shared::TERMINAL_SUBMIT_SETTLE_MS);
 
-fn terminal_conversation_frame(text: &str) -> String {
-    if text.contains('\n') {
+fn terminal_conversation_frame(text: &str, provider: Option<shared::Provider>) -> String {
+    // Codex clears its Enter-suppression window on an explicit paste. An
+    // inferred keyboard burst can swallow the separate submit even on one line.
+    if provider == Some(shared::Provider::Codex) || text.contains('\n') {
         format!("\u{1b}[200~{text}\u{1b}[201~")
     } else {
         text.to_string()
@@ -6816,7 +6818,13 @@ async fn handle_terminal_conversation_input(
         return;
     }
 
-    let input_frame = terminal_conversation_frame(&text);
+    let provider = state
+        .sessions
+        .get_session_panes(&sid)
+        .iter()
+        .find(|pane| pane.pane_id == pane_id)
+        .map(|pane| pane.provider);
+    let input_frame = terminal_conversation_frame(&text, provider);
     let input_b64 = base64::engine::general_purpose::STANDARD.encode(input_frame.as_bytes());
     let input_sent = state
         .sessions
@@ -7393,6 +7401,20 @@ mod web_input_route_tests {
         assert_eq!(messages[0].content, "legacy one");
         assert_eq!(messages[1].content, "legacy two");
         assert_eq!(state.sessions.seen_input_id(&session_id, "legacy"), None);
+    }
+
+    #[test]
+    fn codex_conversation_text_is_an_explicit_paste_even_on_one_line() {
+        let text = "a single line";
+        assert_eq!(
+            terminal_conversation_frame(text, Some(shared::Provider::Codex)),
+            "\x1b[200~a single line\x1b[201~"
+        );
+        assert_eq!(
+            terminal_conversation_frame(text, Some(shared::Provider::Claude)),
+            text
+        );
+        assert_eq!(terminal_conversation_frame(text, None), text);
     }
 
     #[tokio::test]

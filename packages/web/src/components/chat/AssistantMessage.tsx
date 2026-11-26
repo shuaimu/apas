@@ -3,8 +3,7 @@
 import { memo } from "react";
 import { Message } from "@/lib/store";
 import { Bot } from "lucide-react";
-import ReactMarkdown from "react-markdown";
-import remarkGfm from "remark-gfm";
+import { ConversationMarkdown } from "./ConversationMarkdown";
 import { CodeBlock } from "@/components/code/CodeBlock";
 import { ToolCard } from "@/components/tools/ToolCard";
 import { ApprovalPrompt } from "@/components/tools/ApprovalPrompt";
@@ -305,7 +304,7 @@ function fixHeaderlessTables(text: string): string {
 
   let i = 0;
   while (i < lines.length) {
-    if (isTableRow(lines[i]) && !(i + 1 < lines.length && isSeparator(lines[i + 1]))) {
+    if (isTableRow(lines[i])) {
       // Start of a headerless table block — collect all consecutive rows
       const blockStart = i;
       while (i < lines.length && isTableRow(lines[i])) i++;
@@ -313,7 +312,7 @@ function fixHeaderlessTables(text: string): string {
       const cols = firstRow.trim().replace(/^\||\|$/g, "").split("|").length;
       const separator = "|" + " --- |".repeat(cols);
       out.push(firstRow);
-      out.push(separator);
+      if (!isSeparator(lines[blockStart + 1] ?? "")) out.push(separator);
       for (let j = blockStart + 1; j < i; j++) out.push(lines[j]);
     } else {
       out.push(lines[i]);
@@ -367,72 +366,7 @@ function TextContent({ content }: { content: string }) {
 
   return (
     <div className="bg-gray-100 dark:bg-gray-800 rounded-2xl rounded-tl-sm px-3 sm:px-4 py-2 prose dark:prose-invert prose-base max-w-full overflow-x-auto">
-      <ReactMarkdown
-        remarkPlugins={[remarkGfm]}
-        components={{
-          code({ className, children, ...props }) {
-            const match = /language-(\w+)/.exec(className || "");
-            const isInline = !match;
-
-            if (isInline) {
-              return (
-                <code
-                  className="bg-gray-200 dark:bg-gray-700 px-1 py-0.5 rounded text-sm"
-                  {...props}
-                >
-                  {children}
-                </code>
-              );
-            }
-
-            return (
-              <CodeBlock
-                code={String(children).replace(/\n$/, "")}
-                language={match[1]}
-              />
-            );
-          },
-          table({ children }) {
-            return (
-              <div className="overflow-x-auto my-2">
-                <table className="min-w-full border-collapse text-sm">
-                  {children}
-                </table>
-              </div>
-            );
-          },
-          thead({ children }) {
-            return (
-              <thead className="bg-gray-200 dark:bg-gray-700">
-                {children}
-              </thead>
-            );
-          },
-          th({ children }) {
-            return (
-              <th className="border border-gray-300 dark:border-gray-600 px-3 py-2 text-left font-semibold">
-                {children}
-              </th>
-            );
-          },
-          td({ children }) {
-            return (
-              <td className="border border-gray-300 dark:border-gray-600 px-3 py-2">
-                {children}
-              </td>
-            );
-          },
-          tr({ children }) {
-            return (
-              <tr className="even:bg-gray-50 dark:even:bg-gray-800">
-                {children}
-              </tr>
-            );
-          },
-        }}
-      >
-        {processed}
-      </ReactMarkdown>
+      <ConversationMarkdown content={processed} />
     </div>
   );
 }

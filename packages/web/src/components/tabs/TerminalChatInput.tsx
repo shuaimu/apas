@@ -66,9 +66,9 @@ export function TerminalChatInput({
             // Shift+Enter for a newline matches every chat box; plain Enter
             // sends. On a phone there is no Shift, which is why the multi-line
             // path has to survive being pasted rather than typed.
-            if (e.key === "Enter" && !e.shiftKey) {
+            if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing && e.nativeEvent.keyCode !== 229) {
               e.preventDefault();
-              send();
+              if (!e.repeat) send();
             }
           }}
           rows={1}

@@ -53,6 +53,7 @@ export default function SessionActivityScreen() {
   const terminalEnabled = useMobileStore((state) => Boolean(state.features.terminal));
   const summarySupported = useMobileStore((state) => state.negotiatedCapabilities.includes("pane_work_summary_v1"));
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
+  const sending = useRef(false);
   const [followUp, setFollowUp] = useState("");
   const [followUpRequestId, setFollowUpRequestId] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
@@ -275,7 +276,7 @@ export default function SessionActivityScreen() {
   };
 
   const steer = async () => {
-    if (!mutationsAllowed() || !followUp.trim() || activePaneId === null || selectedUnavailable) return;
+    if (sending.current || !mutationsAllowed() || !followUp.trim() || activePaneId === null || selectedUnavailable) return;
     const supervisor = connectionSupervisor();
     if (!supervisor) {
       setActionError("Reconnect before sending this message.");
@@ -290,6 +291,7 @@ export default function SessionActivityScreen() {
       setFollowUpRequestId(requestId);
       setActionError(null);
       try {
+        sending.current = true;
         await supervisor.sendAcknowledged({
           type: "terminal_conversation_input",
           session_id: sessionId,
@@ -302,6 +304,8 @@ export default function SessionActivityScreen() {
       } catch (error) {
         settleUnsentFollowUp(error);
         setActionError(error instanceof Error ? error.message : "The terminal conversation message was not acknowledged.");
+      } finally {
+        sending.current = false;
       }
       return;
     }
@@ -309,6 +313,7 @@ export default function SessionActivityScreen() {
     setFollowUpRequestId(requestId);
     setActionError(null);
     try {
+      sending.current = true;
       await supervisor.sendAcknowledged({
         type: "input",
         session_id: sessionId,
@@ -321,6 +326,8 @@ export default function SessionActivityScreen() {
     } catch (error) {
       settleUnsentFollowUp(error);
       setActionError(error instanceof Error ? error.message : "The instruction was not acknowledged. Retry safely.");
+    } finally {
+      sending.current = false;
     }
   };
 
@@ -429,7 +436,7 @@ export default function SessionActivityScreen() {
       <View style={[styles.composer, { borderColor: theme.border, backgroundColor: theme.background }]}> 
         {connection === "ready" && selectedStatus ? <View testID="pane-working-status" accessibilityLiveRegion="polite" style={[styles.workingStatus, { backgroundColor: theme.surface }]}>{selectedAwaitingAnswer ? <Text style={[styles.pendingIcon, { color: theme.warning }]}>?</Text> : <ActivityIndicator size="small" color={theme.accent} />}<Text numberOfLines={1} style={[styles.workingText, { color: selectedAwaitingAnswer ? theme.warning : theme.accent }]}>{selectedStatus}</Text></View> : null}
         {selectedUnavailable ? <View testID="pane-unavailable" accessibilityLiveRegion="polite" style={[styles.unavailable, { backgroundColor: theme.surfaceMuted, borderColor: theme.warning }]}><Text style={{ color: theme.text }}>{selectedUnavailable}</Text></View> : null}
-        <FormField label="Message" value={followUp} editable={!selectedIsRetiredBot} onChangeText={(value) => { setFollowUp(value); setFollowUpRequestId(null); }} placeholder={selectedIsTerminal ? "Message this terminal conversation" : "Steer this exact session and pane"} multiline />
+        <FormField label="Message" value={followUp} editable={!selectedIsRetiredBot} onChangeText={(value) => { setFollowUp(value); setFollowUpRequestId(null); }} placeholder={selectedIsTerminal ? "Message this terminal conversation" : "Steer this exact session and pane"} multiline returnKeyType="send" submitBehavior="submit" onSubmitEditing={() => void steer()} />
         <PrimaryButton disabled={!mutationsAllowed() || activePaneId === null || !followUp.trim() || (selectedIsTerminal && !terminalEnabled) || selectedUnavailable !== null} onPress={() => void steer()}>{followUpRequestId ? "Retry message safely" : "Send message"}</PrimaryButton>
       </View>
       <PaneWorkSummarySheet

@@ -444,8 +444,9 @@ describe("mobile code screens", () => {
     expect(view.queryByText("Interrupt")).toBeNull();
     expect(view.queryByText("Summary")).toBeNull();
     expect(view.queryByText(/Conversation mode/)).toBeNull();
-    fireEvent.changeText(view.getByPlaceholderText("Message this terminal conversation"), "Please summarize the current state.");
-    fireEvent.press(view.getByText("Send message"));
+    const composer = view.getByPlaceholderText("Message this terminal conversation");
+    fireEvent.changeText(composer, "Please summarize the current state.");
+    fireEvent(composer, "submitEditing");
 
     await waitFor(() => expect(mockSendAcknowledged).toHaveBeenCalledWith({
       type: "terminal_conversation_input",
@@ -593,6 +594,16 @@ describe("mobile code screens", () => {
 
     act(() => useMobileStore.getState().setPaneStatus(session.id, 8, null));
     await waitFor(() => expect(view.queryByTestId("pane-working-status")).toBeNull());
+  });
+
+  it.each(["live", "history"])("shows a full %s Markdown table from Codex, including the last row", (source) => {
+    const content = "Results\n\n| Tool | State |\n| --- | --- |\n| **Codex** | Done |\n| Next | Ready |";
+    const detail = source === "history" ? { role: "assistant", content }
+      : { type: "assistant", message: { content: [{ type: "text", text: content }] } };
+    const view = render(<EventCard event={{ ...event(1), detail, summary: "Results…" }} expanded={false} onPress={jest.fn()} />);
+    expect(view.getByLabelText("Conversation table")).toBeTruthy();
+    expect(view.getByText("Codex")).toBeTruthy();
+    expect(view.getByText("Ready")).toBeTruthy();
   });
 
   it("styles user instructions as distinct bubbles without a redundant kind label", () => {

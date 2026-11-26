@@ -33,6 +33,7 @@ import { LOOP_PROMPT_ACTION_LABEL, LOOP_PROMPT_OFFLINE_TEXT, paneCanHaveLoopProm
 import { AutopilotRequestNotices } from "@/components/tabs/AutopilotStatus";
 import { AskUserQuestionCard } from "@/components/tools/AskUserQuestionCard";
 import { ProjectWorkersWorkspace } from "@/components/workers/ProjectWorkersWorkspace";
+import { ConversationMarkdown } from "@/components/chat/ConversationMarkdown";
 import { OverviewEmpty, OverviewSection, overviewCard, overviewMuted } from "@/components/overview/OverviewElements";
 import { readSelectedPane, writeSelectedPane } from "@/lib/mobileSelectedPane";
 import { isOmpQuestionInput, ompQuestionKey, parseOmpQuestionResult } from "@/lib/ompQuestions";
@@ -379,6 +380,21 @@ function MobileEventCard({
   const label = eventLabel(message);
   const expandable = detail.length > 180 || detail.includes("\n") || output?.type === "tool_use";
 
+  // Show table replies in full; a three-line preview can hide every data row.
+  const tableReply = message.role === "assistant" && (!output || output.type === "text")
+    && /^ *\|?(?:[ \t]*:?-+:?[ \t]*\|)+[ \t]*(?::?-+:?)?[ \t]*$/m.test(detail);
+  if (tableReply) {
+    return (
+      <article data-message-role={message.role} className={`min-w-0 rounded-2xl border p-3.5 ${eventSurface(message)} ${eventTone(message, answeredQuestions, false)}`}>
+        <div className="prose prose-sm max-w-full break-words dark:prose-invert">
+          <ConversationMarkdown content={detail} />
+        </div>
+        <time dateTime={message.timestamp.toISOString()} className="mt-2 block text-xs text-[#686873] dark:text-[#aaaab6]">
+          {message.timestamp.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })}
+        </time>
+      </article>
+    );
+  }
   return (
     <article data-message-role={message.role} className={`rounded-2xl border p-3.5 ${eventSurface(message)} ${eventTone(message, answeredQuestions, !!nativeState?.result)}`}>
       <button
@@ -1441,7 +1457,13 @@ export function MobileSessionActivity({ connected, onBack, onReconnect }: Mobile
             Open Antigravity terminal
           </button>
         ) : <div className="flex items-end gap-2">
-          <textarea value={followUp} onChange={(event) => setFollowUp(event.target.value)} rows={2} placeholder={selectedIsBot ? "Legacy bot history is read-only" : selectedIsRetired ? "This tab is read-only" : selectedIsTerminal ? "Message this terminal conversation" : "Steer this session and pane"} disabled={!canCompose} className="min-h-[2.75rem] flex-1 resize-none rounded-xl border border-[#dedee7] bg-white px-3 py-2 text-sm outline-none focus:border-[#6d5efc] disabled:opacity-50 dark:border-[#383842] dark:bg-[#1b1b21]" />
+          <textarea value={followUp} onChange={(event) => setFollowUp(event.target.value)}
+            enterKeyHint="send"
+            onKeyDown={(event) => {
+              if (event.key !== "Enter" || event.shiftKey || event.nativeEvent.isComposing || event.nativeEvent.keyCode === 229) return;
+              event.preventDefault();
+              if (canSend && !event.repeat) sendFollowUp();
+            }} rows={2} placeholder={selectedIsBot ? "Legacy bot history is read-only" : selectedIsRetired ? "This tab is read-only" : selectedIsTerminal ? "Message this terminal conversation" : "Steer this session and pane"} disabled={!canCompose} className="min-h-[2.75rem] flex-1 resize-none rounded-xl border border-[#dedee7] bg-white px-3 py-2 text-sm outline-none focus:border-[#6d5efc] disabled:opacity-50 dark:border-[#383842] dark:bg-[#1b1b21]" />
           <button type="button" aria-label={selectedIsTerminal ? "Send conversation message" : "Send follow-up"} disabled={!canSend || !followUp.trim()} onClick={sendFollowUp} className="flex h-11 w-11 shrink-0 items-center justify-center rounded-xl bg-[#6d5efc] text-white disabled:opacity-40"><Send className="h-5 w-5" /></button>
         </div>}
       </div>

@@ -2898,8 +2898,10 @@ via the same `TerminalInput` path the xterm view uses; the TUI cannot tell the
 difference. **MCP is not and cannot be involved**: it is agent-pull, so a tool
 server can answer a call but can never push a turn into a live conversation.
 Multi-line text is sent as a bracketed paste (`ESC[200~ … ESC[201~`) so the TUI
-takes it atomically instead of treating the first newline as submit; single-line
-text is sent bare, since a TUI that never enabled DECSET 2004 would otherwise
+takes it atomically instead of treating the first newline as submit. Codex also
+gets an explicit paste for a single line, so its paste-burst detector accepts
+the next Enter as submit. Other providers get single-line text bare, since
+a TUI that never enabled DECSET 2004 would otherwise
 show the wrapper as literal keystrokes. The carriage return is a separate write.
 The caveat is that it is sent **blind** — unlike the terminal view you cannot
 see whether the agent is mid-turn or sitting in a menu, so the UI says where the

@@ -627,6 +627,29 @@ describe("MobileSessionActivity", () => {
     expect(classes).not.toContain("text-xs");
   });
 
+  it("renders a Codex table before expanding the reply and keeps all data rows", () => {
+    seedStore({ paneMessages: { "3": [message({ id: "reply", content:
+      "Results\n\n| Command | Result |\n| :--- | ---: |\n| `first` | 10 |\n| second | 20 |" })] } });
+    renderActivity();
+    const table = within(screen.getByRole("table"));
+    expect(table.getAllByRole("columnheader")).toHaveLength(2);
+    expect(table.getAllByRole("row")).toHaveLength(3);
+    expect(table.getByRole("cell", { name: "first" })).toBeTruthy();
+    expect(table.getByRole("cell", { name: "20" })).toBeTruthy();
+  });
+
+  it("sends from the mobile Codex composer on Enter and keeps Shift+Enter for a newline", () => {
+    const actions = seedStore({ paneConfigs: [pane({ pane_id: 3, kind: "terminal" })] });
+    renderActivity();
+    const box = screen.getByPlaceholderText("Message this terminal conversation");
+    fireEvent.change(box, { target: { value: "check this" } });
+    fireEvent.keyDown(box, { key: "Enter", shiftKey: true });
+    fireEvent.keyDown(box, { key: "Enter", isComposing: true });
+    expect(actions.sendTerminalConversationMessage).not.toHaveBeenCalled();
+    fireEvent.keyDown(box, { key: "Enter" });
+    expect(actions.sendTerminalConversationMessage).toHaveBeenCalledExactlyOnceWith(3, "check this");
+  });
+
   it("expands agent detail to a full-width panel outside the toggle button", () => {
     seedStore({
       paneMessages: {

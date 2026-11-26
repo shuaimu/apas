@@ -1,6 +1,8 @@
-import { Pressable, StyleSheet, Text } from "react-native";
+import { useMemo } from "react";
+import { Pressable, StyleSheet, Text, View } from "react-native";
 import type { CodeEvent } from "@apas/protocol";
 
+import { conversationTableBlocks, ConversationTableReply } from "./ConversationTable";
 import { StatusBadge } from "@/components/ui";
 import { useTheme } from "@/design/tokens";
 
@@ -8,6 +10,15 @@ export function EventCard({ event, expanded, onPress }: { event: CodeEvent; expa
   const theme = useTheme();
   const isUserMessage = event.kind === "instruction";
   const showKind = !isUserMessage && event.kind !== "agent_status";
+  const table = useMemo(() => conversationTableBlocks(event), [event]);
+  if (table) {
+    return (
+      <View style={[styles.card, { borderColor: theme.border, backgroundColor: theme.surface }]}>
+        <ConversationTableReply blocks={table} />
+        <Text style={[styles.time, { color: theme.textMuted }]}>{new Date(event.created_at).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })}</Text>
+      </View>
+    );
+  }
   return (
     <Pressable
       accessibilityRole="button"
