@@ -317,6 +317,32 @@ describe("mobile code screens", () => {
     expect(view.queryByLabelText("Open pane-working")).toBeNull();
   });
 
+  it("catches up an open Codex conversation after reconnect and keeps live turns received during the cache read", async () => {
+    mockParams = { sessionId: session.id };
+    const old = event(1);
+    const live = { ...event(2), kind: "instruction" as const, summary: "Prompt from desktop" };
+    const reply = { ...event(3), summary: "Answer from Codex" };
+    const snapshot = { events: [old], watermarks: { [`${session.id}:3`]: old.created_at } };
+    const delayed = Promise.withResolvers<typeof snapshot>();
+    mockReadCachedSnapshot.mockReturnValue(delayed.promise);
+    useMobileStore.setState({
+      connection: "offline", sessions: [session],
+      panesBySession: { [session.id]: [{ ...terminalPane, pane_id: 3 }] },
+    });
+    const view = render(<SessionActivityScreen />);
+    expect(mockReadCachedSnapshot).toHaveBeenCalledWith(session.id);
+    expect(mockSend).not.toHaveBeenCalledWith(expect.objectContaining({ type: "get_session_messages" }));
+
+    act(() => useMobileStore.getState().setConnection("ready"));
+    act(() => useMobileStore.getState().setEvents(session.id, [live, reply]));
+    await act(async () => delayed.resolve(snapshot));
+    expect(view.getAllByTestId("event-message-line").map((line) => line.props.children[0]))
+      .toEqual([old.summary, live.summary, reply.summary]);
+    expect(mockSend).toHaveBeenCalledWith(expect.objectContaining({
+      type: "get_session_messages", session_id: session.id, pane_watermarks: { "3": old.created_at },
+    }));
+  });
+
   it("labels cached offline rendering and disables action assumptions", () => {
     useMobileStore.setState({ connection: "offline", lastUpdatedAt: "2026-08-08T12:00:00Z" });
     const view = render(<OfflineBanner />);

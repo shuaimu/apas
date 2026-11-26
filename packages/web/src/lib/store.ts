@@ -88,6 +88,8 @@ export interface Message {
   role: "user" | "assistant" | "system";
   content: string;
   timestamp: Date;
+  /** Exact UTC storage timestamp. Distinct rows can share a JS millisecond. */
+  serverCreatedAt?: string;
   outputType?: OutputType;
   sessionId?: string;
   paneId?: number;
@@ -4787,8 +4789,7 @@ function routeMessage(
   message = {
     ...message, sessionId: msgSessionId,
     paneId: normalizePaneId(rawPaneType, normalizeRawPaneId(rawPaneId)) ?? undefined,
-    ...(serverCreatedAt && message.outputType && "toolUseId" in message.outputType && message.outputType.toolUseId?.startsWith("omp:")
-      ? { timestamp: new Date(serverCreatedAt) } : {}),
+    ...(serverCreatedAt ? { serverCreatedAt, timestamp: new Date(serverCreatedAt) } : {}),
   };
   reconcileOmpQuestion(set, message);
   const { sessionId: currentSessionId } = get();
@@ -6765,6 +6766,7 @@ export function handleServerMessage(
           role,
           content: displayContent,
           timestamp: new Date(m.created_at as string || Date.now()),
+          serverCreatedAt: m.created_at as string | undefined,
           outputType,
           sessionId: responseSessionId,
           paneId: normalizePaneId(m.pane_type as string | undefined, m.pane_id as number | undefined) ?? undefined,
@@ -6975,26 +6977,9 @@ export function handleServerMessage(
           get().prependMessages(parsedMessages, hasMore);
         }
       } else if (isDualPane || hasPaneType) {
-        // Initial / window-refresh load - dual pane mode. `paneMsgBuckets`
-        // holds a contiguous newest-N slice per pane straight from the
-        // server. We reconcile it as a SLIDING WINDOW so the rendered tail
-        // is always a hole-free, server-authoritative block ending at
-        // "now":
-        //   - empty local bucket  -> accept the slice (first-time load).
-        //   - non-empty bucket     -> keep cached messages strictly OLDER
-        //     than the slice's oldest, then let the slice REPLACE the
-        //     recent window. This overwrites any hole a flaky reconnect
-        //     left BELOW the watermark — which the `after_created_at`
-        //     catchup can only ever skip, since it extends the frontier
-        //     forward and never re-examines older territory.
-        //
-        // Replacing the range wholesale (rather than merging by id) is what
-        // keeps it safe: stream_message messages carry client-random ids
-        // while session_messages carry storage ids, so an id-merge would
-        // duplicate the overlap. The window swap sidesteps that entirely;
-        // the only overlap is at the boundary, cut by the strict-older
-        // filter. Older history still pages in contiguously via
-        // loadMoreMessages (scroll-to-top, the isLoadingMore branch above).
+        // Replace the range covered by each pane's history read. Live frames
+        // have different IDs from stored rows and can arrive while that read
+        // is in flight, so retain confirmed messages beyond its upper bound.
         const { paneModes: existingPaneModes, paneMessages: existingPaneMessages, paneHasMore: existingPaneHasMore, messages: existingMessages } = get();
         const newPaneMessages: Record<string, Message[]> = { ...existingPaneMessages };
         const newPaneHasMore: Record<string, boolean> = { ...existingPaneHasMore };
@@ -7005,17 +6990,16 @@ export function handleServerMessage(
             newPaneMessages[paneId] = mergeOmpQuestionMessages(msgs);
             newPaneHasMore[paneId] = hasMore;
           } else if (msgs.length > 0) {
-            // Sliding-window reconcile: overwrite the recent range with the
-            // server's contiguous slice, keep older cached history.
-            const windowOldest = msgs.reduce(
-              (min, m) => (m.timestamp < min ? m.timestamp : min),
-              msgs[0].timestamp,
-            );
-            const kept = existing.filter((m) => m.timestamp < windowOldest);
-            newPaneMessages[paneId] = mergeOmpQuestionMessages([...kept, ...msgs]);
-            // There's older history to page if we kept anything below the
-            // slice, or the server flags more before it.
-            newPaneHasMore[paneId] = kept.length > 0 ? true : hasMore;
+            // Both history routes return each pane's rows oldest first.
+            const first = msgs[0];
+            const last = msgs[msgs.length - 1];
+            const older = existing.filter((m) => m.serverCreatedAt && first.serverCreatedAt
+              ? m.serverCreatedAt < first.serverCreatedAt
+              : m.timestamp < first.timestamp);
+            const newer = existing.filter((m) => m.serverCreatedAt && last.serverCreatedAt
+              && m.serverCreatedAt > last.serverCreatedAt);
+            newPaneMessages[paneId] = mergeOmpQuestionMessages([...older, ...msgs, ...newer]);
+            newPaneHasMore[paneId] = older.length > 0 || hasMore;
           }
         }
         // Same rule for the legacy single-pane bucket.
@@ -7139,6 +7123,7 @@ export function handleServerMessage(
                 updated[idx] = {
                   ...orig,
                   id: orig.id.replace(/^optimistic-/, ""),
+                  ...(serverCreatedAt ? { serverCreatedAt, timestamp: new Date(serverCreatedAt) } : {}),
                   // An attempt sent before a refusal arrived can still be
                   // delivered once the machine runs again: the echo stands.
                   deliveryError: undefined,

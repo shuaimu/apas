@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { ActivityIndicator, FlatList, type NativeScrollEvent, type NativeSyntheticEvent, StyleSheet, Text, View } from "react-native";
 import { router, useLocalSearchParams } from "expo-router";
 import * as Crypto from "expo-crypto";
-import type { CodeEvent, MobilePaneSummary, PaneConfig } from "@apas/protocol";
+import { applyCodeEvents, type CodeEvent, type MobilePaneSummary, type PaneConfig } from "@apas/protocol";
 
 import { DecisionActions, type DecisionResponse } from "@/components/DecisionActions";
 import { EventCard } from "@/components/EventCard";
@@ -12,7 +12,7 @@ import { EmptyState, ErrorNotice, FormField, OfflineBanner, PrimaryButton, Scree
 import { connectionSupervisor } from "@/connection/runtime";
 import { MutationRefusedError } from "@/connection/supervisor";
 import { useTheme } from "@/design/tokens";
-import { readCachedSnapshot, readConversationPosition, readSelectedConversationPane, saveConversationPosition, saveSelectedConversationPane, type ConversationPosition } from "@/storage/cache";
+import { readCachedSnapshot, readConversationPosition, readSelectedConversationPane, saveConversationPosition, saveSelectedConversationPane, type CachedSnapshot, type ConversationPosition } from "@/storage/cache";
 import { paneIsRetiredBot, paneStatusIsPendingAnswer } from "@/state/paneStatus";
 import {
   instancesForSession,
@@ -153,16 +153,33 @@ export default function SessionActivityScreen() {
     [activePaneId, events],
   );
 
+  const ready = connection === "ready";
+  const hasSession = Boolean(session);
+  const offlineHistory = useRef<{ sessionId: string; read: Promise<CachedSnapshot> } | null>(null);
   useEffect(() => {
-    restoredPosition.current = false;
-    void readCachedSnapshot(sessionId).then((cached) => {
-      setEvents(sessionId, cached.events);
+    if (!hasSession) {
+      offlineHistory.current = null;
+      return;
+    }
+    let active = true;
+    // Keep the pre-reconnect cursor even if a new live turn reaches SQLite
+    // while the socket is reattaching.
+    const read = ready && offlineHistory.current?.sessionId === sessionId
+      ? offlineHistory.current.read : readCachedSnapshot(sessionId);
+    offlineHistory.current = ready ? null : { sessionId, read };
+    const supervisor = connectionSupervisor();
+    if (ready) supervisor?.send({ type: "attach_session", session_id: sessionId });
+    void read.then((cached) => {
+      if (!active) return;
+      const live = useMobileStore.getState().eventsBySession[sessionId] ?? EMPTY_EVENTS;
+      setEvents(sessionId, applyCodeEvents(live, cached.events));
+      if (!ready) return;
       const paneWatermarks = Object.fromEntries(
         Object.entries(cached.watermarks)
           .filter(([key]) => key.startsWith(`${sessionId}:`) && !key.endsWith(":all"))
           .map(([key, value]) => [key.slice(key.lastIndexOf(":") + 1), value]),
       );
-      connectionSupervisor()?.send({
+      supervisor?.send({
         type: "get_session_messages",
         session_id: sessionId,
         limit: 100,
@@ -171,10 +188,11 @@ export default function SessionActivityScreen() {
           ? null
           : cached.events.reduce<string | null>((latest, event) => !latest || event.created_at > latest ? event.created_at : latest, null),
       });
-    }).catch(() => undefined);
-    const supervisor = connectionSupervisor();
-    supervisor?.send({ type: "attach_session", session_id: sessionId });
-  }, [sessionId, setEvents]);
+    }).catch(() => {
+      if (active && ready) supervisor?.send({ type: "get_session_messages", session_id: sessionId, limit: 100 });
+    });
+    return () => { active = false; };
+  }, [hasSession, ready, sessionId, setEvents]);
 
   useEffect(() => {
     if ((Number.isInteger(initialPaneId) && initialPaneId >= 0) || eventId) return;

@@ -378,6 +378,49 @@ describe("MobileSessionActivity", () => {
     await waitFor(() => expect(screen.getByPlaceholderText("Steer this session and pane")).toBeTruthy());
   });
 
+  it("keeps a desktop Codex turn visible when an older history reply arrives on the open phone", () => {
+    seedStore({ paneConfigs: [pane({ pane_id: 3, kind: "terminal" })] });
+    renderActivity();
+    const deliver = (frame: Record<string, unknown>) => act(() => {
+      handleServerMessage({ ...frame, session_id: "session-a" }, useStore.setState, useStore.getState);
+    });
+    const stored = (id: string, role: string, content: string, fraction: string) => ({
+      id, role, content, pane_id: 3, message_type: "text",
+      created_at: `2026-08-09T12:05:00.${fraction}+00:00`,
+    });
+    const previous = stored("old", "assistant", "Earlier turn", "123000");
+    const prompt = stored("prompt", "user", "Prompt typed on desktop", "123100");
+    const reply = stored("reply", "assistant", "Codex reply from desktop", "123200");
+    deliver({ type: "user_input", pane_id: 3, text: prompt.content, created_at: prompt.created_at });
+    deliver({
+      type: "stream_message", pane_id: 3, created_at: reply.created_at,
+      message: { type: "assistant", message: { content: [{ type: "text", text: reply.content }] } },
+    });
+    const log = within(screen.getByRole("log", { name: "Conversation activity" }));
+    expect(log.getByText(prompt.content)).toBeTruthy();
+    expect(log.getByText(reply.content)).toBeTruthy();
+
+    // A history read started before either live frame. The next one includes both.
+    deliver({ type: "session_messages", messages: [previous] });
+    expect(log.getByText(prompt.content)).toBeTruthy();
+    expect(log.getByText(reply.content)).toBeTruthy();
+    deliver({ type: "session_messages", messages: [previous, prompt, reply] });
+    expect(log.getAllByText(prompt.content)).toHaveLength(1);
+    expect(log.getAllByText(reply.content)).toHaveLength(1);
+    expect(useStore.getState().paneMessages["3"].slice(-2).map((item) => item.id)).toEqual(["prompt", "reply"]);
+  });
+
+  it("requests missed activity on reconnect while the same project stays open", () => {
+    const { loadSessionActivity } = seedStore();
+    const props = { onBack: vi.fn(), onReconnect: vi.fn() };
+    const view = render(<MobileSessionActivity {...props} connected />);
+    loadSessionActivity.mockClear();
+    view.rerender(<MobileSessionActivity {...props} connected={false} />);
+    expect(loadSessionActivity).not.toHaveBeenCalled();
+    view.rerender(<MobileSessionActivity {...props} connected />);
+    expect(loadSessionActivity).toHaveBeenCalledExactlyOnceWith("session-a");
+  });
+
   it("hides routine result bookkeeping but keeps real system errors", () => {
     seedStore({
       paneMessages: {

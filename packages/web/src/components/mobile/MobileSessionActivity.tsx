@@ -675,8 +675,9 @@ export function MobileSessionActivity({ connected, onBack, onReconnect }: Mobile
   const loopPromptSheetOpen = loopPromptPane !== undefined && loopPromptSheetPaneId === loopPromptPane.pane_id;
 
   useEffect(() => {
-    if (sessionId) loadSessionActivity(sessionId);
-  }, [loadSessionActivity, sessionId]);
+    // A reconnect can reattach the same project after missing desktop turns.
+    if (connected && sessionId) loadSessionActivity(sessionId);
+  }, [connected, loadSessionActivity, sessionId]);
 
   useEffect(() => {
     if (!sessionId) return;
