@@ -638,6 +638,18 @@ describe("MobileSessionActivity", () => {
     expect(table.getByRole("cell", { name: "20" })).toBeTruthy();
   });
 
+  it("keeps a table scrolled sideways when another reply arrives", () => {
+    const reply = message({ id: "table", content: "| Name | Value |\n| --- | --- |\n| A | B |" });
+    seedStore({ paneMessages: { "3": [reply] } });
+    renderActivity();
+    const scroller = screen.getByRole("table").parentElement!;
+    scroller.scrollLeft = 180;
+    act(() => useStore.setState({ paneMessages: { "3": [reply, message({ id: "next", content: "Finished." })] } }));
+    expect(screen.getByText("Finished.")).toBeTruthy();
+    expect(screen.getByRole("table").parentElement).toBe(scroller);
+    expect(scroller.scrollLeft).toBe(180);
+  });
+
   it("sends from the mobile Codex composer on Enter and keeps Shift+Enter for a newline", () => {
     const actions = seedStore({ paneConfigs: [pane({ pane_id: 3, kind: "terminal" })] });
     renderActivity();
